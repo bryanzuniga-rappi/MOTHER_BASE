@@ -20,21 +20,44 @@ def inject_mother_base_theme() -> None:
             --muted: #6f6b63;
         }
 
-        html, body, [class*="css"] {
-            font-family: "IBM Plex Mono", monospace;
-            color: var(--ink);
+        html,
+        body,
+        #root {
+            background-color: #f2efe6 !important;
+            color: #111111 !important;
+            color-scheme: light !important;
         }
 
-        .stApp {
-            color: var(--ink) !important;
-            background:
+        html, body, [class*="css"] {
+            font-family: "IBM Plex Mono", monospace;
+            color: #111111 !important;
+        }
+
+        .stApp,
+        [data-testid="stApp"],
+        [data-testid="stAppViewContainer"],
+        [data-testid="stMain"],
+        section.main,
+        .main {
+            color: #111111 !important;
+            background-color: #f2efe6 !important;
+        }
+
+        .stApp,
+        [data-testid="stAppViewContainer"],
+        [data-testid="stMain"] {
+            background-image:
                 linear-gradient(rgba(17,17,17,.055) 1px, transparent 1px),
-                linear-gradient(90deg, rgba(17,17,17,.055) 1px, transparent 1px),
-                var(--paper) !important;
+                linear-gradient(90deg, rgba(17,17,17,.055) 1px, transparent 1px) !important;
             background-size: 28px 28px !important;
         }
 
-        [data-testid="stHeader"] { background: transparent; }
+        [data-testid="stMainBlockContainer"],
+        .block-container {
+            background-color: transparent !important;
+        }
+
+        [data-testid="stHeader"] { background: transparent !important; }
         [data-testid="stSidebar"] { display: none; }
         [data-testid="stToolbar"], #MainMenu, footer { visibility: hidden; }
         .block-container { max-width: 1440px; padding: 2rem 3rem 4rem; }
