@@ -53,6 +53,7 @@ from mother_base_theme import (
 APP_NAME = "Les Enfants Terribles"
 MAX_UPLOAD_MB = 500
 DATA_TRANSFERS_SPREADSHEET_ID = "18kHevkMvf9l4s6ANg3h5KdNyj2yEPGAp5C_t8JwxFVw"
+DATABASE_SESSION_KEY = "mb_validated_database"
 
 ORIGIN_WAREHOUSES = {
     444: "CITYPARK TURBO",
@@ -1290,6 +1291,33 @@ def fetch_public_database() -> bytes:
             "Google no devolvió un archivo Excel válido. Revisa el acceso público."
         )
     return workbook_bytes
+
+
+def load_database_session(*, force_refresh: bool = False) -> dict[str, Any]:
+    """Descarga y valida la base una sola vez por sesión de Streamlit."""
+    if force_refresh:
+        fetch_public_database.clear()
+        st.session_state.pop(DATABASE_SESSION_KEY, None)
+
+    if DATABASE_SESSION_KEY not in st.session_state:
+        try:
+            workbook_bytes = fetch_public_database()
+            state = {
+                "workbook_bytes": workbook_bytes,
+                "health": inspect_database(workbook_bytes),
+                "city_labels": extract_available_cities(workbook_bytes),
+                "error": "",
+            }
+        except Exception as exc:
+            state = {
+                "workbook_bytes": None,
+                "health": None,
+                "city_labels": {},
+                "error": str(exc),
+            }
+        st.session_state[DATABASE_SESSION_KEY] = state
+
+    return st.session_state[DATABASE_SESSION_KEY]
 
 
 def save_database(workbook_bytes: bytes, destination: Path) -> None:
@@ -5254,16 +5282,20 @@ def render() -> None:
     )
 
     st.markdown('<span class="section-label">01 — BASE DE DATOS</span>', unsafe_allow_html=True)
-    database_bytes: bytes | None = None
-    database_health: dict[str, Any] | None = None
-    city_labels: dict[str, str] = {}
-    try:
+    if DATABASE_SESSION_KEY not in st.session_state:
         with st.spinner("Validando fuentes de información…"):
-            database_bytes = fetch_public_database()
-            database_health = inspect_database(database_bytes)
-            city_labels = extract_available_cities(database_bytes)
+            database_state = load_database_session()
+    else:
+        database_state = load_database_session()
+
+    database_bytes = database_state["workbook_bytes"]
+    database_health = database_state["health"]
+    city_labels = database_state["city_labels"]
+    database_error = database_state["error"]
+
+    if database_health is not None:
         render_database_health(database_health)
-    except Exception as exc:
+    else:
         st.markdown(
             """
             <div class="database-status review">
@@ -5272,10 +5304,11 @@ def render() -> None:
             """,
             unsafe_allow_html=True,
         )
-        st.error(f"No fue posible validar la base de datos: {exc}")
+        st.error(f"No fue posible validar la base de datos: {database_error}")
 
     if st.button("VOLVER A VALIDAR LA BASE", use_container_width=False):
-        fetch_public_database.clear()
+        with st.spinner("Actualizando y validando fuentes de información…"):
+            load_database_session(force_refresh=True)
         st.rerun()
 
     st.markdown('<span class="section-label">02 — ARCHIVO DE PLANEACIÓN</span>', unsafe_allow_html=True)
@@ -5610,10 +5643,12 @@ def render() -> None:
                     f"Guardando y consolidando {len(uploaded_plans):,} CSV "
                     "cargado(s) de forma temporal…"
                 )
-                st.write("Validando la versión actual de la base de datos…")
-                fetch_public_database.clear()
-                database_bytes = fetch_public_database()
-                database_health = inspect_database(database_bytes)
+                st.write("Usando la base de datos validada al iniciar la sesión…")
+                if database_bytes is None or database_health is None:
+                    raise RuntimeError(
+                        "La base de datos no está disponible. Presiona 'Volver a "
+                        "validar la base' antes de ejecutar."
+                    )
                 if not database_health["online"]:
                     raise RuntimeError(
                         "La base de datos tiene una o más fuentes con error. "
