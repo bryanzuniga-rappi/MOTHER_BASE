@@ -7,7 +7,11 @@ from auth import (
     login_big_boss,
     login_raiden,
 )
-from mother_base_theme import inject_mother_base_theme, render_system_stamp
+from mother_base_theme import (
+    inject_mother_base_theme,
+    render_action_card,
+    render_system_stamp,
+)
 
 
 st.set_page_config(
@@ -21,6 +25,25 @@ st.set_page_config(
 MODULE_HOME = "MOTHER BASE"
 MODULE_PLANNING = "LES ENFANTS TERRIBLES"
 MODULE_REPORTS = "MILITAIRES SANS FRONTIÈRES"
+
+
+@st.dialog("BIG BOSS · ACCESS CONTROL", width="small")
+def render_big_boss_authentication() -> None:
+    st.caption("Ingresa el código de acceso para desbloquear Mother Base.")
+    with st.form("big_boss_access", clear_on_submit=False):
+        password = st.text_input(
+            "Código de acceso",
+            type="password",
+            placeholder="••••••••",
+        )
+        submitted = st.form_submit_button(
+            "DESBLOQUEAR ACCESO →",
+            use_container_width=True,
+        )
+    if submitted:
+        if login_big_boss(password):
+            st.rerun()
+        st.error("Código de acceso incorrecto.")
 
 
 def render_gateway() -> None:
@@ -38,43 +61,31 @@ def render_gateway() -> None:
     st.write("")
     big_boss_column, raiden_column = st.columns(2, gap="large")
     with big_boss_column:
-        st.markdown(
-            """
-            <div class="mb-card active">
-                <div class="mb-card-code">PROFILE / 01</div>
-                <h3>BIG BOSS</h3>
-                <p>Acceso completo al centro de comando. Requiere autenticación.</p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        with st.form("big_boss_access", clear_on_submit=False):
-            password = st.text_input(
-                "Código de acceso",
-                type="password",
-                placeholder="••••••••",
-            )
-            submitted = st.form_submit_button(
-                "INGRESAR COMO BIG BOSS →",
-                use_container_width=True,
-            )
-        if submitted:
-            if login_big_boss(password):
-                st.rerun()
-            st.error("Código de acceso incorrecto.")
+        if render_action_card(
+            key="profile_big_boss",
+            eyebrow="PROFILE / 01 · FULL ACCESS",
+            title="BIG BOSS",
+            description=(
+                "Acceso completo al centro de comando. Haz clic en esta tarjeta "
+                "para autenticarte."
+            ),
+            active=True,
+            tone="acid",
+        ):
+            render_big_boss_authentication()
 
     with raiden_column:
-        st.markdown(
-            """
-            <div class="mb-card">
-                <div class="mb-card-code">PROFILE / 02</div>
-                <h3>RAIDEN</h3>
-                <p>Acceso operativo sin contraseña. Por ahora tiene las mismas funciones.</p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        if st.button("INGRESAR COMO RAIDEN →", use_container_width=True):
+        if render_action_card(
+            key="profile_raiden",
+            eyebrow="PROFILE / 02 · OPERATIVE ACCESS",
+            title="RAIDEN",
+            description=(
+                "Acceso operativo sin contraseña. Por ahora tiene las mismas "
+                "funciones."
+            ),
+            active=False,
+            tone="white",
+        ):
             login_raiden()
             st.rerun()
 
@@ -98,32 +109,29 @@ def render_home() -> None:
     st.write("")
     planning_column, reporting_column = st.columns(2, gap="large")
     with planning_column:
-        st.markdown(
-            """
-            <div class="mb-card active">
-                <div class="mb-card-code">MODULE / 01 · OPERATIONAL</div>
-                <h3>LES ENFANTS TERRIBLES</h3>
-                <p>Naked, Solidus y Liquid Engines. Planeación táctica de transferencias.</p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        if st.button("ABRIR PLANEACIÓN →", use_container_width=True):
+        if render_action_card(
+            key="module_planning",
+            eyebrow="MODULE / 01 · OPERATIONAL",
+            title="LES ENFANTS TERRIBLES",
+            description=(
+                "Naked, Solidus y Liquid Engines. Planeación táctica de "
+                "transferencias."
+            ),
+            active=True,
+            tone="acid",
+        ):
             st.session_state["mb_module"] = MODULE_PLANNING
             st.rerun()
     with reporting_column:
-        st.markdown(
-            """
-            <div class="mb-card wip">
-                <div class="mb-card-code">MODULE / 02 · INTELLIGENCE</div>
-                <h3>MILITAIRES SANS FRONTIÈRES</h3>
-                <p>Reportes ejecutivos, históricos y seguimiento de misiones.</p>
-                <div class="mb-wip">WORK IN PROGRESS</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        if st.button("VER MÓDULO →", use_container_width=True):
+        if render_action_card(
+            key="module_reporting",
+            eyebrow="MODULE / 02 · INTELLIGENCE",
+            title="MILITAIRES SANS FRONTIÈRES",
+            description="Reportes ejecutivos, históricos y seguimiento de misiones.",
+            active=True,
+            tone="blue",
+            status="WORK IN PROGRESS",
+        ):
             st.session_state["mb_module"] = MODULE_REPORTS
             st.rerun()
 
