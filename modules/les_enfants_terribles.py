@@ -43,7 +43,11 @@ from engines.liquid_engine import (
     parse_manual_skus,
 )
 from engines.mission_control import select_engine_rows
-from mother_base_theme import inject_mother_base_theme, render_system_stamp
+from mother_base_theme import (
+    inject_mother_base_theme,
+    render_action_card,
+    render_system_stamp,
+)
 
 
 APP_NAME = "Les Enfants Terribles"
@@ -504,11 +508,19 @@ def inject_styles() -> None:
             min-height: 190px;
         }
 
-        div[data-testid="stForm"], div[data-testid="stExpander"] {
+        div[data-testid="stForm"],
+        div[data-testid="stExpander"] {
             border: 3px solid var(--ink);
             border-radius: 0;
-            background: rgba(255,253,247,.92);
+            background: var(--white);
             box-shadow: 6px 6px 0 var(--ink);
+        }
+
+        div[data-testid="stVerticalBlockBorderWrapper"] {
+            border: 1px solid #c9c5bb;
+            border-radius: 10px;
+            background: var(--white);
+            box-shadow: none;
         }
 
         div[data-testid="stTextInput"] input,
@@ -5381,36 +5393,52 @@ def render() -> None:
             "Solidus + Liquid nunca podrán excederlo."
         )
 
-    with st.container(border=True):
-        st.markdown(
-            """
-            <div class="engine-panel naked">
-                <h4>NAKED ENGINE</h4>
-                <p>Recomendación natural de Fountain9. Tiene la primera prioridad.</p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        include_naked_engine = st.toggle(
-            "Activar Naked Engine",
-            value=True,
-            help="Procesa exclusivamente casos con ROQ natural positivo.",
-        )
+    st.session_state.setdefault("mb_engine_naked_enabled", True)
+    st.session_state.setdefault("mb_engine_solidus_enabled", True)
+    st.session_state.setdefault("mb_engine_liquid_enabled", False)
 
     with st.container(border=True):
-        st.markdown(
-            """
-            <div class="engine-panel solidus">
-                <h4>SOLIDUS ENGINE</h4>
-                <p>Protecciones manuales, forecast 0, cobertura AVL y prevención.</p>
-            </div>
-            """,
-            unsafe_allow_html=True,
+        include_naked_engine = bool(
+            st.session_state["mb_engine_naked_enabled"]
         )
-        include_solidus_engine = st.toggle(
-            "Activar Solidus Engine",
-            value=True,
+        if render_action_card(
+            key="engine_naked_card",
+            eyebrow="ENGINE / 01 · FOUNTAIN9",
+            title="NAKED ENGINE",
+            description=(
+                "Recomendación natural de Fountain9. Tiene la primera prioridad "
+                "sobre el presupuesto compartido de tareas."
+            ),
+            active=include_naked_engine,
+            tone="acid",
+            status="ACTIVO" if include_naked_engine else "INACTIVO · CLIC PARA ACTIVAR",
+            min_height=150,
+            help_text="Haz clic en la tarjeta para activar o desactivar Naked Engine.",
+        ):
+            st.session_state["mb_engine_naked_enabled"] = not include_naked_engine
+            st.rerun()
+        st.caption("Procesa exclusivamente casos con ROQ natural positivo.")
+
+    with st.container(border=True):
+        include_solidus_engine = bool(
+            st.session_state["mb_engine_solidus_enabled"]
         )
+        if render_action_card(
+            key="engine_solidus_card",
+            eyebrow="ENGINE / 02 · PROTECTION",
+            title="SOLIDUS ENGINE",
+            description=(
+                "Protecciones manuales, forecast 0, cobertura AVL y prevención "
+                "de posibles quiebres."
+            ),
+            active=include_solidus_engine,
+            tone="blue",
+            status="ACTIVO" if include_solidus_engine else "INACTIVO · CLIC PARA ACTIVAR",
+            min_height=150,
+            help_text="Haz clic en la tarjeta para activar o desactivar Solidus Engine.",
+        ):
+            st.session_state["mb_engine_solidus_enabled"] = not include_solidus_engine
+            st.rerun()
         avl_left, preventive_right = st.columns(2)
         with avl_left:
             include_avl_fill = st.toggle(
@@ -5450,19 +5478,25 @@ def render() -> None:
 
     liquid_manual_skus_by_origin_raw: dict[int, str] = {}
     with st.container(border=True):
-        st.markdown(
-            """
-            <div class="engine-panel liquid">
-                <h4>LIQUID ENGINE</h4>
-                <p>Agota remanentes por origen. Nivela DOH y después utiliza share.</p>
-            </div>
-            """,
-            unsafe_allow_html=True,
+        include_liquid_engine = bool(
+            st.session_state["mb_engine_liquid_enabled"]
         )
-        include_liquid_engine = st.toggle(
-            "Activar Liquid Engine",
-            value=False,
-        )
+        if render_action_card(
+            key="engine_liquid_card",
+            eyebrow="ENGINE / 03 · INVENTORY LIQUIDATION",
+            title="LIQUID ENGINE",
+            description=(
+                "Agota remanentes por origen. Primero nivela DOH y después utiliza "
+                "el share de ventas de las tiendas."
+            ),
+            active=include_liquid_engine,
+            tone="coral",
+            status="ACTIVO" if include_liquid_engine else "INACTIVO · CLIC PARA ACTIVAR",
+            min_height=150,
+            help_text="Haz clic en la tarjeta para activar o desactivar Liquid Engine.",
+        ):
+            st.session_state["mb_engine_liquid_enabled"] = not include_liquid_engine
+            st.rerun()
         liquid_left, liquid_right = st.columns([2, 1])
         with liquid_left:
             liquid_automatic_tail = st.toggle(
