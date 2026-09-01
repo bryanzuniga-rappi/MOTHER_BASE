@@ -5329,7 +5329,7 @@ def render() -> None:
         if origin in ORIGIN_WAREHOUSES
     ] or [811, 834]
 
-    with st.container(border=True):
+    with st.container(border=True, key="mission_control_shared"):
         st.markdown("### MISSION CONTROL · VARIABLES COMPARTIDAS")
         left, right = st.columns([2, 1])
         with left:
@@ -5397,7 +5397,7 @@ def render() -> None:
     st.session_state.setdefault("mb_engine_solidus_enabled", True)
     st.session_state.setdefault("mb_engine_liquid_enabled", False)
 
-    with st.container(border=True):
+    with st.container(border=True, key="engine_naked_module"):
         include_naked_engine = bool(
             st.session_state["mb_engine_naked_enabled"]
         )
@@ -5417,9 +5417,18 @@ def render() -> None:
         ):
             st.session_state["mb_engine_naked_enabled"] = not include_naked_engine
             st.rerun()
-        st.caption("Procesa exclusivamente casos con ROQ natural positivo.")
+        if include_naked_engine:
+            st.caption("Procesa exclusivamente casos con ROQ natural positivo.")
+        else:
+            st.caption(
+                "Naked Engine está apagado. Activa la tarjeta para incluir la "
+                "recomendación natural de Fountain9."
+            )
 
-    with st.container(border=True):
+    include_avl_fill = False
+    include_preventive_fill = False
+    avl_doh = 3.0
+    with st.container(border=True, key="engine_solidus_module"):
         include_solidus_engine = bool(
             st.session_state["mb_engine_solidus_enabled"]
         )
@@ -5439,45 +5448,49 @@ def render() -> None:
         ):
             st.session_state["mb_engine_solidus_enabled"] = not include_solidus_engine
             st.rerun()
-        avl_left, preventive_right = st.columns(2)
-        with avl_left:
-            include_avl_fill = st.toggle(
-                "Cubrir stockouts del catálogo (AVL)",
-                value=False,
-                disabled=not include_solidus_engine,
+        if include_solidus_engine:
+            avl_left, preventive_right = st.columns(2)
+            with avl_left:
+                include_avl_fill = st.toggle(
+                    "Cubrir stockouts del catálogo (AVL)",
+                    value=False,
+                    help=(
+                        "Busca productos del catálogo con stock final cero y utiliza "
+                        "exclusivamente tareas sobrantes."
+                    ),
+                )
+            with preventive_right:
+                include_preventive_fill = st.toggle(
+                    "Blindar posibles quiebres del catálogo",
+                    value=False,
+                    help=(
+                        "Busca inventarios positivos menores a 1 DOH o a 3 unidades, "
+                        "sin recomendación positiva de Fountain9."
+                    ),
+                )
+            avl_doh = st.number_input(
+                "DOH objetivo de Solidus",
+                min_value=0.5,
+                max_value=30.0,
+                value=3.0,
+                step=0.5,
+                disabled=not (include_avl_fill or include_preventive_fill),
                 help=(
-                    "Busca productos del catálogo con stock final cero y utiliza "
-                    "exclusivamente tareas sobrantes."
+                    "Aplica a cobertura AVL y prevención. Se envían al menos 3 "
+                    "unidades salvo falta de stock o capacidad."
                 ),
             )
-        with preventive_right:
-            include_preventive_fill = st.toggle(
-                "Blindar posibles quiebres del catálogo",
-                value=False,
-                disabled=not include_solidus_engine,
-                help=(
-                    "Busca inventarios positivos menores a 1 DOH o a 3 unidades, "
-                    "sin recomendación positiva de Fountain9."
-                ),
+        else:
+            st.caption(
+                "Solidus Engine está apagado. Sus protecciones y parámetros no "
+                "están disponibles para esta corrida."
             )
-        avl_doh = st.number_input(
-            "DOH objetivo de Solidus",
-            min_value=0.5,
-            max_value=30.0,
-            value=3.0,
-            step=0.5,
-            disabled=not (
-                include_solidus_engine
-                and (include_avl_fill or include_preventive_fill)
-            ),
-            help=(
-                "Aplica a cobertura AVL y prevención. Se envían al menos 3 "
-                "unidades salvo falta de stock o capacidad."
-            ),
-        )
 
     liquid_manual_skus_by_origin_raw: dict[int, str] = {}
-    with st.container(border=True):
+    liquid_automatic_tail = False
+    liquid_automatic_tail_origins: set[int] = set()
+    forecast_horizon_days = 7
+    with st.container(border=True, key="engine_liquid_module"):
         include_liquid_engine = bool(
             st.session_state["mb_engine_liquid_enabled"]
         )
@@ -5497,70 +5510,71 @@ def render() -> None:
         ):
             st.session_state["mb_engine_liquid_enabled"] = not include_liquid_engine
             st.rerun()
-        liquid_left, liquid_right = st.columns([2, 1])
-        with liquid_left:
-            liquid_automatic_tail = st.toggle(
-                "Agotar automáticamente remanentes menores a 10 unidades",
-                value=True,
-                disabled=not include_liquid_engine,
-                help=(
-                    "Evalúa el stock que quede después de Naked y Solidus. Solo "
-                    "crea tareas mientras exista cupo global."
-                ),
-            )
-            liquid_automatic_tail_origins = set(
-                st.multiselect(
-                    "Orígenes habilitados para remanentes automáticos",
-                    options=list(selected_origins),
-                    default=list(selected_origins),
-                    format_func=format_origin,
-                    disabled=not (
-                        include_liquid_engine and liquid_automatic_tail
-                    ),
+        if include_liquid_engine:
+            liquid_left, liquid_right = st.columns([2, 1])
+            with liquid_left:
+                liquid_automatic_tail = st.toggle(
+                    "Agotar automáticamente remanentes menores a 10 unidades",
+                    value=True,
                     help=(
-                        "Liquid solo agotará automáticamente saldos menores a 10 "
-                        "en los orígenes marcados aquí."
+                        "Evalúa el stock que quede después de Naked y Solidus. Solo "
+                        "crea tareas mientras exista cupo global."
                     ),
                 )
-            )
-        with liquid_right:
-            forecast_horizon_days = st.number_input(
-                "Días del horizonte de forecast",
-                min_value=1,
-                max_value=90,
-                value=7,
-                step=1,
-                disabled=not include_liquid_engine,
-                help=(
-                    "Convierte Predicted Demand for selected duration en ADU para "
-                    "nivelar las tiendas hasta un máximo de 14 DOH."
-                ),
-            )
-            st.info(
-                "Liquid solo considera tiendas que aparecen en los archivos "
-                "cargados ese día. No exige que el SKU esté en CATALOGO."
-            )
-
-        st.markdown("#### SKUs MANUALES A AGOTAR POR ORIGEN")
-        if selected_origins:
-            sku_columns = st.columns(2)
-            for index, origin in enumerate(selected_origins):
-                with sku_columns[index % 2]:
-                    liquid_manual_skus_by_origin_raw[origin] = st.text_area(
-                        f"{format_origin(origin)}",
-                        value="",
-                        placeholder="Ejemplo: 10087, 10589, 10848",
-                        key=f"liquid_manual_skus_{origin}",
-                        disabled=not include_liquid_engine,
+                liquid_automatic_tail_origins = set(
+                    st.multiselect(
+                        "Orígenes habilitados para remanentes automáticos",
+                        options=list(selected_origins),
+                        default=list(selected_origins),
+                        format_func=format_origin,
+                        disabled=not liquid_automatic_tail,
                         help=(
-                            "Estos SKUs se agotarán únicamente desde este warehouse. "
-                            "Acepta comas o saltos de línea."
+                            "Liquid solo agotará automáticamente saldos menores a 10 "
+                            "en los orígenes marcados aquí."
                         ),
                     )
+                )
+            with liquid_right:
+                forecast_horizon_days = st.number_input(
+                    "Días del horizonte de forecast",
+                    min_value=1,
+                    max_value=90,
+                    value=7,
+                    step=1,
+                    help=(
+                        "Convierte Predicted Demand for selected duration en ADU para "
+                        "nivelar las tiendas hasta un máximo de 14 DOH."
+                    ),
+                )
+                st.info(
+                    "Liquid solo considera tiendas que aparecen en los archivos "
+                    "cargados ese día. No exige que el SKU esté en CATALOGO."
+                )
+
+            st.markdown("#### SKUs MANUALES A AGOTAR POR ORIGEN")
+            if selected_origins:
+                sku_columns = st.columns(2)
+                for index, origin in enumerate(selected_origins):
+                    with sku_columns[index % 2]:
+                        liquid_manual_skus_by_origin_raw[origin] = st.text_area(
+                            f"{format_origin(origin)}",
+                            value="",
+                            placeholder="Ejemplo: 10087, 10589, 10848",
+                            key=f"liquid_manual_skus_{origin}",
+                            help=(
+                                "Estos SKUs se agotarán únicamente desde este warehouse. "
+                                "Acepta comas o saltos de línea."
+                            ),
+                        )
+            else:
+                st.info(
+                    "Selecciona al menos un warehouse origen en Mission Control para "
+                    "capturar SKUs manuales de Liquid."
+                )
         else:
-            st.info(
-                "Selecciona al menos un warehouse origen en Mission Control para "
-                "capturar SKUs manuales de Liquid."
+            st.caption(
+                "Liquid Engine está apagado. Sus reglas de liquidación y captura "
+                "de SKUs no están disponibles para esta corrida."
             )
 
     submitted = st.button(
