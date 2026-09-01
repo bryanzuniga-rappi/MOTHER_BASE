@@ -292,20 +292,44 @@ def inject_styles() -> None:
             --muted: #6f6b63;
         }
 
+        html,
+        body,
+        #root {
+            background-color: #f2efe6 !important;
+            color: #111111 !important;
+            color-scheme: light !important;
+        }
+
         html, body, [class*="css"] {
             font-family: "IBM Plex Mono", monospace;
+            color: #111111 !important;
         }
 
-        .stApp {
-            background:
+        .stApp,
+        [data-testid="stApp"],
+        [data-testid="stAppViewContainer"],
+        [data-testid="stMain"],
+        section.main,
+        .main {
+            color: #111111 !important;
+            background-color: #f2efe6 !important;
+        }
+
+        .stApp,
+        [data-testid="stAppViewContainer"],
+        [data-testid="stMain"] {
+            background-image:
                 linear-gradient(rgba(17,17,17,.055) 1px, transparent 1px),
-                linear-gradient(90deg, rgba(17,17,17,.055) 1px, transparent 1px),
-                var(--paper);
-            background-size: 28px 28px;
-            color: var(--ink);
+                linear-gradient(90deg, rgba(17,17,17,.055) 1px, transparent 1px) !important;
+            background-size: 28px 28px !important;
         }
 
-        [data-testid="stHeader"] { background: transparent; }
+        [data-testid="stMainBlockContainer"],
+        .block-container {
+            background-color: transparent !important;
+        }
+
+        [data-testid="stHeader"] { background: transparent !important; }
         [data-testid="stToolbar"], #MainMenu, footer { visibility: hidden; }
         .block-container { max-width: 1440px; padding: 2rem 3rem 4rem; }
 
