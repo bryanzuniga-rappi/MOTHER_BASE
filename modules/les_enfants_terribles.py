@@ -85,7 +85,6 @@ REQUIRED_DATABASE_SHEETS = (
     "HIGH_VALUE",
     "RACKEADOS",
     "CAP_RECIBO",
-    "COPERNICO",
     "CATALOGO",
     "NO_DISPONIBLE",
     "STOCK",
@@ -127,10 +126,6 @@ SHEET_DESCRIPTIONS = {
     ),
     "CAP_RECIBO": (
         "Capacidad máxima de recibo de cada tienda expresada en metros cúbicos."
-    ),
-    "COPERNICO": (
-        "Inventario detallado por ubicación del warehouse 444. Permite identificar "
-        "y descontar el stock no utilizable."
     ),
     "CATALOGO": (
         "Catálogo de surtido por tienda y producto con su ADU. Se utiliza para "
@@ -3688,6 +3683,7 @@ def write_executive_pdf(
 
 
 def execute_planning(
+    uploaded_copernico,
     uploaded_plans,
     database_bytes: bytes,
     origins: tuple[int, ...],
@@ -3712,9 +3708,14 @@ def execute_planning(
     st.session_state["last_workspace"] = str(workspace)
     input_dir = workspace / "input"
     data_path = input_dir / "DATA_TRANSFERS.xlsx"
+    copernico_path = input_dir / "COPERNICO.csv"
     canonical_plan_path = input_dir / (
         f"Plan_Consolidado_{run_date:%d-%m-%Y}.csv"
     )
+
+    if uploaded_copernico is None:
+        raise ValueError("Falta cargar el CSV obligatorio de COPÉRNICO")
+    save_uploaded_file(uploaded_copernico, copernico_path)
 
     uploaded_plan_list = list(uploaded_plans or [])
     plan_paths: list[Path] = []
@@ -3748,7 +3749,11 @@ def execute_planning(
 
     captured = io.StringIO()
     with redirect_stdout(captured):
-        catalogs = engine.load_catalogs(data_path, config)
+        catalogs = engine.load_catalogs(
+            data_path,
+            config,
+            copernico_csv_path=copernico_path,
+        )
         fruver_811_summary = apply_fruver_811_block(
             catalogs,
             origins,
@@ -5302,9 +5307,49 @@ def render() -> None:
         load_database_resource.clear()
         st.rerun()
 
-    st.markdown('<span class="section-label">02 — ARCHIVO DE PLANEACIÓN</span>', unsafe_allow_html=True)
+    st.markdown(
+        '<span class="section-label">02 — INVENTARIO COPÉRNICO</span>',
+        unsafe_allow_html=True,
+    )
+    uploaded_copernico = st.file_uploader(
+        "Archivo COPÉRNICO (.csv)",
+        type=["csv"],
+        accept_multiple_files=False,
+        max_upload_size=MAX_UPLOAD_MB,
+        key="copernico_csv_upload",
+        help=(
+            "Este archivo sustituye completamente la hoja COPERNICO de la base. "
+            "Se utiliza para descontar las ubicaciones no usables del warehouse "
+            "indicado en la columna Bodega."
+        ),
+    )
+    with st.expander("Columnas requeridas del CSV de COPÉRNICO"):
+        st.markdown(
+            """
+            - `Bodega`: warehouse al que pertenece el inventario.
+            - `EAN`: identificador interno del producto (`PRODUCT_ID`).
+            - `Ubicacion`: ubicación física utilizada para determinar si el saldo es usable.
+            - `Saldo`: unidades disponibles en esa ubicación.
+
+            Cada saldo no usable se descuenta únicamente de la combinación
+            **Bodega + EAN** correspondiente. Por ejemplo, una fila con Bodega 856
+            afectará al origen 856 y no al 444. El archivo se lee en streaming al
+            ejecutar para soportar archivos grandes. La hoja `COPERNICO` de
+            `DATA_TRANSFERS` ya no participa en el cálculo.
+            """
+        )
+    if uploaded_copernico is not None:
+        st.success(
+            f"COPÉRNICO listo · {uploaded_copernico.name} · "
+            f"{uploaded_copernico.size / (1024 ** 2):,.1f} MB"
+        )
+
+    st.markdown(
+        '<span class="section-label">03 — ARCHIVOS FOUNTAIN9</span>',
+        unsafe_allow_html=True,
+    )
     uploaded_plans = st.file_uploader(
-        "Archivos de planeación (.csv)",
+        "Archivos de planeación Fountain9 (.csv)",
         type=["csv"],
         accept_multiple_files=True,
         max_upload_size=MAX_UPLOAD_MB,
@@ -5345,7 +5390,7 @@ def render() -> None:
                     f"{uploaded_file.size / (1024 ** 2):,.1f} MB"
                 )
 
-    st.markdown('<span class="section-label">03 — VARIABLES</span>', unsafe_allow_html=True)
+    st.markdown('<span class="section-label">04 — VARIABLES</span>', unsafe_allow_html=True)
     run_date = datetime.now(ZoneInfo("America/Mexico_City")).date()
     default_origins = [
         origin
@@ -5612,6 +5657,9 @@ def render() -> None:
     )
 
     if submitted:
+        if uploaded_copernico is None:
+            st.error("Primero sube el CSV de COPÉRNICO.")
+            st.stop()
         if not uploaded_plans:
             st.error("Primero sube al menos un CSV de planeación.")
             st.stop()
@@ -5634,6 +5682,9 @@ def render() -> None:
                 and (parsed := parse_manual_skus(raw_value))
             }
             with st.status("Ejecutando motor de planeación…", expanded=True) as status:
+                st.write(
+                    "Guardando y procesando el inventario COPÉRNICO cargado…"
+                )
                 st.write(
                     f"Guardando y consolidando {len(uploaded_plans):,} CSV "
                     "cargado(s) de forma temporal…"
@@ -5700,6 +5751,7 @@ def render() -> None:
                         "positiva de Fountain9…"
                     )
                 run = execute_planning(
+                    uploaded_copernico=uploaded_copernico,
                     uploaded_plans=uploaded_plans,
                     database_bytes=database_bytes,
                     origins=origins,
