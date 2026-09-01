@@ -19,7 +19,7 @@ la capacidad y el número de tareas cambian después de cada requerimiento.
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Iterable, Iterator
@@ -433,6 +433,106 @@ def copernico_is_usable(location: Any) -> bool:
     return len(value) >= 8
 
 
+def load_copernico_unusable_csv(
+    path: Path,
+) -> tuple[dict[tuple[int, int], float], dict[str, Any]]:
+    """Acumula saldo no usable por la combinación Bodega + producto."""
+    header_aliases = {
+        "Bodega": {"BODEGA", "WAREHOUSE ID", "WAREHOUSE_ID"},
+        "EAN": {"EAN", "PRODUCT ID", "PRODUCT_ID"},
+        "Ubicacion": {"UBICACION", "UBICACIÓN", "LOCATION"},
+        "Saldo": {"SALDO", "STOCK", "QUANTITY"},
+    }
+
+    def normalized_csv_header(value: Any) -> str:
+        folded = "".join(
+            character
+            for character in unicodedata.normalize("NFKD", clean_text(value))
+            if not unicodedata.combining(character)
+        )
+        return re.sub(r"\s+", " ", folded.replace("_", " ")).strip().upper()
+
+    normalized_aliases = {
+        canonical: {normalized_csv_header(alias) for alias in aliases}
+        for canonical, aliases in header_aliases.items()
+    }
+    unusable_stock: dict[tuple[int, int], float] = defaultdict(float)
+    total_rows = 0
+    source_rows = 0
+    unusable_rows = 0
+
+    with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as handle:
+        sample = handle.read(8192)
+        handle.seek(0)
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
+        except csv.Error:
+            dialect = csv.excel
+        reader = csv.DictReader(handle, dialect=dialect)
+        if reader.fieldnames is None:
+            raise ValueError("El CSV de COPÉRNICO no contiene encabezados")
+
+        normalized_fields = {
+            normalized_csv_header(field_name): field_name
+            for field_name in reader.fieldnames
+            if clean_text(field_name)
+        }
+        field_lookup: dict[str, str] = {}
+        missing: list[str] = []
+        for canonical, aliases in normalized_aliases.items():
+            match = next(
+                (
+                    normalized_fields[alias]
+                    for alias in aliases
+                    if alias in normalized_fields
+                ),
+                None,
+            )
+            if match is None:
+                missing.append(canonical)
+            else:
+                field_lookup[canonical] = match
+        if missing:
+            raise ValueError(
+                "El CSV de COPÉRNICO no contiene las columnas obligatorias: "
+                + ", ".join(missing)
+            )
+
+        for row_number, row in enumerate(reader, start=2):
+            total_rows += 1
+            warehouse = to_id(
+                row.get(field_lookup["Bodega"]),
+                f"COPÉRNICO CSV fila {row_number}.Bodega",
+                allow_none=True,
+            )
+            sku = to_id(
+                row.get(field_lookup["EAN"]),
+                f"COPÉRNICO CSV fila {row_number}.EAN",
+                allow_none=True,
+            )
+            if warehouse is None or sku is None:
+                continue
+            source_rows += 1
+            if copernico_is_usable(row.get(field_lookup["Ubicacion"])):
+                continue
+            unusable_rows += 1
+            unusable_stock[(warehouse, sku)] += max(
+                to_float(row.get(field_lookup["Saldo"]), 0.0),
+                0.0,
+            )
+
+    warehouses = sorted({warehouse for warehouse, _ in unusable_stock})
+    summary = {
+        "total_rows": total_rows,
+        "source_rows": source_rows,
+        "unusable_rows": unusable_rows,
+        "unusable_warehouse_skus": len(unusable_stock),
+        "unusable_warehouses": warehouses,
+        "unusable_units": sum(unusable_stock.values()),
+    }
+    return dict(unusable_stock), summary
+
+
 @dataclass
 class Catalogs:
     volume_m3: dict[int, float]
@@ -449,9 +549,17 @@ class Catalogs:
     stores: dict[int, dict[str, str]]
     storage: dict[int, str]
     warnings: list[str]
+    copernico_unusable_by_warehouse: dict[tuple[int, int], float] = field(
+        default_factory=dict
+    )
 
 
-def load_catalogs(path: Path, config: Config) -> Catalogs:
+def load_catalogs(
+    path: Path,
+    config: Config,
+    *,
+    copernico_csv_path: Path | None = None,
+) -> Catalogs:
     warnings: list[str] = []
     workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
     try:
@@ -527,16 +635,51 @@ def load_catalogs(path: Path, config: Config) -> Catalogs:
                 "min",
             )
 
-        copernico_unusable_444: dict[int, float] = defaultdict(float)
-        for row in iter_sheet_records(
-            workbook,
-            "COPERNICO",
-            ["Bodega", "EAN", "Ubicacion", "Saldo"],
-        ):
-            warehouse = to_id(row["Bodega"], "COPERNICO.Bodega", True)
-            sku = to_id(row["EAN"], "COPERNICO.EAN", True)
-            if warehouse == 444 and sku is not None and not copernico_is_usable(row["Ubicacion"]):
-                copernico_unusable_444[sku] += max(to_float(row["Saldo"], 0.0), 0.0)
+        if copernico_csv_path is not None:
+            copernico_unusable_by_warehouse, copernico_summary = (
+                load_copernico_unusable_csv(copernico_csv_path)
+            )
+            copernico_unusable_444 = {
+                sku: quantity
+                for (warehouse, sku), quantity in (
+                    copernico_unusable_by_warehouse.items()
+                )
+                if warehouse == 444
+            }
+            warehouse_text = ", ".join(
+                map(str, copernico_summary["unusable_warehouses"])
+            ) or "sin bodegas con saldo no usable"
+            warnings.append(
+                "COPÉRNICO CSV: se procesaron "
+                f"{copernico_summary['total_rows']:,} filas; "
+                f"{copernico_summary['unusable_rows']:,} ubicaciones no usables de "
+                f"{copernico_summary['unusable_warehouse_skus']:,} combinaciones "
+                f"bodega-SKU descontaron "
+                f"{copernico_summary['unusable_units']:,.0f} unidades. "
+                f"Bodegas afectadas: {warehouse_text}."
+            )
+        else:
+            copernico_unusable_444 = defaultdict(float)
+            for row in iter_sheet_records(
+                workbook,
+                "COPERNICO",
+                ["Bodega", "EAN", "Ubicacion", "Saldo"],
+            ):
+                warehouse = to_id(row["Bodega"], "COPERNICO.Bodega", True)
+                sku = to_id(row["EAN"], "COPERNICO.EAN", True)
+                if (
+                    warehouse == 444
+                    and sku is not None
+                    and not copernico_is_usable(row["Ubicacion"])
+                ):
+                    copernico_unusable_444[sku] += max(
+                        to_float(row["Saldo"], 0.0),
+                        0.0,
+                    )
+            copernico_unusable_by_warehouse = {
+                (444, sku): quantity
+                for sku, quantity in copernico_unusable_444.items()
+            }
 
         unavailable_stock: dict[tuple[int, int], float] = defaultdict(float)
         for row in iter_sheet_records(
@@ -623,6 +766,9 @@ def load_catalogs(path: Path, config: Config) -> Catalogs:
         stores=stores,
         storage=storage,
         warnings=warnings,
+        copernico_unusable_by_warehouse=dict(
+            copernico_unusable_by_warehouse
+        ),
     )
 
 
@@ -810,10 +956,14 @@ def calculate_target_quantity(row: dict[str, Any], config: Config) -> tuple[int,
 def source_stock_components(catalogs: Catalogs, source: int, sku: int) -> dict[str, Any]:
     base = max(catalogs.stock_base.get((source, sku), 0.0), 0.0)
     unavailable = max(catalogs.unavailable_stock.get((source, sku), 0.0), 0.0)
-    copernico_unusable = (
-        max(catalogs.copernico_unusable_444.get(sku, 0.0), 0.0)
-        if source == 444
-        else 0.0
+    copernico_unusable = max(
+        catalogs.copernico_unusable_by_warehouse.get(
+            (source, sku),
+            catalogs.copernico_unusable_444.get(sku, 0.0)
+            if source == 444
+            else 0.0,
+        ),
+        0.0,
     )
     rackeado = source == 444 and sku in catalogs.rackeados_444
     adjusted = max(base - unavailable - copernico_unusable, 0.0)
@@ -1086,8 +1236,11 @@ def plan_transfers(
                 diagnostics: list[str] = []
                 if origin_info.get(444, {}).get("rackeado"):
                     diagnostics.append("RACKEADO_444")
-                if origin_info.get(444, {}).get("copernico_unusable", 0) > 0:
-                    diagnostics.append("COPERNICO_NO_USABLE_444")
+                if any(
+                    info.get("copernico_unusable", 0) > 0
+                    for info in origin_info.values()
+                ):
+                    diagnostics.append("COPERNICO_NO_USABLE")
                 if any(info["unavailable"] > 0 for info in origin_info.values()):
                     diagnostics.append("NO_DISPONIBLE")
                 suffix = f" ({', '.join(diagnostics)})" if diagnostics else ""
