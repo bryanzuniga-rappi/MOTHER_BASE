@@ -268,17 +268,38 @@ def apply_liquid_engine(
     closed_store_ids: set[int],
     blocked_cities: tuple[str, ...],
     store_shares: dict[int, float],
-    manual_skus: set[int],
+    manual_skus_by_origin: dict[int, set[int]],
     *,
     automatic_tail: bool,
+    automatic_tail_origins: set[int] | None = None,
     forecast_horizon_days: int,
     max_doh: float = 14.0,
     reason_column: str = "PLANNING_REASON",
 ) -> dict[str, Any]:
     """Agota stock remanente sin rebasar stock, capacidad o tareas globales."""
     summary = empty_liquid_summary(True)
-    summary["manual_skus"] = len(manual_skus)
+    unknown_origins = set(manual_skus_by_origin) - set(config.origin_warehouses)
+    if unknown_origins:
+        raise ValueError(
+            "Liquid Engine recibió SKUs para orígenes no seleccionados: "
+            + ", ".join(map(str, sorted(unknown_origins)))
+        )
+    summary["manual_skus"] = sum(
+        len(skus) for skus in manual_skus_by_origin.values()
+    )
     summary["automatic_tail_enabled"] = automatic_tail
+    tail_origins = (
+        set(config.origin_warehouses)
+        if automatic_tail_origins is None
+        else set(automatic_tail_origins)
+    )
+    unknown_tail_origins = tail_origins - set(config.origin_warehouses)
+    if unknown_tail_origins:
+        raise ValueError(
+            "Liquid Engine recibió remanentes automáticos para orígenes no "
+            "seleccionados: "
+            + ", ".join(map(str, sorted(unknown_tail_origins)))
+        )
     summary["tasks_before"] = result.tasks_used
     if forecast_horizon_days <= 0:
         raise ValueError("Los días del horizonte de forecast deben ser mayores a cero.")
@@ -312,12 +333,13 @@ def apply_liquid_engine(
     stock_remaining: dict[tuple[int, int], int] = {}
     candidates: list[dict[str, Any]] = []
     for source in config.origin_warehouses:
+        source_manual_skus = set(manual_skus_by_origin.get(source, set()))
         source_skus = {
             sku
             for warehouse, sku in catalogs.stock_base
             if warehouse == source
         }
-        for sku in source_skus | manual_skus:
+        for sku in source_skus | source_manual_skus:
             info = engine.source_stock_components(catalogs, source, sku)
             remaining = max(
                 int(info["adjusted"])
@@ -326,8 +348,12 @@ def apply_liquid_engine(
             )
             source_info[(source, sku)] = info
             stock_remaining[(source, sku)] = remaining
-            is_manual = sku in manual_skus
-            is_tail = automatic_tail and 0 < remaining < 10
+            is_manual = sku in source_manual_skus
+            is_tail = (
+                automatic_tail
+                and source in tail_origins
+                and 0 < remaining < 10
+            )
             if remaining > 0 and (is_manual or is_tail):
                 candidates.append(
                     {

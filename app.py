@@ -3,11 +3,9 @@ from __future__ import annotations
 import streamlit as st
 
 from auth import (
-    PROFILE_BIG_BOSS,
     initialize_auth_state,
     login_big_boss,
     login_raiden,
-    logout,
 )
 from mother_base_theme import inject_mother_base_theme, render_system_stamp
 
@@ -16,7 +14,7 @@ st.set_page_config(
     page_title="Mother Base | Supply Command",
     page_icon="◆",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
 
@@ -130,36 +128,6 @@ def render_home() -> None:
             st.rerun()
 
 
-def render_navigation() -> str:
-    with st.sidebar:
-        st.markdown(
-            f"""
-            <div class="mb-profile">
-                <small>ACTIVE PROFILE</small><br>
-                <strong>{st.session_state.get('mb_profile', '')}</strong>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        selected = st.radio(
-            "COMMAND MODULES",
-            (MODULE_HOME, MODULE_PLANNING, MODULE_REPORTS),
-            index=(MODULE_HOME, MODULE_PLANNING, MODULE_REPORTS).index(
-                st.session_state.get("mb_module", MODULE_HOME)
-            ),
-            label_visibility="collapsed",
-        )
-        st.session_state["mb_module"] = selected
-        st.divider()
-        st.caption(
-            "Big Boss y Raiden tienen los mismos permisos en esta primera versión."
-        )
-        if st.button("CERRAR SESIÓN", use_container_width=True):
-            logout()
-            st.rerun()
-    return selected
-
-
 def main() -> None:
     inject_mother_base_theme()
     initialize_auth_state()
@@ -167,7 +135,7 @@ def main() -> None:
         render_gateway()
         return
 
-    selected_module = render_navigation()
+    selected_module = st.session_state.get("mb_module", MODULE_HOME)
     if selected_module == MODULE_PLANNING:
         from modules.les_enfants_terribles import render
 
@@ -182,4 +150,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

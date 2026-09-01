@@ -3643,7 +3643,8 @@ def execute_planning(
     include_solidus_engine: bool = True,
     include_liquid_engine: bool = False,
     liquid_automatic_tail: bool = True,
-    liquid_manual_skus: set[int] | None = None,
+    liquid_automatic_tail_origins: set[int] | None = None,
+    liquid_manual_skus_by_origin: dict[int, set[int]] | None = None,
     forecast_horizon_days: int = 7,
 ) -> dict[str, Any]:
     clear_previous_workspace()
@@ -3846,8 +3847,18 @@ def execute_planning(
                 closed_store_ids,
                 blocked_cities,
                 store_shares,
-                set(liquid_manual_skus or ()),
+                {
+                    int(source): set(skus)
+                    for source, skus in (
+                        liquid_manual_skus_by_origin or {}
+                    ).items()
+                },
                 automatic_tail=liquid_automatic_tail,
+                automatic_tail_origins=set(
+                    liquid_automatic_tail_origins
+                    if liquid_automatic_tail_origins is not None
+                    else origins
+                ),
                 forecast_horizon_days=forecast_horizon_days,
                 max_doh=14.0,
                 reason_column=PLANNING_REASON_COLUMN,
@@ -5282,42 +5293,8 @@ def render() -> None:
         if origin in ORIGIN_WAREHOUSES
     ] or [811, 834]
 
-    with st.form("planning_config"):
-        st.markdown("#### ENGINE LOADOUT")
-        naked_column, solidus_column, liquid_column = st.columns(3)
-        with naked_column:
-            include_naked_engine = st.toggle(
-                "NAKED ENGINE",
-                value=True,
-                help=(
-                    "Procesa únicamente el ROQ natural de Fountain9. Siempre "
-                    "consume primero el presupuesto global de tareas."
-                ),
-            )
-        with solidus_column:
-            include_solidus_engine = st.toggle(
-                "SOLIDUS ENGINE",
-                value=True,
-                help=(
-                    "Agrega forecast 0, protecciones manuales, cobertura AVL y "
-                    "prevención de quiebres con las tareas que queden."
-                ),
-            )
-        with liquid_column:
-            include_liquid_engine = st.toggle(
-                "LIQUID ENGINE",
-                value=False,
-                help=(
-                    "Ejecuta al final. Agota SKUs manuales y, opcionalmente, "
-                    "remanentes menores a 10 unidades usando DOH y share."
-                ),
-            )
-
-        st.caption(
-            "Los tres motores comparten un solo límite: Naked + Solidus + "
-            "Liquid nunca podrán superar el máximo de tareas configurado."
-        )
-
+    with st.container(border=True):
+        st.markdown("### MISSION CONTROL · VARIABLES COMPARTIDAS")
         left, right = st.columns([2, 1])
         with left:
             selected_origins = st.multiselect(
@@ -5356,27 +5333,60 @@ def render() -> None:
             )
             st.warning(f"Se bloqueará completamente: {selected_names}")
 
-        include_insumos = st.toggle(
-            "Agregar insumos al BulkCD_444",
+        support_left, support_right = st.columns(2)
+        with support_left:
+            include_insumos = st.toggle(
+                "Agregar insumos al BulkCD_444",
+                value=True,
+                help=(
+                    "Anexa insumos únicamente a tiendas que ya reciben producto "
+                    "normal desde 444. No consumen tareas."
+                ),
+            )
+        with support_right:
+            block_fruver_811 = st.toggle(
+                "Bloquear FRUVER desde el warehouse 811",
+                value=False,
+                help=(
+                    "El stock FRUVER del 811 queda fuera de los tres engines; los "
+                    "demás orígenes permanecen disponibles."
+                ),
+            )
+        st.caption(
+            "El máximo de tareas es un solo presupuesto compartido: Naked + "
+            "Solidus + Liquid nunca podrán excederlo."
+        )
+
+    with st.container(border=True):
+        st.markdown(
+            """
+            <div class="engine-panel naked">
+                <h4>NAKED ENGINE</h4>
+                <p>Recomendación natural de Fountain9. Tiene la primera prioridad.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        include_naked_engine = st.toggle(
+            "Activar Naked Engine",
             value=True,
-            help=(
-                "Cuando está activo, anexa los insumos de Aleph únicamente a las "
-                "tiendas que ya reciben producto normal desde el warehouse 444. "
-                "No consumen tareas ni capacidad; el envío se limita por el stock "
-                "ajustado del 444 y se recorta en múltiplos de MOQ."
-            ),
+            help="Procesa exclusivamente casos con ROQ natural positivo.",
         )
 
-        block_fruver_811 = st.toggle(
-            "Bloquear envíos FRUVER desde el warehouse 811",
-            value=False,
-            help=(
-                "Cuando está activo y el 811 es un origen seleccionado, su stock "
-                "de productos clasificados como FRUVER queda fuera de la asignación. "
-                "El motor puede cubrirlos desde los demás orígenes disponibles."
-            ),
+    with st.container(border=True):
+        st.markdown(
+            """
+            <div class="engine-panel solidus">
+                <h4>SOLIDUS ENGINE</h4>
+                <p>Protecciones manuales, forecast 0, cobertura AVL y prevención.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
-
+        include_solidus_engine = st.toggle(
+            "Activar Solidus Engine",
+            value=True,
+        )
         avl_left, preventive_right = st.columns(2)
         with avl_left:
             include_avl_fill = st.toggle(
@@ -5384,10 +5394,8 @@ def render() -> None:
                 value=False,
                 disabled=not include_solidus_engine,
                 help=(
-                    "Después de cubrir Fountain9, busca productos del catálogo con stock "
-                    "final igual a cero en la tienda y utiliza únicamente las "
-                    "tareas sobrantes. Mantiene capacidad, rutas, bloqueos, "
-                    "rackeados y prioridad de orígenes."
+                    "Busca productos del catálogo con stock final cero y utiliza "
+                    "exclusivamente tareas sobrantes."
                 ),
             )
         with preventive_right:
@@ -5396,30 +5404,41 @@ def render() -> None:
                 value=False,
                 disabled=not include_solidus_engine,
                 help=(
-                    "En una última pasada busca productos del catálogo con inventario "
-                    "positivo, pero menor a 1 DOH o menor a 3 unidades. Solo aplica "
-                    "cuando Fountain9 no generó una recomendación positiva para ese "
-                    "caso y utiliza exclusivamente tareas sobrantes."
+                    "Busca inventarios positivos menores a 1 DOH o a 3 unidades, "
+                    "sin recomendación positiva de Fountain9."
                 ),
             )
+        avl_doh = st.number_input(
+            "DOH objetivo de Solidus",
+            min_value=0.5,
+            max_value=30.0,
+            value=3.0,
+            step=0.5,
+            disabled=not (
+                include_solidus_engine
+                and (include_avl_fill or include_preventive_fill)
+            ),
+            help=(
+                "Aplica a cobertura AVL y prevención. Se envían al menos 3 "
+                "unidades salvo falta de stock o capacidad."
+            ),
+        )
 
-        _, doh_column, _ = st.columns([1, 2, 1])
-        with doh_column:
-            avl_doh = st.number_input(
-                "DOH objetivo para coberturas de catálogo",
-                min_value=0.5,
-                max_value=30.0,
-                value=3.0,
-                step=0.5,
-                disabled=not (include_avl_fill or include_preventive_fill),
-                help=(
-                    "Para stockout, objetivo = ADU × DOH. Para el blindaje, objetivo "
-                    "adicional = ADU × DOH menos el inventario actual. En ambos se "
-                    "envían al menos 3 unidades, salvo que el stock permitido no alcance."
-                ),
-            )
-
-        st.markdown("#### LIQUID ENGINE / MISSION PARAMETERS")
+    liquid_manual_skus_by_origin_raw: dict[int, str] = {}
+    with st.container(border=True):
+        st.markdown(
+            """
+            <div class="engine-panel liquid">
+                <h4>LIQUID ENGINE</h4>
+                <p>Agota remanentes por origen. Nivela DOH y después utiliza share.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        include_liquid_engine = st.toggle(
+            "Activar Liquid Engine",
+            value=False,
+        )
         liquid_left, liquid_right = st.columns([2, 1])
         with liquid_left:
             liquid_automatic_tail = st.toggle(
@@ -5431,12 +5450,20 @@ def render() -> None:
                     "crea tareas mientras exista cupo global."
                 ),
             )
-            liquid_manual_skus_raw = st.text_area(
-                "SKUs adicionales para agotar",
-                value="",
-                placeholder="Ejemplo: 10087, 10589, 10848",
-                disabled=not include_liquid_engine,
-                help="Acepta IDs separados por comas o saltos de línea.",
+            liquid_automatic_tail_origins = set(
+                st.multiselect(
+                    "Orígenes habilitados para remanentes automáticos",
+                    options=list(selected_origins),
+                    default=list(selected_origins),
+                    format_func=format_origin,
+                    disabled=not (
+                        include_liquid_engine and liquid_automatic_tail
+                    ),
+                    help=(
+                        "Liquid solo agotará automáticamente saldos menores a 10 "
+                        "en los orígenes marcados aquí."
+                    ),
+                )
             )
         with liquid_right:
             forecast_horizon_days = st.number_input(
@@ -5456,9 +5483,33 @@ def render() -> None:
                 "cargados ese día. No exige que el SKU esté en CATALOGO."
             )
 
-        submitted = st.form_submit_button(
-            "EJECUTAR PLANEACIÓN →", use_container_width=True
-        )
+        st.markdown("#### SKUs MANUALES A AGOTAR POR ORIGEN")
+        if selected_origins:
+            sku_columns = st.columns(2)
+            for index, origin in enumerate(selected_origins):
+                with sku_columns[index % 2]:
+                    liquid_manual_skus_by_origin_raw[origin] = st.text_area(
+                        f"{format_origin(origin)}",
+                        value="",
+                        placeholder="Ejemplo: 10087, 10589, 10848",
+                        key=f"liquid_manual_skus_{origin}",
+                        disabled=not include_liquid_engine,
+                        help=(
+                            "Estos SKUs se agotarán únicamente desde este warehouse. "
+                            "Acepta comas o saltos de línea."
+                        ),
+                    )
+        else:
+            st.info(
+                "Selecciona al menos un warehouse origen en Mission Control para "
+                "capturar SKUs manuales de Liquid."
+            )
+
+    submitted = st.button(
+        "EJECUTAR PLANEACIÓN →",
+        use_container_width=True,
+        type="primary",
+    )
 
     if submitted:
         if not uploaded_plans:
@@ -5476,11 +5527,12 @@ def render() -> None:
             st.stop()
         try:
             origins = tuple(selected_origins)
-            liquid_manual_skus = (
-                parse_manual_skus(liquid_manual_skus_raw)
+            liquid_manual_skus_by_origin = {
+                int(origin): parsed
+                for origin, raw_value in liquid_manual_skus_by_origin_raw.items()
                 if include_liquid_engine
-                else set()
-            )
+                and (parsed := parse_manual_skus(raw_value))
+            }
             with st.status("Ejecutando motor de planeación…", expanded=True) as status:
                 st.write(
                     f"Guardando y consolidando {len(uploaded_plans):,} CSV "
@@ -5561,7 +5613,12 @@ def render() -> None:
                     include_solidus_engine=include_solidus_engine,
                     include_liquid_engine=include_liquid_engine,
                     liquid_automatic_tail=liquid_automatic_tail,
-                    liquid_manual_skus=liquid_manual_skus,
+                    liquid_automatic_tail_origins=(
+                        liquid_automatic_tail_origins
+                        if include_liquid_engine and liquid_automatic_tail
+                        else set()
+                    ),
+                    liquid_manual_skus_by_origin=liquid_manual_skus_by_origin,
                     forecast_horizon_days=int(forecast_horizon_days),
                 )
                 status.update(label="Planeación finalizada", state="complete", expanded=False)

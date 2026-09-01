@@ -4,53 +4,58 @@ import streamlit as st
 
 
 def inject_mother_base_theme() -> None:
+    """Extiende sin sustituir la paleta brutalista del Transfer Planner."""
     st.markdown(
         """
         <style>
-        @import url('https://fonts.googleapis.com/css2?family=Black+Ops+One&family=IBM+Plex+Mono:wght@400;500;600;700&display=swap');
+        @import url('https://fonts.googleapis.com/css2?family=Archivo+Black&family=IBM+Plex+Mono:wght@400;500;600;700&display=swap');
 
         :root {
-            --mb-black: #080b09;
-            --mb-panel: #111713;
-            --mb-panel-2: #182019;
-            --mb-line: #8fa68b;
-            --mb-green: #c8ff3d;
-            --mb-red: #ff493d;
-            --mb-paper: #e9eadf;
-            --mb-muted: #9ba49a;
+            --ink: #111111;
+            --paper: #f2efe6;
+            --acid: #d9ff3f;
+            --coral: #ff5a47;
+            --blue: #5e7cff;
+            --white: #fffdf7;
+            --muted: #6f6b63;
         }
 
         html, body, [class*="css"] {
             font-family: "IBM Plex Mono", monospace;
+            color: var(--ink);
         }
 
         .stApp {
-            color: var(--mb-paper);
+            color: var(--ink) !important;
             background:
-                linear-gradient(rgba(143,166,139,.08) 1px, transparent 1px),
-                linear-gradient(90deg, rgba(143,166,139,.08) 1px, transparent 1px),
-                radial-gradient(circle at 80% 10%, rgba(200,255,61,.07), transparent 28%),
-                var(--mb-black);
-            background-size: 28px 28px, 28px 28px, auto, auto;
+                linear-gradient(rgba(17,17,17,.055) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(17,17,17,.055) 1px, transparent 1px),
+                var(--paper) !important;
+            background-size: 28px 28px !important;
         }
 
         [data-testid="stHeader"] { background: transparent; }
-        [data-testid="stSidebar"] {
-            background: #0b100c;
-            border-right: 2px solid var(--mb-line);
+        [data-testid="stSidebar"] { display: none; }
+        [data-testid="stToolbar"], #MainMenu, footer { visibility: hidden; }
+        .block-container { max-width: 1440px; padding: 2rem 3rem 4rem; }
+
+        h1, h2, h3, h4, p, label,
+        [data-testid="stMarkdownContainer"],
+        [data-testid="stWidgetLabel"] {
+            color: var(--ink);
         }
 
         h1, h2, h3 {
-            font-family: "Black Ops One", "IBM Plex Mono", monospace !important;
-            letter-spacing: .04em;
+            font-family: "Archivo Black", sans-serif !important;
+            letter-spacing: -.035em;
         }
 
         .mb-scanline {
-            height: 5px;
+            height: 6px;
             margin: 8px 0 22px;
             background: repeating-linear-gradient(
                 90deg,
-                var(--mb-green) 0 18px,
+                var(--ink) 0 18px,
                 transparent 18px 25px
             );
         }
@@ -58,99 +63,120 @@ def inject_mother_base_theme() -> None:
         .mb-hero {
             position: relative;
             overflow: hidden;
-            padding: 38px 42px;
-            border: 2px solid var(--mb-line);
-            box-shadow: 9px 9px 0 #000;
-            background: linear-gradient(135deg, #151d16, #090d0a 70%);
+            padding: 34px 38px;
+            margin: 6px 10px 32px 0;
+            border: 4px solid var(--ink);
+            box-shadow: 10px 10px 0 var(--ink);
+            background: var(--coral);
         }
 
         .mb-hero::after {
-            content: "MB";
+            content: "MOTHER BASE";
             position: absolute;
-            right: 24px;
-            top: -34px;
-            color: rgba(200,255,61,.06);
-            font: 190px/1 "Black Ops One", monospace;
+            right: -38px;
+            top: 38px;
+            transform: rotate(8deg);
+            border: 3px solid var(--ink);
+            background: var(--acid);
+            color: var(--ink);
+            padding: 8px 48px;
+            font-weight: 900;
+            letter-spacing: .08em;
         }
 
         .mb-kicker {
             display: inline-block;
+            border: 3px solid var(--ink);
             padding: 5px 9px;
-            color: var(--mb-black);
-            background: var(--mb-green);
-            font-weight: 800;
-            letter-spacing: .12em;
+            color: var(--ink);
+            background: var(--white);
+            font-weight: 900;
+            letter-spacing: .08em;
         }
 
         .mb-hero h1 {
             position: relative;
             z-index: 1;
+            max-width: 1000px;
             margin: 20px 0 8px;
-            color: var(--mb-paper);
+            color: var(--ink) !important;
             font-size: clamp(44px, 8vw, 92px);
-            line-height: .9;
+            line-height: .88;
         }
 
         .mb-hero p {
             position: relative;
             z-index: 1;
-            max-width: 720px;
-            color: var(--mb-muted);
+            max-width: 760px;
+            color: var(--ink) !important;
             font-size: 15px;
+            font-weight: 700;
         }
 
         .mb-card {
             min-height: 190px;
             padding: 23px;
-            border: 2px solid var(--mb-line);
-            box-shadow: 7px 7px 0 #000;
-            background: var(--mb-panel);
+            margin: 0 7px 18px 0;
+            border: 3px solid var(--ink);
+            box-shadow: 7px 7px 0 var(--ink);
+            background: var(--white);
+            color: var(--ink);
         }
 
-        .mb-card.active { border-color: var(--mb-green); }
-        .mb-card.wip { border-color: var(--mb-red); }
-        .mb-card h3 { margin: 9px 0; color: var(--mb-paper); }
-        .mb-card p { color: var(--mb-muted); }
-        .mb-card-code { color: var(--mb-green); font-size: 12px; font-weight: 700; }
-        .mb-wip { color: var(--mb-red); font-weight: 800; }
-
-        .mb-profile {
-            padding: 14px;
-            margin-bottom: 15px;
-            border: 1px solid var(--mb-line);
-            background: var(--mb-panel);
+        .mb-card.active { background: var(--acid); }
+        .mb-card.wip { background: var(--blue); color: var(--white); }
+        .mb-card h3 { margin: 9px 0; color: inherit !important; }
+        .mb-card p { color: inherit !important; font-weight: 600; }
+        .mb-card-code { color: inherit; font-size: 12px; font-weight: 900; }
+        .mb-wip {
+            display: inline-block;
+            padding: 4px 7px;
+            border: 2px solid var(--ink);
+            color: var(--ink);
+            background: var(--coral);
+            font-weight: 900;
         }
 
-        .mb-profile strong { color: var(--mb-green); }
+        .engine-panel {
+            border: 3px solid var(--ink);
+            box-shadow: 6px 6px 0 var(--ink);
+            padding: 18px 20px;
+            margin: 8px 7px 22px 0;
+            background: var(--white);
+        }
+        .engine-panel.naked { background: var(--acid); }
+        .engine-panel.solidus { background: var(--blue); color: var(--white); }
+        .engine-panel.liquid { background: var(--coral); }
+        .engine-panel h4, .engine-panel p { color: inherit !important; }
 
         div.stButton > button,
         div.stDownloadButton > button,
         div[data-testid="stFormSubmitButton"] > button {
-            min-height: 45px;
-            border: 2px solid var(--mb-line) !important;
+            min-height: 50px;
+            border: 3px solid var(--ink) !important;
             border-radius: 0 !important;
-            box-shadow: 5px 5px 0 #000 !important;
-            color: var(--mb-paper) !important;
-            background: var(--mb-panel-2) !important;
+            box-shadow: 5px 5px 0 var(--ink) !important;
+            color: var(--ink) !important;
+            background: var(--acid) !important;
             font-family: "IBM Plex Mono", monospace !important;
-            font-weight: 800 !important;
+            font-weight: 900 !important;
             text-transform: uppercase;
         }
 
         div.stButton > button:hover,
         div.stDownloadButton > button:hover,
         div[data-testid="stFormSubmitButton"] > button:hover {
-            border-color: var(--mb-green) !important;
-            color: var(--mb-black) !important;
-            background: var(--mb-green) !important;
-            transform: translate(-2px, -2px);
-            box-shadow: 7px 7px 0 #000 !important;
+            color: var(--ink) !important;
+            background: var(--acid) !important;
+            transform: translate(3px, 3px);
+            box-shadow: 2px 2px 0 var(--ink) !important;
         }
 
-        [data-testid="stMetric"] {
-            border: 1px solid var(--mb-line);
-            padding: 15px;
-            background: var(--mb-panel);
+        [data-testid="stMetric"],
+        [data-testid="stFileUploader"],
+        [data-testid="stExpander"],
+        [data-testid="stVerticalBlockBorderWrapper"] {
+            color: var(--ink) !important;
         }
 
         [data-testid="stFileUploaderDropzone"],
@@ -158,7 +184,21 @@ def inject_mother_base_theme() -> None:
         [data-baseweb="input"] > div,
         [data-testid="stNumberInput"] input,
         textarea {
+            color: var(--ink) !important;
+            background: var(--white) !important;
             border-radius: 0 !important;
+        }
+
+        [data-testid="stAlert"] {
+            color: var(--ink) !important;
+            border: 3px solid var(--ink);
+            border-radius: 0;
+        }
+
+        @media (max-width: 800px) {
+            .block-container { padding: 1rem 1rem 3rem; }
+            .mb-hero { padding: 24px 20px; }
+            .mb-hero::after { display: none; }
         }
         </style>
         """,
@@ -171,4 +211,3 @@ def render_system_stamp(label: str) -> None:
         f'<span class="mb-kicker">{label}</span><div class="mb-scanline"></div>',
         unsafe_allow_html=True,
     )
-

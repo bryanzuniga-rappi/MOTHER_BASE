@@ -61,6 +61,14 @@ Se ejecuta al final. Puede:
 Liquid solo considera tiendas presentes en los CSV de la misión del día. Para
 esta lógica el producto no necesita aparecer en `CATALOGO`.
 
+Los SKUs manuales se capturan de forma independiente para cada warehouse origen
+seleccionado. Si el SKU 10087 se captura solamente en el cuadro del origen 444,
+Liquid no utilizará el stock disponible del mismo SKU en 831.
+
+La limpieza automática de remanentes también permite seleccionar en cuáles
+orígenes debe operar. De esta forma, un saldo menor a 10 unidades puede agotarse
+en 444 sin activar la misma regla para 831.
+
 Los tres motores comparten el mismo límite:
 
 ```text
@@ -70,6 +78,16 @@ TAREAS NAKED + TAREAS SOLIDUS + TAREAS LIQUID <= MAX_TASKS
 Una tarea corresponde a una combinación origen–destino–SKU. Si Liquid agrega
 unidades sobre una combinación que ya existe, aumenta su cantidad sin crear una
 tarea nueva.
+
+## Navegación
+
+Mother Base no utiliza barra lateral. Después de seleccionar Big Boss o Raiden,
+la pantalla principal permite entrar a un módulo. Dentro del módulo no existe un
+botón de regreso; para reiniciar el acceso y volver a la portada se recarga la
+página.
+
+La aplicación conserva la paleta original del Transfer Planner: fondo papel,
+negro, verde ácido, coral y azul.
 
 ## Hoja SHARE_VENTAS
 
