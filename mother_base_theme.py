@@ -202,6 +202,17 @@ def inject_mother_base_theme() -> None:
             color: var(--ink) !important;
         }
 
+        [data-testid="stVerticalBlockBorderWrapper"],
+        [data-testid="stForm"],
+        [data-testid="stExpander"] {
+            background-color: var(--white) !important;
+        }
+
+        [data-testid="stVerticalBlockBorderWrapper"] {
+            border-color: #c9c5bb !important;
+            border-radius: 10px !important;
+        }
+
         [data-testid="stFileUploaderDropzone"],
         [data-baseweb="select"] > div,
         [data-baseweb="input"] > div,
@@ -233,4 +244,107 @@ def render_system_stamp(label: str) -> None:
     st.markdown(
         f'<span class="mb-kicker">{label}</span><div class="mb-scanline"></div>',
         unsafe_allow_html=True,
+    )
+
+
+def render_action_card(
+    *,
+    key: str,
+    eyebrow: str,
+    title: str,
+    description: str,
+    active: bool = False,
+    tone: str = "acid",
+    status: str | None = None,
+    min_height: int = 178,
+    help_text: str | None = None,
+) -> bool:
+    """Renderiza una tarjeta completa como botón nativo de Streamlit."""
+    tone_colors = {
+        "acid": ("#d9ff3f", "#111111"),
+        "coral": ("#ff5a47", "#111111"),
+        "blue": ("#5e7cff", "#fffdf7"),
+        "white": ("#fffdf7", "#111111"),
+    }
+    active_background, active_foreground = tone_colors.get(
+        tone, tone_colors["acid"]
+    )
+    background = active_background if active else "#fffdf7"
+    foreground = active_foreground if active else "#111111"
+    css_key = "".join(
+        character if character.isalnum() or character in {"_", "-"} else "-"
+        for character in key
+    )
+    st.markdown(
+        f"""
+        <style>
+        .st-key-{css_key} div.stButton > button {{
+            display: flex !important;
+            width: 100% !important;
+            min-height: {int(min_height)}px !important;
+            align-items: flex-start !important;
+            justify-content: flex-start !important;
+            padding: 20px 22px !important;
+            border: 3px solid #111111 !important;
+            border-radius: 10px !important;
+            box-shadow: 6px 6px 0 #111111 !important;
+            color: {foreground} !important;
+            background-color: {background} !important;
+            text-align: left !important;
+            text-transform: none !important;
+        }}
+
+        .st-key-{css_key} div.stButton > button:hover,
+        .st-key-{css_key} div.stButton > button:focus,
+        .st-key-{css_key} div.stButton > button:active {{
+            color: {foreground} !important;
+            background-color: {background} !important;
+            border-color: #111111 !important;
+        }}
+
+        .st-key-{css_key} div.stButton > button p {{
+            width: 100% !important;
+            margin: 0 !important;
+            color: inherit !important;
+            white-space: pre-line !important;
+            text-align: left !important;
+            font-size: .77rem !important;
+            font-weight: 700 !important;
+            line-height: 1.45 !important;
+        }}
+
+        .st-key-{css_key} div.stButton > button strong {{
+            display: block !important;
+            margin: 7px 0 9px !important;
+            color: inherit !important;
+            font-family: "Archivo Black", sans-serif !important;
+            font-size: clamp(1.25rem, 2.5vw, 2rem) !important;
+            line-height: 1 !important;
+            letter-spacing: -.035em !important;
+        }}
+
+        .st-key-{css_key} div.stButton > button code {{
+            display: inline-block !important;
+            margin-top: 11px !important;
+            padding: 4px 7px !important;
+            border: 2px solid #111111 !important;
+            border-radius: 0 !important;
+            color: #111111 !important;
+            background: #f2efe6 !important;
+            font-family: "IBM Plex Mono", monospace !important;
+            font-size: .67rem !important;
+            font-weight: 900 !important;
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    label = f"{eyebrow}\n\n**{title}**\n\n{description}"
+    if status:
+        label += f"\n\n`{status}`"
+    return st.button(
+        label,
+        key=key,
+        use_container_width=True,
+        help=help_text,
     )
