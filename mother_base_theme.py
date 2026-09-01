@@ -213,9 +213,15 @@ def inject_mother_base_theme() -> None:
             border-radius: 10px !important;
         }
 
+        .st-key-mission_control_shared,
         .st-key-engine_naked_module,
         .st-key-engine_solidus_module,
         .st-key-engine_liquid_module,
+        .st-key-mission_control_shared > div,
+        .st-key-engine_naked_module > div,
+        .st-key-engine_solidus_module > div,
+        .st-key-engine_liquid_module > div,
+        .st-key-mission_control_shared [data-testid="stVerticalBlockBorderWrapper"],
         .st-key-engine_naked_module [data-testid="stVerticalBlockBorderWrapper"],
         .st-key-engine_solidus_module [data-testid="stVerticalBlockBorderWrapper"],
         .st-key-engine_liquid_module [data-testid="stVerticalBlockBorderWrapper"] {
