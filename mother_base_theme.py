@@ -213,6 +213,16 @@ def inject_mother_base_theme() -> None:
             border-radius: 10px !important;
         }
 
+        .st-key-engine_naked_module,
+        .st-key-engine_solidus_module,
+        .st-key-engine_liquid_module,
+        .st-key-engine_naked_module [data-testid="stVerticalBlockBorderWrapper"],
+        .st-key-engine_solidus_module [data-testid="stVerticalBlockBorderWrapper"],
+        .st-key-engine_liquid_module [data-testid="stVerticalBlockBorderWrapper"] {
+            background: #fffdf7 !important;
+            background-color: #fffdf7 !important;
+        }
+
         [data-testid="stFileUploaderDropzone"],
         [data-baseweb="select"] > div,
         [data-baseweb="input"] > div,
@@ -271,6 +281,8 @@ def render_action_card(
     )
     background = active_background if active else "#fffdf7"
     foreground = active_foreground if active else "#111111"
+    badge_background = "#fffdf7" if active else "#111111"
+    badge_foreground = "#111111" if active else "#fffdf7"
     css_key = "".join(
         character if character.isalnum() or character in {"_", "-"} else "-"
         for character in key
@@ -278,7 +290,10 @@ def render_action_card(
     st.markdown(
         f"""
         <style>
-        .st-key-{css_key} div.stButton > button {{
+        .st-key-{css_key} div.stButton > button,
+        .st-key-{css_key} [data-testid="stButton"] > button,
+        .st-key-{css_key} [data-testid="stButton"] button,
+        .st-key-{css_key} button {{
             display: flex !important;
             width: 100% !important;
             min-height: {int(min_height)}px !important;
@@ -289,6 +304,7 @@ def render_action_card(
             border-radius: 10px !important;
             box-shadow: 6px 6px 0 #111111 !important;
             color: {foreground} !important;
+            background: {background} !important;
             background-color: {background} !important;
             text-align: left !important;
             text-transform: none !important;
@@ -296,13 +312,22 @@ def render_action_card(
 
         .st-key-{css_key} div.stButton > button:hover,
         .st-key-{css_key} div.stButton > button:focus,
-        .st-key-{css_key} div.stButton > button:active {{
+        .st-key-{css_key} div.stButton > button:active,
+        .st-key-{css_key} [data-testid="stButton"] button:hover,
+        .st-key-{css_key} [data-testid="stButton"] button:focus,
+        .st-key-{css_key} [data-testid="stButton"] button:active,
+        .st-key-{css_key} button:hover,
+        .st-key-{css_key} button:focus,
+        .st-key-{css_key} button:active {{
             color: {foreground} !important;
+            background: {background} !important;
             background-color: {background} !important;
             border-color: #111111 !important;
         }}
 
-        .st-key-{css_key} div.stButton > button p {{
+        .st-key-{css_key} div.stButton > button p,
+        .st-key-{css_key} [data-testid="stButton"] button p,
+        .st-key-{css_key} button p {{
             width: 100% !important;
             margin: 0 !important;
             color: inherit !important;
@@ -313,7 +338,9 @@ def render_action_card(
             line-height: 1.45 !important;
         }}
 
-        .st-key-{css_key} div.stButton > button strong {{
+        .st-key-{css_key} div.stButton > button strong,
+        .st-key-{css_key} [data-testid="stButton"] button strong,
+        .st-key-{css_key} button strong {{
             display: block !important;
             margin: 7px 0 9px !important;
             color: inherit !important;
@@ -323,14 +350,16 @@ def render_action_card(
             letter-spacing: -.035em !important;
         }}
 
-        .st-key-{css_key} div.stButton > button code {{
+        .st-key-{css_key} div.stButton > button code,
+        .st-key-{css_key} [data-testid="stButton"] button code,
+        .st-key-{css_key} button code {{
             display: inline-block !important;
             margin-top: 11px !important;
             padding: 4px 7px !important;
             border: 2px solid #111111 !important;
             border-radius: 0 !important;
-            color: #111111 !important;
-            background: #f2efe6 !important;
+            color: {badge_foreground} !important;
+            background: {badge_background} !important;
             font-family: "IBM Plex Mono", monospace !important;
             font-size: .67rem !important;
             font-weight: 900 !important;
