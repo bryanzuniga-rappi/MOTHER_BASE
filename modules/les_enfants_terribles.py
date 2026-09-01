@@ -53,7 +53,6 @@ from mother_base_theme import (
 APP_NAME = "Les Enfants Terribles"
 MAX_UPLOAD_MB = 500
 DATA_TRANSFERS_SPREADSHEET_ID = "18kHevkMvf9l4s6ANg3h5KdNyj2yEPGAp5C_t8JwxFVw"
-DATABASE_SESSION_KEY = "mb_validated_database"
 
 ORIGIN_WAREHOUSES = {
     444: "CITYPARK TURBO",
@@ -1293,31 +1292,28 @@ def fetch_public_database() -> bytes:
     return workbook_bytes
 
 
-def load_database_session(*, force_refresh: bool = False) -> dict[str, Any]:
-    """Descarga y valida la base una sola vez por sesión de Streamlit."""
-    if force_refresh:
-        fetch_public_database.clear()
-        st.session_state.pop(DATABASE_SESSION_KEY, None)
-
-    if DATABASE_SESSION_KEY not in st.session_state:
-        try:
-            workbook_bytes = fetch_public_database()
-            state = {
-                "workbook_bytes": workbook_bytes,
-                "health": inspect_database(workbook_bytes),
-                "city_labels": extract_available_cities(workbook_bytes),
-                "error": "",
-            }
-        except Exception as exc:
-            state = {
-                "workbook_bytes": None,
-                "health": None,
-                "city_labels": {},
-                "error": str(exc),
-            }
-        st.session_state[DATABASE_SESSION_KEY] = state
-
-    return st.session_state[DATABASE_SESSION_KEY]
+@st.cache_resource(
+    scope="session",
+    show_spinner="Validando fuentes de información…",
+)
+def load_database_resource() -> dict[str, Any]:
+    """Descarga, inspecciona y conserva la base entre todos los reruns normales."""
+    try:
+        workbook_bytes = fetch_public_database()
+        return {
+            "workbook_bytes": workbook_bytes,
+            "health": inspect_database(workbook_bytes),
+            "city_labels": extract_available_cities(workbook_bytes),
+            "error": "",
+        }
+    except Exception as exc:
+        # También se conserva el error: sólo el botón de actualización reintenta.
+        return {
+            "workbook_bytes": None,
+            "health": None,
+            "city_labels": {},
+            "error": str(exc),
+        }
 
 
 def save_database(workbook_bytes: bytes, destination: Path) -> None:
@@ -5282,12 +5278,7 @@ def render() -> None:
     )
 
     st.markdown('<span class="section-label">01 — BASE DE DATOS</span>', unsafe_allow_html=True)
-    if DATABASE_SESSION_KEY not in st.session_state:
-        with st.spinner("Validando fuentes de información…"):
-            database_state = load_database_session()
-    else:
-        database_state = load_database_session()
-
+    database_state = load_database_resource()
     database_bytes = database_state["workbook_bytes"]
     database_health = database_state["health"]
     city_labels = database_state["city_labels"]
@@ -5307,8 +5298,8 @@ def render() -> None:
         st.error(f"No fue posible validar la base de datos: {database_error}")
 
     if st.button("VOLVER A VALIDAR LA BASE", use_container_width=False):
-        with st.spinner("Actualizando y validando fuentes de información…"):
-            load_database_session(force_refresh=True)
+        fetch_public_database.clear()
+        load_database_resource.clear()
         st.rerun()
 
     st.markdown('<span class="section-label">02 — ARCHIVO DE PLANEACIÓN</span>', unsafe_allow_html=True)
@@ -5363,6 +5354,10 @@ def render() -> None:
     ] or [811, 834]
 
     with st.container(border=True, key="mission_control_shared"):
+        st.markdown(
+            '<span class="mission-control-marker" aria-hidden="true"></span>',
+            unsafe_allow_html=True,
+        )
         st.markdown("### MISSION CONTROL · VARIABLES COMPARTIDAS")
         left, right = st.columns([2, 1])
         with left:
