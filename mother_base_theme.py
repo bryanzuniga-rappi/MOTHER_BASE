@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# Mother Base theme build 2026-09-02.9 — Engine cards uniformes.
+
 import streamlit as st
 
 
@@ -319,6 +321,9 @@ def render_action_card(
         character if character.isalnum() or character in {"_", "-"} else "-"
         for character in key
     )
+    # Evita que las tarjetas cortas se compriman y que las descripciones largas
+    # cambien la alineación del contenido entre engines.
+    card_height = max(int(min_height), 168)
     st.markdown(
         f"""
         <style>
@@ -328,10 +333,11 @@ def render_action_card(
         .st-key-{css_key} button {{
             display: flex !important;
             width: 100% !important;
-            min-height: {int(min_height)}px !important;
-            align-items: flex-start !important;
+            min-height: {card_height}px !important;
+            box-sizing: border-box !important;
+            align-items: stretch !important;
             justify-content: flex-start !important;
-            padding: 20px 22px !important;
+            padding: 22px 24px !important;
             border: 3px solid #111111 !important;
             border-radius: 10px !important;
             box-shadow: 6px 6px 0 #111111 !important;
@@ -340,6 +346,19 @@ def render_action_card(
             background-color: {background} !important;
             text-align: left !important;
             text-transform: none !important;
+        }}
+
+        .st-key-{css_key} div.stButton,
+        .st-key-{css_key} [data-testid="stButton"],
+        .st-key-{css_key} [data-testid="stMarkdownContainer"] {{
+            width: 100% !important;
+            min-width: 0 !important;
+        }}
+
+        .st-key-{css_key} [data-testid="stMarkdownContainer"] {{
+            display: flex !important;
+            align-self: stretch !important;
+            align-items: stretch !important;
         }}
 
         .st-key-{css_key} div.stButton > button:hover,
@@ -360,8 +379,14 @@ def render_action_card(
         .st-key-{css_key} div.stButton > button p,
         .st-key-{css_key} [data-testid="stButton"] button p,
         .st-key-{css_key} button p {{
+            position: relative !important;
+            display: block !important;
             width: 100% !important;
+            min-width: 0 !important;
+            min-height: {card_height - 50}px !important;
             margin: 0 !important;
+            padding: 0 0 34px !important;
+            box-sizing: border-box !important;
             color: inherit !important;
             white-space: pre-line !important;
             text-align: left !important;
@@ -386,7 +411,10 @@ def render_action_card(
         .st-key-{css_key} [data-testid="stButton"] button code,
         .st-key-{css_key} button code {{
             display: inline-block !important;
-            margin-top: 11px !important;
+            position: absolute !important;
+            left: 0 !important;
+            bottom: 0 !important;
+            margin: 0 !important;
             padding: 4px 7px !important;
             border: 2px solid #111111 !important;
             border-radius: 0 !important;
