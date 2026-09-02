@@ -189,7 +189,7 @@ ALEPH_MAX_AGE_HOURS = {
     "STOCK": 1.2,
     "INSUMOS": 1.2,
     "NO_DISPONIBLE": 1.2,
-    "POR_MERMAR": 1.2,
+    "POR_MERMAR": 24.0,
     "KVI": 24.0,
     "CATALOGO": 24.0,
     "GOLDEN_INFALTABLES": 24.0,
