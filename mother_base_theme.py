@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# Mother Base theme build 2026-09-02.13 — Engine inner-width left alignment.
+# Mother Base theme build 2026-09-02.14 — Engine nested wrappers left alignment.
 
 import streamlit as st
 
@@ -241,10 +241,10 @@ def inject_mother_base_theme() -> None:
          * es corto. La corrección se limita a los cuatro engines: no altera las
          * tarjetas de acceso, módulos, alturas, padding ni estados.
          */
-        .st-key-engine_naked_card button > div,
-        .st-key-engine_solidus_card button > div,
-        .st-key-engine_shalashaska_card button > div,
-        .st-key-engine_liquid_card button > div,
+        .st-key-engine_naked_card button div,
+        .st-key-engine_solidus_card button div,
+        .st-key-engine_shalashaska_card button div,
+        .st-key-engine_liquid_card button div,
         .st-key-engine_naked_card button [data-testid="stMarkdownContainer"],
         .st-key-engine_solidus_card button [data-testid="stMarkdownContainer"],
         .st-key-engine_shalashaska_card button [data-testid="stMarkdownContainer"],
@@ -256,6 +256,15 @@ def inject_mother_base_theme() -> None:
             align-self: stretch !important;
             margin-left: 0 !important;
             margin-right: 0 !important;
+            text-align: left !important;
+        }
+
+        .st-key-engine_naked_card button,
+        .st-key-engine_solidus_card button,
+        .st-key-engine_shalashaska_card button,
+        .st-key-engine_liquid_card button {
+            align-items: stretch !important;
+            justify-content: flex-start !important;
             text-align: left !important;
         }
 
