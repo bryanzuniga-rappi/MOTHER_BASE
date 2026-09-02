@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# Mother Base build 2026-09-02.3 — KVI, Aleph freshness and global SKU exclusions.
+# Mother Base build 2026-09-02.4 — Shalashaska expiration-evacuation engine.
 
 from collections import Counter, defaultdict
 from contextlib import redirect_stdout
@@ -44,6 +44,12 @@ from engines.liquid_engine import (
     load_store_shares,
     parse_manual_skus,
 )
+from engines.shalashaska_engine import (
+    SHALASHASKA_CUT,
+    apply_shalashaska_engine,
+    empty_shalashaska_summary,
+    load_expiring_inventory,
+)
 from engines.mission_control import select_engine_rows
 from mother_base_theme import (
     inject_mother_base_theme,
@@ -71,6 +77,7 @@ ALEPH_SHEETS = {
     "KVI",
     "SHARE_VENTAS",
     "NO_DISPONIBLE",
+    "POR_MERMAR",
     "STOCK",
     "INSUMOS",
     "GOLDEN_INFALTABLES",
@@ -93,6 +100,7 @@ REQUIRED_DATABASE_SHEETS = (
     "KVI",
     "SHARE_VENTAS",
     "NO_DISPONIBLE",
+    "POR_MERMAR",
     "STOCK",
     "INSUMOS",
     "GOLDEN_INFALTABLES",
@@ -146,6 +154,11 @@ SHEET_DESCRIPTIONS = {
         "Stock no disponible por warehouse y producto que debe descontarse del "
         "inventario disponible final."
     ),
+    "POR_MERMAR": (
+        "Inventario próximo a caducar por warehouse origen y producto. Incluye "
+        "unidades disponibles, valor en riesgo, llegada y caducidad; alimenta "
+        "Shalashaska Engine sin sustituir el stock final mandante."
+    ),
     "STOCK": (
         "Stock disponible final por warehouse y producto. Es la fuente mandante "
         "para determinar cuánto puede enviarse."
@@ -176,6 +189,7 @@ ALEPH_MAX_AGE_HOURS = {
     "STOCK": 1.2,
     "INSUMOS": 1.2,
     "NO_DISPONIBLE": 1.2,
+    "POR_MERMAR": 1.2,
     "KVI": 24.0,
     "CATALOGO": 24.0,
     "GOLDEN_INFALTABLES": 24.0,
@@ -213,6 +227,7 @@ BREAKDOWN_ORDER = (
     "OK PARCIAL - CORTE POR STOCK",
     "ENVIADOS PARA CUBRIR AVL",
     "ENVIADOS PARA PREVENIR QUIEBRE",
+    SHALASHASKA_CUT,
     LIQUID_CUT,
     "SIN RECOMENDACIÓN",
     "CORTE POR RUTA DE COSTOS",
@@ -3196,6 +3211,7 @@ def write_executive_pdf(
     avl: dict[str, Any],
     preventive: dict[str, Any],
     liquid: dict[str, Any],
+    shalashaska: dict[str, Any],
     fruver_811: dict[str, Any],
     input_consolidation: dict[str, Any],
 ) -> None:
@@ -3443,6 +3459,16 @@ def write_executive_pdf(
                     )
                     if preventive.get("enabled")
                     else "Blindaje preventivo desactivado."
+                )
+                + (
+                    (
+                        f" Shalashaska: {shalashaska['units_evacuated']:,} de "
+                        f"{shalashaska['units_at_risk']:,} unidades próximas a "
+                        f"caducar evacuadas con {shalashaska['tasks_added']:,} "
+                        "tareas nuevas."
+                    )
+                    if shalashaska.get("enabled")
+                    else " Shalashaska Engine desactivado."
                 )
                 + (
                     (
@@ -3756,6 +3782,11 @@ def execute_planning(
     include_preventive_fill: bool = False,
     include_naked_engine: bool = True,
     include_solidus_engine: bool = True,
+    include_shalashaska_engine: bool = False,
+    shalashaska_target_doh: float = 7.0,
+    shalashaska_max_stores_per_sku: int = 8,
+    shalashaska_max_store_share_pct: float = 25.0,
+    shalashaska_forecast_horizon_days: int = 7,
     include_liquid_engine: bool = False,
     liquid_automatic_tail: bool = True,
     liquid_automatic_tail_origins: set[int] | None = None,
@@ -3926,6 +3957,36 @@ def execute_planning(
                 f"{len(blocked_plan_rows):,} requerimientos antes de asignar stock."
             )
 
+        store_shares_cache: dict[int, float] | None = None
+        shalashaska_summary = empty_shalashaska_summary(
+            include_shalashaska_engine
+        )
+        if include_shalashaska_engine:
+            expiring_rows = load_expiring_inventory(data_path)
+            store_shares_cache = load_store_shares(data_path)
+            shalashaska_summary = apply_shalashaska_engine(
+                result,
+                catalogs,
+                config,
+                daily_plan_rows,
+                expiring_rows,
+                closed_store_ids,
+                blocked_cities,
+                store_shares_cache,
+                run_date=run_date,
+                forecast_horizon_days=shalashaska_forecast_horizon_days,
+                target_doh=shalashaska_target_doh,
+                max_stores_per_sku=shalashaska_max_stores_per_sku,
+                max_store_share_pct=shalashaska_max_store_share_pct,
+                reason_column=PLANNING_REASON_COLUMN,
+            )
+            result.warnings.append(
+                "Shalashaska Engine: se evacuaron "
+                f"{shalashaska_summary['units_evacuated']:,} de "
+                f"{shalashaska_summary['units_at_risk']:,} unidades próximas a "
+                f"caducar mediante {shalashaska_summary['tasks_added']:,} tareas nuevas."
+            )
+
         catalog_fill_rows: list[dict[str, Any]] = []
         include_avl_fill = include_solidus_engine and include_avl_fill
         include_preventive_fill = (
@@ -3989,7 +4050,7 @@ def execute_planning(
         omit_unexecuted_manual_task_rows(result)
         liquid_summary = empty_liquid_summary(include_liquid_engine)
         if include_liquid_engine:
-            store_shares = load_store_shares(data_path)
+            store_shares = store_shares_cache or load_store_shares(data_path)
             liquid_summary = apply_liquid_engine(
                 result,
                 catalogs,
@@ -4084,6 +4145,7 @@ def execute_planning(
             avl=avl_summary,
             preventive=preventive_summary,
             liquid=liquid_summary,
+            shalashaska=shalashaska_summary,
             fruver_811=fruver_811_summary,
             input_consolidation=consolidation_summary,
         )
@@ -4131,6 +4193,13 @@ def execute_planning(
                 f"{liquid_summary['units_added']:,} unidades / "
                 f"{liquid_summary['stock_exhausted_cases']:,} saldos agotados"
             )
+        if shalashaska_summary["enabled"]:
+            print(
+                "Shalashaska Engine: "
+                f"{shalashaska_summary['tasks_added']:,} tareas / "
+                f"{shalashaska_summary['units_evacuated']:,} unidades / "
+                f"${shalashaska_summary['value_protected']:,.2f} de valor protegido"
+            )
         if insumos_summary["enabled"]:
             print(
                 "Insumos agregados a BulkCD_444: "
@@ -4167,6 +4236,7 @@ def execute_planning(
         "avl": avl_summary,
         "preventive": preventive_summary,
         "liquid": liquid_summary,
+        "shalashaska": shalashaska_summary,
         "fruver_811": fruver_811_summary,
         "input_consolidation": consolidation_summary,
         "engine_selection": engine_selection,
@@ -5179,6 +5249,67 @@ def render_results(run: dict[str, Any]) -> None:
             f"{preventive.get('units_added', 0):,} unidades adicionales."
         )
 
+    shalashaska = run.get("shalashaska", {})
+    if shalashaska.get("enabled"):
+        st.markdown(
+            '<span class="section-label">SHALASHASKA ENGINE · EVACUACIÓN</span>',
+            unsafe_allow_html=True,
+        )
+        render_kpi_cards(
+            [
+                {
+                    "category": "TAREAS · SHALASHASKA",
+                    "label": "TAREAS NUEVAS UTILIZADAS",
+                    "value": f"{shalashaska.get('tasks_added', 0):,}",
+                    "description": (
+                        "Nuevas combinaciones origen–destino–SKU creadas para "
+                        "evacuar inventario próximo a caducar. Comparten el mismo "
+                        "límite global con los demás engines."
+                    ),
+                    "tone": "blue",
+                },
+                {
+                    "category": "UNIDADES · RIESGO",
+                    "label": "UNIDADES POR MERMAR",
+                    "value": f"{shalashaska.get('units_at_risk', 0):,}",
+                    "description": (
+                        "Unidades informadas por POR_MERMAR para los orígenes "
+                        "seleccionados y sin SKUs excluidos, antes de aplicar el "
+                        "stock final mandante, bloqueos y capacidad."
+                    ),
+                    "tone": "coral",
+                },
+                {
+                    "category": "UNIDADES · EVACUADAS",
+                    "label": "UNIDADES REUBICADAS",
+                    "value": f"{shalashaska.get('units_evacuated', 0):,}",
+                    "description": (
+                        "Unidades próximas a caducar que sí fueron distribuidas. "
+                        "Primero se nivelan por necesidad y DOH; el sobrante se "
+                        "diversifica mediante share de ventas."
+                    ),
+                    "tone": "acid",
+                },
+                {
+                    "category": "VALOR · PROTEGIDO",
+                    "label": "VALOR REUBICADO",
+                    "value": f"${shalashaska.get('value_protected', 0):,.2f}",
+                    "description": (
+                        "Valor proporcional del inventario por mermar que fue "
+                        "reubicado en tiendas con oportunidad de venta. No representa "
+                        "venta garantizada ni ahorro contable realizado."
+                    ),
+                },
+            ],
+            columns_count=4,
+        )
+        if shalashaska.get("units_not_evacuated", 0) > 0:
+            st.warning(
+                f"Quedaron {shalashaska['units_not_evacuated']:,} unidades sin "
+                "evacuar por stock mandante, restricciones, capacidad, concentración "
+                "o límite compartido de tareas."
+            )
+
     liquid = run.get("liquid", {})
     if liquid.get("enabled"):
         st.markdown(
@@ -5539,8 +5670,8 @@ def render() -> None:
             value="",
             placeholder="Ejemplo: 14588, 85097, 86195",
             help=(
-                "Los PRODUCT_ID ingresados se eliminan de Naked, Solidus, Liquid "
-                "e Insumos. No aparecerán en los Bulk ni consumirán stock, "
+                "Los PRODUCT_ID ingresados se eliminan de Naked, Solidus, "
+                "Shalashaska, Liquid e Insumos. No aparecerán en los Bulk ni consumirán stock, "
                 "capacidad o tareas. Acepta comas o saltos de línea."
             ),
         )
@@ -5566,11 +5697,12 @@ def render() -> None:
             )
         st.caption(
             "El máximo de tareas es un solo presupuesto compartido: Naked + "
-            "Solidus + Liquid nunca podrán excederlo."
+            "Solidus + Shalashaska + Liquid nunca podrán excederlo."
         )
 
     st.session_state.setdefault("mb_engine_naked_enabled", True)
     st.session_state.setdefault("mb_engine_solidus_enabled", True)
+    st.session_state.setdefault("mb_engine_shalashaska_enabled", False)
     st.session_state.setdefault("mb_engine_liquid_enabled", False)
 
     with st.container(border=True, key="engine_naked_module"):
@@ -5662,6 +5794,98 @@ def render() -> None:
                 "están disponibles para esta corrida."
             )
 
+    shalashaska_target_doh = 7.0
+    shalashaska_max_stores_per_sku = 8
+    shalashaska_max_store_share_pct = 25.0
+    shalashaska_forecast_horizon_days = 7
+    with st.container(border=True, key="engine_shalashaska_module"):
+        include_shalashaska_engine = bool(
+            st.session_state["mb_engine_shalashaska_enabled"]
+        )
+        if render_action_card(
+            key="engine_shalashaska_card",
+            eyebrow="ENGINE / 03 · EXPIRATION EVACUATION",
+            title="SHALASHASKA ENGINE",
+            description=(
+                "Evacúa inventario próximo a caducar. Primero cubre necesidad y "
+                "nivela DOH; después diversifica por share de ventas."
+            ),
+            active=include_shalashaska_engine,
+            tone="orange",
+            status=(
+                "ACTIVO"
+                if include_shalashaska_engine
+                else "INACTIVO · CLIC PARA ACTIVAR"
+            ),
+            min_height=150,
+            help_text=(
+                "Haz clic en la tarjeta para activar o desactivar Shalashaska Engine."
+            ),
+        ):
+            st.session_state["mb_engine_shalashaska_enabled"] = (
+                not include_shalashaska_engine
+            )
+            st.rerun()
+        if include_shalashaska_engine:
+            shala_left, shala_middle, shala_right = st.columns(3)
+            with shala_left:
+                shalashaska_target_doh = st.number_input(
+                    "DOH objetivo de evacuación",
+                    min_value=1.0,
+                    max_value=14.0,
+                    value=7.0,
+                    step=0.5,
+                    help=(
+                        "Primero distribuye el producto para acercar las tiendas a "
+                        "este DOH. El objetivo se reduce automáticamente si el SKU "
+                        "caduca antes."
+                    ),
+                )
+                shalashaska_forecast_horizon_days = st.number_input(
+                    "Días del horizonte de forecast · Shalashaska",
+                    min_value=1,
+                    max_value=90,
+                    value=7,
+                    step=1,
+                    help=(
+                        "Convierte el forecast cargado en ADU para calcular la "
+                        "necesidad de cada tienda."
+                    ),
+                )
+            with shala_middle:
+                shalashaska_max_stores_per_sku = st.number_input(
+                    "Máximo de tiendas por SKU a evacuar",
+                    min_value=2,
+                    max_value=30,
+                    value=8,
+                    step=1,
+                    help=(
+                        "Controla cuántas tareas puede abrir cada combinación "
+                        "origen–SKU y evita una dispersión operativa excesiva."
+                    ),
+                )
+            with shala_right:
+                shalashaska_max_store_share_pct = st.number_input(
+                    "Concentración máxima por tienda (%)",
+                    min_value=5.0,
+                    max_value=100.0,
+                    value=25.0,
+                    step=5.0,
+                    help=(
+                        "Limita el porcentaje del inventario próximo a caducar que "
+                        "puede concentrarse en una sola tienda. Si hay pocas tiendas "
+                        "elegibles, el modelo lo ajusta para repartir equitativamente."
+                    ),
+                )
+                st.info(
+                    "Solo considera tiendas presentes en la planeación del día. "
+                    "POR_MERMAR nunca sustituye al STOCK_DISPONIBLE_FINAL."
+                )
+        else:
+            st.caption(
+                "Shalashaska Engine está apagado. No se procesará la hoja POR_MERMAR."
+            )
+
     liquid_manual_skus_by_origin_raw: dict[int, str] = {}
     liquid_automatic_tail = False
     liquid_automatic_tail_origins: set[int] = set()
@@ -5672,7 +5896,7 @@ def render() -> None:
         )
         if render_action_card(
             key="engine_liquid_card",
-            eyebrow="ENGINE / 03 · INVENTORY LIQUIDATION",
+            eyebrow="ENGINE / 04 · INVENTORY LIQUIDATION",
             title="LIQUID ENGINE",
             description=(
                 "Agota remanentes por origen. Primero nivela DOH y después utiliza "
@@ -5693,8 +5917,9 @@ def render() -> None:
                     "Agotar automáticamente remanentes menores a 10 unidades",
                     value=True,
                     help=(
-                        "Evalúa el stock que quede después de Naked y Solidus. Solo "
-                        "crea tareas mientras exista cupo global."
+                        "Evalúa el stock que quede después de Naked, Solidus, "
+                        "Shalashaska y las coberturas activas. Solo crea tareas "
+                        "mientras exista cupo global."
                     ),
                 )
                 liquid_automatic_tail_origins = set(
@@ -5772,6 +5997,7 @@ def render() -> None:
         if not (
             include_naked_engine
             or include_solidus_engine
+            or include_shalashaska_engine
             or include_liquid_engine
         ):
             st.error("Activa al menos un engine para ejecutar la misión.")
@@ -5837,6 +6063,7 @@ def render() -> None:
                         for enabled, name in (
                             (include_naked_engine, "Naked"),
                             (include_solidus_engine, "Solidus"),
+                            (include_shalashaska_engine, "Shalashaska"),
                             (include_liquid_engine, "Liquid"),
                         )
                         if enabled
@@ -5869,6 +6096,17 @@ def render() -> None:
                     include_preventive_fill=include_preventive_fill,
                     include_naked_engine=include_naked_engine,
                     include_solidus_engine=include_solidus_engine,
+                    include_shalashaska_engine=include_shalashaska_engine,
+                    shalashaska_target_doh=float(shalashaska_target_doh),
+                    shalashaska_max_stores_per_sku=int(
+                        shalashaska_max_stores_per_sku
+                    ),
+                    shalashaska_max_store_share_pct=float(
+                        shalashaska_max_store_share_pct
+                    ),
+                    shalashaska_forecast_horizon_days=int(
+                        shalashaska_forecast_horizon_days
+                    ),
                     include_liquid_engine=include_liquid_engine,
                     liquid_automatic_tail=liquid_automatic_tail,
                     liquid_automatic_tail_origins=(
