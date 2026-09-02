@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# Mother Base build 2026-09-02.4 — Shalashaska expiration-evacuation engine.
+# Mother Base build 2026-09-02.5 — Shalashaska simplificado con ADU directo.
 
 from collections import Counter, defaultdict
 from contextlib import redirect_stdout
@@ -3784,9 +3784,6 @@ def execute_planning(
     include_solidus_engine: bool = True,
     include_shalashaska_engine: bool = False,
     shalashaska_target_doh: float = 7.0,
-    shalashaska_max_stores_per_sku: int = 8,
-    shalashaska_max_store_share_pct: float = 25.0,
-    shalashaska_forecast_horizon_days: int = 7,
     include_liquid_engine: bool = False,
     liquid_automatic_tail: bool = True,
     liquid_automatic_tail_origins: set[int] | None = None,
@@ -3958,26 +3955,33 @@ def execute_planning(
             )
 
         store_shares_cache: dict[int, float] | None = None
+        catalog_fill_rows_cache: list[dict[str, Any]] | None = None
         shalashaska_summary = empty_shalashaska_summary(
             include_shalashaska_engine
         )
         if include_shalashaska_engine:
             expiring_rows = load_expiring_inventory(data_path)
             store_shares_cache = load_store_shares(data_path)
+            catalog_fill_rows_cache, catalog_warnings = load_avl_catalog_rows(
+                data_path
+            )
+            result.warnings.extend(catalog_warnings)
+            catalog_adu = {
+                (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"]): row["ADU"]
+                for row in catalog_fill_rows_cache
+                if row["RETAIL_ID"] not in excluded_sku_set
+            }
             shalashaska_summary = apply_shalashaska_engine(
                 result,
                 catalogs,
                 config,
-                daily_plan_rows,
                 expiring_rows,
+                catalog_adu,
                 closed_store_ids,
                 blocked_cities,
                 store_shares_cache,
                 run_date=run_date,
-                forecast_horizon_days=shalashaska_forecast_horizon_days,
                 target_doh=shalashaska_target_doh,
-                max_stores_per_sku=shalashaska_max_stores_per_sku,
-                max_store_share_pct=shalashaska_max_store_share_pct,
                 reason_column=PLANNING_REASON_COLUMN,
             )
             result.warnings.append(
@@ -3993,8 +3997,11 @@ def execute_planning(
             include_solidus_engine and include_preventive_fill
         )
         if include_avl_fill or include_preventive_fill:
-            avl_catalog_rows, avl_warnings = load_avl_catalog_rows(data_path)
-            result.warnings.extend(avl_warnings)
+            if catalog_fill_rows_cache is None:
+                avl_catalog_rows, avl_warnings = load_avl_catalog_rows(data_path)
+                result.warnings.extend(avl_warnings)
+            else:
+                avl_catalog_rows = catalog_fill_rows_cache
             catalog_fill_rows = [
                 row
                 for row in avl_catalog_rows
@@ -5306,8 +5313,8 @@ def render_results(run: dict[str, Any]) -> None:
         if shalashaska.get("units_not_evacuated", 0) > 0:
             st.warning(
                 f"Quedaron {shalashaska['units_not_evacuated']:,} unidades sin "
-                "evacuar por stock mandante, restricciones, capacidad, concentración "
-                "o límite compartido de tareas."
+                "evacuar por stock mandante, falta de ADU o ruta natural, "
+                "restricciones, capacidad o límite compartido de tareas."
             )
 
     liquid = run.get("liquid", {})
@@ -5795,9 +5802,6 @@ def render() -> None:
             )
 
     shalashaska_target_doh = 7.0
-    shalashaska_max_stores_per_sku = 8
-    shalashaska_max_store_share_pct = 25.0
-    shalashaska_forecast_horizon_days = 7
     with st.container(border=True, key="engine_shalashaska_module"):
         include_shalashaska_engine = bool(
             st.session_state["mb_engine_shalashaska_enabled"]
@@ -5807,8 +5811,9 @@ def render() -> None:
             eyebrow="ENGINE / 03 · EXPIRATION EVACUATION",
             title="SHALASHASKA ENGINE",
             description=(
-                "Evacúa inventario próximo a caducar. Primero cubre necesidad y "
-                "nivela DOH; después diversifica por share de ventas."
+                "Evacúa inventario próximo a caducar hacia tiendas que ya salen "
+                "desde el mismo origen. Primero nivela DOH con ADU de CATALOGO; "
+                "después distribuye el remanente por share de ventas."
             ),
             active=include_shalashaska_engine,
             tone="orange",
@@ -5827,59 +5832,26 @@ def render() -> None:
             )
             st.rerun()
         if include_shalashaska_engine:
-            shala_left, shala_middle, shala_right = st.columns(3)
+            shala_left, shala_right = st.columns([1, 2])
             with shala_left:
                 shalashaska_target_doh = st.number_input(
-                    "DOH objetivo de evacuación",
+                    "DOH objetivo · primera pasada",
                     min_value=1.0,
-                    max_value=14.0,
+                    max_value=30.0,
                     value=7.0,
                     step=0.5,
                     help=(
-                        "Primero distribuye el producto para acercar las tiendas a "
-                        "este DOH. El objetivo se reduce automáticamente si el SKU "
-                        "caduca antes."
-                    ),
-                )
-                shalashaska_forecast_horizon_days = st.number_input(
-                    "Días del horizonte de forecast · Shalashaska",
-                    min_value=1,
-                    max_value=90,
-                    value=7,
-                    step=1,
-                    help=(
-                        "Convierte el forecast cargado en ADU para calcular la "
-                        "necesidad de cada tienda."
-                    ),
-                )
-            with shala_middle:
-                shalashaska_max_stores_per_sku = st.number_input(
-                    "Máximo de tiendas por SKU a evacuar",
-                    min_value=2,
-                    max_value=30,
-                    value=8,
-                    step=1,
-                    help=(
-                        "Controla cuántas tareas puede abrir cada combinación "
-                        "origen–SKU y evita una dispersión operativa excesiva."
+                        "La primera pasada intenta llevar de forma pareja a todas "
+                        "las tiendas elegibles hasta este DOH usando el ADU directo "
+                        "de CATALOGO."
                     ),
                 )
             with shala_right:
-                shalashaska_max_store_share_pct = st.number_input(
-                    "Concentración máxima por tienda (%)",
-                    min_value=5.0,
-                    max_value=100.0,
-                    value=25.0,
-                    step=5.0,
-                    help=(
-                        "Limita el porcentaje del inventario próximo a caducar que "
-                        "puede concentrarse en una sola tienda. Si hay pocas tiendas "
-                        "elegibles, el modelo lo ajusta para repartir equitativamente."
-                    ),
-                )
                 st.info(
-                    "Solo considera tiendas presentes en la planeación del día. "
-                    "POR_MERMAR nunca sustituye al STOCK_DISPONIBLE_FINAL."
+                    "Shalashaska usa únicamente tiendas que ya tienen una "
+                    "transferencia desde el mismo origen en esta corrida. Primero "
+                    "nivela todas al DOH objetivo; si queda inventario, lo reparte "
+                    "por SHARE_VENTAS. POR_MERMAR nunca sustituye al stock final."
                 )
         else:
             st.caption(
@@ -6098,15 +6070,6 @@ def render() -> None:
                     include_solidus_engine=include_solidus_engine,
                     include_shalashaska_engine=include_shalashaska_engine,
                     shalashaska_target_doh=float(shalashaska_target_doh),
-                    shalashaska_max_stores_per_sku=int(
-                        shalashaska_max_stores_per_sku
-                    ),
-                    shalashaska_max_store_share_pct=float(
-                        shalashaska_max_store_share_pct
-                    ),
-                    shalashaska_forecast_horizon_days=int(
-                        shalashaska_forecast_horizon_days
-                    ),
                     include_liquid_engine=include_liquid_engine,
                     liquid_automatic_tail=liquid_automatic_tail,
                     liquid_automatic_tail_origins=(
