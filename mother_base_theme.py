@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# Mother Base theme build 2026-09-02.12 — Alineación exclusiva de engines.
+# Mother Base theme build 2026-09-02.13 — Engine inner-width left alignment.
 
 import streamlit as st
 
@@ -241,12 +241,19 @@ def inject_mother_base_theme() -> None:
          * es corto. La corrección se limita a los cuatro engines: no altera las
          * tarjetas de acceso, módulos, alturas, padding ni estados.
          */
-        .st-key-engine_naked_card [data-testid="stMarkdownContainer"],
-        .st-key-engine_solidus_card [data-testid="stMarkdownContainer"],
-        .st-key-engine_shalashaska_card [data-testid="stMarkdownContainer"],
-        .st-key-engine_liquid_card [data-testid="stMarkdownContainer"] {
+        .st-key-engine_naked_card button > div,
+        .st-key-engine_solidus_card button > div,
+        .st-key-engine_shalashaska_card button > div,
+        .st-key-engine_liquid_card button > div,
+        .st-key-engine_naked_card button [data-testid="stMarkdownContainer"],
+        .st-key-engine_solidus_card button [data-testid="stMarkdownContainer"],
+        .st-key-engine_shalashaska_card button [data-testid="stMarkdownContainer"],
+        .st-key-engine_liquid_card button [data-testid="stMarkdownContainer"] {
             width: 100% !important;
+            max-width: none !important;
             min-width: 0 !important;
+            flex: 1 1 auto !important;
+            align-self: stretch !important;
             margin-left: 0 !important;
             margin-right: 0 !important;
             text-align: left !important;
