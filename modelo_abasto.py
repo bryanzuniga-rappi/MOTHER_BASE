@@ -539,7 +539,8 @@ class Catalogs:
     blocked_products: set[int]
     route_cost_blocks: set[tuple[int, int]]
     store_priority: dict[int, int]
-    high_value: dict[int, str]
+    # Clasificación referencial por (warehouse origen, SKU).
+    high_value: dict[tuple[int, int], str]
     rackeados_444: set[int]
     store_capacity: dict[int, float]
     copernico_unusable_444: dict[int, float]
@@ -552,6 +553,8 @@ class Catalogs:
     copernico_unusable_by_warehouse: dict[tuple[int, int], float] = field(
         default_factory=dict
     )
+    kvi_products: set[tuple[int, int]] = field(default_factory=set)
+    excluded_products: set[int] = field(default_factory=set)
 
 
 def load_catalogs(
@@ -603,13 +606,25 @@ def load_catalogs(
             priority = int(round(to_float(row["PRIORIDAD"], 100)))
             put_unique(store_priority, warehouse, priority, warnings, "PRIORIDAD", "min")
 
-        high_value: dict[int, str] = {}
-        for row in iter_sheet_records(workbook, "HIGH_VALUE", ["EAN", "Category"]):
-            # En este archivo EAN representa PRODUCT_ID.
-            sku = to_id(row["EAN"], "HIGH_VALUE.EAN", True)
-            if sku is not None:
-                category = clean_text(row["Category"]) or "HV"
-                put_unique(high_value, sku, category, warnings, "HIGH_VALUE", "first")
+        high_value: dict[tuple[int, int], str] = {}
+        for source, sheet_name in ((444, "444_HV"), (831, "831_HV")):
+            for row in iter_sheet_records(
+                workbook,
+                sheet_name,
+                ["EAN", "Category"],
+            ):
+                # En estas hojas EAN representa PRODUCT_ID.
+                sku = to_id(row["EAN"], f"{sheet_name}.EAN", True)
+                if sku is not None:
+                    category = clean_text(row["Category"]) or "HV"
+                    put_unique(
+                        high_value,
+                        (source, sku),
+                        category,
+                        warnings,
+                        sheet_name,
+                        "first",
+                    )
 
         rackeados_444: set[int] = set()
         for row in iter_sheet_records(workbook, "RACKEADOS", ["WHS", "SYNC"]):
@@ -716,6 +731,19 @@ def load_catalogs(
             if sku is not None and city:
                 golden_infaltables.add((sku, city))
 
+        kvi_products: set[tuple[int, int]] = set()
+        for row in iter_sheet_records(
+            workbook,
+            "KVI",
+            ["WAREHOUSE_ID", "PRODUCT_ID", "KVI"],
+        ):
+            warehouse = to_id(row["WAREHOUSE_ID"], "KVI.WAREHOUSE_ID", True)
+            sku = to_id(row["PRODUCT_ID"], "KVI.PRODUCT_ID", True)
+            kvi_flag = clean_text(row["KVI"]).upper()
+            is_kvi = kvi_flag not in {"0", "FALSE", "FALSO", "NO", "N"}
+            if warehouse is not None and sku is not None and is_kvi:
+                kvi_products.add((warehouse, sku))
+
         stores: dict[int, dict[str, str]] = {}
         for row in iter_sheet_records(
             workbook,
@@ -769,6 +797,30 @@ def load_catalogs(
         copernico_unusable_by_warehouse=dict(
             copernico_unusable_by_warehouse
         ),
+        kvi_products=kvi_products,
+    )
+
+
+def source_value_category(catalogs: Catalogs, source: int, sku: int) -> str:
+    """Devuelve la categoría de valor aplicable al origen real de la línea."""
+    return catalogs.high_value.get((source, sku), "REGULAR")
+
+
+def allocation_value_summary(
+    catalogs: Catalogs,
+    allocations: Iterable[tuple[int, int]],
+    sku: int,
+) -> str:
+    """Resume VALUE en una fila de reporte que puede utilizar varios orígenes."""
+    used_sources = [source for source, quantity in allocations if quantity > 0]
+    if not used_sources:
+        return "REGULAR"
+    values = [source_value_category(catalogs, source, sku) for source in used_sources]
+    if len(set(values)) == 1:
+        return values[0]
+    return " | ".join(
+        f"{source}:{source_value_category(catalogs, source, sku)}"
+        for source in used_sources
     )
 
 
@@ -967,7 +1019,7 @@ def source_stock_components(catalogs: Catalogs, source: int, sku: int) -> dict[s
     )
     rackeado = source == 444 and sku in catalogs.rackeados_444
     adjusted = max(base - unavailable - copernico_unusable, 0.0)
-    if rackeado:
+    if rackeado or sku in catalogs.excluded_products:
         adjusted = 0.0
     return {
         "base": base,
@@ -986,10 +1038,17 @@ def is_regional_block(
     destination_city_norm: str,
     is_golden_infaltable: bool,
 ) -> bool:
+    """Aplica únicamente los bloqueos explícitos de la hoja BLOQUEOS.
+
+    ``is_golden_infaltable`` se conserva en la firma por compatibilidad con los
+    distintos engines, pero Golden Infaltables ya no genera una restricción de
+    origen o ciudad. Su clasificación sigue disponible para prioridad y
+    reporting.
+    """
     if source == destination:
         return True
     source_city_norm = catalogs.stores[source]["city_norm"]
-    restricted_product = sku in catalogs.blocked_products or is_golden_infaltable
+    restricted_product = sku in catalogs.blocked_products
     return (
         restricted_product
         and source_city_norm == CDMX
@@ -1016,6 +1075,8 @@ def plan_transfers(
     for row in plan_rows:
         destination = row["WAREHOUSE_DESTINATION"]
         sku = row["RETAIL_ID"]
+        if sku in catalogs.excluded_products:
+            continue
         store = catalogs.stores.get(destination)
         city = store["city"] if store else ""
         city_norm = store["city_norm"] if store else ""
@@ -1026,6 +1087,7 @@ def plan_transfers(
         )
         target, demand_rule = calculate_target_quantity(row, config)
         is_golden = bool(city_norm) and (sku, city_norm) in catalogs.golden_infaltables
+        is_kvi = (destination, sku) in catalogs.kvi_products
         enriched = dict(row)
         enriched.update(
             {
@@ -1037,12 +1099,13 @@ def plan_transfers(
                     row.get("ES_MANUAL_FORECAST_ZERO", False)
                 ),
                 "ES_GOLDEN_INFALTABLE": is_golden,
+                "ES_KVI": is_kvi,
                 "ES_STOCKOUT": row["CURRENT_INVENTORY"] <= 0,
                 "M3_POR_UNIDAD": catalogs.volume_m3.get(
                     sku, config.default_m3_per_unit
                 ),
                 "STORAGE": catalogs.storage.get(sku, "UNKNOWN"),
-                "VALUE": catalogs.high_value.get(sku, "REGULAR"),
+                "VALUE": "POR ORIGEN",
                 "CANTIDAD_OBJETIVO": target,
                 "REGLA_DEMANDA": demand_rule,
                 "SIN_RUTA_COSTOS": (destination, sku)
@@ -1053,8 +1116,12 @@ def plan_transfers(
 
     prepared.sort(
         key=lambda row: (
+            0
+            if row["ES_GOLDEN_INFALTABLE"]
+            else 1
+            if row["ES_KVI"]
+            else 2,
             0 if not row["ES_MANUAL_FORECAST_ZERO"] else 1,
-            0 if row["ES_GOLDEN_INFALTABLE"] else 1,
             row["PRIORIDAD_TIENDA"],
             0 if row["ES_STOCKOUT"] else 1,
             row["WAREHOUSE_DESTINATION"],
@@ -1081,6 +1148,7 @@ def plan_transfers(
     tasks_used = 0
     base_rows: list[dict[str, Any]] = []
     allocation_rows: list[dict[str, Any]] = []
+    deferred_stock_rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
 
     for planning_order, row in enumerate(prepared, start=1):
         destination = row["WAREHOUSE_DESTINATION"]
@@ -1118,6 +1186,8 @@ def plan_transfers(
         detalle_motivo = ""
         passes_capacity = True
         passes_tasks = True
+        stock_insufficient = False
+        capacity_target = 0
 
         if target <= 0:
             tipo_corte = "SIN DEMANDA"
@@ -1160,6 +1230,14 @@ def plan_transfers(
                 if remaining_candidate <= 0:
                     break
 
+            # Una necesidad que no puede cubrirse completa con el stock
+            # elegible remanente no debe consumir inventario. Se omite esta
+            # tienda y se conserva el saldo para requerimientos posteriores
+            # que sí puedan atenderse al 100%.
+            stock_insufficient = remaining_candidate > 0
+            if stock_insufficient:
+                candidate_allocations = []
+
             available_task_slots = max(config.max_tasks - tasks_used, 0)
             allocations = candidate_allocations[:available_task_slots]
             passes_tasks = len(allocations) == len(candidate_allocations)
@@ -1178,7 +1256,7 @@ def plan_transfers(
                         "DELIVERY_PRIORITY": 1,
                         "CITY": city,
                         "STORAGE": row["STORAGE"],
-                        "VALUE": row["VALUE"],
+                        "VALUE": source_value_category(catalogs, source, sku),
                     }
                 )
 
@@ -1244,7 +1322,22 @@ def plan_transfers(
                 if any(info["unavailable"] > 0 for info in origin_info.values()):
                     diagnostics.append("NO_DISPONIBLE")
                 suffix = f" ({', '.join(diagnostics)})" if diagnostics else ""
-                detalle_motivo = "Sin stock permitido en los orígenes configurados" + suffix
+                eligible_remaining = sum(
+                    origin_before[source]
+                    for source in config.origin_warehouses
+                    if not regional_blocks[source]
+                )
+                if stock_insufficient and eligible_remaining > 0:
+                    detalle_motivo = (
+                        f"Stock elegible remanente {eligible_remaining} menor que "
+                        f"la cantidad requerida {capacity_target}; no se consumió "
+                        "para permitir atender prioridades posteriores"
+                        + suffix
+                    )
+                else:
+                    detalle_motivo = (
+                        "Sin stock permitido en los orígenes configurados" + suffix
+                    )
 
         assigned_by_origin = {source: 0 for source in config.origin_warehouses}
         for source, quantity in allocations:
@@ -1276,6 +1369,7 @@ def plan_transfers(
             "CANTIDAD_ASIGNADA": assigned_total,
             "CANTIDAD_FALTANTE": max(target - assigned_total, 0),
             "ES_GOLDEN_INFALTABLE": is_golden,
+            "ES_KVI": row["ES_KVI"],
             "PRIORIDAD_TIENDA": row["PRIORIDAD_TIENDA"],
             "ES_STOCKOUT": row["ES_STOCKOUT"],
             "SIN_RUTA_COSTOS": row["SIN_RUTA_COSTOS"],
@@ -1297,7 +1391,7 @@ def plan_transfers(
                 f"{source}:{quantity}" for source, quantity in allocations
             ),
             "STORAGE": row["STORAGE"],
-            "VALUE": row["VALUE"],
+            "VALUE": allocation_value_summary(catalogs, allocations, sku),
             "TIPO_DE_CORTE": tipo_corte,
             "DETALLE_MOTIVO": detalle_motivo,
         }
@@ -1313,11 +1407,166 @@ def plan_transfers(
                     f"STOCK_INICIAL_AJUSTADO_{source}": info["adjusted"],
                     f"STOCK_ANTES_{source}": origin_before[source],
                     f"BLOQUEO_REGIONAL_{source}": regional_blocks[source],
+                    f"VALUE_{source}": source_value_category(catalogs, source, sku),
                     f"ASIGNADO_{source}": assigned_by_origin[source],
                     f"STOCK_REMANENTE_{source}": stock_remaining[(source, sku)],
                 }
             )
         base_rows.append(report_row)
+
+        if stock_insufficient and assigned_total == 0 and capacity_target > 0:
+            deferred_stock_rows.append((row, report_row))
+
+    # Segunda pasada: una vez atendidas todas las necesidades que cabían
+    # completas, el stock todavía remanente vuelve a las tiendas diferidas en
+    # su orden original de prioridad. En esta etapa sí se permite una atención
+    # parcial para aprovechar el saldo sin bloquear tiendas posteriores.
+    for row, report_row in deferred_stock_rows:
+        destination = row["WAREHOUSE_DESTINATION"]
+        sku = row["RETAIL_ID"]
+        target = row["CANTIDAD_OBJETIVO"]
+        m3_per_unit = row["M3_POR_UNIDAD"]
+        capacity = catalogs.store_capacity.get(
+            destination, config.default_store_capacity_m3
+        )
+        capacity_before = cap_used_normal[destination]
+        capacity_remaining_m3 = max(capacity - capacity_before, 0.0)
+        if m3_per_unit > 0:
+            capacity_units = int(
+                math.floor((capacity_remaining_m3 / m3_per_unit) + 1e-9)
+            )
+        else:
+            capacity_units = target
+        second_pass_target = min(target, max(capacity_units, 0))
+        if second_pass_target <= 0:
+            continue
+
+        second_pass_before: dict[int, int] = {}
+        second_pass_blocks: dict[int, bool] = {}
+        candidates: list[tuple[int, int]] = []
+        remaining = second_pass_target
+        for source in config.origin_warehouses:
+            second_pass_before[source] = stock_remaining[(source, sku)]
+            blocked = is_regional_block(
+                catalogs,
+                source,
+                destination,
+                sku,
+                row["CITY_NORMALIZED"],
+                row["ES_GOLDEN_INFALTABLE"],
+            )
+            second_pass_blocks[source] = blocked
+            if blocked:
+                continue
+            quantity = min(remaining, stock_remaining[(source, sku)])
+            if quantity > 0:
+                candidates.append((source, quantity))
+                remaining -= quantity
+
+        available_task_slots = max(config.max_tasks - tasks_used, 0)
+        second_allocations = candidates[:available_task_slots]
+        if not second_allocations:
+            continue
+
+        task_before_second_pass = tasks_used
+        assigned_by_origin = {
+            source: 0 for source in config.origin_warehouses
+        }
+        for source, quantity in second_allocations:
+            stock_remaining[(source, sku)] -= quantity
+            assigned_by_origin[source] += quantity
+            tasks_used += 1
+            allocation_rows.append(
+                {
+                    "WAREHOUSE_DESTINATION": destination,
+                    "WAREHOUSE_SOURCE": source,
+                    "RETAIL_ID": sku,
+                    "QUANTITY": int(quantity),
+                    "PLANNED_DATE": "",
+                    "ROUTE": 1,
+                    "DELIVERY_PRIORITY": 1,
+                    "CITY": row["CITY"],
+                    "STORAGE": row["STORAGE"],
+                    "VALUE": source_value_category(catalogs, source, sku),
+                }
+            )
+
+        assigned = sum(quantity for _, quantity in second_allocations)
+        assigned_m3 = assigned * m3_per_unit
+        cap_used_normal[destination] += assigned_m3
+        actual_m3_by_store[destination] += assigned_m3
+        capacity_after = cap_used_normal[destination]
+        if capacity_after >= capacity - 1e-9:
+            cap_closed[destination] = True
+
+        task_limited = len(second_allocations) < len(candidates)
+        capacity_limited = second_pass_target < target
+        blocked_stock = sum(
+            second_pass_before[source]
+            for source in config.origin_warehouses
+            if second_pass_blocks[source]
+        )
+        if task_limited:
+            tipo_corte = "OK PARCIAL - CORTE POR CAPACIDAD DE TAREAS"
+            detalle_motivo = (
+                f"Segunda pasada: asignadas {assigned} de {target}; "
+                "se alcanzó el límite global de tareas"
+            )
+        elif capacity_limited and assigned >= second_pass_target:
+            tipo_corte = "OK PARCIAL - CORTE POR CAPACIDAD DE TIENDA"
+            detalle_motivo = (
+                f"Segunda pasada: asignadas {assigned} de {target}; "
+                "se agotó la capacidad restante de la tienda"
+            )
+        elif blocked_stock > 0:
+            tipo_corte = "OK PARCIAL - BLOQUEO REGIONAL"
+            detalle_motivo = (
+                f"Segunda pasada: asignadas {assigned} de {target}; parte del "
+                "stock permanece bloqueada por la regla regional explícita"
+            )
+        else:
+            tipo_corte = "OK PARCIAL - CORTE POR STOCK"
+            detalle_motivo = (
+                f"Segunda pasada: asignadas {assigned} de {target} con el stock "
+                "remanente después de atender las solicitudes completas"
+            )
+
+        report_row.update(
+            {
+                "CANTIDAD_ASIGNADA": assigned,
+                "CANTIDAD_FALTANTE": max(target - assigned, 0),
+                "M3_ASIGNADO": assigned_m3,
+                "M3_CAPACIDAD_ANTES": capacity_before,
+                "M3_CAPACIDAD_DESPUES": capacity_after,
+                "EXCEDE_CAPACIDAD_EN_ESTA_LINEA": False,
+                "PASA_CAPACIDAD": not capacity_limited,
+                "TAREAS_ANTES": task_before_second_pass,
+                "TAREAS_GENERADAS": len(second_allocations),
+                "TAREAS_ACUMULADAS": tasks_used,
+                "PASA_TAREAS": not task_limited,
+                "ORIGENES_USADOS": " | ".join(
+                    f"{source}:{quantity}"
+                    for source, quantity in second_allocations
+                ),
+                "VALUE": allocation_value_summary(
+                    catalogs,
+                    second_allocations,
+                    sku,
+                ),
+                "TIPO_DE_CORTE": tipo_corte,
+                "DETALLE_MOTIVO": detalle_motivo,
+            }
+        )
+        for source in config.origin_warehouses:
+            report_row.update(
+                {
+                    f"STOCK_ANTES_{source}": second_pass_before[source],
+                    f"BLOQUEO_REGIONAL_{source}": second_pass_blocks[source],
+                    f"VALUE_{source}": source_value_category(catalogs, source, sku),
+                    f"ASIGNADO_{source}": assigned_by_origin[source],
+                    f"STOCK_REMANENTE_{source}": stock_remaining[(source, sku)],
+                }
+            )
 
     capacity_rows: list[dict[str, Any]] = []
     destinations = sorted({row["WAREHOUSE_DESTINATION"] for row in prepared})

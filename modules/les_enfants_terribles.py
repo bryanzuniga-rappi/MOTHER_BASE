@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# Mother Base build 2026-09-02.5 — Shalashaska simplificado con ADU directo.
+# Mother Base build 2026-09-02.6 — High Value por warehouse origen.
 
 from collections import Counter, defaultdict
 from contextlib import redirect_stdout
@@ -93,7 +93,8 @@ REQUIRED_DATABASE_SHEETS = (
     "BLOQUEOS",
     "RUTA_COSTOS",
     "PRIORIDAD",
-    "HIGH_VALUE",
+    "444_HV",
+    "831_HV",
     "RACKEADOS",
     "CAP_RECIBO",
     "CATALOGO",
@@ -130,9 +131,13 @@ SHEET_DESCRIPTIONS = {
         "Prioridad de atención por warehouse destino. El valor 1 representa la "
         "prioridad más alta."
     ),
-    "HIGH_VALUE": (
-        "Clasificación referencial de productos de alto valor utilizada en los "
-        "archivos de salida."
+    "444_HV": (
+        "Clasificación referencial de productos de alto valor cuando la mercancía "
+        "sale del warehouse 444."
+    ),
+    "831_HV": (
+        "Clasificación referencial de productos de alto valor cuando la mercancía "
+        "sale del warehouse 831."
     ),
     "RACKEADOS": (
         "Productos rackeados por warehouse. Para el origen 444, estos productos "
@@ -1511,7 +1516,7 @@ def load_insumos_rows(
                     "DELIVERY_PRIORITY": 1,
                     "CITY": store.get("city", ""),
                     "STORAGE": resolved_storage(catalogs.storage.get(sku)),
-                    "VALUE": catalogs.high_value.get(sku, "REGULAR"),
+                    "VALUE": engine.source_value_category(catalogs, 444, sku),
                     PLANNING_REASON_COLUMN: PLANNING_REASON_INSUMOS,
                 }
             )
@@ -3051,7 +3056,7 @@ def apply_avl_fill(
                     "DELIVERY_PRIORITY": 1,
                     "CITY": city,
                     "STORAGE": resolved_storage(catalogs.storage.get(sku)),
-                    "VALUE": catalogs.high_value.get(sku, "REGULAR"),
+                    "VALUE": engine.source_value_category(catalogs, source, sku),
                     PLANNING_REASON_COLUMN: (
                         PLANNING_REASON_AVL
                         if candidate_mode == "stockout"
@@ -3136,7 +3141,7 @@ def apply_avl_fill(
                 f"{source}:{quantity}" for source, quantity in allocations
             ),
             "STORAGE": resolved_storage(catalogs.storage.get(sku)),
-            "VALUE": catalogs.high_value.get(sku, "REGULAR"),
+            "VALUE": engine.allocation_value_summary(catalogs, allocations, sku),
             "TIPO_DE_CORTE": (
                 "ENVIADOS PARA CUBRIR AVL"
                 if candidate_mode == "stockout"
@@ -3169,6 +3174,11 @@ def apply_avl_fill(
                     f"STOCK_INICIAL_AJUSTADO_{source}": info["adjusted"],
                     f"STOCK_ANTES_{source}": origin_before[source],
                     f"BLOQUEO_REGIONAL_{source}": regional_blocks[source],
+                    f"VALUE_{source}": engine.source_value_category(
+                        catalogs,
+                        source,
+                        sku,
+                    ),
                     f"ASIGNADO_{source}": assigned_by_origin[source],
                     f"STOCK_REMANENTE_{source}": stock_remaining[(source, sku)],
                 }

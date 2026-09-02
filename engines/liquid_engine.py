@@ -579,7 +579,7 @@ def apply_liquid_engine(
                     "DELIVERY_PRIORITY": 1,
                     "CITY": option["store"].get("city", ""),
                     "STORAGE": catalogs.storage.get(sku) or "Room Temperature",
-                    "VALUE": catalogs.high_value.get(sku, "REGULAR"),
+                    "VALUE": engine.source_value_category(catalogs, source, sku),
                     reason_column: LIQUID_REASON,
                 }
                 result.allocation_rows.append(existing)
@@ -656,7 +656,7 @@ def apply_liquid_engine(
                 "PASA_TAREAS": True,
                 "ORIGENES_USADOS": f"{source}:{int(quantity)}",
                 "STORAGE": catalogs.storage.get(sku) or "Room Temperature",
-                "VALUE": catalogs.high_value.get(sku, "REGULAR"),
+                "VALUE": engine.source_value_category(catalogs, source, sku),
                 "TIPO_DE_CORTE": LIQUID_CUT,
                 "DETALLE_MOTIVO": (
                     "Liquid Engine distribuyó inventario remanente por nivelación "

@@ -495,7 +495,7 @@ def apply_shalashaska_engine(
                     "DELIVERY_PRIORITY": 1,
                     "CITY": option["store"].get("city", ""),
                     "STORAGE": catalogs.storage.get(sku) or "Room Temperature",
-                    "VALUE": catalogs.high_value.get(sku, "REGULAR"),
+                    "VALUE": engine.source_value_category(catalogs, source, sku),
                     reason_column: SHALASHASKA_REASON,
                 }
                 result.allocation_rows.append(allocation)
@@ -584,7 +584,7 @@ def apply_shalashaska_engine(
                 "PASA_TAREAS": True,
                 "ORIGENES_USADOS": f"{source}:{quantity}",
                 "STORAGE": catalogs.storage.get(sku) or "Room Temperature",
-                "VALUE": catalogs.high_value.get(sku, "REGULAR"),
+                "VALUE": engine.source_value_category(catalogs, source, sku),
                 "TIPO_DE_CORTE": SHALASHASKA_CUT,
                 "DETALLE_MOTIVO": (
                     "Inventario próximo a caducar distribuido por necesidad, DOH "
