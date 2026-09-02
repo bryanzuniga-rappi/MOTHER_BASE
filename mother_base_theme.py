@@ -229,26 +229,6 @@ def inject_mother_base_theme() -> None:
             background-color: #fffdf7 !important;
         }
 
-        .mission-control-marker {
-            display: none !important;
-        }
-
-        [data-testid="stVerticalBlockBorderWrapper"]:has(.mission-control-marker),
-        .st-key-mission_control_shared [data-testid="stVerticalBlockBorderWrapper"] {
-            background: #fffdf7 !important;
-            background-color: #fffdf7 !important;
-            border: 3px solid #111111 !important;
-            border-radius: 10px !important;
-            box-shadow: 7px 7px 0 #111111 !important;
-        }
-
-        [data-testid="stVerticalBlockBorderWrapper"]:has(.mission-control-marker)
-        [data-testid="stVerticalBlock"],
-        .st-key-mission_control_shared [data-testid="stVerticalBlock"] {
-            background: #fffdf7 !important;
-            background-color: #fffdf7 !important;
-        }
-
         [data-testid="stFileUploaderDropzone"],
         [data-baseweb="select"] > div,
         [data-baseweb="input"] > div,
