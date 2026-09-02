@@ -989,7 +989,7 @@ def is_regional_block(
     if source == destination:
         return True
     source_city_norm = catalogs.stores[source]["city_norm"]
-    restricted_product = sku in catalogs.blocked_products
+    restricted_product = sku in catalogs.blocked_products or is_golden_infaltable
     return (
         restricted_product
         and source_city_norm == CDMX
@@ -1736,4 +1736,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
- 
