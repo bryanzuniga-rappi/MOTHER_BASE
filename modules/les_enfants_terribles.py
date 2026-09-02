@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# Mother Base build 2026-09-02.6 — High Value por warehouse origen.
+# Mother Base build 2026-09-02.7 — Storage por origen, outliers F9 y perfil operativo.
 
 from collections import Counter, defaultdict
 from contextlib import redirect_stdout
@@ -15,6 +15,7 @@ import csv
 import re
 import shutil
 import tempfile
+import time
 import urllib.error
 import urllib.request
 import zipfile
@@ -95,6 +96,7 @@ REQUIRED_DATABASE_SHEETS = (
     "PRIORIDAD",
     "444_HV",
     "831_HV",
+    "OVER_ORIGEN_STORAGE",
     "RACKEADOS",
     "CAP_RECIBO",
     "CATALOGO",
@@ -138,6 +140,10 @@ SHEET_DESCRIPTIONS = {
     "831_HV": (
         "Clasificación referencial de productos de alto valor cuando la mercancía "
         "sale del warehouse 831."
+    ),
+    "OVER_ORIGEN_STORAGE": (
+        "Override opcional de STORAGE_TYPE por warehouse origen y producto. "
+        "WAREHOUSE_ID identifica el origen, nunca la tienda destino."
     ),
     "RACKEADOS": (
         "Productos rackeados por warehouse. Para el origen 444, estos productos "
@@ -1515,7 +1521,7 @@ def load_insumos_rows(
                     "ROUTE": 1,
                     "DELIVERY_PRIORITY": 1,
                     "CITY": store.get("city", ""),
-                    "STORAGE": resolved_storage(catalogs.storage.get(sku)),
+                    "STORAGE": engine.source_storage_type(catalogs, 444, sku),
                     "VALUE": engine.source_value_category(catalogs, 444, sku),
                     PLANNING_REASON_COLUMN: PLANNING_REASON_INSUMOS,
                 }
@@ -3055,7 +3061,7 @@ def apply_avl_fill(
                     "ROUTE": 1,
                     "DELIVERY_PRIORITY": 1,
                     "CITY": city,
-                    "STORAGE": resolved_storage(catalogs.storage.get(sku)),
+                    "STORAGE": engine.source_storage_type(catalogs, source, sku),
                     "VALUE": engine.source_value_category(catalogs, source, sku),
                     PLANNING_REASON_COLUMN: (
                         PLANNING_REASON_AVL
@@ -3140,7 +3146,11 @@ def apply_avl_fill(
             "ORIGENES_USADOS": " | ".join(
                 f"{source}:{quantity}" for source, quantity in allocations
             ),
-            "STORAGE": resolved_storage(catalogs.storage.get(sku)),
+            "STORAGE": engine.allocation_storage_summary(
+                catalogs,
+                allocations,
+                sku,
+            ),
             "VALUE": engine.allocation_value_summary(catalogs, allocations, sku),
             "TIPO_DE_CORTE": (
                 "ENVIADOS PARA CUBRIR AVL"
@@ -3175,6 +3185,11 @@ def apply_avl_fill(
                     f"STOCK_ANTES_{source}": origin_before[source],
                     f"BLOQUEO_REGIONAL_{source}": regional_blocks[source],
                     f"VALUE_{source}": engine.source_value_category(
+                        catalogs,
+                        source,
+                        sku,
+                    ),
+                    f"STORAGE_{source}": engine.source_storage_type(
                         catalogs,
                         source,
                         sku,
@@ -3224,6 +3239,7 @@ def write_executive_pdf(
     shalashaska: dict[str, Any],
     fruver_811: dict[str, Any],
     input_consolidation: dict[str, Any],
+    outliers_f9: dict[str, Any],
 ) -> None:
     """Genera un reporte PDF ejecutivo, legible y listo para compartir."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -3494,6 +3510,9 @@ def write_executive_pdf(
             para(
                 f"{closed_stores.get('requirements', 0):,} casos por tienda cerrada; "
                 f"{city_block.get('requirements', 0):,} por ciudad bloqueada; "
+                f"{outliers_f9.get('requirements_excluded', 0):,} combinaciones "
+                f"de {outliers_f9.get('stores_excluded', 0):,} tiendas excluidas "
+                "como outlier Fountain9; "
                 f"{insumos.get('lines_added', 0):,} líneas y "
                 f"{insumos.get('units_added', 0):,} unidades de insumos; "
                 f"{insumos.get('units_cut_stock', 0):,} unidades recortadas por "
@@ -3800,6 +3819,7 @@ def execute_planning(
     liquid_manual_skus_by_origin: dict[int, set[int]] | None = None,
     forecast_horizon_days: int = 7,
     excluded_skus: set[int] | None = None,
+    apply_origin_storage_override: bool = False,
 ) -> dict[str, Any]:
     clear_previous_workspace()
     workspace = Path(tempfile.mkdtemp(prefix="transfer_planner_"))
@@ -3852,6 +3872,9 @@ def execute_planning(
             config,
             copernico_csv_path=copernico_path,
         )
+        catalogs.origin_storage_override_enabled = bool(
+            apply_origin_storage_override
+        )
         excluded_sku_set = set(excluded_skus or ())
         catalogs.excluded_products = excluded_sku_set
         if excluded_sku_set:
@@ -3898,6 +3921,25 @@ def execute_planning(
             consolidated_input,
             consolidation_summary,
         )
+        outlier_summary = engine.detect_fountain9_store_outliers(
+            consolidated_input,
+            catalogs,
+        )
+        outlier_store_ids = set(outlier_summary["store_ids"])
+        engine_blocked_store_ids = set(closed_store_ids) | outlier_store_ids
+        if outlier_store_ids:
+            plan_read.rows = [
+                row
+                for row in plan_read.rows
+                if row["WAREHOUSE_DESTINATION"] not in outlier_store_ids
+            ]
+            catalogs.warnings.append(
+                "Control de outliers Fountain9: se excluyeron "
+                f"{outlier_summary['stores_excluded']:,} tiendas y "
+                f"{outlier_summary['requirements_excluded']:,} combinaciones "
+                "tienda-SKU por tener 50% o menos de las líneas de la tienda "
+                f"mediana ({outlier_summary['median_lines']:g})."
+            )
         excluded_plan_rows = [
             row
             for row in plan_read.rows
@@ -3911,7 +3953,7 @@ def execute_planning(
         rows_after_closed_stores, closed_plan_rows = (
             split_plan_rows_by_closed_store(
                 plan_read.rows,
-                closed_store_ids,
+                engine_blocked_store_ids,
             )
         )
         active_plan_rows, blocked_plan_rows = split_plan_rows_by_blocked_city(
@@ -3987,7 +4029,7 @@ def execute_planning(
                 config,
                 expiring_rows,
                 catalog_adu,
-                closed_store_ids,
+                engine_blocked_store_ids,
                 blocked_cities,
                 store_shares_cache,
                 run_date=run_date,
@@ -4025,7 +4067,7 @@ def execute_planning(
                 catalog_fill_rows,
                 catalogs,
                 config,
-                closed_store_ids,
+                engine_blocked_store_ids,
                 blocked_cities,
                 avl_doh,
             )
@@ -4048,7 +4090,7 @@ def execute_planning(
                 catalog_fill_rows,
                 catalogs,
                 config,
-                closed_store_ids,
+                engine_blocked_store_ids,
                 blocked_cities,
                 avl_doh,
                 candidate_mode="preventive",
@@ -4073,7 +4115,7 @@ def execute_planning(
                 catalogs,
                 config,
                 daily_plan_rows,
-                closed_store_ids,
+                engine_blocked_store_ids,
                 blocked_cities,
                 store_shares,
                 {
@@ -4116,6 +4158,17 @@ def execute_planning(
             output_dir,
         )
         local_files = [Path(path) for path in local_files]
+        if outlier_summary["details"]:
+            outlier_path = output_dir / (
+                f"Outliers_Fountain9_Excluidos_{run_date:%d-%m-%Y}.csv"
+            )
+            outlier_columns = list(outlier_summary["details"][0])
+            engine.write_csv(
+                outlier_path,
+                outlier_summary["details"],
+                outlier_columns,
+            )
+            local_files.append(outlier_path)
         rewrite_bulk_csvs_with_planning_reason(local_files, result)
         insumos_summary = append_insumos_to_bulk_444(
             local_files,
@@ -4151,7 +4204,7 @@ def execute_planning(
             origins=origins,
             analytics=analytics,
             status_counts=status_counts,
-            input_requirements=len(plan_read.rows),
+            input_requirements=consolidation_summary["unique_requirements"],
             evaluated_requirements=requirements,
             tasks=result.tasks_used,
             max_tasks=config.max_tasks,
@@ -4165,9 +4218,13 @@ def execute_planning(
             shalashaska=shalashaska_summary,
             fruver_811=fruver_811_summary,
             input_consolidation=consolidation_summary,
+            outliers_f9=outlier_summary,
         )
         local_files.append(pdf_path)
-        print(f"Requerimientos únicos del input: {len(plan_read.rows):,}")
+        print(
+            "Requerimientos únicos del input: "
+            f"{consolidation_summary['unique_requirements']:,}"
+        )
         print(
             f"Archivos consolidados: {consolidation_summary['files']:,} / "
             f"filas sumadas: {consolidation_summary['source_rows']:,}"
@@ -4188,6 +4245,11 @@ def execute_planning(
         print(
             "Requerimientos excluidos por SKU general: "
             f"{len(excluded_plan_rows):,}"
+        )
+        print(
+            "Outliers Fountain9 excluidos: "
+            f"{outlier_summary['stores_excluded']:,} tiendas / "
+            f"{outlier_summary['requirements_excluded']:,} combinaciones"
         )
         print(f"Tareas generadas: {result.tasks_used:,}")
         if avl_summary["enabled"]:
@@ -4241,7 +4303,7 @@ def execute_planning(
         "tasks": result.tasks_used,
         "units": units,
         "requirements": requirements,
-        "input_requirements": len(plan_read.rows),
+        "input_requirements": consolidation_summary["unique_requirements"],
         "status_counts": dict(status_counts),
         "warnings": list(result.warnings),
         "logs": captured.getvalue(),
@@ -4259,6 +4321,11 @@ def execute_planning(
         "engine_selection": engine_selection,
         "excluded_skus": sorted(excluded_sku_set),
         "excluded_requirements": len(excluded_plan_rows),
+        "outliers_f9": outlier_summary,
+        "origin_storage_override": {
+            "enabled": bool(apply_origin_storage_override),
+            "configured_pairs": len(catalogs.storage_override_by_origin),
+        },
     }
 
 
@@ -5046,7 +5113,8 @@ def render_results(run: dict[str, Any]) -> None:
                 "description": (
                     "Combinaciones tienda–SKU únicas obtenidas después de sumar todos "
                     "los CSV cargados. Incluye tiendas cerradas y ciudades "
-                    "bloqueadas antes de aplicar exclusiones."
+                    "bloqueadas, así como tiendas detectadas como outlier, antes "
+                    "de aplicar exclusiones."
                 ),
                 "tone": "acid",
             },
@@ -5056,7 +5124,8 @@ def render_results(run: dict[str, Any]) -> None:
                 "value": f"{run['requirements']:,}",
                 "description": (
                     "Casos tienda–SKU que llegaron al motor después de quitar "
-                    "TIENDAS_CERRADAS y los bloqueos opcionales de ciudad."
+                    "TIENDAS_CERRADAS, outliers Fountain9 y los bloqueos "
+                    "opcionales de ciudad."
                 ),
             },
             {
@@ -5103,6 +5172,14 @@ def render_results(run: dict[str, Any]) -> None:
         ],
         columns_count=3,
     )
+
+    storage_override = run.get("origin_storage_override", {})
+    if storage_override.get("enabled"):
+        st.info(
+            "Override de storage por origen aplicado: "
+            f"{storage_override.get('configured_pairs', 0):,} combinaciones "
+            "warehouse origen–SKU disponibles en OVER_ORIGEN_STORAGE."
+        )
 
     consolidation = run.get("input_consolidation", {})
     if consolidation:
@@ -5153,6 +5230,77 @@ def render_results(run: dict[str, Any]) -> None:
             ],
             columns_count=4,
         )
+
+    outliers = run.get("outliers_f9", {})
+    if outliers.get("enabled"):
+        st.markdown(
+            '<span class="section-label">CONTROL DE OUTLIERS · FOUNTAIN9</span>',
+            unsafe_allow_html=True,
+        )
+        render_kpi_cards(
+            [
+                {
+                    "category": "TIENDAS · INPUT",
+                    "label": "TIENDAS EVALUADAS",
+                    "value": f"{outliers.get('stores_evaluated', 0):,}",
+                    "description": (
+                        "Tiendas distintas encontradas en el conjunto consolidado "
+                        "de archivos Fountain9."
+                    ),
+                    "tone": "blue",
+                },
+                {
+                    "category": "LÍNEAS · REFERENCIA",
+                    "label": "MEDIANA POR TIENDA",
+                    "value": f"{outliers.get('median_lines', 0):,.1f}",
+                    "description": (
+                        "Mediana de combinaciones SKU–tienda únicas. Es más "
+                        "estable que el promedio frente a archivos anómalos."
+                    ),
+                },
+                {
+                    "category": "LÍNEAS · CONTROL",
+                    "label": "UMBRAL DE EXCLUSIÓN",
+                    "value": f"{outliers.get('threshold', 0):,}",
+                    "description": (
+                        "Una tienda se excluye cuando contiene 50% o menos de la "
+                        "mediana de líneas. La regla solo se activa con al menos "
+                        "cinco tiendas y una mediana mínima de 20."
+                    ),
+                    "tone": "acid",
+                },
+                {
+                    "category": "TIENDAS · EXCLUIDAS",
+                    "label": "OUTLIERS DETECTADOS",
+                    "value": f"{outliers.get('stores_excluded', 0):,}",
+                    "description": (
+                        "Tiendas eliminadas antes de ejecutar cualquier engine. "
+                        "No consumieron stock, capacidad ni tareas."
+                    ),
+                    "tone": "coral",
+                },
+            ],
+            columns_count=4,
+        )
+        if outliers.get("stores"):
+            report_table(
+                outliers["stores"],
+                column_config={
+                    "WAREHOUSE_DESTINATION": st.column_config.NumberColumn(
+                        "WAREHOUSE", format="%d"
+                    ),
+                    "PORCENTAJE_DE_LA_MEDIANA": st.column_config.NumberColumn(
+                        "% DE LA MEDIANA", format="%.1f%%"
+                    ),
+                },
+                max_height=420,
+            )
+        if outliers.get("requirements_excluded", 0):
+            st.warning(
+                f"Se excluyeron {outliers['requirements_excluded']:,} combinaciones "
+                f"de {outliers['stores_excluded']:,} tiendas anómalas. El detalle "
+                "completo está en el CSV Outliers_Fountain9_Excluidos."
+            )
 
     avl = run.get("avl", {})
     if avl.get("enabled"):
@@ -5693,7 +5841,7 @@ def render() -> None:
             ),
         )
 
-        support_left, support_right = st.columns(2)
+        support_left, support_center, support_right = st.columns(3)
         with support_left:
             include_insumos = st.toggle(
                 "Agregar insumos al BulkCD_444",
@@ -5703,13 +5851,23 @@ def render() -> None:
                     "normal desde 444. No consumen tareas."
                 ),
             )
-        with support_right:
+        with support_center:
             block_fruver_811 = st.toggle(
                 "Bloquear FRUVER desde el warehouse 811",
                 value=False,
                 help=(
                     "El stock FRUVER del 811 queda fuera de los tres engines; los "
                     "demás orígenes permanecen disponibles."
+                ),
+            )
+        with support_right:
+            apply_origin_storage_override = st.toggle(
+                "Aplicar override de storage por origen",
+                value=False,
+                help=(
+                    "Usa OVER_ORIGEN_STORAGE con la llave WAREHOUSE_ID origen + "
+                    "PRODUCT_ID. Si no existe override, conserva STORAGE; si "
+                    "tampoco existe, usa Room Temperature."
                 ),
             )
         st.caption(
@@ -6038,6 +6196,12 @@ def render() -> None:
                         "no está seleccionado como origen."
                     )
                 st.write("Calculando demanda, stock, capacidad y tareas…")
+                if st.session_state.get("mb_profile") == "RAIDEN":
+                    st.write(
+                        "Asignando ventana de procesamiento para el perfil "
+                        "operativo…"
+                    )
+                    time.sleep(10)
                 st.write(
                     "Loadout activo: "
                     + ", ".join(
@@ -6090,6 +6254,7 @@ def render() -> None:
                     liquid_manual_skus_by_origin=liquid_manual_skus_by_origin,
                     forecast_horizon_days=int(forecast_horizon_days),
                     excluded_skus=excluded_skus,
+                    apply_origin_storage_override=apply_origin_storage_override,
                 )
                 status.update(label="Planeación finalizada", state="complete", expanded=False)
             st.session_state["last_run"] = run

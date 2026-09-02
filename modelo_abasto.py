@@ -29,6 +29,7 @@ import io
 import math
 import re
 import shutil
+import statistics
 import sys
 import unicodedata
 
@@ -550,6 +551,10 @@ class Catalogs:
     stores: dict[int, dict[str, str]]
     storage: dict[int, str]
     warnings: list[str]
+    storage_override_by_origin: dict[tuple[int, int], str] = field(
+        default_factory=dict
+    )
+    origin_storage_override_enabled: bool = False
     copernico_unusable_by_warehouse: dict[tuple[int, int], float] = field(
         default_factory=dict
     )
@@ -625,6 +630,33 @@ def load_catalogs(
                         sheet_name,
                         "first",
                     )
+
+        storage_override_by_origin: dict[tuple[int, int], str] = {}
+        for row in iter_sheet_records(
+            workbook,
+            "OVER_ORIGEN_STORAGE",
+            ["WAREHOUSE_ID", "PRODUCT_ID", "STORAGE_TYPE"],
+        ):
+            source = to_id(
+                row["WAREHOUSE_ID"],
+                "OVER_ORIGEN_STORAGE.WAREHOUSE_ID",
+                True,
+            )
+            sku = to_id(
+                row["PRODUCT_ID"],
+                "OVER_ORIGEN_STORAGE.PRODUCT_ID",
+                True,
+            )
+            storage_type = clean_text(row["STORAGE_TYPE"])
+            if source is not None and sku is not None and storage_type:
+                put_unique(
+                    storage_override_by_origin,
+                    (source, sku),
+                    storage_type,
+                    warnings,
+                    "OVER_ORIGEN_STORAGE",
+                    "first",
+                )
 
         rackeados_444: set[int] = set()
         for row in iter_sheet_records(workbook, "RACKEADOS", ["WHS", "SYNC"]):
@@ -798,12 +830,27 @@ def load_catalogs(
             copernico_unusable_by_warehouse
         ),
         kvi_products=kvi_products,
+        storage_override_by_origin=storage_override_by_origin,
     )
 
 
 def source_value_category(catalogs: Catalogs, source: int, sku: int) -> str:
     """Devuelve la categoría de valor aplicable al origen real de la línea."""
     return catalogs.high_value.get((source, sku), "REGULAR")
+
+
+def source_storage_type(catalogs: Catalogs, source: int, sku: int) -> str:
+    """Resuelve STORAGE por origen cuando el override está habilitado."""
+    if catalogs.origin_storage_override_enabled:
+        override = clean_text(
+            catalogs.storage_override_by_origin.get((source, sku))
+        )
+        if override:
+            return override
+    storage_type = clean_text(catalogs.storage.get(sku))
+    if not storage_type or storage_type.upper() in {"UNKNOWN", "N/A", "NULL"}:
+        return "Room Temperature"
+    return storage_type
 
 
 def allocation_value_summary(
@@ -822,6 +869,98 @@ def allocation_value_summary(
         f"{source}:{source_value_category(catalogs, source, sku)}"
         for source in used_sources
     )
+
+
+def allocation_storage_summary(
+    catalogs: Catalogs,
+    allocations: Iterable[tuple[int, int]],
+    sku: int,
+) -> str:
+    """Resume STORAGE para un caso atendido desde uno o varios orígenes."""
+    used_sources = [source for source, quantity in allocations if quantity > 0]
+    if not used_sources:
+        return source_storage_type(catalogs, 0, sku)
+    values = [source_storage_type(catalogs, source, sku) for source in used_sources]
+    if len(set(values)) == 1:
+        return values[0]
+    return " | ".join(
+        f"{source}:{source_storage_type(catalogs, source, sku)}"
+        for source in used_sources
+    )
+
+
+def detect_fountain9_store_outliers(
+    consolidated: dict[tuple[int, int], dict[str, Any]],
+    catalogs: Catalogs,
+) -> dict[str, Any]:
+    """Detecta tiendas con una cobertura de líneas F9 anormalmente baja."""
+    line_counts = Counter(destination for destination, _ in consolidated)
+    median_lines = float(statistics.median(line_counts.values())) if line_counts else 0.0
+    threshold = int(math.floor(median_lines * 0.50))
+    detection_enabled = len(line_counts) >= 5 and median_lines >= 20
+    outlier_store_ids = {
+        destination
+        for destination, count in line_counts.items()
+        if detection_enabled and count <= threshold
+    }
+    stores: list[dict[str, Any]] = []
+    for destination in sorted(outlier_store_ids, key=lambda value: (line_counts[value], value)):
+        store = catalogs.stores.get(destination, {})
+        count = int(line_counts[destination])
+        stores.append(
+            {
+                "WAREHOUSE_DESTINATION": destination,
+                "WAREHOUSE_NAME": store.get("warehouse_name", ""),
+                "CITY": store.get("city", ""),
+                "LINEAS_F9_UNICAS": count,
+                "MEDIANA_LINEAS_TIENDAS": round(median_lines, 1),
+                "UMBRAL_OUTLIER_50_PCT": threshold,
+                "PORCENTAJE_DE_LA_MEDIANA": round(
+                    (count / median_lines) * 100,
+                    1,
+                ) if median_lines else 0.0,
+                "ACCION": "EXCLUIDA DE LA PLANEACION",
+            }
+        )
+    details: list[dict[str, Any]] = []
+    for (destination, sku), record in sorted(consolidated.items()):
+        if destination not in outlier_store_ids:
+            continue
+        store = catalogs.stores.get(destination, {})
+        details.append(
+            {
+                "WAREHOUSE_DESTINATION": destination,
+                "WAREHOUSE_NAME": store.get("warehouse_name", ""),
+                "CITY": store.get("city", ""),
+                "RETAIL_ID": sku,
+                "PREDICTED_DEMAND": record["PREDICTED_DEMAND"],
+                "PREDICTED_OPENING_INVENTORY": record[
+                    "PREDICTED_OPENING_INVENTORY"
+                ],
+                "ROQ_INPUT": record["ROQ_INPUT"],
+                "NET_INTER_STORE_TRANSFERS": record[
+                    "NET_INTER_STORE_TRANSFERS"
+                ],
+                "ARCHIVOS_INPUT": " | ".join(sorted(record["SOURCE_FILES"])),
+                "FILAS_INPUT_SUMADAS": record["SOURCE_ROWS"],
+                "MOTIVO_EXCLUSION": (
+                    f"La tienda solo contiene {line_counts[destination]} líneas "
+                    f"únicas frente a una mediana de {median_lines:g}; umbral "
+                    f"automático: {threshold}."
+                ),
+            }
+        )
+    return {
+        "enabled": detection_enabled,
+        "stores_evaluated": len(line_counts),
+        "median_lines": median_lines,
+        "threshold": threshold,
+        "store_ids": sorted(outlier_store_ids),
+        "stores": stores,
+        "details": details,
+        "stores_excluded": len(outlier_store_ids),
+        "requirements_excluded": len(details),
+    }
 
 
 # %% Lectura y preparación del requerimiento diario
@@ -1255,7 +1394,7 @@ def plan_transfers(
                         "ROUTE": 1,
                         "DELIVERY_PRIORITY": 1,
                         "CITY": city,
-                        "STORAGE": row["STORAGE"],
+                        "STORAGE": source_storage_type(catalogs, source, sku),
                         "VALUE": source_value_category(catalogs, source, sku),
                     }
                 )
@@ -1390,7 +1529,7 @@ def plan_transfers(
             "ORIGENES_USADOS": " | ".join(
                 f"{source}:{quantity}" for source, quantity in allocations
             ),
-            "STORAGE": row["STORAGE"],
+            "STORAGE": allocation_storage_summary(catalogs, allocations, sku),
             "VALUE": allocation_value_summary(catalogs, allocations, sku),
             "TIPO_DE_CORTE": tipo_corte,
             "DETALLE_MOTIVO": detalle_motivo,
@@ -1408,6 +1547,7 @@ def plan_transfers(
                     f"STOCK_ANTES_{source}": origin_before[source],
                     f"BLOQUEO_REGIONAL_{source}": regional_blocks[source],
                     f"VALUE_{source}": source_value_category(catalogs, source, sku),
+                    f"STORAGE_{source}": source_storage_type(catalogs, source, sku),
                     f"ASIGNADO_{source}": assigned_by_origin[source],
                     f"STOCK_REMANENTE_{source}": stock_remaining[(source, sku)],
                 }
@@ -1486,7 +1626,7 @@ def plan_transfers(
                     "ROUTE": 1,
                     "DELIVERY_PRIORITY": 1,
                     "CITY": row["CITY"],
-                    "STORAGE": row["STORAGE"],
+                    "STORAGE": source_storage_type(catalogs, source, sku),
                     "VALUE": source_value_category(catalogs, source, sku),
                 }
             )
@@ -1553,6 +1693,11 @@ def plan_transfers(
                     second_allocations,
                     sku,
                 ),
+                "STORAGE": allocation_storage_summary(
+                    catalogs,
+                    second_allocations,
+                    sku,
+                ),
                 "TIPO_DE_CORTE": tipo_corte,
                 "DETALLE_MOTIVO": detalle_motivo,
             }
@@ -1563,6 +1708,7 @@ def plan_transfers(
                     f"STOCK_ANTES_{source}": second_pass_before[source],
                     f"BLOQUEO_REGIONAL_{source}": second_pass_blocks[source],
                     f"VALUE_{source}": source_value_category(catalogs, source, sku),
+                    f"STORAGE_{source}": source_storage_type(catalogs, source, sku),
                     f"ASIGNADO_{source}": assigned_by_origin[source],
                     f"STOCK_REMANENTE_{source}": stock_remaining[(source, sku)],
                 }

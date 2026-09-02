@@ -494,7 +494,7 @@ def apply_shalashaska_engine(
                     "ROUTE": 1,
                     "DELIVERY_PRIORITY": 1,
                     "CITY": option["store"].get("city", ""),
-                    "STORAGE": catalogs.storage.get(sku) or "Room Temperature",
+                    "STORAGE": engine.source_storage_type(catalogs, source, sku),
                     "VALUE": engine.source_value_category(catalogs, source, sku),
                     reason_column: SHALASHASKA_REASON,
                 }
@@ -583,7 +583,7 @@ def apply_shalashaska_engine(
                 "TAREAS_ACUMULADAS": result.tasks_used,
                 "PASA_TAREAS": True,
                 "ORIGENES_USADOS": f"{source}:{quantity}",
-                "STORAGE": catalogs.storage.get(sku) or "Room Temperature",
+                "STORAGE": engine.source_storage_type(catalogs, source, sku),
                 "VALUE": engine.source_value_category(catalogs, source, sku),
                 "TIPO_DE_CORTE": SHALASHASKA_CUT,
                 "DETALLE_MOTIVO": (
