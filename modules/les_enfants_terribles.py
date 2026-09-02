@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# Mother Base build 2026-09-02.3 — KVI, Aleph freshness and global SKU exclusions.
+
 from collections import Counter, defaultdict
 from contextlib import redirect_stdout
 from datetime import date, datetime, timedelta, timezone
@@ -66,6 +68,8 @@ ORIGIN_WAREHOUSES = {
 
 ALEPH_SHEETS = {
     "CATALOGO",
+    "KVI",
+    "SHARE_VENTAS",
     "NO_DISPONIBLE",
     "STOCK",
     "INSUMOS",
@@ -86,6 +90,8 @@ REQUIRED_DATABASE_SHEETS = (
     "RACKEADOS",
     "CAP_RECIBO",
     "CATALOGO",
+    "KVI",
+    "SHARE_VENTAS",
     "NO_DISPONIBLE",
     "STOCK",
     "INSUMOS",
@@ -132,6 +138,10 @@ SHEET_DESCRIPTIONS = {
         "detectar oportunidades de stockout y completar tareas disponibles mediante "
         "la cobertura AVL opcional."
     ),
+    "KVI": (
+        "Productos KVI definidos por warehouse destino y PRODUCT_ID. Se atienden "
+        "antes que los productos regulares, sin poder saltarse bloqueos operativos."
+    ),
     "NO_DISPONIBLE": (
         "Stock no disponible por warehouse y producto que debe descontarse del "
         "inventario disponible final."
@@ -160,6 +170,18 @@ SHEET_DESCRIPTIONS = {
         "Share general de ventas por tienda. Liquid Engine lo utiliza para "
         "distribuir excedentes cuando ya no puede nivelar por DOH."
     ),
+}
+
+ALEPH_MAX_AGE_HOURS = {
+    "STOCK": 1.2,
+    "INSUMOS": 1.2,
+    "NO_DISPONIBLE": 1.2,
+    "KVI": 24.0,
+    "CATALOGO": 24.0,
+    "GOLDEN_INFALTABLES": 24.0,
+    "TIENDA": 24.0,
+    "STORAGE": 24.0,
+    "SHARE_VENTAS": 24.0,
 }
 
 DEMAND_RULE_LABELS = {
@@ -821,6 +843,7 @@ def parse_update_timestamp(value: Any) -> datetime | None:
 def relative_update_text(
     value: Any,
     now: datetime | None = None,
+    max_age_hours: float | None = None,
 ) -> tuple[str, bool]:
     parsed = parse_update_timestamp(value)
     if parsed is None:
@@ -835,15 +858,21 @@ def relative_update_text(
     seconds = max(seconds, 0)
 
     if seconds < 60:
-        return "Hace menos de 1 min", True
-    if seconds < 3600:
+        detail = "Hace menos de 1 min"
+    elif seconds < 7200:
         minutes = int(seconds // 60)
-        return f"Hace {minutes} min", True
-    if seconds < 86400:
-        hours = int(seconds // 3600)
-        return f"Hace {hours} h", True
-    days = int(seconds // 86400)
-    return f"Hace {days} día" if days == 1 else f"Hace {days} días", True
+        detail = f"Hace {minutes} min"
+    elif seconds < 86400:
+        hours = seconds / 3600
+        detail = f"Hace {hours:.1f} h"
+    else:
+        days = seconds / 86400
+        detail = f"Hace {days:.1f} días"
+
+    healthy = max_age_hours is None or seconds <= max_age_hours * 3600
+    if not healthy:
+        detail += " · DESACTUALIZADA"
+    return detail, healthy
 
 
 def inspect_database(workbook_bytes: bytes) -> dict[str, Any]:
@@ -875,7 +904,10 @@ def inspect_database(workbook_bytes: bytes) -> dict[str, Any]:
                 value = value_sheet["C7"].value
                 if value is None:
                     value = formula_sheet["C7"].value
-                detail, healthy = relative_update_text(value)
+                detail, healthy = relative_update_text(
+                    value,
+                    max_age_hours=ALEPH_MAX_AGE_HOURS.get(sheet_name, 24.0),
+                )
                 if contains_ref_error(value):
                     healthy = False
                     detail = "#REF! DETECTADO EN C7"
@@ -1496,6 +1528,7 @@ def append_insumos_to_bulk_444(
         "lines_reduced": 0,
         "lines_removed": 0,
         "products_cut_stock": 0,
+        "lines_blocked_regional": 0,
         "stock_detail": [],
     }
     if not summary["enabled"]:
@@ -1510,11 +1543,31 @@ def append_insumos_to_bulk_444(
         row["WAREHOUSE_DESTINATION"] for row in regular_444_rows
     }
     summary["eligible_stores"] = len(eligible_destinations)
-    selected_requested = [
-        row
-        for row in insumos_rows
-        if row["WAREHOUSE_DESTINATION"] in eligible_destinations
-    ]
+    selected_requested: list[dict[str, Any]] = []
+    for row in insumos_rows:
+        destination = int(row["WAREHOUSE_DESTINATION"])
+        sku = int(row["RETAIL_ID"])
+        if destination not in eligible_destinations:
+            continue
+        if sku in catalogs.excluded_products:
+            continue
+        store = catalogs.stores.get(destination, {})
+        city_norm = store.get("city_norm", "")
+        is_golden = bool(city_norm) and (
+            sku,
+            city_norm,
+        ) in catalogs.golden_infaltables
+        if engine.is_regional_block(
+            catalogs,
+            444,
+            destination,
+            sku,
+            city_norm,
+            is_golden,
+        ):
+            summary["lines_blocked_regional"] += 1
+            continue
+        selected_requested.append(row)
     if not selected_requested:
         return summary
 
@@ -2789,6 +2842,8 @@ def apply_avl_fill(
         destination = catalog_row["WAREHOUSE_DESTINATION"]
         sku = catalog_row["RETAIL_ID"]
         key = (destination, sku)
+        if sku in catalogs.excluded_products:
+            continue
         if destination in closed_store_ids:
             summary["skipped_closed_store"] += 1
             continue
@@ -2833,6 +2888,7 @@ def apply_avl_fill(
             sku,
             city_norm,
         ) in catalogs.golden_infaltables
+        is_kvi = (destination, sku) in catalogs.kvi_products
         candidates.append(
             {
                 "WAREHOUSE_DESTINATION": destination,
@@ -2843,13 +2899,14 @@ def apply_avl_fill(
                 "TARGET": target,
                 "STORE": store,
                 "IS_GOLDEN": is_golden,
+                "IS_KVI": is_kvi,
                 "PRIORITY": catalogs.store_priority.get(destination, 100),
             }
         )
 
     candidates.sort(
         key=lambda row: (
-            0 if row["IS_GOLDEN"] else 1,
+            0 if row["IS_GOLDEN"] else (1 if row["IS_KVI"] else 2),
             row["PRIORITY"],
             row["CURRENT_DOH"],
             row["DESTINATION_STOCK"],
@@ -2871,6 +2928,7 @@ def apply_avl_fill(
         city = store.get("city", "")
         city_norm = store.get("city_norm", "")
         is_golden = candidate["IS_GOLDEN"]
+        is_kvi = candidate["IS_KVI"]
         m3_per_unit = catalogs.volume_m3.get(
             sku,
             config.default_m3_per_unit,
@@ -3041,6 +3099,7 @@ def apply_avl_fill(
             "CANTIDAD_ASIGNADA": assigned,
             "CANTIDAD_FALTANTE": max(original_target - assigned, 0),
             "ES_GOLDEN_INFALTABLE": is_golden,
+            "ES_KVI": is_kvi,
             "PRIORIDAD_TIENDA": candidate["PRIORITY"],
             "ES_STOCKOUT": candidate["DESTINATION_STOCK"] <= 0,
             "SIN_RUTA_COSTOS": False,
@@ -3702,6 +3761,7 @@ def execute_planning(
     liquid_automatic_tail_origins: set[int] | None = None,
     liquid_manual_skus_by_origin: dict[int, set[int]] | None = None,
     forecast_horizon_days: int = 7,
+    excluded_skus: set[int] | None = None,
 ) -> dict[str, Any]:
     clear_previous_workspace()
     workspace = Path(tempfile.mkdtemp(prefix="transfer_planner_"))
@@ -3754,6 +3814,13 @@ def execute_planning(
             config,
             copernico_csv_path=copernico_path,
         )
+        excluded_sku_set = set(excluded_skus or ())
+        catalogs.excluded_products = excluded_sku_set
+        if excluded_sku_set:
+            catalogs.warnings.append(
+                "Exclusión general: se bloquearon completamente "
+                f"{len(excluded_sku_set):,} SKUs ingresados en Mission Control."
+            )
         fruver_811_summary = apply_fruver_811_block(
             catalogs,
             origins,
@@ -3773,6 +3840,11 @@ def execute_planning(
                 data_path,
                 catalogs,
             )
+            insumos_rows = [
+                row
+                for row in insumos_rows
+                if row["RETAIL_ID"] not in excluded_sku_set
+            ]
             catalogs.warnings.extend(insumos_warnings)
         plan_path, consolidated_input, consolidation_summary = (
             consolidate_plan_files(
@@ -3788,6 +3860,16 @@ def execute_planning(
             consolidated_input,
             consolidation_summary,
         )
+        excluded_plan_rows = [
+            row
+            for row in plan_read.rows
+            if row["RETAIL_ID"] in excluded_sku_set
+        ]
+        plan_read.rows = [
+            row
+            for row in plan_read.rows
+            if row["RETAIL_ID"] not in excluded_sku_set
+        ]
         rows_after_closed_stores, closed_plan_rows = (
             split_plan_rows_by_closed_store(
                 plan_read.rows,
@@ -3852,7 +3934,11 @@ def execute_planning(
         if include_avl_fill or include_preventive_fill:
             avl_catalog_rows, avl_warnings = load_avl_catalog_rows(data_path)
             result.warnings.extend(avl_warnings)
-            catalog_fill_rows = avl_catalog_rows
+            catalog_fill_rows = [
+                row
+                for row in avl_catalog_rows
+                if row["RETAIL_ID"] not in excluded_sku_set
+            ]
 
         avl_summary = empty_avl_summary(include_avl_fill, avl_doh)
         if include_avl_fill:
@@ -3913,7 +3999,7 @@ def execute_planning(
                 blocked_cities,
                 store_shares,
                 {
-                    int(source): set(skus)
+                    int(source): set(skus) - excluded_sku_set
                     for source, skus in (
                         liquid_manual_skus_by_origin or {}
                     ).items()
@@ -4020,6 +4106,10 @@ def execute_planning(
             f"{len(closed_plan_rows):,}"
         )
         print(f"Requerimientos excluidos por ciudad: {len(blocked_plan_rows):,}")
+        print(
+            "Requerimientos excluidos por SKU general: "
+            f"{len(excluded_plan_rows):,}"
+        )
         print(f"Tareas generadas: {result.tasks_used:,}")
         if avl_summary["enabled"]:
             print(
@@ -4080,6 +4170,8 @@ def execute_planning(
         "fruver_811": fruver_811_summary,
         "input_consolidation": consolidation_summary,
         "engine_selection": engine_selection,
+        "excluded_skus": sorted(excluded_sku_set),
+        "excluded_requirements": len(excluded_plan_rows),
     }
 
 
@@ -5442,6 +5534,17 @@ def render() -> None:
             )
             st.warning(f"Se bloqueará completamente: {selected_names}")
 
+        excluded_skus_raw = st.text_area(
+            "Exclusión global de SKUs — opcional",
+            value="",
+            placeholder="Ejemplo: 14588, 85097, 86195",
+            help=(
+                "Los PRODUCT_ID ingresados se eliminan de Naked, Solidus, Liquid "
+                "e Insumos. No aparecerán en los Bulk ni consumirán stock, "
+                "capacidad o tareas. Acepta comas o saltos de línea."
+            ),
+        )
+
         support_left, support_right = st.columns(2)
         with support_left:
             include_insumos = st.toggle(
@@ -5675,6 +5778,7 @@ def render() -> None:
             st.stop()
         try:
             origins = tuple(selected_origins)
+            excluded_skus = parse_manual_skus(excluded_skus_raw)
             liquid_manual_skus_by_origin = {
                 int(origin): parsed
                 for origin, raw_value in liquid_manual_skus_by_origin_raw.items()
@@ -5774,6 +5878,7 @@ def render() -> None:
                     ),
                     liquid_manual_skus_by_origin=liquid_manual_skus_by_origin,
                     forecast_horizon_days=int(forecast_horizon_days),
+                    excluded_skus=excluded_skus,
                 )
                 status.update(label="Planeación finalizada", state="complete", expanded=False)
             st.session_state["last_run"] = run
