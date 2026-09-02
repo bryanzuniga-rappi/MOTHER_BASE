@@ -355,17 +355,43 @@ def apply_liquid_engine(
                 and 0 < remaining < 10
             )
             if remaining > 0 and (is_manual or is_tail):
+                priority_rank = 2
+                for destination in daily_destinations:
+                    store = catalogs.stores.get(destination)
+                    if not store:
+                        continue
+                    city_norm = store.get("city_norm", "")
+                    is_golden = bool(city_norm) and (
+                        sku,
+                        city_norm,
+                    ) in catalogs.golden_infaltables
+                    if engine.is_regional_block(
+                        catalogs,
+                        source,
+                        destination,
+                        sku,
+                        city_norm,
+                        is_golden,
+                    ):
+                        continue
+                    if is_golden:
+                        priority_rank = 0
+                        break
+                    if (destination, sku) in catalogs.kvi_products:
+                        priority_rank = min(priority_rank, 1)
                 candidates.append(
                     {
                         "source": source,
                         "sku": sku,
                         "remaining": remaining,
                         "manual": is_manual,
+                        "priority_rank": priority_rank,
                     }
                 )
 
     candidates.sort(
         key=lambda row: (
+            row["priority_rank"],
             0 if row["manual"] else 1,
             -row["remaining"],
             config.origin_warehouses.index(row["source"]),
@@ -410,6 +436,7 @@ def apply_liquid_engine(
                 sku,
                 city_norm,
             ) in catalogs.golden_infaltables
+            is_kvi = (destination, sku) in catalogs.kvi_products
             if engine.is_regional_block(
                 catalogs,
                 source,
@@ -457,6 +484,7 @@ def apply_liquid_engine(
                     "store": store,
                     "city_norm": city_norm,
                     "is_golden": is_golden,
+                    "is_kvi": is_kvi,
                     "priority": catalogs.store_priority.get(destination, 100),
                     "share": max(store_shares.get(destination, 0.0), 0.0),
                     "adu": adu,
@@ -477,6 +505,7 @@ def apply_liquid_engine(
         new_options = sorted(
             (option for option in options if not option["existing_task"]),
             key=lambda option: (
+                0 if option["is_golden"] else (1 if option["is_kvi"] else 2),
                 0 if math.isfinite(option["current_doh"]) else 1,
                 option["current_doh"],
                 option["priority"],
@@ -609,6 +638,7 @@ def apply_liquid_engine(
                 "CANTIDAD_ASIGNADA": int(quantity),
                 "CANTIDAD_FALTANTE": 0,
                 "ES_GOLDEN_INFALTABLE": option["is_golden"],
+                "ES_KVI": option["is_kvi"],
                 "PRIORIDAD_TIENDA": option["priority"],
                 "ES_STOCKOUT": option["current_inventory"] <= 0,
                 "SIN_RUTA_COSTOS": False,
