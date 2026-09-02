@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# Mother Base theme build 2026-09-02.14 — Engine nested wrappers left alignment.
+# Mother Base theme build 2026-09-02.15 — Engine alignment emitted with each card.
 
 import streamlit as st
 
@@ -236,48 +236,6 @@ def inject_mother_base_theme() -> None:
             background-color: #fffdf7 !important;
         }
 
-        /*
-         * Streamlit centra el contenedor Markdown cuando el texto de una tarjeta
-         * es corto. La corrección se limita a los cuatro engines: no altera las
-         * tarjetas de acceso, módulos, alturas, padding ni estados.
-         */
-        .st-key-engine_naked_card button div,
-        .st-key-engine_solidus_card button div,
-        .st-key-engine_shalashaska_card button div,
-        .st-key-engine_liquid_card button div,
-        .st-key-engine_naked_card button [data-testid="stMarkdownContainer"],
-        .st-key-engine_solidus_card button [data-testid="stMarkdownContainer"],
-        .st-key-engine_shalashaska_card button [data-testid="stMarkdownContainer"],
-        .st-key-engine_liquid_card button [data-testid="stMarkdownContainer"] {
-            width: 100% !important;
-            max-width: none !important;
-            min-width: 0 !important;
-            flex: 1 1 auto !important;
-            align-self: stretch !important;
-            margin-left: 0 !important;
-            margin-right: 0 !important;
-            text-align: left !important;
-        }
-
-        .st-key-engine_naked_card button,
-        .st-key-engine_solidus_card button,
-        .st-key-engine_shalashaska_card button,
-        .st-key-engine_liquid_card button {
-            align-items: stretch !important;
-            justify-content: flex-start !important;
-            text-align: left !important;
-        }
-
-        .st-key-engine_naked_card [data-testid="stMarkdownContainer"] p,
-        .st-key-engine_solidus_card [data-testid="stMarkdownContainer"] p,
-        .st-key-engine_shalashaska_card [data-testid="stMarkdownContainer"] p,
-        .st-key-engine_liquid_card [data-testid="stMarkdownContainer"] p {
-            width: 100% !important;
-            margin-left: 0 !important;
-            margin-right: 0 !important;
-            text-align: left !important;
-        }
-
         .mission-control-marker {
             display: none !important;
         }
@@ -363,6 +321,33 @@ def render_action_card(
         character if character.isalnum() or character in {"_", "-"} else "-"
         for character in key
     )
+    engine_alignment_css = ""
+    if key.startswith("engine_") and key.endswith("_card"):
+        engine_alignment_css = f"""
+        .st-key-{css_key} button {{
+            justify-content: flex-start !important;
+            text-align: left !important;
+        }}
+
+        .st-key-{css_key} button > *,
+        .st-key-{css_key} button > * > *,
+        .st-key-{css_key} button [data-testid="stMarkdownContainer"] {{
+            width: 100% !important;
+            max-width: none !important;
+            min-width: 0 !important;
+            flex-grow: 1 !important;
+            align-self: stretch !important;
+            margin-inline: 0 !important;
+            text-align: left !important;
+        }}
+
+        .st-key-{css_key} button [data-testid="stMarkdownContainer"] p {{
+            width: 100% !important;
+            max-width: none !important;
+            margin-inline: 0 !important;
+            text-align: left !important;
+        }}
+        """
     st.markdown(
         f"""
         <style>
@@ -440,6 +425,8 @@ def render_action_card(
             font-size: .67rem !important;
             font-weight: 900 !important;
         }}
+
+        {engine_alignment_css}
         </style>
         """,
         unsafe_allow_html=True,
