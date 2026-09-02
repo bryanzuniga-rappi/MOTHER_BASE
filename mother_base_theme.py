@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# Mother Base theme build 2026-09-02.9 — Engine cards uniformes.
+# Mother Base theme build 2026-09-02.11 — Left-lock de todas las action cards.
 
 import streamlit as st
 
@@ -332,11 +332,14 @@ def render_action_card(
         .st-key-{css_key} [data-testid="stButton"] button,
         .st-key-{css_key} button {{
             display: flex !important;
+            flex-direction: column !important;
             width: 100% !important;
             min-height: {card_height}px !important;
             box-sizing: border-box !important;
-            align-items: stretch !important;
+            align-items: flex-start !important;
             justify-content: flex-start !important;
+            place-content: flex-start !important;
+            place-items: flex-start !important;
             padding: 22px 24px !important;
             border: 3px solid #111111 !important;
             border-radius: 10px !important;
@@ -350,15 +353,27 @@ def render_action_card(
 
         .st-key-{css_key} div.stButton,
         .st-key-{css_key} [data-testid="stButton"],
+        .st-key-{css_key} button > div,
         .st-key-{css_key} [data-testid="stMarkdownContainer"] {{
             width: 100% !important;
             min-width: 0 !important;
+            text-align: left !important;
+            align-items: flex-start !important;
+            justify-content: flex-start !important;
+            place-content: flex-start !important;
+            place-items: flex-start !important;
         }}
 
+        .st-key-{css_key} button > div,
         .st-key-{css_key} [data-testid="stMarkdownContainer"] {{
-            display: flex !important;
-            align-self: stretch !important;
-            align-items: stretch !important;
+            display: block !important;
+            margin: 0 !important;
+            padding: 0 !important;
+        }}
+
+        .st-key-{css_key} button *,
+        .st-key-{css_key} [data-testid="stButton"] button * {{
+            text-align: left !important;
         }}
 
         .st-key-{css_key} div.stButton > button:hover,
@@ -384,7 +399,7 @@ def render_action_card(
             width: 100% !important;
             min-width: 0 !important;
             min-height: {card_height - 50}px !important;
-            margin: 0 !important;
+            margin: 0 auto 0 0 !important;
             padding: 0 0 34px !important;
             box-sizing: border-box !important;
             color: inherit !important;
