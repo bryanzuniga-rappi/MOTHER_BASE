@@ -11,7 +11,7 @@ import openpyxl
 import modelo_abasto as engine
 
 
-SHALASHASKA_REASON = "EVACUACIÃ“N Â· SHALASHASKA ENGINE"
+SHALASHASKA_REASON = "EVACUACIÓN · SHALASHASKA ENGINE"
 SHALASHASKA_CUT = "ENVIADOS POR SHALASHASKA ENGINE"
 
 
@@ -55,7 +55,7 @@ def _parse_date(value: Any, field_name: str) -> date:
             return datetime.strptime(raw, fmt).date()
         except ValueError:
             continue
-    raise ValueError(f"{field_name}: fecha invÃ¡lida {value!r}")
+    raise ValueError(f"{field_name}: fecha inválida {value!r}")
 
 
 def load_expiring_inventory(database_path: Path) -> list[dict[str, Any]]:
@@ -64,7 +64,7 @@ def load_expiring_inventory(database_path: Path) -> list[dict[str, Any]]:
     try:
         if "POR_MERMAR" not in workbook.sheetnames:
             raise ValueError(
-                "Shalashaska Engine requiere la pestaÃ±a POR_MERMAR con las columnas "
+                "Shalashaska Engine requiere la pestaña POR_MERMAR con las columnas "
                 "WAREHOUSE_ID, PRODUCT_ID, STOCK_AVAILABLE, VALUE_STOCK, "
                 "ARRIVAL_DATE y EXPIRATION_DATE."
             )
@@ -175,7 +175,7 @@ def _share_distribution(
     options: list[dict[str, Any]],
     capacity_left: dict[int, int],
 ) -> Counter[int]:
-    """Distribuye remanentes por share con enteros y reasignaciÃ³n de residuos."""
+    """Distribuye remanentes por share con enteros y reasignación de residuos."""
     allocations: Counter[int] = Counter()
     remaining = int(total)
     while remaining > 0:
@@ -255,7 +255,7 @@ def apply_shalashaska_engine(
     max_store_share_pct: float,
     reason_column: str = "PLANNING_REASON",
 ) -> dict[str, Any]:
-    """Evacua inventario prÃ³ximo a caducar sin rebasar restricciones globales."""
+    """Evacua inventario próximo a caducar sin rebasar restricciones globales."""
     summary = empty_shalashaska_summary(True)
     summary["tasks_before"] = result.tasks_used
     if forecast_horizon_days <= 0:
@@ -265,7 +265,7 @@ def apply_shalashaska_engine(
     if max_stores_per_sku < 2:
         raise ValueError("Shalashaska: usa al menos 2 tiendas por SKU.")
     if not 0 < max_store_share_pct <= 100:
-        raise ValueError("Shalashaska: la concentraciÃ³n debe estar entre 0 y 100%.")
+        raise ValueError("Shalashaska: la concentración debe estar entre 0 y 100%.")
 
     blocked_city_set = set(blocked_cities)
     plan_by_key = {
@@ -610,8 +610,8 @@ def apply_shalashaska_engine(
                 "VALUE": catalogs.high_value.get(sku, "REGULAR"),
                 "TIPO_DE_CORTE": SHALASHASKA_CUT,
                 "DETALLE_MOTIVO": (
-                    "Inventario prÃ³ximo a caducar distribuido por necesidad, DOH "
-                    "y share de ventas, con concentraciÃ³n controlada."
+                    "Inventario próximo a caducar distribuido por necesidad, DOH "
+                    "y share de ventas, con concentración controlada."
                 ),
                 "POR_MERMAR_ORIGEN": int(candidate["STOCK_AVAILABLE"]),
                 "VALOR_POR_MERMAR": float(candidate["VALUE_STOCK"]),

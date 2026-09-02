@@ -16,6 +16,7 @@ def inject_mother_base_theme() -> None:
             --acid: #d9ff3f;
             --coral: #ff5a47;
             --blue: #5e7cff;
+            --orange: #ffb000;
             --white: #fffdf7;
             --muted: #6f6b63;
         }
@@ -170,6 +171,7 @@ def inject_mother_base_theme() -> None:
         .engine-panel.naked { background: var(--acid); }
         .engine-panel.solidus { background: var(--blue); color: var(--white); }
         .engine-panel.liquid { background: var(--coral); }
+        .engine-panel.shalashaska { background: var(--orange); }
         .engine-panel h4, .engine-panel p { color: inherit !important; }
 
         div.stButton > button,
@@ -216,15 +218,38 @@ def inject_mother_base_theme() -> None:
         .st-key-mission_control_shared,
         .st-key-engine_naked_module,
         .st-key-engine_solidus_module,
+        .st-key-engine_shalashaska_module,
         .st-key-engine_liquid_module,
         .st-key-mission_control_shared > div,
         .st-key-engine_naked_module > div,
         .st-key-engine_solidus_module > div,
+        .st-key-engine_shalashaska_module > div,
         .st-key-engine_liquid_module > div,
         .st-key-mission_control_shared [data-testid="stVerticalBlockBorderWrapper"],
         .st-key-engine_naked_module [data-testid="stVerticalBlockBorderWrapper"],
         .st-key-engine_solidus_module [data-testid="stVerticalBlockBorderWrapper"],
+        .st-key-engine_shalashaska_module [data-testid="stVerticalBlockBorderWrapper"],
         .st-key-engine_liquid_module [data-testid="stVerticalBlockBorderWrapper"] {
+            background: #fffdf7 !important;
+            background-color: #fffdf7 !important;
+        }
+
+        .mission-control-marker {
+            display: none !important;
+        }
+
+        [data-testid="stVerticalBlockBorderWrapper"]:has(.mission-control-marker),
+        .st-key-mission_control_shared [data-testid="stVerticalBlockBorderWrapper"] {
+            background: #fffdf7 !important;
+            background-color: #fffdf7 !important;
+            border: 3px solid #111111 !important;
+            border-radius: 10px !important;
+            box-shadow: 7px 7px 0 #111111 !important;
+        }
+
+        [data-testid="stVerticalBlockBorderWrapper"]:has(.mission-control-marker)
+        [data-testid="stVerticalBlock"],
+        .st-key-mission_control_shared [data-testid="stVerticalBlock"] {
             background: #fffdf7 !important;
             background-color: #fffdf7 !important;
         }
@@ -280,6 +305,7 @@ def render_action_card(
         "acid": ("#d9ff3f", "#111111"),
         "coral": ("#ff5a47", "#111111"),
         "blue": ("#5e7cff", "#fffdf7"),
+        "orange": ("#ffb000", "#111111"),
         "white": ("#fffdf7", "#111111"),
     }
     active_background, active_foreground = tone_colors.get(
