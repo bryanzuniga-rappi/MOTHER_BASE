@@ -38,6 +38,7 @@ def empty_shalashaska_summary(enabled: bool) -> dict[str, Any]:
         "skipped_origin_not_selected": 0,
         "skipped_excluded_sku": 0,
         "skipped_no_store": 0,
+        "skipped_no_adu": 0,
         "skipped_no_capacity": 0,
         "skipped_task_limit": 0,
         "skipped_regional_block": 0,
@@ -242,48 +243,29 @@ def apply_shalashaska_engine(
     result,
     catalogs,
     config: engine.Config,
-    plan_rows: list[dict[str, Any]],
     expiring_rows: list[dict[str, Any]],
+    catalog_adu: dict[tuple[int, int], float],
     closed_store_ids: set[int],
     blocked_cities: tuple[str, ...],
     store_shares: dict[int, float],
     *,
     run_date: date,
-    forecast_horizon_days: int,
     target_doh: float,
-    max_stores_per_sku: int,
-    max_store_share_pct: float,
     reason_column: str = "PLANNING_REASON",
 ) -> dict[str, Any]:
     """Evacua inventario próximo a caducar sin rebasar restricciones globales."""
     summary = empty_shalashaska_summary(True)
     summary["tasks_before"] = result.tasks_used
-    if forecast_horizon_days <= 0:
-        raise ValueError("Shalashaska: el horizonte de forecast debe ser mayor a cero.")
     if target_doh <= 0:
         raise ValueError("Shalashaska: el DOH objetivo debe ser mayor a cero.")
-    if max_stores_per_sku < 2:
-        raise ValueError("Shalashaska: usa al menos 2 tiendas por SKU.")
-    if not 0 < max_store_share_pct <= 100:
-        raise ValueError("Shalashaska: la concentración debe estar entre 0 y 100%.")
 
     blocked_city_set = set(blocked_cities)
-    plan_by_key = {
-        (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"]): row
-        for row in plan_rows
-    }
-    daily_destinations = {
-        row["WAREHOUSE_DESTINATION"]
-        for row in plan_rows
-        if row["WAREHOUSE_DESTINATION"] not in closed_store_ids
-        and catalogs.stores.get(row["WAREHOUSE_DESTINATION"], {}).get(
-            "city_norm", ""
-        )
-        not in blocked_city_set
-    }
 
     consumed_stock: Counter[tuple[int, int]] = Counter()
     planned_incoming: Counter[tuple[int, int]] = Counter()
+    natural_destinations_by_source: dict[int, set[int]] = {
+        source: set() for source in config.origin_warehouses
+    }
     for allocation in result.allocation_rows:
         consumed_stock[
             (int(allocation["WAREHOUSE_SOURCE"]), int(allocation["RETAIL_ID"]))
@@ -291,6 +273,15 @@ def apply_shalashaska_engine(
         planned_incoming[
             (int(allocation["WAREHOUSE_DESTINATION"]), int(allocation["RETAIL_ID"]))
         ] += int(allocation["QUANTITY"])
+        source = int(allocation["WAREHOUSE_SOURCE"])
+        destination = int(allocation["WAREHOUSE_DESTINATION"])
+        if (
+            source in natural_destinations_by_source
+            and destination not in closed_store_ids
+            and catalogs.stores.get(destination, {}).get("city_norm", "")
+            not in blocked_city_set
+        ):
+            natural_destinations_by_source[source].add(destination)
 
     candidates: list[dict[str, Any]] = []
     for row in expiring_rows:
@@ -316,7 +307,7 @@ def apply_shalashaska_engine(
             continue
         candidate = dict(row)
         priority_rank = 2
-        for destination in daily_destinations:
+        for destination in natural_destinations_by_source.get(source, set()):
             store = catalogs.stores.get(destination)
             if not store:
                 continue
@@ -381,7 +372,7 @@ def apply_shalashaska_engine(
             continue
         m3_per_unit = catalogs.volume_m3.get(sku, config.default_m3_per_unit)
         options: list[dict[str, Any]] = []
-        for destination in daily_destinations:
+        for destination in natural_destinations_by_source.get(source, set()):
             if destination == source:
                 continue
             store = catalogs.stores.get(destination)
@@ -416,11 +407,10 @@ def apply_shalashaska_engine(
             if capacity_units <= 0:
                 continue
 
-            plan_row = plan_by_key.get((destination, sku), {})
-            predicted_demand = max(
-                engine.to_float(plan_row.get("PREDICTED_DEMAND", 0.0)), 0.0
-            )
-            adu = predicted_demand / forecast_horizon_days
+            adu = max(float(catalog_adu.get((destination, sku), 0.0)), 0.0)
+            if adu <= 0:
+                summary["skipped_no_adu"] += 1
+                continue
             current_inventory = max(
                 float(catalogs.stock_base.get((destination, sku), 0.0)), 0.0
             ) + planned_incoming[(destination, sku)]
@@ -449,29 +439,15 @@ def apply_shalashaska_engine(
         options.sort(key=_priority_key)
         existing_options = [option for option in options if option["existing_task"]]
         new_options = [option for option in options if not option["existing_task"]]
-        selected_options = existing_options[:max_stores_per_sku]
-        remaining_option_slots = max(max_stores_per_sku - len(selected_options), 0)
         task_slots = max(config.max_tasks - result.tasks_used, 0)
-        selected_options.extend(new_options[: min(remaining_option_slots, task_slots)])
+        selected_options = existing_options + new_options[:task_slots]
         if not selected_options:
             summary["skipped_task_limit"] += 1
             continue
 
         option_count = len(selected_options)
-        eligible_diversification_count = min(max_stores_per_sku, len(options))
-        concentration_units = int(
-            math.ceil(available * max_store_share_pct / 100.0)
-        )
-        if eligible_diversification_count >= 2:
-            concentration_units = max(
-                concentration_units,
-                int(math.ceil(available / eligible_diversification_count)),
-            )
-        concentration_units = max(concentration_units, 1)
         capacity_left = {
-            option["destination"]: min(
-                int(option["capacity_units"]), concentration_units
-            )
+            option["destination"]: int(option["capacity_units"])
             for option in selected_options
         }
         days_to_expiry = max((candidate["EXPIRATION_DATE"] - run_date).days, 1)
@@ -581,7 +557,8 @@ def apply_shalashaska_engine(
                 "RETAIL_ID": sku,
                 "SKU_NAME": "",
                 "PREDICTED_OPENING_INVENTORY": option["current_inventory"],
-                "PREDICTED_DEMAND": option["adu"] * forecast_horizon_days,
+                "PREDICTED_DEMAND": 0,
+                "ADU_CATALOGO": option["adu"],
                 "CURRENT_INVENTORY": option["current_inventory"],
                 "MOV_ORIGINAL": 0,
                 "REGLA_DEMANDA": "SHALASHASKA_ENGINE",
@@ -611,7 +588,7 @@ def apply_shalashaska_engine(
                 "TIPO_DE_CORTE": SHALASHASKA_CUT,
                 "DETALLE_MOTIVO": (
                     "Inventario próximo a caducar distribuido por necesidad, DOH "
-                    "y share de ventas, con concentración controlada."
+                    "y share de ventas entre rutas que ya salían desde el origen."
                 ),
                 "POR_MERMAR_ORIGEN": int(candidate["STOCK_AVAILABLE"]),
                 "VALOR_POR_MERMAR": float(candidate["VALUE_STOCK"]),
