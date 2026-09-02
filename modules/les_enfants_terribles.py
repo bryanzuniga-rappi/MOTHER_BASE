@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# Mother Base build 2026-09-02.7 — Storage por origen, outliers F9 y perfil operativo.
+# Mother Base build 2026-09-02.8 — Prioridad tienda-producto Infaltable/Golden/Anchor.
 
 from collections import Counter, defaultdict
 from contextlib import redirect_stdout
@@ -81,7 +81,7 @@ ALEPH_SHEETS = {
     "POR_MERMAR",
     "STOCK",
     "INSUMOS",
-    "GOLDEN_INFALTABLES",
+    "GOLDEN_INFALTABLES_ANCHOR",
     "TIENDA",
     "STORAGE",
 }
@@ -106,7 +106,7 @@ REQUIRED_DATABASE_SHEETS = (
     "POR_MERMAR",
     "STOCK",
     "INSUMOS",
-    "GOLDEN_INFALTABLES",
+    "GOLDEN_INFALTABLES_ANCHOR",
     "TIENDA",
     "STORAGE",
 )
@@ -179,9 +179,9 @@ SHEET_DESCRIPTIONS = {
         "tienda. Solo se anexan al BulkCD_444 cuando la tienda ya recibe producto "
         "normal desde ese mismo origen."
     ),
-    "GOLDEN_INFALTABLES": (
-        "Productos Golden e Infaltables definidos por producto y ciudad, con "
-        "prioridad y excepciones especiales de negocio."
+    "GOLDEN_INFALTABLES_ANCHOR": (
+        "Clasificación por warehouse destino y producto. Define por separado "
+        "INFALTABLES, GOLDEN y ANCHOR con jerarquía estricta en ese orden."
     ),
     "TIENDA": (
         "Catálogo de warehouses con el nombre y la ciudad de cada tienda o nodo."
@@ -203,7 +203,7 @@ ALEPH_MAX_AGE_HOURS = {
     "POR_MERMAR": 24.0,
     "KVI": 24.0,
     "CATALOGO": 24.0,
-    "GOLDEN_INFALTABLES": 24.0,
+    "GOLDEN_INFALTABLES_ANCHOR": 24.0,
     "TIENDA": 24.0,
     "STORAGE": 24.0,
     "SHARE_VENTAS": 24.0,
@@ -1579,10 +1579,12 @@ def append_insumos_to_bulk_444(
             continue
         store = catalogs.stores.get(destination, {})
         city_norm = store.get("city_norm", "")
-        is_golden = bool(city_norm) and (
+        priority_profile = engine.product_priority_profile(
+            catalogs,
+            destination,
             sku,
-            city_norm,
-        ) in catalogs.golden_infaltables
+        )
+        is_golden = priority_profile["is_golden"]
         if engine.is_regional_block(
             catalogs,
             444,
@@ -2038,7 +2040,10 @@ def build_planning_analytics(
         if 0 < row["MOV_ORIGINAL"] < 3 and row["CANTIDAD_OBJETIVO"] == 3
     ]
     golden_rows = [
-        row for row in eligible_rows if bool(row.get("ES_GOLDEN_INFALTABLE", False))
+        row
+        for row in eligible_rows
+        if row.get("TIPO_PRIORIDAD_PRODUCTO")
+        in {"INFALTABLE", "GOLDEN", "ANCHOR"}
     ]
 
     rule_accumulators: dict[str, dict[str, float]] = defaultdict(
@@ -2493,13 +2498,17 @@ def apply_reporting_labels(result) -> None:
 
 
 def build_golden_analytics(result) -> dict[str, Any]:
-    """Construye el reporte específico de Golden Infaltables."""
+    """Construye el reporte de Infaltables, Golden y Anchor por tienda-SKU."""
     golden_rows = [
         row
         for row in result.base_rows
-        if bool(row.get("ES_GOLDEN_INFALTABLE", False))
+        if row.get("TIPO_PRIORIDAD_PRODUCTO")
+        in {"INFALTABLE", "GOLDEN", "ANCHOR"}
         and int(row.get("CANTIDAD_OBJETIVO", 0) or 0) > 0
     ]
+    type_data: dict[str, dict[str, int]] = defaultdict(
+        lambda: {"cases": 0, "served": 0, "full": 0, "target": 0, "assigned": 0}
+    )
     city_data: dict[str, dict[str, Any]] = defaultdict(
         lambda: {
             "cases": 0,
@@ -2538,6 +2547,13 @@ def build_golden_analytics(result) -> dict[str, Any]:
         sku_name = engine.clean_text(row.get("SKU_NAME"))
         target = int(row.get("CANTIDAD_OBJETIVO", 0) or 0)
         assigned = int(row.get("CANTIDAD_ASIGNADA", 0) or 0)
+        product_type = row.get("TIPO_PRIORIDAD_PRODUCTO", "REGULAR")
+        type_bucket = type_data[product_type]
+        type_bucket["cases"] += 1
+        type_bucket["served"] += int(assigned > 0)
+        type_bucket["full"] += int(assigned >= target)
+        type_bucket["target"] += target
+        type_bucket["assigned"] += assigned
 
         city_bucket = city_data[city]
         city_bucket["cases"] += 1
@@ -2577,6 +2593,7 @@ def build_golden_analytics(result) -> dict[str, Any]:
                 "CIUDAD": city,
                 "TIENDA": f"{destination} · {warehouse_name}",
                 "SKU": f"{sku} · {sku_name}" if sku_name else str(sku),
+                "TIPO": product_type,
                 "OBJETIVO": target,
                 "ASIGNADO": assigned,
                 "FALTANTE": max(target - assigned, 0),
@@ -2627,8 +2644,32 @@ def build_golden_analytics(result) -> dict[str, Any]:
         for source, data in sorted(origin_data.items())
     ]
     detail_rows.sort(
-        key=lambda row: (-row["FALTANTE"], row["CIUDAD"], row["TIENDA"], row["SKU"])
+        key=lambda row: (
+            {"INFALTABLE": 0, "GOLDEN": 1, "ANCHOR": 2}.get(row["TIPO"], 9),
+            -row["FALTANTE"],
+            row["CIUDAD"],
+            row["TIENDA"],
+            row["SKU"],
+        )
     )
+    type_rows = [
+        {
+            "TIPO": product_type,
+            "CASOS": data["cases"],
+            "CON_ENVÍO": data["served"],
+            "COMPLETOS": data["full"],
+            "OBJETIVO": data["target"],
+            "ASIGNADO": data["assigned"],
+            "FALTANTE": max(data["target"] - data["assigned"], 0),
+            "COMPLIANCE_%": percentage(data["assigned"], data["target"]),
+        }
+        for product_type, data in sorted(
+            type_data.items(),
+            key=lambda item: {"INFALTABLE": 0, "GOLDEN": 1, "ANCHOR": 2}.get(
+                item[0], 9
+            ),
+        )
+    ]
 
     target_units = sum(int(row["CANTIDAD_OBJETIVO"]) for row in golden_rows)
     assigned_units = sum(int(row["CANTIDAD_ASIGNADA"]) for row in golden_rows)
@@ -2667,6 +2708,7 @@ def build_golden_analytics(result) -> dict[str, Any]:
         "store_rows": store_rows,
         "origin_rows": origin_rows,
         "detail_rows": detail_rows,
+        "type_rows": type_rows,
     }
 
 
@@ -2910,11 +2952,13 @@ def apply_avl_fill(
             summary["skipped_route_cost"] += 1
             continue
 
-        is_golden = bool(city_norm) and (
+        priority_profile = engine.product_priority_profile(
+            catalogs,
+            destination,
             sku,
-            city_norm,
-        ) in catalogs.golden_infaltables
-        is_kvi = (destination, sku) in catalogs.kvi_products
+        )
+        is_golden = priority_profile["is_golden"]
+        is_kvi = priority_profile["is_kvi"]
         candidates.append(
             {
                 "WAREHOUSE_DESTINATION": destination,
@@ -2925,14 +2969,18 @@ def apply_avl_fill(
                 "TARGET": target,
                 "STORE": store,
                 "IS_GOLDEN": is_golden,
+                "IS_INFALTABLE": priority_profile["is_infaltable"],
+                "IS_ANCHOR": priority_profile["is_anchor"],
                 "IS_KVI": is_kvi,
+                "PRODUCT_PRIORITY_TYPE": priority_profile["type"],
+                "PRODUCT_PRIORITY_RANK": priority_profile["rank"],
                 "PRIORITY": catalogs.store_priority.get(destination, 100),
             }
         )
 
     candidates.sort(
         key=lambda row: (
-            0 if row["IS_GOLDEN"] else (1 if row["IS_KVI"] else 2),
+            row["PRODUCT_PRIORITY_RANK"],
             row["PRIORITY"],
             row["CURRENT_DOH"],
             row["DESTINATION_STOCK"],
@@ -2954,6 +3002,8 @@ def apply_avl_fill(
         city = store.get("city", "")
         city_norm = store.get("city_norm", "")
         is_golden = candidate["IS_GOLDEN"]
+        is_infaltable = candidate["IS_INFALTABLE"]
+        is_anchor = candidate["IS_ANCHOR"]
         is_kvi = candidate["IS_KVI"]
         m3_per_unit = catalogs.volume_m3.get(
             sku,
@@ -3124,7 +3174,12 @@ def apply_avl_fill(
             "CANTIDAD_OBJETIVO": original_target,
             "CANTIDAD_ASIGNADA": assigned,
             "CANTIDAD_FALTANTE": max(original_target - assigned, 0),
-            "ES_GOLDEN_INFALTABLE": is_golden,
+            "ES_INFALTABLE": is_infaltable,
+            "ES_GOLDEN": is_golden,
+            "ES_ANCHOR": is_anchor,
+            "TIPO_PRIORIDAD_PRODUCTO": candidate["PRODUCT_PRIORITY_TYPE"],
+            "RANGO_PRIORIDAD_PRODUCTO": candidate["PRODUCT_PRIORITY_RANK"],
+            "ES_GOLDEN_INFALTABLE": is_infaltable or is_golden,
             "ES_KVI": is_kvi,
             "PRIORIDAD_TIENDA": candidate["PRIORITY"],
             "ES_STOCKOUT": candidate["DESTINATION_STOCK"] <= 0,
@@ -3613,16 +3668,16 @@ def write_executive_pdf(
         story.extend(
             [
                 PageBreak(),
-                Paragraph("GOLDEN INFALTABLES", title_style),
+                Paragraph("INFALTABLES · GOLDEN · ANCHOR", title_style),
                 Paragraph(
-                    "Seguimiento exclusivo de los casos Golden: cobertura completa "
-                    "por caso, cumplimiento de unidades y faltantes prioritarios.",
+                    "Seguimiento por tienda-SKU con jerarquía estricta: Infaltable, "
+                    "Golden y Anchor. Se conserva una sola clasificación mandante.",
                     subtitle_style,
                 ),
                 Spacer(1, 3 * mm),
                 kpi_cards(
                     [
-                        ("Casos Golden", fmt_int(golden_summary["cases"]), blue),
+                        ("Casos prioritarios", fmt_int(golden_summary["cases"]), blue),
                         ("Casos completos", fmt_int(golden_summary["full_cases"]), acid),
                         (
                             "Compliance de casos",
@@ -3636,7 +3691,22 @@ def write_executive_pdf(
                         ),
                     ]
                 ),
-                Paragraph("GOLDEN POR CIUDAD", section_style),
+                Paragraph("RESULTADO POR CLASIFICACIÓN", section_style),
+                report_table_pdf(
+                    golden.get("type_rows", []),
+                    [
+                        ("TIPO", "TIPO", str),
+                        ("CASOS", "CASOS", fmt_int),
+                        ("CON_ENVÍO", "CON ENVÍO", fmt_int),
+                        ("COMPLETOS", "COMPLETOS", fmt_int),
+                        ("OBJETIVO", "OBJETIVO", fmt_int),
+                        ("ASIGNADO", "ASIGNADO", fmt_int),
+                        ("FALTANTE", "FALTANTE", fmt_int),
+                        ("COMPLIANCE_%", "COMPLIANCE", fmt_pct),
+                    ],
+                    [40 * mm, 25 * mm, 28 * mm, 30 * mm, 31 * mm, 31 * mm, 28 * mm, 35 * mm],
+                ),
+                Paragraph("PRIORITARIOS POR CIUDAD", section_style),
                 report_table_pdf(
                     golden.get("city_rows", []),
                     [
@@ -3650,7 +3720,7 @@ def write_executive_pdf(
                     ],
                     [55 * mm, 27 * mm, 31 * mm, 28 * mm, 32 * mm, 32 * mm, 34 * mm],
                 ),
-                Paragraph("GOLDEN POR ORIGEN", section_style),
+                Paragraph("PRIORITARIOS POR ORIGEN", section_style),
                 report_table_pdf(
                     golden.get("origin_rows", []),
                     [
@@ -3663,7 +3733,7 @@ def write_executive_pdf(
                     ],
                     [30 * mm, 85 * mm, 31 * mm, 35 * mm, 34 * mm, 38 * mm],
                 ),
-                Paragraph("TOP 15 TIENDAS GOLDEN POR FALTANTE", section_style),
+                Paragraph("TOP 15 TIENDAS PRIORITARIAS POR FALTANTE", section_style),
                 report_table_pdf(
                     golden.get("store_rows", []),
                     [
@@ -3680,7 +3750,7 @@ def write_executive_pdf(
                     max_rows=15,
                 ),
                 PageBreak(),
-                Paragraph("DETALLE GOLDEN TIENDA-SKU", title_style),
+                Paragraph("DETALLE PRIORITARIO TIENDA-SKU", title_style),
                 Paragraph(
                     "Casos ordenados por unidades faltantes para facilitar la "
                     "gestión de excepciones prioritarias.",
@@ -3693,12 +3763,13 @@ def write_executive_pdf(
                         ("CIUDAD", "CIUDAD", str),
                         ("TIENDA", "TIENDA", str),
                         ("SKU", "SKU", str),
+                        ("TIPO", "TIPO", str),
                         ("OBJETIVO", "OBJ.", fmt_int),
                         ("ASIGNADO", "ASIG.", fmt_int),
                         ("FALTANTE", "FALT.", fmt_int),
                         ("BREAKDOWN", "BREAKDOWN", str),
                     ],
-                    [31 * mm, 59 * mm, 66 * mm, 21 * mm, 21 * mm, 21 * mm, 47 * mm],
+                    [27 * mm, 51 * mm, 55 * mm, 25 * mm, 20 * mm, 20 * mm, 20 * mm, 40 * mm],
                     max_rows=20,
                 ),
             ]
@@ -4547,13 +4618,15 @@ def render_golden_report(analytics: dict[str, Any]) -> None:
         return
 
     st.markdown(
-        '<div class="report-title">GOLDEN INFALTABLES.</div>',
+        '<div class="report-title">INFALTABLES · GOLDEN · ANCHOR.</div>',
         unsafe_allow_html=True,
     )
     st.markdown(
         """
         <div class="report-note">
-            Este bloque considera únicamente casos marcados como Golden Infaltables.
+            Este bloque considera casos clasificados por tienda–SKU. La prioridad es
+            INFALTABLE primero, GOLDEN después y ANCHOR al final. Cuando una combinación
+            tiene más de una bandera, se reporta bajo su clasificación de mayor jerarquía.
             COMPLIANCE DE CASOS exige cubrir el objetivo completo de cada tienda-SKU;
             COMPLIANCE DE UNIDADES compara las unidades asignadas contra las unidades
             objetivo. Las tarjetas distinguen casos, unidades, tiendas y productos.
@@ -4564,60 +4637,60 @@ def render_golden_report(analytics: dict[str, Any]) -> None:
     render_kpi_cards(
         [
             {
-                "category": "CASOS · GOLDEN",
+                "category": "CASOS · PRIORITARIOS",
                 "label": "REQUERIMIENTOS",
                 "value": f"{summary['cases']:,}",
                 "description": (
-                    "Combinaciones tienda–SKU Golden Infaltable con objetivo mayor "
+                    "Combinaciones tienda–SKU Infaltable, Golden o Anchor con objetivo mayor "
                     "a cero evaluadas por el motor."
                 ),
                 "tone": "blue",
             },
             {
-                "category": "CASOS · GOLDEN",
+                "category": "CASOS · PRIORITARIOS",
                 "label": "CON ENVÍO",
                 "value": f"{summary['served_cases']:,}",
                 "description": (
-                    "Casos Golden que recibieron al menos una unidad, aunque la "
+                    "Casos prioritarios que recibieron al menos una unidad, aunque la "
                     "cobertura haya quedado parcial."
                 ),
                 "tone": "acid",
             },
             {
-                "category": "CASOS · GOLDEN",
+                "category": "CASOS · PRIORITARIOS",
                 "label": "CUBIERTOS AL 100%",
                 "value": f"{summary['full_cases']:,}",
                 "description": (
-                    "Casos Golden cuya cantidad asignada alcanzó completamente su "
+                    "Casos prioritarios cuya cantidad asignada alcanzó completamente su "
                     "cantidad objetivo."
                 ),
                 "tone": "acid",
             },
             {
-                "category": "CASOS · GOLDEN",
+                "category": "CASOS · PRIORITARIOS",
                 "label": "SIN ENVÍO",
                 "value": f"{summary['not_served_cases']:,}",
                 "description": (
-                    "Casos Golden con objetivo positivo que no recibieron ninguna "
+                    "Casos prioritarios con objetivo positivo que no recibieron ninguna "
                     "unidad por alguna regla de corte."
                 ),
                 "tone": "coral",
             },
             {
-                "category": "UNIDADES · GOLDEN",
+                "category": "UNIDADES · PRIORITARIAS",
                 "label": "OBJETIVO",
                 "value": f"{summary['target_units']:,}",
                 "description": (
-                    "Suma de las unidades objetivo de todos los casos Golden. No es "
+                    "Suma de unidades objetivo de Infaltables, Golden y Anchor. No es "
                     "un conteo de tareas."
                 ),
             },
             {
-                "category": "UNIDADES · GOLDEN",
+                "category": "UNIDADES · PRIORITARIAS",
                 "label": "ASIGNADAS",
                 "value": f"{summary['assigned_units']:,}",
                 "description": (
-                    "Unidades de producto realmente asignadas a casos Golden desde "
+                    "Unidades realmente asignadas a casos prioritarios desde "
                     "todos los orígenes."
                 ),
                 "tone": "acid",
@@ -4627,8 +4700,8 @@ def render_golden_report(analytics: dict[str, Any]) -> None:
                 "label": "CASOS COMPLETOS",
                 "value": f"{summary['case_compliance_pct']:,.1f}%",
                 "description": (
-                    "Casos Golden cubiertos al 100% divididos entre todos los casos "
-                    "Golden con objetivo positivo."
+                    "Casos prioritarios cubiertos al 100% divididos entre todos los "
+                    "casos Infaltable, Golden y Anchor con objetivo positivo."
                 ),
                 "tone": "blue",
             },
@@ -4637,7 +4710,7 @@ def render_golden_report(analytics: dict[str, Any]) -> None:
                 "label": "UNIDADES CUBIERTAS",
                 "value": f"{summary['unit_compliance_pct']:,.1f}%",
                 "description": (
-                    "Unidades Golden asignadas divididas entre las unidades Golden "
+                    "Unidades prioritarias asignadas divididas entre sus unidades "
                     "objetivo. Puede diferir del compliance de casos."
                 ),
                 "tone": "blue",
@@ -4645,7 +4718,21 @@ def render_golden_report(analytics: dict[str, Any]) -> None:
         ]
     )
 
-    st.markdown('<span class="section-label">GOLDEN POR CIUDAD</span>', unsafe_allow_html=True)
+    st.markdown(
+        '<span class="section-label">RESULTADO POR CLASIFICACIÓN</span>',
+        unsafe_allow_html=True,
+    )
+    report_table(
+        golden.get("type_rows", []),
+        column_config={
+            "COMPLIANCE_%": st.column_config.NumberColumn(
+                "COMPLIANCE %", format="%.1f%%", width="small"
+            ),
+        },
+        max_height=260,
+    )
+
+    st.markdown('<span class="section-label">PRIORITARIOS POR CIUDAD</span>', unsafe_allow_html=True)
     compact_city = [
         {
             "CIUDAD": row["CIUDAD"],
@@ -4668,10 +4755,10 @@ def render_golden_report(analytics: dict[str, Any]) -> None:
         max_height=360,
     )
 
-    st.markdown('<span class="section-label">GOLDEN POR ORIGEN</span>', unsafe_allow_html=True)
+    st.markdown('<span class="section-label">PRIORITARIOS POR ORIGEN</span>', unsafe_allow_html=True)
     report_table(golden.get("origin_rows", []), max_height=300)
 
-    st.markdown('<span class="section-label">GOLDEN POR TIENDA</span>', unsafe_allow_html=True)
+    st.markdown('<span class="section-label">PRIORITARIOS POR TIENDA</span>', unsafe_allow_html=True)
     report_table(
         golden.get("store_rows", []),
         column_config={
@@ -4684,7 +4771,7 @@ def render_golden_report(analytics: dict[str, Any]) -> None:
     )
 
     st.markdown(
-        '<span class="section-label">DETALLE TIENDA–SKU GOLDEN</span>',
+        '<span class="section-label">DETALLE TIENDA–SKU PRIORITARIO</span>',
         unsafe_allow_html=True,
     )
     report_table(
@@ -5042,11 +5129,11 @@ def render_planning_analytics(analytics: dict[str, Any]) -> None:
                 "tone": "acid",
             },
             {
-                "category": "CASOS · GOLDEN",
-                "label": "GOLDEN CON ENVÍO",
+                "category": "CASOS · PRIORITARIOS",
+                "label": "PRIORITARIOS CON ENVÍO",
                 "value": f"{summary['golden_served_cases']:,}",
                 "description": (
-                    "Casos Golden Infaltables que reciben al menos una unidad, sin "
+                    "Casos Infaltable, Golden o Anchor que reciben al menos una unidad, sin "
                     "importar cuántas tareas se generaron."
                 ),
                 "tone": "blue",

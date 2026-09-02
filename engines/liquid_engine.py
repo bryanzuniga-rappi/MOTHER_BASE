@@ -355,16 +355,18 @@ def apply_liquid_engine(
                 and 0 < remaining < 10
             )
             if remaining > 0 and (is_manual or is_tail):
-                priority_rank = 2
+                priority_rank = 4
                 for destination in daily_destinations:
                     store = catalogs.stores.get(destination)
                     if not store:
                         continue
                     city_norm = store.get("city_norm", "")
-                    is_golden = bool(city_norm) and (
+                    priority_profile = engine.product_priority_profile(
+                        catalogs,
+                        destination,
                         sku,
-                        city_norm,
-                    ) in catalogs.golden_infaltables
+                    )
+                    is_golden = priority_profile["is_golden"]
                     if engine.is_regional_block(
                         catalogs,
                         source,
@@ -374,11 +376,10 @@ def apply_liquid_engine(
                         is_golden,
                     ):
                         continue
-                    if is_golden:
-                        priority_rank = 0
-                        break
-                    if (destination, sku) in catalogs.kvi_products:
-                        priority_rank = min(priority_rank, 1)
+                    priority_rank = min(
+                        priority_rank,
+                        priority_profile["rank"],
+                    )
                 candidates.append(
                     {
                         "source": source,
@@ -432,11 +433,13 @@ def apply_liquid_engine(
             city_norm = store.get("city_norm", "")
             if (destination, sku) in catalogs.route_cost_blocks:
                 continue
-            is_golden = bool(city_norm) and (
+            priority_profile = engine.product_priority_profile(
+                catalogs,
+                destination,
                 sku,
-                city_norm,
-            ) in catalogs.golden_infaltables
-            is_kvi = (destination, sku) in catalogs.kvi_products
+            )
+            is_golden = priority_profile["is_golden"]
+            is_kvi = priority_profile["is_kvi"]
             if engine.is_regional_block(
                 catalogs,
                 source,
@@ -484,7 +487,11 @@ def apply_liquid_engine(
                     "store": store,
                     "city_norm": city_norm,
                     "is_golden": is_golden,
+                    "is_infaltable": priority_profile["is_infaltable"],
+                    "is_anchor": priority_profile["is_anchor"],
                     "is_kvi": is_kvi,
+                    "product_priority_type": priority_profile["type"],
+                    "product_priority_rank": priority_profile["rank"],
                     "priority": catalogs.store_priority.get(destination, 100),
                     "share": max(store_shares.get(destination, 0.0), 0.0),
                     "adu": adu,
@@ -505,7 +512,7 @@ def apply_liquid_engine(
         new_options = sorted(
             (option for option in options if not option["existing_task"]),
             key=lambda option: (
-                0 if option["is_golden"] else (1 if option["is_kvi"] else 2),
+                option["product_priority_rank"],
                 0 if math.isfinite(option["current_doh"]) else 1,
                 option["current_doh"],
                 option["priority"],
@@ -637,7 +644,14 @@ def apply_liquid_engine(
                 "CANTIDAD_OBJETIVO": int(quantity),
                 "CANTIDAD_ASIGNADA": int(quantity),
                 "CANTIDAD_FALTANTE": 0,
-                "ES_GOLDEN_INFALTABLE": option["is_golden"],
+                "ES_INFALTABLE": option["is_infaltable"],
+                "ES_GOLDEN": option["is_golden"],
+                "ES_ANCHOR": option["is_anchor"],
+                "TIPO_PRIORIDAD_PRODUCTO": option["product_priority_type"],
+                "RANGO_PRIORIDAD_PRODUCTO": option["product_priority_rank"],
+                "ES_GOLDEN_INFALTABLE": (
+                    option["is_infaltable"] or option["is_golden"]
+                ),
                 "ES_KVI": option["is_kvi"],
                 "PRIORIDAD_TIENDA": option["priority"],
                 "ES_STOCKOUT": option["current_inventory"] <= 0,

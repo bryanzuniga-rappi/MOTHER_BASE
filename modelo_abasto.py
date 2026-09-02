@@ -560,6 +560,9 @@ class Catalogs:
     )
     kvi_products: set[tuple[int, int]] = field(default_factory=set)
     excluded_products: set[int] = field(default_factory=set)
+    infaltable_products: set[tuple[int, int]] = field(default_factory=set)
+    golden_products: set[tuple[int, int]] = field(default_factory=set)
+    anchor_products: set[tuple[int, int]] = field(default_factory=set)
 
 
 def load_catalogs(
@@ -752,16 +755,47 @@ def load_catalogs(
             stock = max(to_float(row["STOCK_DISPONIBLE_FINAL"]), 0.0)
             put_unique(stock_base, (warehouse, sku), stock, warnings, "STOCK", "min")
 
+        # Campo legado conservado vacío para compatibilidad de objetos Catalogs.
         golden_infaltables: set[tuple[int, str]] = set()
+        infaltable_products: set[tuple[int, int]] = set()
+        golden_products: set[tuple[int, int]] = set()
+        anchor_products: set[tuple[int, int]] = set()
         for row in iter_sheet_records(
             workbook,
-            "GOLDEN_INFALTABLES",
-            ["PRODUCT_ID", "CITY"],
+            "GOLDEN_INFALTABLES_ANCHOR",
+            [
+                "WAREHOUSE_ID",
+                "PRODUCT_ID_SYNC",
+                "IS_INFALTABLE",
+                "IS_GOLDEN",
+                "IS_ANCHOR",
+            ],
         ):
-            sku = to_id(row["PRODUCT_ID"], "GOLDEN_INFALTABLES.PRODUCT_ID", True)
-            city = normalize_city(row["CITY"])
-            if sku is not None and city:
-                golden_infaltables.add((sku, city))
+            destination = to_id(
+                row["WAREHOUSE_ID"],
+                "GOLDEN_INFALTABLES_ANCHOR.WAREHOUSE_ID",
+                True,
+            )
+            sku = to_id(
+                row["PRODUCT_ID_SYNC"],
+                "GOLDEN_INFALTABLES_ANCHOR.PRODUCT_ID_SYNC",
+                True,
+            )
+            if destination is None or sku is None:
+                continue
+
+            def active_flag(value: Any) -> bool:
+                return clean_text(value).upper() in {
+                    "1", "TRUE", "VERDADERO", "YES", "SI", "SÍ", "Y",
+                }
+
+            key = (destination, sku)
+            if active_flag(row["IS_INFALTABLE"]):
+                infaltable_products.add(key)
+            if active_flag(row["IS_GOLDEN"]):
+                golden_products.add(key)
+            if active_flag(row["IS_ANCHOR"]):
+                anchor_products.add(key)
 
         kvi_products: set[tuple[int, int]] = set()
         for row in iter_sheet_records(
@@ -831,6 +865,9 @@ def load_catalogs(
         ),
         kvi_products=kvi_products,
         storage_override_by_origin=storage_override_by_origin,
+        infaltable_products=infaltable_products,
+        golden_products=golden_products,
+        anchor_products=anchor_products,
     )
 
 
@@ -851,6 +888,36 @@ def source_storage_type(catalogs: Catalogs, source: int, sku: int) -> str:
     if not storage_type or storage_type.upper() in {"UNKNOWN", "N/A", "NULL"}:
         return "Room Temperature"
     return storage_type
+
+
+def product_priority_profile(
+    catalogs: Catalogs,
+    destination: int,
+    sku: int,
+) -> dict[str, Any]:
+    """Clasifica tienda–SKU con jerarquía INFALTABLE > GOLDEN > ANCHOR."""
+    key = (destination, sku)
+    is_infaltable = key in catalogs.infaltable_products
+    is_golden = key in catalogs.golden_products
+    is_anchor = key in catalogs.anchor_products
+    if is_infaltable:
+        product_type, rank = "INFALTABLE", 0
+    elif is_golden:
+        product_type, rank = "GOLDEN", 1
+    elif is_anchor:
+        product_type, rank = "ANCHOR", 2
+    elif key in catalogs.kvi_products:
+        product_type, rank = "KVI", 3
+    else:
+        product_type, rank = "REGULAR", 4
+    return {
+        "is_infaltable": is_infaltable,
+        "is_golden": is_golden,
+        "is_anchor": is_anchor,
+        "is_kvi": key in catalogs.kvi_products,
+        "type": product_type,
+        "rank": rank,
+    }
 
 
 def allocation_value_summary(
@@ -1225,8 +1292,11 @@ def plan_transfers(
             else row.get("CSV_WAREHOUSE_NAME", "")
         )
         target, demand_rule = calculate_target_quantity(row, config)
-        is_golden = bool(city_norm) and (sku, city_norm) in catalogs.golden_infaltables
-        is_kvi = (destination, sku) in catalogs.kvi_products
+        priority_profile = product_priority_profile(catalogs, destination, sku)
+        is_infaltable = priority_profile["is_infaltable"]
+        is_golden = priority_profile["is_golden"]
+        is_anchor = priority_profile["is_anchor"]
+        is_kvi = priority_profile["is_kvi"]
         enriched = dict(row)
         enriched.update(
             {
@@ -1237,7 +1307,12 @@ def plan_transfers(
                 "ES_MANUAL_FORECAST_ZERO": bool(
                     row.get("ES_MANUAL_FORECAST_ZERO", False)
                 ),
-                "ES_GOLDEN_INFALTABLE": is_golden,
+                "ES_INFALTABLE": is_infaltable,
+                "ES_GOLDEN": is_golden,
+                "ES_ANCHOR": is_anchor,
+                "TIPO_PRIORIDAD_PRODUCTO": priority_profile["type"],
+                "RANGO_PRIORIDAD_PRODUCTO": priority_profile["rank"],
+                "ES_GOLDEN_INFALTABLE": is_infaltable or is_golden,
                 "ES_KVI": is_kvi,
                 "ES_STOCKOUT": row["CURRENT_INVENTORY"] <= 0,
                 "M3_POR_UNIDAD": catalogs.volume_m3.get(
@@ -1255,11 +1330,7 @@ def plan_transfers(
 
     prepared.sort(
         key=lambda row: (
-            0
-            if row["ES_GOLDEN_INFALTABLE"]
-            else 1
-            if row["ES_KVI"]
-            else 2,
+            row["RANGO_PRIORIDAD_PRODUCTO"],
             0 if not row["ES_MANUAL_FORECAST_ZERO"] else 1,
             row["PRIORIDAD_TIENDA"],
             0 if row["ES_STOCKOUT"] else 1,
@@ -1295,7 +1366,7 @@ def plan_transfers(
         target = row["CANTIDAD_OBJETIVO"]
         city = row["CITY"]
         city_norm = row["CITY_NORMALIZED"]
-        is_golden = row["ES_GOLDEN_INFALTABLE"]
+        is_golden = row["ES_GOLDEN"]
         m3_per_unit = row["M3_POR_UNIDAD"]
         capacity = catalogs.store_capacity.get(
             destination, config.default_store_capacity_m3
@@ -1507,7 +1578,12 @@ def plan_transfers(
             "CANTIDAD_OBJETIVO": target,
             "CANTIDAD_ASIGNADA": assigned_total,
             "CANTIDAD_FALTANTE": max(target - assigned_total, 0),
-            "ES_GOLDEN_INFALTABLE": is_golden,
+            "ES_INFALTABLE": row["ES_INFALTABLE"],
+            "ES_GOLDEN": row["ES_GOLDEN"],
+            "ES_ANCHOR": row["ES_ANCHOR"],
+            "TIPO_PRIORIDAD_PRODUCTO": row["TIPO_PRIORIDAD_PRODUCTO"],
+            "RANGO_PRIORIDAD_PRODUCTO": row["RANGO_PRIORIDAD_PRODUCTO"],
+            "ES_GOLDEN_INFALTABLE": row["ES_GOLDEN_INFALTABLE"],
             "ES_KVI": row["ES_KVI"],
             "PRIORIDAD_TIENDA": row["PRIORIDAD_TIENDA"],
             "ES_STOCKOUT": row["ES_STOCKOUT"],
@@ -1593,7 +1669,7 @@ def plan_transfers(
                 destination,
                 sku,
                 row["CITY_NORMALIZED"],
-                row["ES_GOLDEN_INFALTABLE"],
+                row["ES_GOLDEN"],
             )
             second_pass_blocks[source] = blocked
             if blocked:
