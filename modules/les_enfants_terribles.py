@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# Mother Base build 2026-09-02.8 — Prioridad tienda-producto Infaltable/Golden/Anchor.
+# Mother Base build 2026-09-03.1 — Toggle de exclusión de outliers Fountain9.
 
 from collections import Counter, defaultdict
 from contextlib import redirect_stdout
@@ -3891,6 +3891,7 @@ def execute_planning(
     forecast_horizon_days: int = 7,
     excluded_skus: set[int] | None = None,
     apply_origin_storage_override: bool = False,
+    exclude_fountain9_outlier_stores: bool = True,
 ) -> dict[str, Any]:
     clear_previous_workspace()
     workspace = Path(tempfile.mkdtemp(prefix="transfer_planner_"))
@@ -3996,6 +3997,32 @@ def execute_planning(
             consolidated_input,
             catalogs,
         )
+        outlier_summary["exclusion_enabled"] = bool(
+            exclude_fountain9_outlier_stores
+        )
+        outlier_summary["detection_enabled"] = bool(
+            outlier_summary.get("enabled")
+        )
+        if not exclude_fountain9_outlier_stores:
+            outlier_summary["detected_store_ids"] = list(
+                outlier_summary.get("store_ids", [])
+            )
+            outlier_summary["stores_detected"] = int(
+                outlier_summary.get("stores_excluded", 0)
+            )
+            outlier_summary["requirements_detected"] = int(
+                outlier_summary.get("requirements_excluded", 0)
+            )
+            outlier_summary.update(
+                {
+                    "enabled": False,
+                    "store_ids": [],
+                    "stores": [],
+                    "details": [],
+                    "stores_excluded": 0,
+                    "requirements_excluded": 0,
+                }
+            )
         outlier_store_ids = set(outlier_summary["store_ids"])
         engine_blocked_store_ids = set(closed_store_ids) | outlier_store_ids
         if outlier_store_ids:
@@ -5917,6 +5944,18 @@ def render() -> None:
             )
             st.warning(f"Se bloqueará completamente: {selected_names}")
 
+        exclude_fountain9_outlier_stores = st.toggle(
+            "Excluir tiendas con cobertura Fountain9 anormalmente baja",
+            value=True,
+            help=(
+                "Cuando está activo, excluye las tiendas con combinaciones SKU–tienda "
+                "iguales o inferiores al 50% de la mediana del archivo consolidado. "
+                "La regla solo se activa si hay al menos cinco tiendas y la mediana "
+                "es de 20 líneas o más. Al apagarlo, ninguna tienda se elimina por "
+                "este control."
+            ),
+        )
+
         excluded_skus_raw = st.text_area(
             "Exclusión global de SKUs — opcional",
             value="",
@@ -6263,6 +6302,14 @@ def render() -> None:
                         for city in selected_blocked_cities
                     )
                     st.write(f"Excluyendo ciudades bloqueadas: {blocked_names}…")
+                if exclude_fountain9_outlier_stores:
+                    st.write(
+                        "Validando tiendas con cobertura Fountain9 anormalmente baja…"
+                    )
+                else:
+                    st.write(
+                        "Exclusión de tiendas outlier Fountain9 desactivada para esta corrida."
+                    )
                 if include_insumos and 444 in origins:
                     st.write("Preparando insumos para las rutas activas del 444…")
                 elif include_insumos:
@@ -6342,6 +6389,9 @@ def render() -> None:
                     forecast_horizon_days=int(forecast_horizon_days),
                     excluded_skus=excluded_skus,
                     apply_origin_storage_override=apply_origin_storage_override,
+                    exclude_fountain9_outlier_stores=(
+                        exclude_fountain9_outlier_stores
+                    ),
                 )
                 status.update(label="Planeación finalizada", state="complete", expanded=False)
             st.session_state["last_run"] = run
