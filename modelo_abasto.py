@@ -709,27 +709,11 @@ def load_catalogs(
                 f"Bodegas afectadas: {warehouse_text}."
             )
         else:
-            copernico_unusable_444 = defaultdict(float)
-            for row in iter_sheet_records(
-                workbook,
-                "COPERNICO",
-                ["Bodega", "EAN", "Ubicacion", "Saldo"],
-            ):
-                warehouse = to_id(row["Bodega"], "COPERNICO.Bodega", True)
-                sku = to_id(row["EAN"], "COPERNICO.EAN", True)
-                if (
-                    warehouse == 444
-                    and sku is not None
-                    and not copernico_is_usable(row["Ubicacion"])
-                ):
-                    copernico_unusable_444[sku] += max(
-                        to_float(row["Saldo"], 0.0),
-                        0.0,
-                    )
-            copernico_unusable_by_warehouse = {
-                (444, sku): quantity
-                for sku, quantity in copernico_unusable_444.items()
-            }
+            # COPÉRNICO es un insumo opcional cargado por el usuario. Si no se
+            # proporciona, no se descuenta inventario por ubicaciones no pickeables
+            # y la hoja histórica COPERNICO de DATA_TRANSFERS no participa.
+            copernico_unusable_444 = {}
+            copernico_unusable_by_warehouse = {}
 
         unavailable_stock: dict[tuple[int, int], float] = defaultdict(float)
         for row in iter_sheet_records(

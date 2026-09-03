@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# Mother Base build 2026-09-03.2 — Toggle de exclusión de outliers Fountain9.
+# Mother Base build 2026-09-03.3 — Carga opcional de inventario COPÉRNICO.
 
 from collections import Counter, defaultdict
 from contextlib import redirect_stdout
@@ -3898,14 +3898,14 @@ def execute_planning(
     st.session_state["last_workspace"] = str(workspace)
     input_dir = workspace / "input"
     data_path = input_dir / "DATA_TRANSFERS.xlsx"
-    copernico_path = input_dir / "COPERNICO.csv"
+    copernico_path: Path | None = None
     canonical_plan_path = input_dir / (
         f"Plan_Consolidado_{run_date:%d-%m-%Y}.csv"
     )
 
-    if uploaded_copernico is None:
-        raise ValueError("Falta cargar el CSV obligatorio de COPÉRNICO")
-    save_uploaded_file(uploaded_copernico, copernico_path)
+    if uploaded_copernico is not None:
+        copernico_path = input_dir / "COPERNICO.csv"
+        save_uploaded_file(uploaded_copernico, copernico_path)
 
     uploaded_plan_list = list(uploaded_plans or [])
     plan_paths: list[Path] = []
@@ -5814,15 +5814,17 @@ def render() -> None:
         unsafe_allow_html=True,
     )
     uploaded_copernico = st.file_uploader(
-        "Archivo COPÉRNICO (.csv)",
+        "Archivo COPÉRNICO (.csv) — opcional",
         type=["csv"],
         accept_multiple_files=False,
         max_upload_size=MAX_UPLOAD_MB,
         key="copernico_csv_upload",
         help=(
-            "Este archivo sustituye completamente la hoja COPERNICO de la base. "
+            "Si lo cargas, este archivo sustituye completamente la hoja COPERNICO "
+            "de la base. "
             "Se utiliza para descontar las ubicaciones no usables del warehouse "
-            "indicado en la columna Bodega."
+            "indicado en la columna Bodega. Si no lo cargas, la planeación continúa "
+            "sin realizar este descuento."
         ),
     )
     with st.expander("Columnas requeridas del CSV de COPÉRNICO"):
@@ -5837,7 +5839,8 @@ def render() -> None:
             **Bodega + EAN** correspondiente. Por ejemplo, una fila con Bodega 856
             afectará al origen 856 y no al 444. El archivo se lee en streaming al
             ejecutar para soportar archivos grandes. La hoja `COPERNICO` de
-            `DATA_TRANSFERS` ya no participa en el cálculo.
+            `DATA_TRANSFERS` ya no participa en el cálculo. Si no cargas un archivo,
+            no se aplicará ningún descuento por ubicaciones no pickeables.
             """
         )
     if uploaded_copernico is not None:
@@ -6251,9 +6254,6 @@ def render() -> None:
     )
 
     if submitted:
-        if uploaded_copernico is None:
-            st.error("Primero sube el CSV de COPÉRNICO.")
-            st.stop()
         if not uploaded_plans:
             st.error("Primero sube al menos un CSV de planeación.")
             st.stop()
@@ -6278,9 +6278,15 @@ def render() -> None:
                 and (parsed := parse_manual_skus(raw_value))
             }
             with st.status("Ejecutando motor de planeación…", expanded=True) as status:
-                st.write(
-                    "Guardando y procesando el inventario COPÉRNICO cargado…"
-                )
+                if uploaded_copernico is not None:
+                    st.write(
+                        "Guardando y procesando el inventario COPÉRNICO cargado…"
+                    )
+                else:
+                    st.write(
+                        "COPÉRNICO no cargado: se ejecutará sin descuento por "
+                        "ubicaciones no pickeables."
+                    )
                 st.write(
                     f"Guardando y consolidando {len(uploaded_plans):,} CSV "
                     "cargado(s) de forma temporal…"
