@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# Mother Base build 2026-09-03.3 — Carga opcional de inventario COPÉRNICO.
+# Mother Base build 2026-09-04.1 — Reglas COPÉRNICO 856 y storage automático.
 
 from collections import Counter, defaultdict
 from contextlib import redirect_stdout
@@ -5841,6 +5841,17 @@ def render() -> None:
             ejecutar para soportar archivos grandes. La hoja `COPERNICO` de
             `DATA_TRANSFERS` ya no participa en el cálculo. Si no cargas un archivo,
             no se aplicará ningún descuento por ubicaciones no pickeables.
+
+            **Reglas especiales para Bodega 856 usando `ZonaPiso`:**
+
+            - `E`: inventario usable y `STORAGE_TYPE = Room Temperature`.
+            - `RCC`: inventario usable y `STORAGE_TYPE = Freezer`.
+            - `RR`: inventario usable y `STORAGE_TYPE = Refrigerated`.
+            - `BIN`, `DIF` y `RC`: inventario no usable; su saldo se descuenta.
+            - `MRM`: se ignora porque ya está descontado en el stock de la base.
+
+            El override derivado de COPÉRNICO 856 se aplica automáticamente y
+            tiene prioridad sobre el storage general y el override manual por origen.
             """
         )
     if uploaded_copernico is not None:

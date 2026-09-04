@@ -18,6 +18,8 @@ la capacidad y el número de tareas cambian después de cada requerimiento.
 
 from __future__ import annotations
 
+# Mother Base model build 2026-09-04.1 — Reglas COPÉRNICO 856.
+
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -436,13 +438,18 @@ def copernico_is_usable(location: Any) -> bool:
 
 def load_copernico_unusable_csv(
     path: Path,
-) -> tuple[dict[tuple[int, int], float], dict[str, Any]]:
-    """Acumula saldo no usable por la combinación Bodega + producto."""
+) -> tuple[
+    dict[tuple[int, int], float],
+    dict[tuple[int, int], str],
+    dict[str, Any],
+]:
+    """Resuelve saldo no usable y storage por Bodega + producto."""
     header_aliases = {
         "Bodega": {"BODEGA", "WAREHOUSE ID", "WAREHOUSE_ID"},
         "EAN": {"EAN", "PRODUCT ID", "PRODUCT_ID"},
         "Ubicacion": {"UBICACION", "UBICACIÓN", "LOCATION"},
         "Saldo": {"SALDO", "STOCK", "QUANTITY"},
+        "ZonaPiso": {"ZONAPISO", "ZONA PISO", "FLOOR ZONE", "FLOOR_ZONE"},
     }
 
     def normalized_csv_header(value: Any) -> str:
@@ -458,9 +465,16 @@ def load_copernico_unusable_csv(
         for canonical, aliases in header_aliases.items()
     }
     unusable_stock: dict[tuple[int, int], float] = defaultdict(float)
+    storage_balances_856: dict[tuple[int, int], dict[str, float]] = defaultdict(
+        lambda: defaultdict(float)
+    )
     total_rows = 0
     source_rows = 0
     unusable_rows = 0
+    warehouse_856_rows = 0
+    warehouse_856_ignored_mrm_rows = 0
+    warehouse_856_unknown_zone_rows = 0
+    warehouse_856_unknown_zones: Counter[str] = Counter()
 
     with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as handle:
         sample = handle.read(8192)
@@ -489,9 +503,9 @@ def load_copernico_unusable_csv(
                 ),
                 None,
             )
-            if match is None:
+            if match is None and canonical != "ZonaPiso":
                 missing.append(canonical)
-            else:
+            elif match is not None:
                 field_lookup[canonical] = match
         if missing:
             raise ValueError(
@@ -514,12 +528,70 @@ def load_copernico_unusable_csv(
             if warehouse is None or sku is None:
                 continue
             source_rows += 1
+            balance = max(
+                to_float(row.get(field_lookup["Saldo"]), 0.0),
+                0.0,
+            )
+
+            if warehouse == 856:
+                warehouse_856_rows += 1
+                zone_field = field_lookup.get("ZonaPiso")
+                if zone_field is None:
+                    raise ValueError(
+                        "El CSV de COPÉRNICO contiene filas de Bodega 856 pero "
+                        "no incluye la columna ZonaPiso"
+                    )
+                floor_zone = clean_text(row.get(zone_field)).upper()
+                storage_by_zone = {
+                    "E": "Room Temperature",
+                    "RCC": "Freezer",
+                    "RR": "Refrigerated",
+                }
+                if floor_zone == "MRM":
+                    # Este saldo ya fue descontado en STOCK_DISPONIBLE_FINAL.
+                    warehouse_856_ignored_mrm_rows += 1
+                    continue
+                if floor_zone in storage_by_zone:
+                    storage_balances_856[(warehouse, sku)][
+                        storage_by_zone[floor_zone]
+                    ] += balance
+                    continue
+
+                # BIN, DIF y RC no son inventario pickeable. Una zona vacía o
+                # desconocida también se excluye de forma conservadora.
+                unusable_rows += 1
+                unusable_stock[(warehouse, sku)] += balance
+                if floor_zone not in {"BIN", "DIF", "RC"}:
+                    warehouse_856_unknown_zone_rows += 1
+                    warehouse_856_unknown_zones[floor_zone or "<VACIA>"] += 1
+                continue
+
             if copernico_is_usable(row.get(field_lookup["Ubicacion"])):
                 continue
             unusable_rows += 1
-            unusable_stock[(warehouse, sku)] += max(
-                to_float(row.get(field_lookup["Saldo"]), 0.0),
-                0.0,
+            unusable_stock[(warehouse, sku)] += balance
+
+    storage_overrides: dict[tuple[int, int], str] = {}
+    storage_conflicts: list[dict[str, Any]] = []
+    for key, balances in sorted(storage_balances_856.items()):
+        selected_storage = sorted(
+            balances,
+            key=lambda storage: (-balances[storage], storage),
+        )[0]
+        storage_overrides[key] = selected_storage
+        positive_environments = {
+            storage: quantity
+            for storage, quantity in balances.items()
+            if quantity > 0
+        }
+        if len(positive_environments) > 1:
+            storage_conflicts.append(
+                {
+                    "warehouse": key[0],
+                    "sku": key[1],
+                    "selected_storage": selected_storage,
+                    "balances": dict(sorted(positive_environments.items())),
+                }
             )
 
     warehouses = sorted({warehouse for warehouse, _ in unusable_stock})
@@ -530,8 +602,14 @@ def load_copernico_unusable_csv(
         "unusable_warehouse_skus": len(unusable_stock),
         "unusable_warehouses": warehouses,
         "unusable_units": sum(unusable_stock.values()),
+        "storage_overrides_856": len(storage_overrides),
+        "storage_conflicts_856": storage_conflicts,
+        "warehouse_856_rows": warehouse_856_rows,
+        "warehouse_856_ignored_mrm_rows": warehouse_856_ignored_mrm_rows,
+        "warehouse_856_unknown_zone_rows": warehouse_856_unknown_zone_rows,
+        "warehouse_856_unknown_zones": dict(warehouse_856_unknown_zones),
     }
-    return dict(unusable_stock), summary
+    return dict(unusable_stock), storage_overrides, summary
 
 
 @dataclass
@@ -556,6 +634,9 @@ class Catalogs:
     )
     origin_storage_override_enabled: bool = False
     copernico_unusable_by_warehouse: dict[tuple[int, int], float] = field(
+        default_factory=dict
+    )
+    copernico_storage_by_warehouse: dict[tuple[int, int], str] = field(
         default_factory=dict
     )
     kvi_products: set[tuple[int, int]] = field(default_factory=set)
@@ -686,7 +767,11 @@ def load_catalogs(
             )
 
         if copernico_csv_path is not None:
-            copernico_unusable_by_warehouse, copernico_summary = (
+            (
+                copernico_unusable_by_warehouse,
+                copernico_storage_by_warehouse,
+                copernico_summary,
+            ) = (
                 load_copernico_unusable_csv(copernico_csv_path)
             )
             copernico_unusable_444 = {
@@ -706,14 +791,37 @@ def load_catalogs(
                 f"{copernico_summary['unusable_warehouse_skus']:,} combinaciones "
                 f"bodega-SKU descontaron "
                 f"{copernico_summary['unusable_units']:,.0f} unidades. "
-                f"Bodegas afectadas: {warehouse_text}."
+                f"Bodegas afectadas: {warehouse_text}. "
+                f"Overrides de storage 856: "
+                f"{copernico_summary['storage_overrides_856']:,}."
             )
+            if copernico_summary["warehouse_856_unknown_zone_rows"]:
+                warnings.append(
+                    "COPÉRNICO 856: se excluyeron "
+                    f"{copernico_summary['warehouse_856_unknown_zone_rows']:,} "
+                    "filas con ZonaPiso vacía o desconocida. Valores: "
+                    + ", ".join(
+                        f"{zone} ({count:,})"
+                        for zone, count in sorted(
+                            copernico_summary["warehouse_856_unknown_zones"].items()
+                        )
+                    )
+                    + "."
+                )
+            if copernico_summary["storage_conflicts_856"]:
+                warnings.append(
+                    "COPÉRNICO 856: "
+                    f"{len(copernico_summary['storage_conflicts_856']):,} SKUs "
+                    "aparecieron con saldo usable en más de un ambiente; se usó "
+                    "el ambiente con mayor saldo."
+                )
         else:
             # COPÉRNICO es un insumo opcional cargado por el usuario. Si no se
             # proporciona, no se descuenta inventario por ubicaciones no pickeables
             # y la hoja histórica COPERNICO de DATA_TRANSFERS no participa.
             copernico_unusable_444 = {}
             copernico_unusable_by_warehouse = {}
+            copernico_storage_by_warehouse = {}
 
         unavailable_stock: dict[tuple[int, int], float] = defaultdict(float)
         for row in iter_sheet_records(
@@ -847,6 +955,9 @@ def load_catalogs(
         copernico_unusable_by_warehouse=dict(
             copernico_unusable_by_warehouse
         ),
+        copernico_storage_by_warehouse=dict(
+            copernico_storage_by_warehouse
+        ),
         kvi_products=kvi_products,
         storage_override_by_origin=storage_override_by_origin,
         infaltable_products=infaltable_products,
@@ -862,6 +973,11 @@ def source_value_category(catalogs: Catalogs, source: int, sku: int) -> str:
 
 def source_storage_type(catalogs: Catalogs, source: int, sku: int) -> str:
     """Resuelve STORAGE por origen cuando el override está habilitado."""
+    copernico_storage = clean_text(
+        catalogs.copernico_storage_by_warehouse.get((source, sku))
+    )
+    if copernico_storage:
+        return copernico_storage
     if catalogs.origin_storage_override_enabled:
         override = clean_text(
             catalogs.storage_override_by_origin.get((source, sku))
