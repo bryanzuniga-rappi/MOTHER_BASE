@@ -18,7 +18,7 @@ la capacidad y el número de tareas cambian después de cada requerimiento.
 
 from __future__ import annotations
 
-# Mother Base model build 2026-09-04.1 — Reglas COPÉRNICO 856.
+# Mother Base model build 2026-09-05.1 — OWNER 425/856 y fuentes opcionales.
 
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -106,6 +106,9 @@ OUTPUT_COLUMNS = [
     "STORAGE",
     "VALUE",
 ]
+
+OWNER_SPLIT_SOURCES = {425, 856}
+OWNER_REPORT_COLUMNS = [*OUTPUT_COLUMNS, "OWNER_NAME"]
 
 CDMX = "CDMX"
 GDL = "GDL"
@@ -644,6 +647,7 @@ class Catalogs:
     infaltable_products: set[tuple[int, int]] = field(default_factory=set)
     golden_products: set[tuple[int, int]] = field(default_factory=set)
     anchor_products: set[tuple[int, int]] = field(default_factory=set)
+    owner_stock: dict[tuple[int, int, str], int] = field(default_factory=dict)
 
 
 def load_catalogs(
@@ -715,32 +719,35 @@ def load_catalogs(
                         "first",
                     )
 
+        # Se conserva el soporte para una futura reactivación, pero esta hoja ya
+        # no es obligatoria ni participa mientras no exista y no se habilite.
         storage_override_by_origin: dict[tuple[int, int], str] = {}
-        for row in iter_sheet_records(
-            workbook,
-            "OVER_ORIGEN_STORAGE",
-            ["WAREHOUSE_ID", "PRODUCT_ID", "STORAGE_TYPE"],
-        ):
-            source = to_id(
-                row["WAREHOUSE_ID"],
-                "OVER_ORIGEN_STORAGE.WAREHOUSE_ID",
-                True,
-            )
-            sku = to_id(
-                row["PRODUCT_ID"],
-                "OVER_ORIGEN_STORAGE.PRODUCT_ID",
-                True,
-            )
-            storage_type = clean_text(row["STORAGE_TYPE"])
-            if source is not None and sku is not None and storage_type:
-                put_unique(
-                    storage_override_by_origin,
-                    (source, sku),
-                    storage_type,
-                    warnings,
-                    "OVER_ORIGEN_STORAGE",
-                    "first",
+        if "OVER_ORIGEN_STORAGE" in workbook.sheetnames:
+            for row in iter_sheet_records(
+                workbook,
+                "OVER_ORIGEN_STORAGE",
+                ["WAREHOUSE_ID", "PRODUCT_ID", "STORAGE_TYPE"],
+            ):
+                source = to_id(
+                    row["WAREHOUSE_ID"],
+                    "OVER_ORIGEN_STORAGE.WAREHOUSE_ID",
+                    True,
                 )
+                sku = to_id(
+                    row["PRODUCT_ID"],
+                    "OVER_ORIGEN_STORAGE.PRODUCT_ID",
+                    True,
+                )
+                storage_type = clean_text(row["STORAGE_TYPE"])
+                if source is not None and sku is not None and storage_type:
+                    put_unique(
+                        storage_override_by_origin,
+                        (source, sku),
+                        storage_type,
+                        warnings,
+                        "OVER_ORIGEN_STORAGE",
+                        "first",
+                    )
 
         rackeados_444: set[int] = set()
         for row in iter_sheet_records(workbook, "RACKEADOS", ["WHS", "SYNC"]):
@@ -846,6 +853,34 @@ def load_catalogs(
                 continue
             stock = max(to_float(row["STOCK_DISPONIBLE_FINAL"]), 0.0)
             put_unique(stock_base, (warehouse, sku), stock, warnings, "STOCK", "min")
+
+        owner_stock: dict[tuple[int, int, str], int] = defaultdict(int)
+        for row in iter_sheet_records(
+            workbook,
+            "OWNER",
+            [
+                "WAREHOUSE_ID",
+                "PRODUCT_ID",
+                "OWNER_NAME",
+                "STOCK_DISPONIBLE_FINAL",
+            ],
+        ):
+            source = to_id(row["WAREHOUSE_ID"], "OWNER.WAREHOUSE_ID", True)
+            sku = to_id(row["PRODUCT_ID"], "OWNER.PRODUCT_ID", True)
+            owner = normalize_header(row["OWNER_NAME"])
+            quantity = int(
+                math.floor(
+                    max(to_float(row["STOCK_DISPONIBLE_FINAL"], 0.0), 0.0)
+                    + 1e-9
+                )
+            )
+            if (
+                source in OWNER_SPLIT_SOURCES
+                and sku is not None
+                and owner
+                and quantity > 0
+            ):
+                owner_stock[(source, sku, owner)] += quantity
 
         # Campo legado conservado vacío para compatibilidad de objetos Catalogs.
         golden_infaltables: set[tuple[int, str]] = set()
@@ -963,6 +998,7 @@ def load_catalogs(
         infaltable_products=infaltable_products,
         golden_products=golden_products,
         anchor_products=anchor_products,
+        owner_stock=dict(owner_stock),
     )
 
 
@@ -1325,6 +1361,16 @@ def source_stock_components(catalogs: Catalogs, source: int, sku: int) -> dict[s
     )
     rackeado = source == 444 and sku in catalogs.rackeados_444
     adjusted = max(base - unavailable - copernico_unusable, 0.0)
+    owner_total: int | None = None
+    if source in OWNER_SPLIT_SOURCES:
+        owner_total = sum(
+            quantity
+            for (owner_source, owner_sku, _), quantity in catalogs.owner_stock.items()
+            if owner_source == source and owner_sku == sku
+        )
+        # STOCK sigue siendo el techo mandante. OWNER solamente identifica qué
+        # parte de ese inventario pertenece a cada razón social.
+        adjusted = min(adjusted, float(owner_total))
     if rackeado or sku in catalogs.excluded_products:
         adjusted = 0.0
     return {
@@ -1332,7 +1378,185 @@ def source_stock_components(catalogs: Catalogs, source: int, sku: int) -> dict[s
         "unavailable": unavailable,
         "copernico_unusable": copernico_unusable,
         "rackeado": rackeado,
+        "owner_total": owner_total,
         "adjusted": int(math.floor(adjusted + 1e-9)),
+    }
+
+
+def apply_owner_inventory_partition(
+    result: "PlanningResult",
+    catalogs: Catalogs,
+    config: Config,
+) -> dict[str, Any]:
+    """Separa asignaciones de 425/856 sin mezclar owners ni romper max_tasks."""
+    if getattr(result, "owner_partition_applied", False):
+        return {"applied": False, "tasks_added": 0, "units_cut_task_cap": 0}
+
+    original_rows = list(result.allocation_rows)
+    extra_task_budget = max(config.max_tasks - len(original_rows), 0)
+    remaining = {
+        key: int(quantity) for key, quantity in catalogs.owner_stock.items()
+    }
+    partitioned: list[dict[str, Any]] = []
+    tasks_added = 0
+    units_cut = 0
+    owner_lines: Counter[tuple[int, str]] = Counter()
+
+    for original in original_rows:
+        source = int(original["WAREHOUSE_SOURCE"])
+        sku = int(original["RETAIL_ID"])
+        requested = int(original.get("QUANTITY", 0) or 0)
+        if source not in OWNER_SPLIT_SOURCES:
+            row = dict(original)
+            row["OWNER_NAME"] = ""
+            partitioned.append(row)
+            continue
+
+        pools = sorted(
+            (
+                (owner, quantity)
+                for (pool_source, pool_sku, owner), quantity in remaining.items()
+                if pool_source == source and pool_sku == sku and quantity > 0
+            ),
+            key=lambda item: (-item[1], item[0]),
+        )
+        if requested <= 0 or not pools:
+            units_cut += max(requested, 0)
+            continue
+
+        single = next(
+            ((owner, quantity) for owner, quantity in pools if quantity >= requested),
+            None,
+        )
+        if single is not None:
+            chunks = [(single[0], requested)]
+        elif extra_task_budget > 0:
+            chunks: list[tuple[str, int]] = []
+            pending = requested
+            for owner, available in pools:
+                quantity = min(pending, available)
+                if quantity > 0:
+                    chunks.append((owner, quantity))
+                    pending -= quantity
+                if pending <= 0:
+                    break
+            extra_needed = max(len(chunks) - 1, 0)
+            if extra_needed > extra_task_budget:
+                owner, available = pools[0]
+                chunks = [(owner, min(requested, available))]
+            else:
+                extra_task_budget -= extra_needed
+                tasks_added += extra_needed
+        else:
+            owner, available = pools[0]
+            chunks = [(owner, min(requested, available))]
+
+        assigned = 0
+        for owner, quantity in chunks:
+            if quantity <= 0:
+                continue
+            row = dict(original)
+            row["QUANTITY"] = int(quantity)
+            row["OWNER_NAME"] = owner
+            partitioned.append(row)
+            remaining[(source, sku, owner)] -= int(quantity)
+            owner_lines[(source, owner)] += 1
+            assigned += int(quantity)
+        units_cut += max(requested - assigned, 0)
+
+    result.allocation_rows = partitioned
+    result.tasks_used = len(partitioned)
+    setattr(result, "owner_partition_applied", True)
+
+    if units_cut:
+        remaining_by_source_key: Counter[tuple[int, int, int]] = Counter()
+        for allocation in partitioned:
+            remaining_by_source_key[
+                (
+                    int(allocation["WAREHOUSE_DESTINATION"]),
+                    int(allocation["RETAIL_ID"]),
+                    int(allocation["WAREHOUSE_SOURCE"]),
+                )
+            ] += int(allocation["QUANTITY"])
+
+        # Puede haber más de un renglón de reporte para el mismo tienda–SKU
+        # (por ejemplo Naked + Shalashaska). Se reconcilia en orden, sin duplicar
+        # la asignación final en cada renglón.
+        for row in result.base_rows:
+            destination = int(row["WAREHOUSE_DESTINATION"])
+            sku = int(row["RETAIL_ID"])
+            source_parts = []
+            assigned = 0
+            for source in config.origin_warehouses:
+                previous_source = int(row.get(f"ASIGNADO_{source}", 0) or 0)
+                available = remaining_by_source_key[
+                    (destination, sku, source)
+                ]
+                quantity = min(previous_source, available)
+                remaining_by_source_key[(destination, sku, source)] -= quantity
+                row[f"ASIGNADO_{source}"] = quantity
+                assigned += quantity
+                if quantity:
+                    source_parts.append(f"{source}:{quantity}")
+
+            previous = int(row.get("CANTIDAD_ASIGNADA", 0) or 0)
+            if previous == assigned:
+                continue
+            target = int(row.get("CANTIDAD_OBJETIVO", 0) or 0)
+            row["CANTIDAD_ASIGNADA"] = assigned
+            row["CANTIDAD_FALTANTE"] = max(target - assigned, 0)
+            row["M3_ASIGNADO"] = assigned * float(
+                row.get("M3_POR_UNIDAD", 0) or 0
+            )
+            row["ORIGENES_USADOS"] = " | ".join(source_parts)
+            if target > 0 and assigned < target:
+                row["TIPO_DE_CORTE"] = (
+                    "OK PARCIAL - CORTE POR CAPACIDAD DE TAREAS"
+                    if assigned > 0
+                    else "CORTE POR CAPACIDAD DE TAREAS"
+                )
+                row["DETALLE_MOTIVO"] = (
+                    "La separación obligatoria por owner requería otra tarea y "
+                    "se respetó el límite global configurado."
+                )
+
+        m3_per_key = {
+            (int(row["WAREHOUSE_DESTINATION"]), int(row["RETAIL_ID"])): float(
+                row.get("M3_POR_UNIDAD", 0) or 0
+            )
+            for row in result.base_rows
+        }
+        m3_by_destination: Counter[int] = Counter()
+        for allocation in partitioned:
+            destination = int(allocation["WAREHOUSE_DESTINATION"])
+            sku = int(allocation["RETAIL_ID"])
+            m3_by_destination[destination] += (
+                int(allocation["QUANTITY"])
+                * m3_per_key.get((destination, sku), 0.0)
+            )
+        for capacity_row in result.capacity_rows:
+            destination = int(capacity_row["WAREHOUSE_DESTINATION"])
+            used = float(m3_by_destination.get(destination, 0.0))
+            capacity = float(capacity_row.get("CAPACIDAD_M3", 0) or 0)
+            capacity_row["M3_CONTABILIZADO_CAPACIDAD"] = used
+            capacity_row["M3_TOTAL_ASIGNADO_INCLUYE_GOLDEN"] = used
+            capacity_row["CAPACIDAD_CERRADA"] = used >= capacity - 1e-9
+            capacity_row["CAPACIDAD_SUPERADA_POR_LINEA"] = used > capacity + 1e-9
+
+    if units_cut:
+        result.warnings.append(
+            "OWNER: se recortaron "
+            f"{units_cut:,} unidades porque separar inventario por owner habría "
+            "rebasado el límite global de tareas o faltaba stock identificable."
+        )
+    return {
+        "applied": True,
+        "tasks_added": tasks_added,
+        "units_cut_task_cap": units_cut,
+        "owner_lines": {
+            f"{source}-{owner}": count
+            for (source, owner), count in sorted(owner_lines.items())
+        },
     }
 
 
@@ -2134,7 +2358,7 @@ def write_planning_report(
         write_rectangular_sheet(
             workbook,
             detail,
-            OUTPUT_COLUMNS,
+            OWNER_REPORT_COLUMNS,
             result.allocation_rows,
             header_format,
             boolean_format,
@@ -2163,9 +2387,22 @@ def create_output_files(
         rows = rows_by_source.get(source, [])
         if not rows and not config.generate_empty_source_files:
             continue
-        path = output_dir / f"BulkCD_{source}.csv"
-        write_csv(path, rows, OUTPUT_COLUMNS)
-        paths.append(path)
+        if source in OWNER_SPLIT_SOURCES:
+            rows_by_owner: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            for row in rows:
+                owner = normalize_header(row.get("OWNER_NAME"))
+                if owner:
+                    rows_by_owner[owner].append(row)
+            for owner, owner_rows in sorted(rows_by_owner.items()):
+                path = output_dir / (
+                    f"BulkCD_{source}_{safe_filename(owner)}.csv"
+                )
+                write_csv(path, owner_rows, OUTPUT_COLUMNS)
+                paths.append(path)
+        else:
+            path = output_dir / f"BulkCD_{source}.csv"
+            write_csv(path, rows, OUTPUT_COLUMNS)
+            paths.append(path)
     return paths
 
 
@@ -2227,6 +2464,7 @@ def run_pipeline(
     plan_read = read_plan_csv(plan_path, config)
     result = plan_transfers(plan_read.rows, catalogs, config)
     result.warnings.extend(plan_read.warnings)
+    apply_owner_inventory_partition(result, catalogs, config)
     local_files = create_output_files(
         result, config, run_date, plan_path.name, output_dir
     )

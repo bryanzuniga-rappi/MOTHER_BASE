@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# Mother Base build 2026-09-04.1 — Reglas COPÉRNICO 856 y storage automático.
+# Mother Base build 2026-09-05.1 — OWNER 425/856 y zonas horarias Aleph.
 
 from collections import Counter, defaultdict
 from contextlib import redirect_stdout
@@ -84,6 +84,7 @@ ALEPH_SHEETS = {
     "GOLDEN_INFALTABLES_ANCHOR",
     "TIENDA",
     "STORAGE",
+    "OWNER",
 }
 
 MANUAL_BACKEND_SHEETS = {"TIENDAS_CERRADAS"}
@@ -96,7 +97,6 @@ REQUIRED_DATABASE_SHEETS = (
     "PRIORIDAD",
     "444_HV",
     "831_HV",
-    "OVER_ORIGEN_STORAGE",
     "RACKEADOS",
     "CAP_RECIBO",
     "CATALOGO",
@@ -109,6 +109,7 @@ REQUIRED_DATABASE_SHEETS = (
     "GOLDEN_INFALTABLES_ANCHOR",
     "TIENDA",
     "STORAGE",
+    "OWNER",
 )
 
 SHEET_DESCRIPTIONS = {
@@ -144,6 +145,10 @@ SHEET_DESCRIPTIONS = {
     "OVER_ORIGEN_STORAGE": (
         "Override opcional de STORAGE_TYPE por warehouse origen y producto. "
         "WAREHOUSE_ID identifica el origen, nunca la tienda destino."
+    ),
+    "OWNER": (
+        "Inventario disponible separado por owner. Para los orígenes 425 y 856 "
+        "divide los entregables de Turbo y Chedraui sin mezclar inventario."
     ),
     "RACKEADOS": (
         "Productos rackeados por warehouse. Para el origen 444, estos productos "
@@ -207,6 +212,7 @@ ALEPH_MAX_AGE_HOURS = {
     "TIENDA": 24.0,
     "STORAGE": 24.0,
     "SHARE_VENTAS": 24.0,
+    "OWNER": 1.2,
 }
 
 DEMAND_RULE_LABELS = {
@@ -807,7 +813,7 @@ def parse_update_timestamp(value: Any) -> datetime | None:
         english = re.fullmatch(
             r"([A-Za-z]+)\s+(\d{1,2}),\s*(\d{4}),?\s*"
             r"(\d{1,2}):(\d{2})(?::(\d{2}))?\s*"
-            r"(AM|PM)?(?:\s+([A-Za-z]{2,5}))?",
+            r"(AM|PM)?(?:\s+([A-Za-z]{2,5}(?:[+-]\d{1,2}(?::?\d{2})?)?))?",
             raw,
             flags=re.IGNORECASE,
         )
@@ -825,11 +831,23 @@ def parse_update_timestamp(value: Any) -> datetime | None:
             if hour_number > 23:
                 return None
             zone_name = (zone or "").upper()
-            tzinfo = (
-                timezone(timedelta(hours=TIMEZONE_OFFSETS[zone_name]))
-                if zone_name in TIMEZONE_OFFSETS
-                else ZoneInfo("America/Mexico_City")
+            gmt_offset = re.fullmatch(
+                r"GMT([+-])(\d{1,2})(?::?(\d{2}))?", zone_name
             )
+            if gmt_offset:
+                sign, offset_hours, offset_minutes = gmt_offset.groups()
+                offset = timedelta(
+                    hours=int(offset_hours), minutes=int(offset_minutes or 0)
+                )
+                if sign == "-":
+                    offset = -offset
+                tzinfo = timezone(offset)
+            elif zone_name in TIMEZONE_OFFSETS:
+                tzinfo = timezone(
+                    timedelta(hours=TIMEZONE_OFFSETS[zone_name])
+                )
+            else:
+                tzinfo = ZoneInfo("America/Mexico_City")
             try:
                 return datetime(
                     int(year),
@@ -1756,17 +1774,36 @@ def rewrite_bulk_csvs_with_planning_reason(
 ) -> None:
     """Agrega el origen de planeación únicamente a los CSV operativos Bulk."""
     rows_by_source: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    rows_by_source_owner: dict[tuple[int, str], list[dict[str, Any]]] = (
+        defaultdict(list)
+    )
     for row in result.allocation_rows:
-        rows_by_source[int(row["WAREHOUSE_SOURCE"])].append(row)
+        source = int(row["WAREHOUSE_SOURCE"])
+        rows_by_source[source].append(row)
+        owner = engine.safe_filename(
+            engine.normalize_header(row.get("OWNER_NAME"))
+        )
+        if owner:
+            rows_by_source_owner[(source, owner)].append(row)
 
     for path in local_files:
-        match = re.fullmatch(r"BulkCD_(\d+)\.csv", path.name, flags=re.IGNORECASE)
+        match = re.fullmatch(
+            r"BulkCD_(\d+)(?:_(.+))?\.csv",
+            path.name,
+            flags=re.IGNORECASE,
+        )
         if match is None:
             continue
         source = int(match.group(1))
+        owner = match.group(2)
+        rows = (
+            rows_by_source_owner.get((source, owner), [])
+            if owner
+            else rows_by_source.get(source, [])
+        )
         engine.write_csv(
             path,
-            rows_by_source.get(source, []),
+            rows,
             BULK_OUTPUT_COLUMNS,
         )
 
@@ -4239,6 +4276,11 @@ def execute_planning(
                 f"{liquid_summary['stock_exhausted_cases']:,} saldos de "
                 "origen-SKU quedaron agotados."
             )
+        owner_summary = engine.apply_owner_inventory_partition(
+            result,
+            catalogs,
+            config,
+        )
         normalize_result_storage(result)
         analytics = build_planning_analytics(result, origins)
         apply_reporting_labels(result)
@@ -4424,6 +4466,7 @@ def execute_planning(
             "enabled": bool(apply_origin_storage_override),
             "configured_pairs": len(catalogs.storage_override_by_origin),
         },
+        "owner_partition": owner_summary,
     }
 
 
@@ -5981,7 +6024,7 @@ def render() -> None:
             ),
         )
 
-        support_left, support_center, support_right = st.columns(3)
+        support_left, support_center = st.columns(2)
         with support_left:
             include_insumos = st.toggle(
                 "Agregar insumos al BulkCD_444",
@@ -6000,16 +6043,8 @@ def render() -> None:
                     "demás orígenes permanecen disponibles."
                 ),
             )
-        with support_right:
-            apply_origin_storage_override = st.toggle(
-                "Aplicar override de storage por origen",
-                value=False,
-                help=(
-                    "Usa OVER_ORIGEN_STORAGE con la llave WAREHOUSE_ID origen + "
-                    "PRODUCT_ID. Si no existe override, conserva STORAGE; si "
-                    "tampoco existe, usa Room Temperature."
-                ),
-            )
+        # Soporte legado conservado en backend para una futura reactivación.
+        apply_origin_storage_override = False
         st.caption(
             "El máximo de tareas es un solo presupuesto compartido: Naked + "
             "Solidus + Shalashaska + Liquid nunca podrán excederlo."
