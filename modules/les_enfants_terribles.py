@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# Mother Base build 2026-09-05.1 — OWNER 425/856 y zonas horarias Aleph.
+# Mother Base build 2026-09-06.1 — CODEC, exclusión de tiendas y reporte F9 cero.
 
 from collections import Counter, defaultdict
 from contextlib import redirect_stdout
@@ -1034,6 +1034,33 @@ def extract_available_cities(workbook_bytes: bytes) -> dict[str, str]:
     )
 
 
+def extract_available_stores(workbook_bytes: bytes) -> dict[int, str]:
+    """Construye las opciones de tienda con formato `WAREHOUSE_ID - Nombre`."""
+    workbook = openpyxl.load_workbook(
+        io.BytesIO(workbook_bytes), read_only=True, data_only=True
+    )
+    try:
+        labels: dict[int, str] = {}
+        for row in engine.iter_sheet_records(
+            workbook,
+            "TIENDA",
+            ["WAREHOUSE_ID", "WAREHOUSE_NAME"],
+            ["WAREHOUSE_ID", "WAREHOUSE_NAME"],
+        ):
+            warehouse = engine.to_id(
+                row["WAREHOUSE_ID"],
+                "TIENDA.WAREHOUSE_ID",
+                allow_none=True,
+            )
+            if warehouse is None:
+                continue
+            name = engine.clean_text(row["WAREHOUSE_NAME"])
+            labels[warehouse] = f"{warehouse} - {name or 'SIN NOMBRE'}"
+    finally:
+        workbook.close()
+    return dict(sorted(labels.items(), key=lambda item: item[1].upper()))
+
+
 def save_uploaded_file(uploaded_file, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     uploaded_file.seek(0)
@@ -1375,6 +1402,7 @@ def load_database_resource() -> dict[str, Any]:
             "workbook_bytes": workbook_bytes,
             "health": inspect_database(workbook_bytes),
             "city_labels": extract_available_cities(workbook_bytes),
+            "store_labels": extract_available_stores(workbook_bytes),
             "error": "",
         }
     except Exception as exc:
@@ -1383,6 +1411,7 @@ def load_database_resource() -> dict[str, Any]:
             "workbook_bytes": None,
             "health": None,
             "city_labels": {},
+            "store_labels": {},
             "error": str(exc),
         }
 
@@ -2785,6 +2814,107 @@ def closed_store_summary(
     }
 
 
+FOUNTAIN9_ZERO_REPORT_COLUMNS = [
+    "WAREHOUSE_ID",
+    "WAREHOUSE_NAME",
+    "CITY",
+    "PRODUCT_ID",
+    "PREDICTED_DEMAND_FOR_SELECTED_DURATION",
+    "PREDICTED_OPENING_INVENTORY",
+    "ROQ_FOUNTAIN9",
+    "NET_INTER_STORE_TRANSFERS",
+    "INVENTARIO_ACTUAL_TIENDA",
+    "CANTIDAD_MANUAL_OBJETIVO",
+    "CANTIDAD_ENVIADA",
+    "RESULTADO_MODELO",
+    "MOTIVO_PLANEACION",
+    "TIENDA_EXCLUIDA_MANUALMENTE",
+    "ARCHIVOS_INPUT",
+    "FILAS_CONSOLIDADAS",
+]
+
+
+def build_fountain9_zero_report(
+    consolidated: dict[tuple[int, int], dict[str, Any]],
+    catalogs,
+    result,
+    manually_excluded_store_ids: set[int],
+) -> list[dict[str, Any]]:
+    """Reporta casos donde demanda, opening y ROQ originales son exactamente 0."""
+    assigned_by_key: Counter[tuple[int, int]] = Counter()
+    reasons_by_key: dict[tuple[int, int], set[str]] = defaultdict(set)
+    for allocation in result.allocation_rows:
+        key = (
+            int(allocation["WAREHOUSE_DESTINATION"]),
+            int(allocation["RETAIL_ID"]),
+        )
+        assigned_by_key[key] += int(allocation.get("QUANTITY", 0) or 0)
+        reason = engine.clean_text(allocation.get(PLANNING_REASON_COLUMN))
+        if reason:
+            reasons_by_key[key].add(reason)
+
+    statuses_by_key: dict[tuple[int, int], set[str]] = defaultdict(set)
+    for row in result.base_rows:
+        key = (
+            int(row["WAREHOUSE_DESTINATION"]),
+            int(row["RETAIL_ID"]),
+        )
+        status = engine.clean_text(row.get("TIPO_DE_CORTE"))
+        if status:
+            statuses_by_key[key].add(status)
+
+    report_rows: list[dict[str, Any]] = []
+    for key, record in consolidated.items():
+        demand = float(record["PREDICTED_DEMAND"])
+        opening = float(record["PREDICTED_OPENING_INVENTORY"])
+        roq = float(record["ROQ_INPUT"])
+        if not (
+            math.isclose(demand, 0.0, abs_tol=1e-9)
+            and math.isclose(opening, 0.0, abs_tol=1e-9)
+            and math.isclose(roq, 0.0, abs_tol=1e-9)
+        ):
+            continue
+        destination, sku = key
+        store = catalogs.stores.get(destination, {})
+        report_rows.append(
+            {
+                "WAREHOUSE_ID": destination,
+                "WAREHOUSE_NAME": store.get("warehouse_name", ""),
+                "CITY": store.get("city", ""),
+                "PRODUCT_ID": sku,
+                "PREDICTED_DEMAND_FOR_SELECTED_DURATION": demand,
+                "PREDICTED_OPENING_INVENTORY": opening,
+                "ROQ_FOUNTAIN9": roq,
+                "NET_INTER_STORE_TRANSFERS": record[
+                    "NET_INTER_STORE_TRANSFERS"
+                ],
+                "INVENTARIO_ACTUAL_TIENDA": max(
+                    float(catalogs.stock_base.get((destination, sku), 0.0)),
+                    0.0,
+                ),
+                "CANTIDAD_MANUAL_OBJETIVO": 4,
+                "CANTIDAD_ENVIADA": int(assigned_by_key.get(key, 0)),
+                "RESULTADO_MODELO": (
+                    "EXCLUIDA MANUALMENTE DESDE CODEC"
+                    if destination in manually_excluded_store_ids
+                    else " | ".join(
+                        sorted(statuses_by_key.get(key, {"NO EVALUADO"}))
+                    )
+                ),
+                "MOTIVO_PLANEACION": " | ".join(
+                    sorted(reasons_by_key.get(key, set()))
+                ),
+                "TIENDA_EXCLUIDA_MANUALMENTE": (
+                    destination in manually_excluded_store_ids
+                ),
+                "ARCHIVOS_INPUT": " | ".join(sorted(record["SOURCE_FILES"])),
+                "FILAS_CONSOLIDADAS": int(record["SOURCE_ROWS"]),
+            }
+        )
+    report_rows.sort(key=lambda row: (row["CITY"], row["WAREHOUSE_ID"], row["PRODUCT_ID"]))
+    return report_rows
+
+
 def split_plan_rows_by_blocked_city(
     plan_rows: list[dict[str, Any]],
     catalogs,
@@ -3927,6 +4057,7 @@ def execute_planning(
     liquid_manual_skus_by_origin: dict[int, set[int]] | None = None,
     forecast_horizon_days: int = 7,
     excluded_skus: set[int] | None = None,
+    excluded_store_ids: set[int] | None = None,
     apply_origin_storage_override: bool = False,
     exclude_fountain9_outlier_stores: bool = True,
 ) -> dict[str, Any]:
@@ -3985,11 +4116,12 @@ def execute_planning(
             apply_origin_storage_override
         )
         excluded_sku_set = set(excluded_skus or ())
+        manually_excluded_store_ids = set(excluded_store_ids or ())
         catalogs.excluded_products = excluded_sku_set
         if excluded_sku_set:
             catalogs.warnings.append(
                 "Exclusión general: se bloquearon completamente "
-                f"{len(excluded_sku_set):,} SKUs ingresados en Mission Control."
+                f"{len(excluded_sku_set):,} SKUs ingresados en CODEC."
             )
         fruver_811_summary = apply_fruver_811_block(
             catalogs,
@@ -4061,7 +4193,11 @@ def execute_planning(
                 }
             )
         outlier_store_ids = set(outlier_summary["store_ids"])
-        engine_blocked_store_ids = set(closed_store_ids) | outlier_store_ids
+        engine_blocked_store_ids = (
+            set(closed_store_ids)
+            | outlier_store_ids
+            | manually_excluded_store_ids
+        )
         if outlier_store_ids:
             plan_read.rows = [
                 row
@@ -4085,10 +4221,16 @@ def execute_planning(
             for row in plan_read.rows
             if row["RETAIL_ID"] not in excluded_sku_set
         ]
-        rows_after_closed_stores, closed_plan_rows = (
+        rows_after_manual_stores, manually_excluded_plan_rows = (
             split_plan_rows_by_closed_store(
                 plan_read.rows,
-                engine_blocked_store_ids,
+                manually_excluded_store_ids,
+            )
+        )
+        rows_after_closed_stores, closed_plan_rows = (
+            split_plan_rows_by_closed_store(
+                rows_after_manual_stores,
+                set(closed_store_ids) | outlier_store_ids,
             )
         )
         active_plan_rows, blocked_plan_rows = split_plan_rows_by_blocked_city(
@@ -4125,6 +4267,20 @@ def execute_planning(
                 "Bloqueo permanente TIENDAS_CERRADAS: se excluyeron "
                 f"{len(closed_plan_rows):,} requerimientos de las tiendas "
                 f"{closed_ids_text} antes de asignar stock."
+            )
+        manual_store_summary = closed_store_summary(
+            manually_excluded_plan_rows,
+            manually_excluded_store_ids,
+            config,
+        )
+        if manually_excluded_plan_rows:
+            manual_ids_text = ", ".join(
+                map(str, manual_store_summary["store_ids"])
+            )
+            result.warnings.append(
+                "Exclusión temporal desde CODEC: se omitieron "
+                f"{len(manually_excluded_plan_rows):,} requerimientos de las "
+                f"tiendas {manual_ids_text} antes de ejecutar los engines."
             )
         block_summary = city_block_summary(
             blocked_plan_rows,
@@ -4285,6 +4441,12 @@ def execute_planning(
         analytics = build_planning_analytics(result, origins)
         apply_reporting_labels(result)
         analytics["golden"] = build_golden_analytics(result)
+        fountain9_zero_rows = build_fountain9_zero_report(
+            consolidated_input,
+            catalogs,
+            result,
+            manually_excluded_store_ids,
+        )
         output_dir = (
             Path(config.local_work_dir)
             / "outputs"
@@ -4298,6 +4460,15 @@ def execute_planning(
             output_dir,
         )
         local_files = [Path(path) for path in local_files]
+        fountain9_zero_path = output_dir / (
+            f"Fountain9_Sin_Recomendacion_{run_date:%d-%m-%Y}.csv"
+        )
+        engine.write_csv(
+            fountain9_zero_path,
+            fountain9_zero_rows,
+            FOUNTAIN9_ZERO_REPORT_COLUMNS,
+        )
+        local_files.append(fountain9_zero_path)
         if outlier_summary["details"]:
             outlier_path = output_dir / (
                 f"Outliers_Fountain9_Excluidos_{run_date:%d-%m-%Y}.csv"
@@ -4381,6 +4552,10 @@ def execute_planning(
             "Requerimientos excluidos por tiendas cerradas: "
             f"{len(closed_plan_rows):,}"
         )
+        print(
+            "Requerimientos excluidos temporalmente desde CODEC: "
+            f"{len(manually_excluded_plan_rows):,}"
+        )
         print(f"Requerimientos excluidos por ciudad: {len(blocked_plan_rows):,}")
         print(
             "Requerimientos excluidos por SKU general: "
@@ -4390,6 +4565,10 @@ def execute_planning(
             "Outliers Fountain9 excluidos: "
             f"{outlier_summary['stores_excluded']:,} tiendas / "
             f"{outlier_summary['requirements_excluded']:,} combinaciones"
+        )
+        print(
+            "Casos Fountain9 con demanda, opening y ROQ en cero: "
+            f"{len(fountain9_zero_rows):,}"
         )
         print(f"Tareas generadas: {result.tasks_used:,}")
         if avl_summary["enabled"]:
@@ -4451,6 +4630,7 @@ def execute_planning(
         "analytics": analytics,
         "city_block": block_summary,
         "closed_stores": closed_summary,
+        "manually_excluded_stores": manual_store_summary,
         "insumos": insumos_summary,
         "avl": avl_summary,
         "preventive": preventive_summary,
@@ -4461,6 +4641,7 @@ def execute_planning(
         "engine_selection": engine_selection,
         "excluded_skus": sorted(excluded_sku_set),
         "excluded_requirements": len(excluded_plan_rows),
+        "fountain9_zero_cases": len(fountain9_zero_rows),
         "outliers_f9": outlier_summary,
         "origin_storage_override": {
             "enabled": bool(apply_origin_storage_override),
@@ -5814,14 +5995,14 @@ def render_results(run: dict[str, Any]) -> None:
 def render() -> None:
     inject_styles()
     inject_mother_base_theme()
-    render_system_stamp("MODULE 01 / TACTICAL PLANNING")
+    render_system_stamp("MODULE 01 / OUTER HEAVEN")
 
     st.markdown(
         """
         <section class="hero">
             <span class="hero-kicker">LES ENFANTS TERRIBLES / MOTHER BASE</span>
-            <h1>TACTICAL<br>PLANNING.</h1>
-            <p>Configura la misión y ejecuta Naked, Solidus y Liquid sobre un mismo presupuesto de stock, capacidad y tareas.</p>
+            <h1>OUTER<br>HEAVEN.</h1>
+            <p>Configura la misión y ejecuta los engines sobre un mismo presupuesto de stock, capacidad y tareas.</p>
         </section>
         """,
         unsafe_allow_html=True,
@@ -5832,6 +6013,7 @@ def render() -> None:
     database_bytes = database_state["workbook_bytes"]
     database_health = database_state["health"]
     city_labels = database_state["city_labels"]
+    store_labels = database_state["store_labels"]
     database_error = database_state["error"]
 
     if database_health is not None:
@@ -5962,7 +6144,7 @@ def render() -> None:
             '<span class="mission-control-marker" aria-hidden="true"></span>',
             unsafe_allow_html=True,
         )
-        st.markdown("### MISSION CONTROL · VARIABLES COMPARTIDAS")
+        st.markdown("### CODEC · VARIABLES COMPARTIDAS")
         left, right = st.columns([2, 1])
         with left:
             selected_origins = st.multiselect(
@@ -6000,6 +6182,28 @@ def render() -> None:
                 city_labels.get(city, city) for city in selected_blocked_cities
             )
             st.warning(f"Se bloqueará completamente: {selected_names}")
+
+        selected_excluded_stores = st.multiselect(
+            "Excluir tiendas directamente — opcional",
+            options=list(store_labels),
+            default=[],
+            format_func=lambda warehouse: store_labels.get(
+                warehouse, str(warehouse)
+            ),
+            help=(
+                "Excluye temporalmente tiendas completas de todos los engines. "
+                "No reemplaza el bloqueo permanente de TIENDAS_CERRADAS y solo "
+                "aplica durante esta ejecución."
+            ),
+        )
+        if selected_excluded_stores:
+            st.warning(
+                "Tiendas excluidas en esta corrida: "
+                + ", ".join(
+                    store_labels.get(warehouse, str(warehouse))
+                    for warehouse in selected_excluded_stores
+                )
+            )
 
         exclude_fountain9_outlier_stores = st.toggle(
             "Excluir tiendas con cobertura Fountain9 anormalmente baja",
@@ -6284,7 +6488,7 @@ def render() -> None:
                         )
             else:
                 st.info(
-                    "Selecciona al menos un warehouse origen en Mission Control para "
+                    "Selecciona al menos un warehouse origen en CODEC para "
                     "capturar SKUs manuales de Liquid."
                 )
         else:
@@ -6354,6 +6558,15 @@ def render() -> None:
                         for city in selected_blocked_cities
                     )
                     st.write(f"Excluyendo ciudades bloqueadas: {blocked_names}…")
+                if selected_excluded_stores:
+                    st.write(
+                        "Excluyendo temporalmente desde CODEC: "
+                        + ", ".join(
+                            store_labels.get(warehouse, str(warehouse))
+                            for warehouse in selected_excluded_stores
+                        )
+                        + "…"
+                    )
                 if exclude_fountain9_outlier_stores:
                     st.write(
                         "Validando tiendas con cobertura Fountain9 anormalmente baja…"
@@ -6440,6 +6653,7 @@ def render() -> None:
                     liquid_manual_skus_by_origin=liquid_manual_skus_by_origin,
                     forecast_horizon_days=int(forecast_horizon_days),
                     excluded_skus=excluded_skus,
+                    excluded_store_ids=set(selected_excluded_stores),
                     apply_origin_storage_override=apply_origin_storage_override,
                     exclude_fountain9_outlier_stores=(
                         exclude_fountain9_outlier_stores
