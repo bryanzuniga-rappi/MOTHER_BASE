@@ -17,6 +17,14 @@ from mother_base_theme import render_system_stamp
 
 DATA_DASHBOARD_SPREADSHEET_ID = "174wMJVmpXdeWEOmn4pamlsDaNcIF0ltE1sJjbUpMKsQ"
 
+# --- Mismos valores de mother_base_theme.py (:root). No hardcodear otros hex aquí. ---
+INK = "#111111"
+ACID = "#d9ff3f"
+BLUE = "#5e7cff"
+CORAL = "#ff5a47"
+ORANGE = "#ffb000"
+WHITE = "#fffdf7"
+
 # --- Umbrales de semáforo operativo. Ajustar si Supply define un SLA distinto. ---
 AVL_HEALTHY, AVL_WARNING = 95.0, 90.0
 SWA_HEALTHY, SWA_WARNING = 90.0, 80.0
@@ -95,93 +103,53 @@ def _load_metrics(payload: bytes) -> tuple[list[dict], list[dict]]:
 
 
 # ---------------------------------------------------------------------------
-# Capa visual — dirección de arte Mother Base / Militaires Sans Frontières
+# Capa visual — reutiliza .mb-card / .engine-panel / .mb-wip de mother_base_theme
+# y solo agrega lo que ese archivo todavía no cubre (KPIs con tooltip, tabla con
+# semáforo, tarjetas de insight y los contenedores nativos con key para filtros
+# e histórico).
 # ---------------------------------------------------------------------------
 
 def _inject_style() -> None:
     st.markdown(
         """
         <style>
-        .msf-card {
-            background: #FFFDF7;
-            border: 3px solid #111111;
-            box-shadow: 6px 6px 0 #111111;
-            padding: 20px 24px;
-            margin-bottom: 20px;
-        }
-        .msf-card--tight { padding: 14px 20px; margin-bottom: 24px; }
-
-        .msf-section-title {
-            font-family: 'JetBrains Mono', 'IBM Plex Mono', 'Courier New', monospace;
-            font-weight: 800;
-            font-size: 0.95rem;
-            letter-spacing: 0.08em;
-            text-transform: uppercase;
-            color: #111111;
-            border-bottom: 3px solid #111111;
-            padding-bottom: 6px;
-            margin: 28px 0 14px 0;
-            text-align: left;
+        /* Contenedores nativos con widgets reales: mismo tratamiento que
+           .st-key-mission_control_shared en mother_base_theme.py (radio 10px,
+           no 0 — ese radio solo aplica a las tarjetas HTML crudas). */
+        .st-key-msf_filters [data-testid="stVerticalBlockBorderWrapper"],
+        .st-key-msf_history [data-testid="stVerticalBlockBorderWrapper"] {
+            background: var(--white, #fffdf7) !important;
+            border: 3px solid var(--ink, #111111) !important;
+            border-radius: 10px !important;
+            box-shadow: 7px 7px 0 var(--ink, #111111) !important;
         }
 
         .msf-note {
-            font-family: 'JetBrains Mono', 'IBM Plex Mono', 'Courier New', monospace;
+            font-family: "IBM Plex Mono", monospace;
             font-size: 0.78rem;
-            color: #111111;
-            opacity: 0.7;
-            text-align: left;
-            margin-top: -8px;
-            margin-bottom: 18px;
+            color: var(--ink, #111111);
+            opacity: 0.65;
+            margin: 6px 0 4px 0;
         }
 
-        /* --- KPIs --- */
-        .msf-kpi-row { display: flex; gap: 18px; flex-wrap: wrap; margin-bottom: 8px; }
-        .msf-kpi {
-            position: relative;
-            flex: 1 1 220px;
-            background: #FFFDF7;
-            border: 3px solid #111111;
-            box-shadow: 6px 6px 0 #111111;
-            padding: 18px 20px;
-            text-align: left;
-            transition: transform 0.12s ease, box-shadow 0.12s ease;
-            cursor: default;
-        }
-        .msf-kpi:hover {
-            transform: translate(-2px, -2px);
-            box-shadow: 8px 8px 0 #111111;
-        }
+        /* --- KPIs: .engine-panel ya trae borde/sombra/tono; solo se agrega
+           la tipografía de label/valor y el tooltip con retraso de 1s. --- */
+        .msf-kpi-row { display: flex; gap: 16px; flex-wrap: wrap; }
+        .msf-kpi { position: relative; flex: 1 1 220px; }
         .msf-kpi-label {
-            font-family: 'JetBrains Mono', 'IBM Plex Mono', 'Courier New', monospace;
+            display: block;
+            font-family: "IBM Plex Mono", monospace;
             font-size: 0.72rem;
             font-weight: 700;
             letter-spacing: 0.08em;
             text-transform: uppercase;
-            color: #111111;
-            display: block;
             margin-bottom: 10px;
         }
         .msf-kpi-value {
-            font-family: 'JetBrains Mono', 'IBM Plex Mono', 'Courier New', monospace;
-            font-weight: 800;
-            font-size: 2.2rem;
+            font-family: "Archivo Black", sans-serif;
+            font-size: 2.1rem;
             line-height: 1;
-            color: #111111;
         }
-        .msf-kpi-chip {
-            display: inline-block;
-            margin-top: 10px;
-            font-family: 'JetBrains Mono', 'IBM Plex Mono', 'Courier New', monospace;
-            font-size: 0.7rem;
-            font-weight: 700;
-            letter-spacing: 0.05em;
-            padding: 3px 8px;
-            border: 2px solid #111111;
-        }
-        .msf-kpi--avl { border-left: 10px solid #D4FF2A; }
-        .msf-kpi--swa { border-left: 10px solid #5B7CFA; }
-        .msf-kpi--wh  { border-left: 10px solid #111111; }
-
         .msf-kpi[data-tip]::after {
             content: attr(data-tip);
             position: absolute;
@@ -190,13 +158,13 @@ def _inject_style() -> None:
             z-index: 20;
             width: max-content;
             max-width: 260px;
-            background: #111111;
-            color: #FFFDF7;
-            font-family: 'JetBrains Mono', 'IBM Plex Mono', 'Courier New', monospace;
+            background: var(--ink, #111111);
+            color: var(--white, #fffdf7);
+            font-family: "IBM Plex Mono", monospace;
             font-size: 0.72rem;
             line-height: 1.35;
             padding: 8px 10px;
-            border: 2px solid #111111;
+            border: 2px solid var(--ink, #111111);
             opacity: 0;
             visibility: hidden;
             pointer-events: none;
@@ -208,87 +176,72 @@ def _inject_style() -> None:
             transition-delay: 1s;
         }
 
-        /* --- Tabla operativa --- */
-        .msf-table-wrap { overflow-x: hidden; }
+        /* --- Tabla operativa. Sin precedente en el tema base: se construye
+           siguiendo su lenguaje (mono, bordes gruesos, sin blur). --- */
         table.msf-table {
             width: 100%;
             border-collapse: collapse;
-            font-family: 'JetBrains Mono', 'IBM Plex Mono', 'Courier New', monospace;
+            font-family: "IBM Plex Mono", monospace;
             font-size: 0.78rem;
             table-layout: fixed;
         }
         table.msf-table th {
-            background: #111111;
-            color: #FFFDF7;
+            background: var(--ink, #111111);
+            color: var(--white, #fffdf7);
             text-align: left;
             text-transform: uppercase;
             letter-spacing: 0.04em;
             padding: 8px 10px;
-            border: 2px solid #111111;
+            border: 2px solid var(--ink, #111111);
         }
         table.msf-table td {
-            background: #FFFDF7;
-            color: #111111;
+            background: var(--white, #fffdf7);
+            color: var(--ink, #111111);
             padding: 7px 10px;
-            border: 2px solid #111111;
+            border: 2px solid var(--ink, #111111);
             overflow: hidden;
             text-overflow: ellipsis;
             white-space: nowrap;
         }
+        /* Chip de estado con las mismas proporciones que .mb-wip. */
         .msf-badge {
             display: inline-block;
-            font-weight: 800;
-            padding: 2px 7px;
-            border: 2px solid #111111;
-            font-size: 0.72rem;
+            font-family: "IBM Plex Mono", monospace;
+            font-weight: 900;
+            padding: 2px 6px;
+            border: 2px solid var(--ink, #111111);
+            font-size: 0.7rem;
         }
-        .msf-badge--ok { background: #D4FF2A; }
-        .msf-badge--warn { background: #FFB000; }
-        .msf-badge--crit { background: #FF5A4A; }
+        .msf-badge--ok { background: var(--acid, #d9ff3f); }
+        .msf-badge--warn { background: var(--orange, #ffb000); }
+        .msf-badge--crit { background: var(--coral, #ff5a47); }
 
-        /* --- Insights --- */
-        .msf-insight-row { display: flex; gap: 18px; flex-wrap: wrap; }
-        .msf-insight {
+        .msf-insight-row { display: flex; gap: 16px; flex-wrap: wrap; }
+        .msf-insight-row .mb-card {
             flex: 1 1 260px;
-            background: #FFFDF7;
-            border: 3px solid #111111;
-            box-shadow: 6px 6px 0 #111111;
-            padding: 16px 18px;
-            text-align: left;
-            font-family: 'JetBrains Mono', 'IBM Plex Mono', 'Courier New', monospace;
+            font-family: "IBM Plex Mono", monospace;
             font-size: 0.85rem;
             font-weight: 600;
-            color: #111111;
         }
-        .msf-insight b { background: #D4FF2A; padding: 0 3px; }
+        .msf-chip {
+            display: inline-block;
+            font-weight: 900;
+            padding: 1px 6px;
+            border: 2px solid var(--ink, #111111);
+        }
+        .msf-chip--ok { background: var(--acid, #d9ff3f); }
+        .msf-chip--warn { background: var(--orange, #ffb000); }
+        .msf-chip--crit { background: var(--coral, #ff5a47); }
 
         .msf-error-card {
-            background: #FF5A4A;
-            border: 3px solid #111111;
-            box-shadow: 6px 6px 0 #111111;
+            background: var(--coral, #ff5a47);
+            border: 3px solid var(--ink, #111111);
+            box-shadow: 7px 7px 0 var(--ink, #111111);
             padding: 18px 20px;
-            font-family: 'JetBrains Mono', 'IBM Plex Mono', 'Courier New', monospace;
+            font-family: "IBM Plex Mono", monospace;
             font-weight: 700;
-            color: #111111;
+            color: var(--ink, #111111);
             margin-bottom: 16px;
-        }
-
-        div[data-testid="stButton"] > button {
-            background: #D4FF2A !important;
-            color: #111111 !important;
-            border: 3px solid #111111 !important;
-            border-radius: 0 !important;
-            font-family: 'JetBrains Mono', 'IBM Plex Mono', 'Courier New', monospace !important;
-            font-weight: 800 !important;
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
-            box-shadow: 5px 5px 0 #111111;
-            transition: transform 0.12s ease, box-shadow 0.12s ease;
-        }
-        div[data-testid="stButton"] > button:hover {
-            transform: translate(-2px, -2px);
-            box-shadow: 7px 7px 0 #111111;
-            color: #111111 !important;
         }
         </style>
         """,
@@ -305,9 +258,9 @@ def _status(value: float, healthy: float, warning: float) -> tuple[str, str]:
     return "CRÍTICO", "msf-badge--crit"
 
 
-def _kpi_card(label: str, value: str, tooltip: str, modifier: str) -> str:
+def _kpi_card(label: str, value: str, tooltip: str, tone_class: str) -> str:
     return (
-        f'<div class="msf-kpi {modifier}" data-tip="{html.escape(tooltip)}">'
+        f'<div class="engine-panel {tone_class} msf-kpi" data-tip="{html.escape(tooltip)}">'
         f'<span class="msf-kpi-label">{html.escape(label)}</span>'
         f'<span class="msf-kpi-value">{html.escape(value)}</span>'
         f"</div>"
@@ -330,6 +283,7 @@ def render() -> None:
         """
         <section class="mb-hero">
             <span class="mb-kicker">MILITAIRES SANS FRONTIÈRES</span>
+            <span class="mb-wip" style="margin-left:10px;">WORK IN PROGRESS</span>
             <h1>NETWORK<br>PERFORMANCE.</h1>
             <p>Control de AVL, SWA y desempeño histórico de la red.</p>
         </section>
@@ -340,7 +294,7 @@ def render() -> None:
     with st.spinner("SINCRONIZANDO INTELIGENCIA DE RED…"):
         try:
             current, history = _load_metrics(_fetch_dashboard())
-        except Exception as exc:  # noqa: BLE001 — mostramos el error tal cual al operador
+        except Exception as exc:  # noqa: BLE001 — se muestra el error tal cual al operador
             _render_error(str(exc))
             if st.button("ACTUALIZAR INTELIGENCIA", key="msf_refresh_error"):
                 _fetch_dashboard.clear()
@@ -352,34 +306,34 @@ def render() -> None:
         _render_error("DATA_DASHBOARD no contiene filas suficientes para construir el dashboard.")
         return
 
-    # --- Barra de filtros ---
-    st.markdown('<div class="msf-card msf-card--tight">', unsafe_allow_html=True)
-    f_city, f_bucket, f_window, f_action = st.columns([1.4, 1.4, 1.2, 1])
+    # --- Barra de filtros: contenedor nativo con key, no HTML crudo, para que
+    # los widgets queden realmente dentro de la tarjeta (ver nota de revisión). ---
+    with st.container(border=True, key="msf_filters"):
+        f_city, f_bucket, f_window, f_action = st.columns([1.4, 1.4, 1.2, 1])
 
-    cities = sorted({str(row["CITY"]).strip() for row in current if row.get("CITY")})
-    selected_city = f_city.selectbox("CIUDAD", ["TODAS"] + cities)
+        cities = sorted({str(row["CITY"]).strip() for row in current if row.get("CITY")})
+        selected_city = f_city.selectbox("CIUDAD", ["TODAS"] + cities)
 
-    bucket_options = sorted({str(row["BUCKET_TYPE"]).strip() for row in history if row.get("BUCKET_TYPE")})
-    selected_bucket = f_bucket.selectbox(
-        "CATÁLOGO / BUCKET",
-        bucket_options,
-        index=bucket_options.index("GENERAL") if "GENERAL" in bucket_options else 0,
-    )
+        bucket_options = sorted({str(row["BUCKET_TYPE"]).strip() for row in history if row.get("BUCKET_TYPE")})
+        selected_bucket = f_bucket.selectbox(
+            "CATÁLOGO / BUCKET",
+            bucket_options,
+            index=bucket_options.index("GENERAL") if "GENERAL" in bucket_options else 0,
+        )
 
-    window_label = f_window.selectbox("VENTANA HISTÓRICA", list(HISTORY_WINDOWS.keys()), index=2)
+        window_label = f_window.selectbox("VENTANA HISTÓRICA", list(HISTORY_WINDOWS.keys()), index=2)
 
-    f_action.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True)
-    if f_action.button("ACTUALIZAR INTELIGENCIA", key="msf_refresh_filters"):
-        _fetch_dashboard.clear()
-        _load_metrics.clear()
-        st.rerun()
+        f_action.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True)
+        if f_action.button("ACTUALIZAR INTELIGENCIA", key="msf_refresh_filters"):
+            _fetch_dashboard.clear()
+            _load_metrics.clear()
+            st.rerun()
 
-    st.markdown(
-        '<p class="msf-note">EL BUCKET SOLO APLICA A LA EVOLUCIÓN HISTÓRICA Y A LA LECTURA OPERATIVA: '
-        "CURRENT_DATE NO DESGLOSA AVL/SWA POR CATÁLOGO.</p>",
-        unsafe_allow_html=True,
-    )
-    st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown(
+            '<p class="msf-note">EL BUCKET SOLO APLICA A LA EVOLUCIÓN HISTÓRICA Y A LA LECTURA OPERATIVA: '
+            "CURRENT_DATE NO DESGLOSA AVL/SWA POR CATÁLOGO.</p>",
+            unsafe_allow_html=True,
+        )
 
     scope = [row for row in current if selected_city == "TODAS" or str(row["CITY"]).strip() == selected_city]
     first = current[0]
@@ -393,23 +347,23 @@ def render() -> None:
     warehouses_medidos = len({row["WAREHOUSE_ID"] for row in scope})
 
     # --- Situación actual ---
-    st.markdown('<div class="msf-section-title">SITUACIÓN ACTUAL</div>', unsafe_allow_html=True)
+    st.markdown("### SITUACIÓN ACTUAL")
     kpi_html = (
         '<div class="msf-kpi-row">'
         + _kpi_card(
             "AVL ACTUAL", f"{avl:.2f}%",
             "Available: % de SKUs del catálogo con inventario disponible en el corte más reciente.",
-            "msf-kpi--avl",
+            "naked",
         )
         + _kpi_card(
             "SWA ACTUAL", f"{swa:.2f}%",
             "Stockout-Weighted Availability: disponibilidad ponderada por relevancia/venta del SKU.",
-            "msf-kpi--swa",
+            "solidus",
         )
         + _kpi_card(
             "WAREHOUSES MEDIDOS", f"{warehouses_medidos:,}",
             "Número de warehouses con datos en el corte actual, dentro del filtro de ciudad seleccionado.",
-            "msf-kpi--wh",
+            "",
         )
         + "</div>"
     )
@@ -436,17 +390,16 @@ def render() -> None:
     window_days = HISTORY_WINDOWS[window_label]
     trend_window = trend[-window_days:]
 
-    st.markdown('<div class="msf-section-title">EVOLUCIÓN HISTÓRICA</div>', unsafe_allow_html=True)
-    st.markdown('<div class="msf-card">', unsafe_allow_html=True)
-    if trend_window:
-        st.line_chart(trend_window, x="FECHA", y=["AVL", "SWA"], color=["#D4FF2A", "#5B7CFA"], height=280)
-        st.dataframe(trend_window, use_container_width=True, hide_index=True)
-    else:
-        st.markdown(
-            '<p class="msf-note">SIN DATOS HISTÓRICOS PARA ESTE CATÁLOGO/CIUDAD EN LA VENTANA SELECCIONADA.</p>',
-            unsafe_allow_html=True,
-        )
-    st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown("### EVOLUCIÓN HISTÓRICA")
+    with st.container(border=True, key="msf_history"):
+        if trend_window:
+            st.line_chart(trend_window, x="FECHA", y=["AVL", "SWA"], color=[ACID, BLUE], height=280)
+            st.dataframe(trend_window, use_container_width=True, hide_index=True)
+        else:
+            st.markdown(
+                '<p class="msf-note">SIN DATOS HISTÓRICOS PARA ESTE CATÁLOGO/CIUDAD EN LA VENTANA SELECCIONADA.</p>',
+                unsafe_allow_html=True,
+            )
 
     # --- Lectura operativa ---
     latest_day = max(by_day) if by_day else None
@@ -463,8 +416,7 @@ def render() -> None:
             })
         detail.sort(key=lambda r: (r["SWA"], r["AVL"]))
 
-    st.markdown('<div class="msf-section-title">LECTURA OPERATIVA</div>', unsafe_allow_html=True)
-    st.markdown('<div class="msf-card msf-table-wrap">', unsafe_allow_html=True)
+    st.markdown("### LECTURA OPERATIVA")
     if detail:
         rows_html = []
         for r in detail[:15]:
@@ -480,26 +432,26 @@ def render() -> None:
                 "</tr>"
             )
         table_html = (
+            '<div class="mb-card" style="min-height:auto;">'
             "<table class='msf-table'><colgroup>"
             "<col style='width:20%'><col style='width:34%'><col style='width:20%'>"
             "<col style='width:20%'><col style='width:6%'></colgroup>"
             "<thead><tr><th>Ciudad</th><th>Warehouse</th><th>AVL</th><th>SWA</th><th>SKUs</th></tr></thead>"
             f"<tbody>{''.join(rows_html)}</tbody></table>"
+            '<p class="msf-note">TOP 15 TIENDAS CON MAYOR OPORTUNIDAD · CORTE MÁS RECIENTE DEL CATÁLOGO SELECCIONADO.</p>'
+            "</div>"
         )
         st.markdown(table_html, unsafe_allow_html=True)
-        st.markdown(
-            '<p class="msf-note">TOP 15 TIENDAS CON MAYOR OPORTUNIDAD · CORTE MÁS RECIENTE DEL CATÁLOGO SELECCIONADO.</p>',
-            unsafe_allow_html=True,
-        )
     else:
         st.markdown(
-            '<p class="msf-note">SIN TIENDAS PARA MOSTRAR CON LOS FILTROS ACTUALES.</p>',
+            '<div class="mb-card" style="min-height:auto;">'
+            '<p class="msf-note">SIN TIENDAS PARA MOSTRAR CON LOS FILTROS ACTUALES.</p>'
+            "</div>",
             unsafe_allow_html=True,
         )
-    st.markdown("</div>", unsafe_allow_html=True)
 
     # --- Insights ---
-    st.markdown('<div class="msf-section-title">INSIGHTS</div>', unsafe_allow_html=True)
+    st.markdown("### INSIGHTS")
     insights: list[str] = []
 
     city_swa: dict[str, float] = {}
@@ -509,27 +461,39 @@ def render() -> None:
             city_swa[city] = _number(row["SWA_CITY"])
     if len(city_swa) > 1:
         worst_city, worst_value = min(city_swa.items(), key=lambda kv: kv[1])
-        insights.append(f"<b>{html.escape(worst_city)}</b> concentra la mayor oportunidad de recuperación de SWA ({worst_value:.1f}%).")
+        insights.append(
+            f'<span class="msf-chip msf-chip--crit">{html.escape(worst_city)}</span> concentra la mayor '
+            f"oportunidad de recuperación de SWA ({worst_value:.1f}%)."
+        )
 
     below_avl = sum(1 for row in scope if _number(row.get("AVL_WH")) < AVL_WARNING)
     if scope:
-        insights.append(f"<b>{below_avl}</b> warehouse(s) están debajo del umbral de AVL ({AVL_WARNING:.0f}%).")
+        chip_tone = "msf-chip--crit" if below_avl > 0 else "msf-chip--ok"
+        insights.append(
+            f'<span class="msf-chip {chip_tone}">{below_avl}</span> warehouse(s) están debajo del umbral '
+            f"de AVL ({AVL_WARNING:.0f}%)."
+        )
 
     if len(trend) >= 2:
         delta_avl = trend[-1]["AVL"] - trend[0]["AVL"]
         delta_swa = trend[-1]["SWA"] - trend[0]["SWA"]
+        avl_tone = "msf-chip--ok" if delta_avl >= 0 else "msf-chip--crit"
+        swa_tone = "msf-chip--ok" if delta_swa >= 0 else "msf-chip--crit"
         arrow_avl = "▲" if delta_avl >= 0 else "▼"
         arrow_swa = "▲" if delta_swa >= 0 else "▼"
         insights.append(
-            f"En la ventana de {window_label.lower()}, AVL se movió {arrow_avl} <b>{abs(delta_avl):.1f} pts</b> "
-            f"y SWA {arrow_swa} <b>{abs(delta_swa):.1f} pts</b>."
+            f"En la ventana de {window_label.lower()}, AVL se movió "
+            f'<span class="msf-chip {avl_tone}">{arrow_avl} {abs(delta_avl):.1f} pts</span> y SWA '
+            f'<span class="msf-chip {swa_tone}">{arrow_swa} {abs(delta_swa):.1f} pts</span>.'
         )
 
     if insights:
-        cards = "".join(f'<div class="msf-insight">{text}</div>' for text in insights)
+        cards = "".join(f'<div class="mb-card">{text}</div>' for text in insights)
         st.markdown(f'<div class="msf-insight-row">{cards}</div>', unsafe_allow_html=True)
     else:
         st.markdown(
-            '<p class="msf-note">SIN DATOS SUFICIENTES PARA GENERAR INSIGHTS CON LOS FILTROS ACTUALES.</p>',
+            '<div class="mb-card" style="min-height:auto;">'
+            '<p class="msf-note">SIN DATOS SUFICIENTES PARA GENERAR INSIGHTS CON LOS FILTROS ACTUALES.</p>'
+            "</div>",
             unsafe_allow_html=True,
         )
