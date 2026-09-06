@@ -11,7 +11,7 @@ import urllib.request
 import zipfile
 
 import openpyxl
-import pandas as pd
+import polars as pl
 import plotly.graph_objects as go
 import streamlit as st
 
@@ -342,15 +342,21 @@ def _build_waterfall(current_data, overall_swa):
     return fig
 
 def _build_trend(trend_window):
-    df = pd.DataFrame(trend_window)
+    # Usando POLARS en lugar de Pandas
+    df = pl.DataFrame(trend_window)
     fig = go.Figure()
     
+    # Extraemos a listas de Python para que Plotly no tenga conflictos de tipos
+    fechas = df["FECHA"].to_list()
+    avl_vals = df["AVL"].to_list()
+    swa_vals = df["SWA"].to_list()
+    
     fig.add_trace(go.Scatter(
-        x=df["FECHA"], y=df["AVL"], name="AVL", mode='lines+markers',
+        x=fechas, y=avl_vals, name="AVL", mode='lines+markers',
         line=dict(color=ACID, width=4), marker=dict(size=8, color=ACID, line=dict(width=2, color=INK))
     ))
     fig.add_trace(go.Scatter(
-        x=df["FECHA"], y=df["SWA"], name="SWA", mode='lines+markers',
+        x=fechas, y=swa_vals, name="SWA", mode='lines+markers',
         line=dict(color=BLUE, width=4), marker=dict(size=8, color=BLUE, line=dict(width=2, color=INK))
     ))
     
