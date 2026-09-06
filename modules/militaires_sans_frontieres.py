@@ -11,21 +11,25 @@ import urllib.request
 import zipfile
 
 import openpyxl
+import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 
 from mother_base_theme import render_system_stamp
 
-DATA_DASHBOARD_SPREADSHEET_ID = "174wMJVmpXdeWEOmn4pamlsDaNcIF0ltE1sJjbUpMKsQ"
+# --- NUEVO ORIGEN DE DATOS ---
+DATA_DASHBOARD_SPREADSHEET_ID = "18kHevkMvf9l4s6ANg3h5KdNyj2yEPGAp5C_t8JwxFVw"
 
-# --- Mismos valores de mother_base_theme.py (:root). No hardcodear otros hex aquí. ---
+# --- PALETA OBLIGATORIA (Brutalismo táctico de Mother Base) ---
 INK = "#111111"
-ACID = "#d9ff3f"
-BLUE = "#5e7cff"
-CORAL = "#ff5a47"
-ORANGE = "#ffb000"
-WHITE = "#fffdf7"
+ACID = "#D4FF2A"
+BLUE = "#5B7CFA"
+CORAL = "#FF5A4A"
+ORANGE = "#FFB000"
+WHITE = "#FFFDF7"
+BG = "#F2EFE6"
 
-# --- Umbrales de semáforo operativo. Ajustar si Supply define un SLA distinto. ---
+# --- Umbrales de semáforo operativo ---
 AVL_HEALTHY, AVL_WARNING = 95.0, 90.0
 SWA_HEALTHY, SWA_WARNING = 90.0, 80.0
 
@@ -33,12 +37,11 @@ HISTORY_WINDOWS = {"7 DÍAS": 7, "14 DÍAS": 14, "28 DÍAS": 28}
 
 
 # ---------------------------------------------------------------------------
-# Capa de datos (misma lógica del módulo original, sin cambios funcionales)
+# Capa de datos
 # ---------------------------------------------------------------------------
 
 def _header(value: object) -> str:
     return re.sub(r"\s+", "_", str(value or "").strip().upper())
-
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _fetch_dashboard() -> bytes:
@@ -58,7 +61,6 @@ def _fetch_dashboard() -> bytes:
         raise RuntimeError("DATA_DASHBOARD no devolvió un archivo Excel válido.")
     return payload
 
-
 def _records(workbook, sheet_name: str, required: set[str]):
     if sheet_name not in workbook.sheetnames:
         raise ValueError(f"Falta la hoja {sheet_name!r} en DATA_DASHBOARD.")
@@ -77,13 +79,11 @@ def _records(workbook, sheet_name: str, required: set[str]):
         if any(value is not None and str(value).strip() for value in record.values()):
             yield record
 
-
 def _number(value: object) -> float:
     try:
         return float(value or 0)
     except (TypeError, ValueError):
         return 0.0
-
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _load_metrics(payload: bytes) -> tuple[list[dict], list[dict]]:
@@ -103,176 +103,271 @@ def _load_metrics(payload: bytes) -> tuple[list[dict], list[dict]]:
 
 
 # ---------------------------------------------------------------------------
-# Capa visual — reutiliza .mb-card / .engine-panel / .mb-wip de mother_base_theme
-# y solo agrega lo que ese archivo todavía no cubre (KPIs con tooltip, tabla con
-# semáforo, tarjetas de insight y los contenedores nativos con key para filtros
-# e histórico).
+# Visual & Charts (Estricto Mother Base)
 # ---------------------------------------------------------------------------
 
 def _inject_style() -> None:
     st.markdown(
-        """
+        f"""
         <style>
-        /* Contenedores nativos con widgets reales: mismo tratamiento que
-           .st-key-mission_control_shared en mother_base_theme.py (radio 10px,
-           no 0 — ese radio solo aplica a las tarjetas HTML crudas). */
-        .st-key-msf_filters [data-testid="stVerticalBlockBorderWrapper"],
-        .st-key-msf_history [data-testid="stVerticalBlockBorderWrapper"] {
-            background: var(--white, #fffdf7) !important;
-            border: 3px solid var(--ink, #111111) !important;
-            border-radius: 10px !important;
-            box-shadow: 7px 7px 0 var(--ink, #111111) !important;
-        }
+        /* Forzar fondo base */
+        .stApp {{ background-color: {BG} !important; }}
 
-        .msf-note {
+        /* Contenedores nativos y filtros */
+        .st-key-msf_filters [data-testid="stVerticalBlockBorderWrapper"],
+        .st-key-msf_history [data-testid="stVerticalBlockBorderWrapper"] {{
+            background: {WHITE} !important;
+            border: 3px solid {INK} !important;
+            border-radius: 10px !important;
+            box-shadow: 7px 7px 0 {INK} !important;
+            padding: 10px;
+        }}
+
+        .msf-note {{
             font-family: "IBM Plex Mono", monospace;
             font-size: 0.78rem;
-            color: var(--ink, #111111);
-            opacity: 0.65;
+            color: {INK};
+            opacity: 0.8;
             margin: 6px 0 4px 0;
-        }
+            text-align: left;
+        }}
 
-        /* --- KPIs: .engine-panel ya trae borde/sombra/tono; solo se agrega
-           la tipografía de label/valor y el tooltip con retraso de 1s. --- */
-        .msf-kpi-row { display: flex; gap: 16px; flex-wrap: wrap; }
-        .msf-kpi { position: relative; flex: 1 1 220px; }
-        .msf-kpi-label {
+        /* Tarjetas HTML Brutalistas */
+        .mb-card-solid {{
+            background: {WHITE};
+            border: 3px solid {INK};
+            box-shadow: 7px 7px 0 {INK};
+            padding: 20px;
+            margin-bottom: 20px;
+            color: {INK};
+            text-align: left;
+        }}
+        .mb-card-solid:hover {{
+            transform: translate(-2px, -2px);
+            box-shadow: 9px 9px 0 {INK};
+            transition: all 0.15s ease;
+        }}
+
+        /* KPIs */
+        .msf-kpi-row {{ display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 20px; }}
+        .msf-kpi {{ 
+            position: relative; flex: 1 1 220px; 
+            background: {WHITE};
+            border: 3px solid {INK};
+            box-shadow: 6px 6px 0 {INK};
+            padding: 20px;
+            text-align: left;
+        }}
+        .msf-kpi-label {{
             display: block;
             font-family: "IBM Plex Mono", monospace;
-            font-size: 0.72rem;
+            font-size: 0.75rem;
             font-weight: 700;
             letter-spacing: 0.08em;
             text-transform: uppercase;
-            margin-bottom: 10px;
-        }
-        .msf-kpi-value {
+            margin-bottom: 12px;
+            color: {INK};
+        }}
+        .msf-kpi-value {{
             font-family: "Archivo Black", sans-serif;
-            font-size: 2.1rem;
+            font-size: 2.6rem;
             line-height: 1;
-        }
-        .msf-kpi[data-tip]::after {
+            color: {INK};
+        }}
+        .kpi-acid .msf-kpi-value {{ color: {ACID}; -webkit-text-stroke: 1px {INK}; }}
+        .kpi-blue .msf-kpi-value {{ color: {BLUE}; -webkit-text-stroke: 1px {INK}; }}
+
+        /* Tooltips */
+        .msf-kpi[data-tip]::after {{
             content: attr(data-tip);
             position: absolute;
             left: 0;
             top: calc(100% + 8px);
             z-index: 20;
             width: max-content;
-            max-width: 260px;
-            background: var(--ink, #111111);
-            color: var(--white, #fffdf7);
+            max-width: 280px;
+            background: {INK};
+            color: {WHITE};
             font-family: "IBM Plex Mono", monospace;
-            font-size: 0.72rem;
-            line-height: 1.35;
-            padding: 8px 10px;
-            border: 2px solid var(--ink, #111111);
+            font-size: 0.75rem;
+            padding: 10px;
+            border: 2px solid {INK};
             opacity: 0;
             visibility: hidden;
             pointer-events: none;
             transition: opacity 0.15s ease, visibility 0.15s ease;
-        }
-        .msf-kpi[data-tip]:hover::after {
+        }}
+        .msf-kpi[data-tip]:hover::after {{
             opacity: 1;
             visibility: visible;
             transition-delay: 1s;
-        }
+        }}
 
-        /* --- Tabla operativa. Sin precedente en el tema base: se construye
-           siguiendo su lenguaje (mono, bordes gruesos, sin blur). --- */
-        table.msf-table {
+        /* Tablas operativas */
+        table.msf-table {{
             width: 100%;
             border-collapse: collapse;
             font-family: "IBM Plex Mono", monospace;
-            font-size: 0.78rem;
-            table-layout: fixed;
-        }
-        table.msf-table th {
-            background: var(--ink, #111111);
-            color: var(--white, #fffdf7);
+            font-size: 0.8rem;
             text-align: left;
+        }}
+        table.msf-table th {{
+            background: {INK};
+            color: {WHITE};
             text-transform: uppercase;
-            letter-spacing: 0.04em;
-            padding: 8px 10px;
-            border: 2px solid var(--ink, #111111);
-        }
-        table.msf-table td {
-            background: var(--white, #fffdf7);
-            color: var(--ink, #111111);
-            padding: 7px 10px;
-            border: 2px solid var(--ink, #111111);
-            overflow: hidden;
-            text-overflow: ellipsis;
-            white-space: nowrap;
-        }
-        /* Chip de estado con las mismas proporciones que .mb-wip. */
-        .msf-badge {
-            display: inline-block;
-            font-family: "IBM Plex Mono", monospace;
-            font-weight: 900;
-            padding: 2px 6px;
-            border: 2px solid var(--ink, #111111);
-            font-size: 0.7rem;
-        }
-        .msf-badge--ok { background: var(--acid, #d9ff3f); }
-        .msf-badge--warn { background: var(--orange, #ffb000); }
-        .msf-badge--crit { background: var(--coral, #ff5a47); }
-
-        .msf-insight-row { display: flex; gap: 16px; flex-wrap: wrap; }
-        .msf-insight-row .mb-card {
-            flex: 1 1 260px;
-            font-family: "IBM Plex Mono", monospace;
-            font-size: 0.85rem;
+            padding: 10px;
+            border: 2px solid {INK};
+        }}
+        table.msf-table td {{
+            background: {WHITE};
+            color: {INK};
+            padding: 10px;
+            border: 2px solid {INK};
             font-weight: 600;
-        }
-        .msf-chip {
+        }}
+        
+        /* Badges & Chips */
+        .msf-badge {{
             display: inline-block;
+            font-family: "IBM Plex Mono", monospace;
             font-weight: 900;
-            padding: 1px 6px;
-            border: 2px solid var(--ink, #111111);
-        }
-        .msf-chip--ok { background: var(--acid, #d9ff3f); }
-        .msf-chip--warn { background: var(--orange, #ffb000); }
-        .msf-chip--crit { background: var(--coral, #ff5a47); }
+            padding: 2px 8px;
+            border: 2px solid {INK};
+            font-size: 0.7rem;
+            color: {INK};
+        }}
+        .bg-ok {{ background: {ACID}; }}
+        .bg-warn {{ background: {ORANGE}; }}
+        .bg-crit {{ background: {CORAL}; }}
+        .bg-blue {{ background: {BLUE}; }}
 
-        .msf-error-card {
-            background: var(--coral, #ff5a47);
-            border: 3px solid var(--ink, #111111);
-            box-shadow: 7px 7px 0 var(--ink, #111111);
-            padding: 18px 20px;
+        .msf-error-card {{
+            background: {CORAL};
+            border: 3px solid {INK};
+            box-shadow: 7px 7px 0 {INK};
+            padding: 20px;
             font-family: "IBM Plex Mono", monospace;
             font-weight: 700;
-            color: var(--ink, #111111);
+            color: {INK};
             margin-bottom: 16px;
-        }
+            text-align: left;
+        }}
+        
+        /* Títulos H3 */
+        h3 {{
+            font-family: "Archivo Black", sans-serif !important;
+            text-transform: uppercase;
+            color: {INK} !important;
+            margin-top: 2rem !important;
+            margin-bottom: 1rem !important;
+            text-align: left !important;
+        }}
         </style>
         """,
         unsafe_allow_html=True,
     )
 
-
 def _status(value: float, healthy: float, warning: float) -> tuple[str, str]:
-    """Devuelve (etiqueta, clase_css) para un valor donde más alto es mejor."""
-    if value >= healthy:
-        return "SANO", "msf-badge--ok"
-    if value >= warning:
-        return "RIESGO", "msf-badge--warn"
-    return "CRÍTICO", "msf-badge--crit"
+    if value >= healthy: return "SANO", "bg-ok"
+    if value >= warning: return "RIESGO", "bg-warn"
+    return "CRÍTICO", "bg-crit"
 
-
-def _kpi_card(label: str, value: str, tooltip: str, tone_class: str) -> str:
+def _kpi_card(label: str, value: str, tooltip: str, color_class: str) -> str:
     return (
-        f'<div class="engine-panel {tone_class} msf-kpi" data-tip="{html.escape(tooltip)}">'
+        f'<div class="msf-kpi {color_class}" data-tip="{html.escape(tooltip)}">'
         f'<span class="msf-kpi-label">{html.escape(label)}</span>'
         f'<span class="msf-kpi-value">{html.escape(value)}</span>'
         f"</div>"
     )
 
+# --- Gráficos Plotly Brutalistas ---
+def _build_waterfall(current_data, overall_swa):
+    """Calcula el peso de la caída de SWA por ciudad (proxy) para el bridge."""
+    city_swa = {}
+    for row in current_data:
+        city = str(row.get("CITY") or "").strip()
+        val = _number(row.get("SWA_CITY"))
+        if city and val > 0 and city not in city_swa:
+            city_swa[city] = val
+            
+    if not city_swa or overall_swa >= 100:
+        return None
+        
+    sorted_cities = sorted(city_swa.items(), key=lambda x: x[1])
+    total_drop = 100.0 - overall_swa
+    
+    gaps = {c: 100.0 - v for c, v in sorted_cities}
+    sum_gaps = sum(gaps.values())
+    impacts = {c: (g / sum_gaps) * total_drop for c, g in gaps.items()} if sum_gaps > 0 else {}
+    
+    top_4 = list(impacts.items())[:4]
+    others_impact = sum(v for k, v in list(impacts.items())[4:])
+    
+    x, y, measure, text = ["SWA IDEAL"], [100.0], ["absolute"], ["100%"]
+    
+    for c, imp in top_4:
+        x.append(c)
+        y.append(-imp)
+        measure.append("relative")
+        text.append(f"-{imp:.1f}%")
+        
+    if others_impact > 0:
+        x.append("OTROS")
+        y.append(-others_impact)
+        measure.append("relative")
+        text.append(f"-{others_impact:.1f}%")
+        
+    x.append("SWA ACTUAL")
+    y.append(overall_swa)
+    measure.append("total")
+    text.append(f"{overall_swa:.1f}%")
+    
+    fig = go.Figure(go.Waterfall(
+        name="SWA Bridge", orientation="v", measure=measure, x=x, y=y,
+        textposition="outside", text=text,
+        connector={"line": {"color": INK, "width": 3}},
+        decreasing={"marker": {"color": CORAL, "line": {"color": INK, "width": 3}}},
+        increasing={"marker": {"color": ACID, "line": {"color": INK, "width": 3}}},
+        totals={"marker": {"color": BLUE, "line": {"color": INK, "width": 3}}}
+    ))
+    
+    fig.update_layout(
+        font_family="IBM Plex Mono", font_color=INK,
+        plot_bgcolor=WHITE, paper_bgcolor='rgba(0,0,0,0)',
+        margin=dict(l=20, r=20, t=20, b=20),
+        yaxis=dict(range=[min(overall_swa - 5, 50), 105], showgrid=True, gridcolor='rgba(17,17,17,0.1)', zeroline=False),
+        xaxis=dict(showgrid=False, linecolor=INK, linewidth=3),
+        shapes=[dict(type="rect", xref="paper", yref="paper", x0=0, y0=0, x1=1, y1=1, line=dict(color=INK, width=3))]
+    )
+    return fig
 
-def _render_error(message: str) -> None:
-    st.markdown(f'<div class="msf-error-card">⚠ {html.escape(message)}</div>', unsafe_allow_html=True)
+def _build_trend(trend_window):
+    df = pd.DataFrame(trend_window)
+    fig = go.Figure()
+    
+    fig.add_trace(go.Scatter(
+        x=df["FECHA"], y=df["AVL"], name="AVL", mode='lines+markers',
+        line=dict(color=ACID, width=4), marker=dict(size=8, color=ACID, line=dict(width=2, color=INK))
+    ))
+    fig.add_trace(go.Scatter(
+        x=df["FECHA"], y=df["SWA"], name="SWA", mode='lines+markers',
+        line=dict(color=BLUE, width=4), marker=dict(size=8, color=BLUE, line=dict(width=2, color=INK))
+    ))
+    
+    fig.update_layout(
+        font_family="IBM Plex Mono", font_color=INK,
+        plot_bgcolor=WHITE, paper_bgcolor='rgba(0,0,0,0)',
+        margin=dict(l=20, r=20, t=10, b=20),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        xaxis=dict(showgrid=True, gridcolor='rgba(17,17,17,0.1)', linecolor=INK, linewidth=3),
+        yaxis=dict(showgrid=True, gridcolor='rgba(17,17,17,0.1)', linecolor=INK, linewidth=3),
+        shapes=[dict(type="rect", xref="paper", yref="paper", x0=0, y0=0, x1=1, y1=1, line=dict(color=INK, width=3))]
+    )
+    return fig
 
 
 # ---------------------------------------------------------------------------
-# Render principal
+# Render principal (Centro de Mando 360)
 # ---------------------------------------------------------------------------
 
 def render() -> None:
@@ -281,11 +376,10 @@ def render() -> None:
 
     st.markdown(
         """
-        <section class="mb-hero">
-            <span class="mb-kicker">MILITAIRES SANS FRONTIÈRES</span>
-            <span class="mb-wip" style="margin-left:10px;">WORK IN PROGRESS</span>
-            <h1>NETWORK<br>PERFORMANCE.</h1>
-            <p>Control de AVL, SWA y desempeño histórico de la red.</p>
+        <section class="mb-hero" style="text-align: left;">
+            <span class="msf-badge bg-ok" style="margin-bottom:10px;">MILITAIRES SANS FRONTIÈRES</span>
+            <h1 style="font-family: 'Archivo Black', sans-serif; font-size: 3.5rem; color: #111111; line-height: 1; margin: 0 0 10px 0;">NETWORK<br>PERFORMANCE.</h1>
+            <p style="font-family: 'IBM Plex Mono', monospace; font-size: 1rem; color: #111111; max-width: 600px;">Control táctico de disponibilidad (AVL), impacto de quiebres (SWA) y planes de acción para la red operativa.</p>
         </section>
         """,
         unsafe_allow_html=True,
@@ -294,206 +388,153 @@ def render() -> None:
     with st.spinner("SINCRONIZANDO INTELIGENCIA DE RED…"):
         try:
             current, history = _load_metrics(_fetch_dashboard())
-        except Exception as exc:  # noqa: BLE001 — se muestra el error tal cual al operador
-            _render_error(str(exc))
-            if st.button("ACTUALIZAR INTELIGENCIA", key="msf_refresh_error"):
-                _fetch_dashboard.clear()
-                _load_metrics.clear()
-                st.rerun()
+        except Exception as exc:
+            st.markdown(f'<div class="msf-error-card">⚠ {html.escape(str(exc))}</div>', unsafe_allow_html=True)
+            if st.button("REINTENTAR SINCRONIZACIÓN", key="msf_refresh_error"):
+                _fetch_dashboard.clear(); _load_metrics.clear(); st.rerun()
             return
 
     if not current or not history:
-        _render_error("DATA_DASHBOARD no contiene filas suficientes para construir el dashboard.")
+        st.markdown('<div class="msf-error-card">⚠ DATA_DASHBOARD sin datos.</div>', unsafe_allow_html=True)
         return
 
-    # --- Barra de filtros: contenedor nativo con key, no HTML crudo, para que
-    # los widgets queden realmente dentro de la tarjeta (ver nota de revisión). ---
+    # --- FILTROS TÁCTICOS ---
     with st.container(border=True, key="msf_filters"):
-        f_city, f_bucket, f_window, f_action = st.columns([1.4, 1.4, 1.2, 1])
-
+        col1, col2, col3, col4 = st.columns([1.5, 1.5, 1.2, 1])
         cities = sorted({str(row["CITY"]).strip() for row in current if row.get("CITY")})
-        selected_city = f_city.selectbox("CIUDAD", ["TODAS"] + cities)
+        selected_city = col1.selectbox("ZONA OPERATIVA", ["TODAS"] + cities)
 
         bucket_options = sorted({str(row["BUCKET_TYPE"]).strip() for row in history if row.get("BUCKET_TYPE")})
-        selected_bucket = f_bucket.selectbox(
-            "CATÁLOGO / BUCKET",
-            bucket_options,
-            index=bucket_options.index("GENERAL") if "GENERAL" in bucket_options else 0,
-        )
+        selected_bucket = col2.selectbox("CATÁLOGO / BUCKET", bucket_options, index=bucket_options.index("GENERAL") if "GENERAL" in bucket_options else 0)
+        window_label = col3.selectbox("VENTANA HISTÓRICA", list(HISTORY_WINDOWS.keys()), index=2)
 
-        window_label = f_window.selectbox("VENTANA HISTÓRICA", list(HISTORY_WINDOWS.keys()), index=2)
+        col4.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True)
+        if col4.button("ACTUALIZAR", key="msf_refresh_filters", use_container_width=True):
+            _fetch_dashboard.clear(); _load_metrics.clear(); st.rerun()
 
-        f_action.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True)
-        if f_action.button("ACTUALIZAR INTELIGENCIA", key="msf_refresh_filters"):
-            _fetch_dashboard.clear()
-            _load_metrics.clear()
-            st.rerun()
-
-        st.markdown(
-            '<p class="msf-note">EL BUCKET SOLO APLICA A LA EVOLUCIÓN HISTÓRICA Y A LA LECTURA OPERATIVA: '
-            "CURRENT_DATE NO DESGLOSA AVL/SWA POR CATÁLOGO.</p>",
-            unsafe_allow_html=True,
-        )
-
+    # Data Scoping
     scope = [row for row in current if selected_city == "TODAS" or str(row["CITY"]).strip() == selected_city]
+    if not scope:
+        st.warning("No hay datos para esta combinación.")
+        return
+        
     first = current[0]
     if selected_city == "TODAS":
-        avl = _number(first["AVL_COUNTRY"])
-        swa = _number(first["SWA_COUNTRY"])
+        avl, swa = _number(first["AVL_COUNTRY"]), _number(first["SWA_COUNTRY"])
     else:
         city_row = next((row for row in scope if row.get("AVL_CITY") is not None), scope[0])
         avl, swa = _number(city_row["AVL_CITY"]), _number(city_row["SWA_CITY"])
-
     warehouses_medidos = len({row["WAREHOUSE_ID"] for row in scope})
 
-    # --- Situación actual ---
+    # --- SITUACIÓN ACTUAL ---
     st.markdown("### SITUACIÓN ACTUAL")
-    kpi_html = (
-        '<div class="msf-kpi-row">'
-        + _kpi_card(
-            "AVL ACTUAL", f"{avl:.2f}%",
-            "Available: % de SKUs del catálogo con inventario disponible en el corte más reciente.",
-            "naked",
-        )
-        + _kpi_card(
-            "SWA ACTUAL", f"{swa:.2f}%",
-            "Stockout-Weighted Availability: disponibilidad ponderada por relevancia/venta del SKU.",
-            "solidus",
-        )
-        + _kpi_card(
-            "WAREHOUSES MEDIDOS", f"{warehouses_medidos:,}",
-            "Número de warehouses con datos en el corte actual, dentro del filtro de ciudad seleccionado.",
-            "",
-        )
-        + "</div>"
+    st.markdown(
+        f'<div class="msf-kpi-row">'
+        f'{_kpi_card("AVL ACTUAL", f"{avl:.2f}%", "Available: % de SKUs del catálogo con inventario.", "kpi-acid")}'
+        f'{_kpi_card("SWA ACTUAL", f"{swa:.2f}%", "Stockout-Weighted Availability: disponibilidad ponderada por relevancia.", "kpi-blue")}'
+        f'{_kpi_card("NODOS ACTIVOS", f"{warehouses_medidos:,}", "Número de almacenes reportando inventario.", "")}'
+        f'</div>',
+        unsafe_allow_html=True,
     )
-    st.markdown(kpi_html, unsafe_allow_html=True)
 
-    # --- Evolución histórica ---
-    rows = [
-        row for row in history
-        if str(row["BUCKET_TYPE"]).strip() == selected_bucket
-        and (selected_city == "TODAS" or str(row["CITY"]).strip() == selected_city)
-    ]
-    by_day: dict[object, list[dict]] = defaultdict(list)
-    for row in rows:
-        by_day[row["MAIN_DATE"]].append(row)
-
-    trend = []
-    for day, items in sorted(by_day.items(), key=lambda item: item[0]):
-        trend.append({
-            "FECHA": day,
-            "AVL": round(sum(_number(x["AVL"]) for x in items) / len(items), 2),
-            "SWA": round(sum(_number(x["SWA"]) for x in items) / len(items), 2),
-        })
-
-    window_days = HISTORY_WINDOWS[window_label]
-    trend_window = trend[-window_days:]
-
-    st.markdown("### EVOLUCIÓN HISTÓRICA")
-    with st.container(border=True, key="msf_history"):
-        if trend_window:
-            st.line_chart(trend_window, x="FECHA", y=["AVL", "SWA"], color=[ACID, BLUE], height=280)
-            st.dataframe(trend_window, use_container_width=True, hide_index=True)
+    # --- ANÁLISIS 360 (CHARTS) ---
+    col_chart1, col_chart2 = st.columns(2)
+    
+    with col_chart1:
+        st.markdown("### ANÁLISIS DE BRECHA (SWA)")
+        if selected_city == "TODAS":
+            fig_waterfall = _build_waterfall(current, swa)
+            if fig_waterfall:
+                st.plotly_chart(fig_waterfall, use_container_width=True, config={'displayModeBar': False})
+            else:
+                st.markdown('<div class="mb-card-solid">Red SWA al 100% o sin datos suficientes.</div>', unsafe_allow_html=True)
         else:
-            st.markdown(
-                '<p class="msf-note">SIN DATOS HISTÓRICOS PARA ESTE CATÁLOGO/CIUDAD EN LA VENTANA SELECCIONADA.</p>',
-                unsafe_allow_html=True,
-            )
+            st.markdown('<div class="mb-card-solid"><p class="msf-note">El análisis de cascada (Bridge) opera a nivel país. Selecciona "TODAS" en Zona Operativa.</p></div>', unsafe_allow_html=True)
 
-    # --- Lectura operativa ---
+    with col_chart2:
+        st.markdown("### TENDENCIA HISTÓRICA")
+        rows = [r for r in history if str(r["BUCKET_TYPE"]).strip() == selected_bucket and (selected_city == "TODAS" or str(r["CITY"]).strip() == selected_city)]
+        by_day = defaultdict(list)
+        for r in rows: by_day[r["MAIN_DATE"]].append(r)
+        
+        trend = []
+        for day, items in sorted(by_day.items(), key=lambda item: item[0]):
+            trend.append({
+                "FECHA": day,
+                "AVL": round(sum(_number(x["AVL"]) for x in items) / len(items), 2),
+                "SWA": round(sum(_number(x["SWA"]) for x in items) / len(items), 2)
+            })
+        trend_window = trend[-HISTORY_WINDOWS[window_label]:]
+        
+        if trend_window:
+            st.plotly_chart(_build_trend(trend_window), use_container_width=True, config={'displayModeBar': False})
+        else:
+            st.markdown('<div class="mb-card-solid">Sin datos históricos.</div>', unsafe_allow_html=True)
+
+    # --- LECTURA OPERATIVA ---
     latest_day = max(by_day) if by_day else None
-    detail: list[dict] = []
+    detail = []
     if latest_day is not None:
         for row in by_day[latest_day]:
-            row_avl, row_swa = _number(row["AVL"]), _number(row["SWA"])
             detail.append({
                 "CIUDAD": str(row["CITY"] or "—"),
                 "WAREHOUSE": str(row["WAREHOUSE_NAME"] or "—"),
-                "AVL": row_avl,
-                "SWA": row_swa,
-                "SKUS": int(_number(row.get("SKUS_IN_BL"))),
+                "AVL": _number(row["AVL"]),
+                "SWA": _number(row["SWA"]),
+                "SKUS": int(_number(row.get("SKUS_IN_BL")))
             })
         detail.sort(key=lambda r: (r["SWA"], r["AVL"]))
 
-    st.markdown("### LECTURA OPERATIVA")
+    st.markdown("### PUNTOS CRÍTICOS (TOP 10)")
     if detail:
         rows_html = []
-        for r in detail[:15]:
+        for r in detail[:10]:
             avl_label, avl_class = _status(r["AVL"], AVL_HEALTHY, AVL_WARNING)
             swa_label, swa_class = _status(r["SWA"], SWA_HEALTHY, SWA_WARNING)
             rows_html.append(
-                "<tr>"
+                f"<tr>"
                 f"<td>{html.escape(r['CIUDAD'])}</td>"
                 f"<td>{html.escape(r['WAREHOUSE'])}</td>"
                 f"<td>{r['AVL']:.1f}% <span class='msf-badge {avl_class}'>{avl_label}</span></td>"
                 f"<td>{r['SWA']:.1f}% <span class='msf-badge {swa_class}'>{swa_label}</span></td>"
                 f"<td>{r['SKUS']:,}</td>"
-                "</tr>"
+                f"</tr>"
             )
         table_html = (
-            '<div class="mb-card" style="min-height:auto;">'
-            "<table class='msf-table'><colgroup>"
-            "<col style='width:20%'><col style='width:34%'><col style='width:20%'>"
-            "<col style='width:20%'><col style='width:6%'></colgroup>"
-            "<thead><tr><th>Ciudad</th><th>Warehouse</th><th>AVL</th><th>SWA</th><th>SKUs</th></tr></thead>"
+            f'<div class="mb-card-solid" style="padding:0;">'
+            f"<table class='msf-table'>"
+            f"<thead><tr><th>Ciudad</th><th>Warehouse</th><th>AVL</th><th>SWA</th><th>SKUs Backlog</th></tr></thead>"
             f"<tbody>{''.join(rows_html)}</tbody></table>"
-            '<p class="msf-note">TOP 15 TIENDAS CON MAYOR OPORTUNIDAD · CORTE MÁS RECIENTE DEL CATÁLOGO SELECCIONADO.</p>'
-            "</div>"
+            f"</div>"
         )
         st.markdown(table_html, unsafe_allow_html=True)
-    else:
-        st.markdown(
-            '<div class="mb-card" style="min-height:auto;">'
-            '<p class="msf-note">SIN TIENDAS PARA MOSTRAR CON LOS FILTROS ACTUALES.</p>'
-            "</div>",
-            unsafe_allow_html=True,
-        )
 
-    # --- Insights ---
-    st.markdown("### INSIGHTS")
-    insights: list[str] = []
-
-    city_swa: dict[str, float] = {}
-    for row in current:
-        city = str(row.get("CITY") or "").strip()
-        if city and city not in city_swa and row.get("SWA_CITY") is not None:
-            city_swa[city] = _number(row["SWA_CITY"])
-    if len(city_swa) > 1:
-        worst_city, worst_value = min(city_swa.items(), key=lambda kv: kv[1])
-        insights.append(
-            f'<span class="msf-chip msf-chip--crit">{html.escape(worst_city)}</span> concentra la mayor '
-            f"oportunidad de recuperación de SWA ({worst_value:.1f}%)."
-        )
-
-    below_avl = sum(1 for row in scope if _number(row.get("AVL_WH")) < AVL_WARNING)
-    if scope:
-        chip_tone = "msf-chip--crit" if below_avl > 0 else "msf-chip--ok"
-        insights.append(
-            f'<span class="msf-chip {chip_tone}">{below_avl}</span> warehouse(s) están debajo del umbral '
-            f"de AVL ({AVL_WARNING:.0f}%)."
-        )
-
+    # --- INSIGHTS Y PLANES DE ACCIÓN AUTOMATIZADOS ---
+    st.markdown("### INTELIGENCIA Y PLANES DE ACCIÓN")
+    plans = []
+    
+    # 1. Alerta de Caída General
     if len(trend) >= 2:
-        delta_avl = trend[-1]["AVL"] - trend[0]["AVL"]
         delta_swa = trend[-1]["SWA"] - trend[0]["SWA"]
-        avl_tone = "msf-chip--ok" if delta_avl >= 0 else "msf-chip--crit"
-        swa_tone = "msf-chip--ok" if delta_swa >= 0 else "msf-chip--crit"
-        arrow_avl = "▲" if delta_avl >= 0 else "▼"
-        arrow_swa = "▲" if delta_swa >= 0 else "▼"
-        insights.append(
-            f"En la ventana de {window_label.lower()}, AVL se movió "
-            f'<span class="msf-chip {avl_tone}">{arrow_avl} {abs(delta_avl):.1f} pts</span> y SWA '
-            f'<span class="msf-chip {swa_tone}">{arrow_swa} {abs(delta_swa):.1f} pts</span>.'
-        )
+        if delta_swa < -1.5:
+            plans.append(f"🔴 <b>ALERTA DE TENDENCIA:</b> El SWA ha caído <span class='msf-badge bg-crit'>{abs(delta_swa):.1f} pts</span> en la ventana actual. <b>ACCIÓN:</b> Revisar inbounds pendientes y mermas en centros de distribución clave.")
+        elif delta_swa > 1.5:
+            plans.append(f"🟢 <b>RECUPERACIÓN:</b> El SWA subió <span class='msf-badge bg-ok'>{delta_swa:.1f} pts</span>. Consolidar el fill-rate actual.")
 
-    if insights:
-        cards = "".join(f'<div class="mb-card">{text}</div>' for text in insights)
-        st.markdown(f'<div class="msf-insight-row">{cards}</div>', unsafe_allow_html=True)
-    else:
-        st.markdown(
-            '<div class="mb-card" style="min-height:auto;">'
-            '<p class="msf-note">SIN DATOS SUFICIENTES PARA GENERAR INSIGHTS CON LOS FILTROS ACTUALES.</p>'
-            "</div>",
-            unsafe_allow_html=True,
-        )
+    # 2. Análisis del peor Warehouse
+    if detail:
+        worst = detail[0]
+        if worst["SWA"] < SWA_WARNING:
+            plans.append(f"⚡ <b>FOCO ROJO:</b> {worst['WAREHOUSE']} ({worst['CIUDAD']}) tiene un SWA crítico de <span class='msf-badge bg-crit'>{worst['SWA']:.1f}%</span>. <b>ACCIÓN:</b> Ejecutar cross-docking urgente para el top 20% de SKUs generadores de venta.")
+
+    # 3. Desalineación Long-tail vs Top-sellers (AVL alto, SWA bajo)
+    for r in detail[:5]:
+        if r["AVL"] >= AVL_HEALTHY and r["SWA"] < SWA_WARNING:
+            plans.append(f"🔍 <b>DESALINEACIÓN DE INVENTARIO:</b> En {r['WAREHOUSE']}, el AVL es sano ({r['AVL']:.1f}%) pero el SWA es pobre ({r['SWA']:.1f}%). <b>ACCIÓN:</b> Depurar el catálogo local; hay exceso de inventario inmovilizado de baja rotación, mientras que los top sellers están en quiebre (stockout).")
+            break
+
+    if not plans:
+        plans.append("🛡️ <b>RED ESTABLE:</b> Los KPIs se mantienen en rangos operativos. Mantener monitoreo de desviaciones.")
+
+    cards = "".join(f'<div class="mb-card-solid" style="margin-bottom:10px; font-size: 0.9rem;">{p}</div>' for p in plans)
+    st.markdown(cards, unsafe_allow_html=True)
