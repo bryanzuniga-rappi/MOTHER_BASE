@@ -18,7 +18,7 @@ import streamlit as st
 from mother_base_theme import render_system_stamp
 
 # --- NUEVO ORIGEN DE DATOS ---
-DATA_DASHBOARD_SPREADSHEET_ID = "18kHevkMvf9l4s6ANg3h5KdNyj2yEPGAp5C_t8JwxFVw"
+DATA_DASHBOARD_SPREADSHEET_ID = "174wMJVmpXdeWEOmn4pamlsDaNcIF0ltE1sJjbUpMKsQ"
 
 # --- PALETA OBLIGATORIA (Brutalismo táctico de Mother Base) ---
 INK = "#111111"
