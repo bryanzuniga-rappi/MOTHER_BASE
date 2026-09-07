@@ -17,7 +17,7 @@ import streamlit as st
 
 from mother_base_theme import render_system_stamp
 
-# --- NUEVO ORIGEN DE DATOS ---
+# --- ORIGEN DE DATOS (SHEET ORIGINAL) ---
 DATA_DASHBOARD_SPREADSHEET_ID = "174wMJVmpXdeWEOmn4pamlsDaNcIF0ltE1sJjbUpMKsQ"
 
 # --- PALETA OBLIGATORIA (Brutalismo táctico de Mother Base) ---
@@ -103,36 +103,97 @@ def _load_metrics(payload: bytes) -> tuple[list[dict], list[dict]]:
 
 
 # ---------------------------------------------------------------------------
-# Visual & Charts (Estricto Mother Base)
+# Visual & CSS Agresivo (Estricto Mother Base Brutalism)
 # ---------------------------------------------------------------------------
 
 def _inject_style() -> None:
     st.markdown(
         f"""
         <style>
-        /* Forzar fondo base */
-        .stApp {{ background-color: {BG} !important; }}
+        /* 1. Fondo general beige papel cálido con CUADRÍCULA MUY SUTIL */
+        .stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"] {{
+            background-color: {BG} !important;
+            background-image: 
+                linear-gradient(rgba(17, 17, 17, 0.04) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(17, 17, 17, 0.04) 1px, transparent 1px) !important;
+            background-size: 20px 20px !important;
+        }}
 
-        /* Contenedores nativos y filtros */
+        /* 2. Forzar alineación a la izquierda y eliminar centrados automáticos */
+        [data-testid="stVerticalBlock"] {{
+            align-items: flex-start !important;
+            text-align: left !important;
+        }}
+
+        /* 3. Títulos grandes, negros, pesados */
+        h1, h2, h3, h4, h5, h6 {{
+            font-family: "Archivo Black", sans-serif !important;
+            text-transform: uppercase !important;
+            color: {INK} !important;
+            text-align: left !important;
+            margin-top: 1.5rem !important;
+            margin-bottom: 1rem !important;
+        }}
+
+        /* 4. Textos estándar en Mono */
+        p, span, div, label {{
+            font-family: "IBM Plex Mono", monospace !important;
+            text-align: left;
+            color: {INK};
+        }}
+
+        /* 5. Contenedores de Filtros (Nativos de Streamlit override) */
         .st-key-msf_filters [data-testid="stVerticalBlockBorderWrapper"],
         .st-key-msf_history [data-testid="stVerticalBlockBorderWrapper"] {{
             background: {WHITE} !important;
             border: 3px solid {INK} !important;
-            border-radius: 10px !important;
+            border-radius: 0px !important; /* BRUTALISMO: Sin bordes redondeados */
             box-shadow: 7px 7px 0 {INK} !important;
-            padding: 10px;
+            padding: 15px !important;
         }}
 
-        .msf-note {{
-            font-family: "IBM Plex Mono", monospace;
-            font-size: 0.78rem;
-            color: {INK};
-            opacity: 0.8;
-            margin: 6px 0 4px 0;
-            text-align: left;
+        /* 6. Estilo de Filtros (Selectbox nativo) */
+        .stSelectbox label p {{
+            font-weight: 800 !important;
+            font-size: 0.8rem !important;
+            text-transform: uppercase !important;
+            letter-spacing: 0.05em !important;
+        }}
+        div[data-baseweb="select"] > div {{
+            background-color: {WHITE} !important;
+            border: 3px solid {INK} !important;
+            border-radius: 0px !important;
+            box-shadow: 4px 4px 0 {INK} !important;
+            color: {INK} !important;
+            font-weight: 700 !important;
         }}
 
-        /* Tarjetas HTML Brutalistas */
+        /* 7. Botón de Acción Brutalista (Rectangular, verde ácido) */
+        .stButton > button {{
+            background-color: {ACID} !important;
+            color: {INK} !important;
+            border: 3px solid {INK} !important;
+            border-radius: 0px !important; /* Rectangular obligatorio */
+            box-shadow: 5px 5px 0 {INK} !important;
+            font-weight: 900 !important;
+            text-transform: uppercase !important;
+            font-size: 0.9rem !important;
+            padding: 0.5rem 1rem !important;
+            transition: all 0.1s ease !important;
+            width: 100% !important;
+        }}
+        .stButton > button:active {{
+            transform: translate(3px, 3px) !important;
+            box-shadow: 2px 2px 0 {INK} !important;
+        }}
+        .stButton > button p {{
+            font-family: "IBM Plex Mono", monospace !important;
+            font-weight: 900 !important;
+            margin: 0 !important;
+            text-align: center !important; /* Única excepción: texto del botón centrado internamente */
+        }}
+
+        /* 8. Tarjetas HTML (Insights y Tablas) */
         .mb-card-solid {{
             background: {WHITE};
             border: 3px solid {INK};
@@ -140,7 +201,7 @@ def _inject_style() -> None:
             padding: 20px;
             margin-bottom: 20px;
             color: {INK};
-            text-align: left;
+            border-radius: 0px;
         }}
         .mb-card-solid:hover {{
             transform: translate(-2px, -2px);
@@ -148,50 +209,57 @@ def _inject_style() -> None:
             transition: all 0.15s ease;
         }}
 
-        /* KPIs */
-        .msf-kpi-row {{ display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 20px; }}
+        /* 9. Microcopy */
+        .msf-note {{
+            font-size: 0.75rem !important;
+            font-weight: 600;
+            opacity: 0.8;
+            margin: 8px 0 4px 0;
+            text-transform: uppercase;
+        }}
+
+        /* 10. KPIs Grandes */
+        .msf-kpi-row {{ display: flex; gap: 20px; flex-wrap: wrap; margin-bottom: 25px; width: 100%; }}
         .msf-kpi {{ 
-            position: relative; flex: 1 1 220px; 
+            position: relative; flex: 1 1 200px; 
             background: {WHITE};
             border: 3px solid {INK};
-            box-shadow: 6px 6px 0 {INK};
+            box-shadow: 7px 7px 0 {INK};
             padding: 20px;
-            text-align: left;
+            border-radius: 0px;
         }}
         .msf-kpi-label {{
             display: block;
-            font-family: "IBM Plex Mono", monospace;
-            font-size: 0.75rem;
-            font-weight: 700;
+            font-weight: 800;
+            font-size: 0.8rem;
             letter-spacing: 0.08em;
             text-transform: uppercase;
             margin-bottom: 12px;
             color: {INK};
         }}
         .msf-kpi-value {{
-            font-family: "Archivo Black", sans-serif;
-            font-size: 2.6rem;
+            font-family: "Archivo Black", sans-serif !important;
+            font-size: 3rem;
             line-height: 1;
-            color: {INK};
+            display: block;
         }}
-        .kpi-acid .msf-kpi-value {{ color: {ACID}; -webkit-text-stroke: 1px {INK}; }}
-        .kpi-blue .msf-kpi-value {{ color: {BLUE}; -webkit-text-stroke: 1px {INK}; }}
+        .kpi-acid .msf-kpi-value {{ color: {ACID}; -webkit-text-stroke: 2px {INK}; }}
+        .kpi-blue .msf-kpi-value {{ color: {BLUE}; -webkit-text-stroke: 2px {INK}; }}
 
-        /* Tooltips */
+        /* Tooltips nativos CSS */
         .msf-kpi[data-tip]::after {{
             content: attr(data-tip);
             position: absolute;
             left: 0;
-            top: calc(100% + 8px);
-            z-index: 20;
+            top: calc(100% + 12px);
+            z-index: 50;
             width: max-content;
-            max-width: 280px;
+            max-width: 300px;
             background: {INK};
             color: {WHITE};
-            font-family: "IBM Plex Mono", monospace;
             font-size: 0.75rem;
-            padding: 10px;
-            border: 2px solid {INK};
+            padding: 12px;
+            border: 3px solid {INK};
             opacity: 0;
             visibility: hidden;
             pointer-events: none;
@@ -200,40 +268,39 @@ def _inject_style() -> None:
         .msf-kpi[data-tip]:hover::after {{
             opacity: 1;
             visibility: visible;
-            transition-delay: 1s;
+            transition-delay: 0.8s;
         }}
 
-        /* Tablas operativas */
+        /* 11. Tablas Operativas Brutalistas */
         table.msf-table {{
             width: 100%;
             border-collapse: collapse;
-            font-family: "IBM Plex Mono", monospace;
-            font-size: 0.8rem;
-            text-align: left;
+            font-size: 0.85rem;
         }}
         table.msf-table th {{
             background: {INK};
             color: {WHITE};
             text-transform: uppercase;
-            padding: 10px;
-            border: 2px solid {INK};
+            padding: 12px;
+            border: 3px solid {INK};
+            font-weight: 800;
         }}
         table.msf-table td {{
             background: {WHITE};
             color: {INK};
-            padding: 10px;
-            border: 2px solid {INK};
+            padding: 12px;
+            border: 3px solid {INK};
             font-weight: 600;
         }}
-        
-        /* Badges & Chips */
+
+        /* 12. Badges/Chips tácticos */
         .msf-badge {{
             display: inline-block;
-            font-family: "IBM Plex Mono", monospace;
             font-weight: 900;
             padding: 2px 8px;
             border: 2px solid {INK};
             font-size: 0.7rem;
+            text-transform: uppercase;
             color: {INK};
         }}
         .bg-ok {{ background: {ACID}; }}
@@ -246,21 +313,10 @@ def _inject_style() -> None:
             border: 3px solid {INK};
             box-shadow: 7px 7px 0 {INK};
             padding: 20px;
-            font-family: "IBM Plex Mono", monospace;
-            font-weight: 700;
+            font-weight: 800;
             color: {INK};
-            margin-bottom: 16px;
-            text-align: left;
-        }}
-        
-        /* Títulos H3 */
-        h3 {{
-            font-family: "Archivo Black", sans-serif !important;
-            text-transform: uppercase;
-            color: {INK} !important;
-            margin-top: 2rem !important;
-            margin-bottom: 1rem !important;
-            text-align: left !important;
+            margin-bottom: 20px;
+            border-radius: 0px;
         }}
         </style>
         """,
@@ -282,7 +338,6 @@ def _kpi_card(label: str, value: str, tooltip: str, color_class: str) -> str:
 
 # --- Gráficos Plotly Brutalistas ---
 def _build_waterfall(current_data, overall_swa):
-    """Calcula el peso de la caída de SWA por ciudad (proxy) para el bridge."""
     city_swa = {}
     for row in current_data:
         city = str(row.get("CITY") or "").strip()
@@ -334,7 +389,7 @@ def _build_waterfall(current_data, overall_swa):
     fig.update_layout(
         font_family="IBM Plex Mono", font_color=INK,
         plot_bgcolor=WHITE, paper_bgcolor='rgba(0,0,0,0)',
-        margin=dict(l=20, r=20, t=20, b=20),
+        margin=dict(l=10, r=10, t=20, b=20),
         yaxis=dict(range=[min(overall_swa - 5, 50), 105], showgrid=True, gridcolor='rgba(17,17,17,0.1)', zeroline=False),
         xaxis=dict(showgrid=False, linecolor=INK, linewidth=3),
         shapes=[dict(type="rect", xref="paper", yref="paper", x0=0, y0=0, x1=1, y1=1, line=dict(color=INK, width=3))]
@@ -342,28 +397,26 @@ def _build_waterfall(current_data, overall_swa):
     return fig
 
 def _build_trend(trend_window):
-    # Usando POLARS en lugar de Pandas
     df = pl.DataFrame(trend_window)
     fig = go.Figure()
     
-    # Extraemos a listas de Python para que Plotly no tenga conflictos de tipos
     fechas = df["FECHA"].to_list()
     avl_vals = df["AVL"].to_list()
     swa_vals = df["SWA"].to_list()
     
     fig.add_trace(go.Scatter(
         x=fechas, y=avl_vals, name="AVL", mode='lines+markers',
-        line=dict(color=ACID, width=4), marker=dict(size=8, color=ACID, line=dict(width=2, color=INK))
+        line=dict(color=ACID, width=4), marker=dict(size=8, color=ACID, line=dict(width=3, color=INK))
     ))
     fig.add_trace(go.Scatter(
         x=fechas, y=swa_vals, name="SWA", mode='lines+markers',
-        line=dict(color=BLUE, width=4), marker=dict(size=8, color=BLUE, line=dict(width=2, color=INK))
+        line=dict(color=BLUE, width=4), marker=dict(size=8, color=BLUE, line=dict(width=3, color=INK))
     ))
     
     fig.update_layout(
         font_family="IBM Plex Mono", font_color=INK,
         plot_bgcolor=WHITE, paper_bgcolor='rgba(0,0,0,0)',
-        margin=dict(l=20, r=20, t=10, b=20),
+        margin=dict(l=10, r=10, t=10, b=20),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         xaxis=dict(showgrid=True, gridcolor='rgba(17,17,17,0.1)', linecolor=INK, linewidth=3),
         yaxis=dict(showgrid=True, gridcolor='rgba(17,17,17,0.1)', linecolor=INK, linewidth=3),
@@ -373,7 +426,7 @@ def _build_trend(trend_window):
 
 
 # ---------------------------------------------------------------------------
-# Render principal (Centro de Mando 360)
+# Render principal
 # ---------------------------------------------------------------------------
 
 def render() -> None:
@@ -382,10 +435,10 @@ def render() -> None:
 
     st.markdown(
         """
-        <section class="mb-hero" style="text-align: left;">
-            <span class="msf-badge bg-ok" style="margin-bottom:10px;">MILITAIRES SANS FRONTIÈRES</span>
-            <h1 style="font-family: 'Archivo Black', sans-serif; font-size: 3.5rem; color: #111111; line-height: 1; margin: 0 0 10px 0;">NETWORK<br>PERFORMANCE.</h1>
-            <p style="font-family: 'IBM Plex Mono', monospace; font-size: 1rem; color: #111111; max-width: 600px;">Control táctico de disponibilidad (AVL), impacto de quiebres (SWA) y planes de acción para la red operativa.</p>
+        <section class="mb-hero" style="margin-bottom: 30px;">
+            <span class="msf-badge bg-ok" style="margin-bottom:15px; display:inline-block;">MILITAIRES SANS FRONTIÈRES</span>
+            <h1 style="font-size: 3.5rem; line-height: 0.9; margin: 0 0 15px 0;">NETWORK<br>PERFORMANCE.</h1>
+            <p style="font-size: 1rem; max-width: 650px; font-weight: 600;">Control táctico de disponibilidad (AVL), impacto de quiebres (SWA) y planes de acción para la red operativa.</p>
         </section>
         """,
         unsafe_allow_html=True,
@@ -395,13 +448,13 @@ def render() -> None:
         try:
             current, history = _load_metrics(_fetch_dashboard())
         except Exception as exc:
-            st.markdown(f'<div class="msf-error-card">⚠ {html.escape(str(exc))}</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="msf-error-card">⚠ ERROR CRÍTICO: {html.escape(str(exc))}</div>', unsafe_allow_html=True)
             if st.button("REINTENTAR SINCRONIZACIÓN", key="msf_refresh_error"):
                 _fetch_dashboard.clear(); _load_metrics.clear(); st.rerun()
             return
 
     if not current or not history:
-        st.markdown('<div class="msf-error-card">⚠ DATA_DASHBOARD sin datos.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="msf-error-card">⚠ DATA_DASHBOARD sin datos suficientes para renderizar el módulo.</div>', unsafe_allow_html=True)
         return
 
     # --- FILTROS TÁCTICOS ---
@@ -415,13 +468,13 @@ def render() -> None:
         window_label = col3.selectbox("VENTANA HISTÓRICA", list(HISTORY_WINDOWS.keys()), index=2)
 
         col4.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True)
-        if col4.button("ACTUALIZAR", key="msf_refresh_filters", use_container_width=True):
+        if col4.button("ACTUALIZAR", key="msf_refresh_filters"):
             _fetch_dashboard.clear(); _load_metrics.clear(); st.rerun()
 
     # Data Scoping
     scope = [row for row in current if selected_city == "TODAS" or str(row["CITY"]).strip() == selected_city]
     if not scope:
-        st.warning("No hay datos para esta combinación.")
+        st.markdown('<div class="msf-error-card">⚠ Sin datos para esta zona operativa.</div>', unsafe_allow_html=True)
         return
         
     first = current[0]
@@ -519,28 +572,25 @@ def render() -> None:
     st.markdown("### INTELIGENCIA Y PLANES DE ACCIÓN")
     plans = []
     
-    # 1. Alerta de Caída General
     if len(trend) >= 2:
         delta_swa = trend[-1]["SWA"] - trend[0]["SWA"]
         if delta_swa < -1.5:
-            plans.append(f"🔴 <b>ALERTA DE TENDENCIA:</b> El SWA ha caído <span class='msf-badge bg-crit'>{abs(delta_swa):.1f} pts</span> en la ventana actual. <b>ACCIÓN:</b> Revisar inbounds pendientes y mermas en centros de distribución clave.")
+            plans.append(f"🔴 <span class='msf-badge bg-crit'>ALERTA DE TENDENCIA</span><br>El SWA ha caído <b>{abs(delta_swa):.1f} pts</b> en la ventana actual. <b>ACCIÓN:</b> Revisar inbounds pendientes y mermas en centros de distribución clave.")
         elif delta_swa > 1.5:
-            plans.append(f"🟢 <b>RECUPERACIÓN:</b> El SWA subió <span class='msf-badge bg-ok'>{delta_swa:.1f} pts</span>. Consolidar el fill-rate actual.")
+            plans.append(f"🟢 <span class='msf-badge bg-ok'>RECUPERACIÓN</span><br>El SWA subió <b>{delta_swa:.1f} pts</b>. Consolidar el fill-rate actual.")
 
-    # 2. Análisis del peor Warehouse
     if detail:
         worst = detail[0]
         if worst["SWA"] < SWA_WARNING:
-            plans.append(f"⚡ <b>FOCO ROJO:</b> {worst['WAREHOUSE']} ({worst['CIUDAD']}) tiene un SWA crítico de <span class='msf-badge bg-crit'>{worst['SWA']:.1f}%</span>. <b>ACCIÓN:</b> Ejecutar cross-docking urgente para el top 20% de SKUs generadores de venta.")
+            plans.append(f"⚡ <span class='msf-badge bg-crit'>FOCO ROJO</span><br><b>{worst['WAREHOUSE']} ({worst['CIUDAD']})</b> tiene un SWA crítico de <b>{worst['SWA']:.1f}%</b>. <b>ACCIÓN:</b> Ejecutar cross-docking urgente para el top 20% de SKUs generadores de venta.")
 
-    # 3. Desalineación Long-tail vs Top-sellers (AVL alto, SWA bajo)
     for r in detail[:5]:
         if r["AVL"] >= AVL_HEALTHY and r["SWA"] < SWA_WARNING:
-            plans.append(f"🔍 <b>DESALINEACIÓN DE INVENTARIO:</b> En {r['WAREHOUSE']}, el AVL es sano ({r['AVL']:.1f}%) pero el SWA es pobre ({r['SWA']:.1f}%). <b>ACCIÓN:</b> Depurar el catálogo local; hay exceso de inventario inmovilizado de baja rotación, mientras que los top sellers están en quiebre (stockout).")
+            plans.append(f"🔍 <span class='msf-badge bg-warn'>DESALINEACIÓN DE INVENTARIO</span><br>En <b>{r['WAREHOUSE']}</b>, el AVL es sano ({r['AVL']:.1f}%) pero el SWA es pobre ({r['SWA']:.1f}%). <b>ACCIÓN:</b> Depurar el catálogo local; hay exceso de inventario inmovilizado, mientras que los top sellers están en quiebre.")
             break
 
     if not plans:
-        plans.append("🛡️ <b>RED ESTABLE:</b> Los KPIs se mantienen en rangos operativos. Mantener monitoreo de desviaciones.")
+        plans.append("🛡️ <span class='msf-badge bg-blue'>RED ESTABLE</span><br>Los KPIs se mantienen en rangos operativos. Mantener monitoreo de desviaciones.")
 
-    cards = "".join(f'<div class="mb-card-solid" style="margin-bottom:10px; font-size: 0.9rem;">{p}</div>' for p in plans)
+    cards = "".join(f'<div class="mb-card-solid" style="margin-bottom:15px; font-size: 0.9rem; line-height: 1.5;">{p}</div>' for p in plans)
     st.markdown(cards, unsafe_allow_html=True)
