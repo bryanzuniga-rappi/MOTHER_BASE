@@ -42,6 +42,7 @@ def empty_shalashaska_summary(enabled: bool) -> dict[str, Any]:
         "skipped_no_capacity": 0,
         "skipped_task_limit": 0,
         "skipped_regional_block": 0,
+        "skipped_schedule_block": 0,
     }
 
 
@@ -322,6 +323,8 @@ def apply_shalashaska_engine(
                 catalogs, source, destination, sku, city_norm, is_golden
             ):
                 continue
+            if engine.is_schedule_blocked(catalogs, source, destination):
+                continue
             priority_rank = min(priority_rank, priority_profile["rank"])
         candidate.update(
             {
@@ -389,6 +392,9 @@ def apply_shalashaska_engine(
                 catalogs, source, destination, sku, city_norm, is_golden
             ):
                 summary["skipped_regional_block"] += 1
+                continue
+            if engine.is_schedule_blocked(catalogs, source, destination):
+                summary["skipped_schedule_block"] += 1
                 continue
 
             capacity = catalogs.store_capacity.get(

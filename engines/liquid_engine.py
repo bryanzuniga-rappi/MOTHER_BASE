@@ -376,6 +376,8 @@ def apply_liquid_engine(
                         is_golden,
                     ):
                         continue
+                    if engine.is_schedule_blocked(catalogs, source, destination):
+                        continue
                     priority_rank = min(
                         priority_rank,
                         priority_profile["rank"],
@@ -448,6 +450,8 @@ def apply_liquid_engine(
                 city_norm,
                 is_golden,
             ):
+                continue
+            if engine.is_schedule_blocked(catalogs, source, destination):
                 continue
 
             capacity = catalogs.store_capacity.get(

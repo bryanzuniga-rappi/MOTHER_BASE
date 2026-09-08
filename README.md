@@ -25,6 +25,7 @@ Mother Base es una aplicación web construida con Streamlit. Su módulo operativ
 - Carga opcional de un CSV de COPÉRNICO.
 - Carga y consolidación de uno o varios CSV de Fountain9.
 - Restricciones de stock, capacidad, tareas, rutas, ciudades, tiendas y productos.
+- Bloqueo opcional de envíos fuera de frecuencia según la hoja `SCHEDULE`.
 - Separación de entregables por owner para los orígenes 425 y 856.
 - Reporte Excel, PDF ejecutivo, archivos CSV por origen/owner y ZIP consolidado.
 
@@ -247,10 +248,20 @@ Los encabezados se buscan dinámicamente en las primeras 40 filas. Esto permite 
 | `GOLDEN_INFALTABLES_ANCHOR` | `WAREHOUSE_ID`, `PRODUCT_ID_SYNC`, `IS_INFALTABLE`, `IS_GOLDEN`, `IS_ANCHOR` | Prioridad exacta destino–SKU. |
 | `TIENDA` | `CITY`, `WAREHOUSE_ID`, `WAREHOUSE_NAME` | Maestro de nodos, nombres y ciudades. |
 | `STORAGE` | `PRODUCT_ID`, `STORAGE_NAME` | Ambiente estándar. |
+| `SCHEDULE` | `WAREHOUSE_ID` (o `WAREHOUSE ID`), `ORIGEN`, `DAYS` | Frecuencia de envío permitida por destino–origen. Opcional: su ausencia no bloquea la planeación. |
 
 ### Hoja legado no obligatoria
 
 `OVER_ORIGEN_STORAGE` puede seguir siendo leída si existe y se habilita internamente. Su `WAREHOUSE_ID` representa el **origen**. La interfaz actual no la activa y la hoja puede no existir.
+
+### SCHEDULE — frecuencia de envío
+
+- Una fila define los días permitidos para un par **WAREHOUSE_ID destino + ORIGEN**. `DAYS` acepta los nombres de día en español separados por coma (`Lunes, Miércoles, Viernes`), tolera acentos, mayúsculas/minúsculas y puntos sueltos (`.Miércoles`).
+- El encabezado del destino acepta tanto `WAREHOUSE_ID` como `WAREHOUSE ID` (con espacio); el resto de las columnas usa los nombres exactos `ORIGEN` y `DAYS`.
+- La hoja es parte del contrato obligatorio (aparece en el panel de salud igual que `RUTA_COSTOS` o `BLOQUEOS`), pero el motor la trata de forma defensiva: si por algún motivo no está presente al momento de cargar, no bloquea la ejecución, simplemente no aplica ninguna restricción de frecuencia.
+- Dentro de la hoja, cada **par destino–origen es independiente y opcional**: un par que **no aparece** en SCHEDULE **no tiene restricción de frecuencia**, incluso con el toggle activo.
+- Filas duplicadas para el mismo par se combinan (unión de días) y generan una advertencia; no producen error.
+- El bloqueo lo activa el toggle de CODEC **"Bloquear envíos fuera de frecuencia"**, apagado por default. Se evalúa contra la **fecha real del sistema** al momento de la corrida (zona horaria `America/Mexico_City`), no contra una fecha capturada manualmente.
 
 ### Defaults
 
@@ -473,6 +484,7 @@ Separar OWNER puede requerir otra línea; si no hay cupo, se recorta la cantidad
 - **SKUs excluidos:** lista por coma/salto; afecta engines e Insumos.
 - **RUTA_COSTOS:** bloquea el par destino–SKU.
 - **BLOQUEOS regionales:** solo si el SKU está en BLOQUEOS, el origen es CDMX y el destino GDL/MTY. Golden/Infaltable/Anchor/KVI no crean este bloqueo.
+- **SCHEDULE (toggle "Bloquear envíos fuera de frecuencia"):** bloquea el par origen–destino si el día real de la corrida no está en `SCHEDULE.DAYS` para ese `WAREHOUSE_ID` + `ORIGEN`. Un par ausente de SCHEDULE no tiene restricción. Apagado por default; aplica a Naked, Solidus (incluye AVL y prevención de quiebres), Shalashaska, Liquid e Insumos. Si todos los orígenes elegibles quedan bloqueados por frecuencia, la línea corta completa; si solo algunos, se asigna con los orígenes disponibles y queda como parcial.
 - **FRUVER 811:** toggle que retira ese stock del 811 sin afectar otros orígenes.
 
 ### Outliers Fountain9
@@ -607,6 +619,7 @@ BulkCD_856_CHEDRAUI.csv
 | Excluir SKUs | Todos e Insumos | Comas o saltos. |
 | Agregar insumos | Postproceso 444 | Activo por default. |
 | Bloquear FRUVER 811 | Stock origen | Apagado por default. |
+| Bloquear envíos fuera de frecuencia | Todos (Naked, Solidus, Shalashaska, Liquid, Insumos) | Apagado por default; usa SCHEDULE y la fecha real del sistema. |
 
 ### Por engine
 
@@ -712,6 +725,8 @@ Los resultados son temporales: deben descargarse antes de que expire la sesión.
 | OK PARCIAL - CORTE POR CAPACIDAD DE TAREAS | Cobertura parcial antes del máximo. |
 | CORTE POR BLOQUEO REGIONAL | Producto explícito BLOQUEOS, CDMX → GDL/MTY. |
 | OK PARCIAL - CORTE POR BLOQUEO REGIONAL | Otro origen cubrió parte. |
+| CORTE POR FRECUENCIA DE ENVÍO | Todos los orígenes elegibles no tienen envío programado hoy según SCHEDULE. |
+| OK PARCIAL - CORTE POR FRECUENCIA DE ENVÍO | Otro origen sí tenía envío programado hoy y cubrió parte o el total. |
 | ERROR DE DATOS | Falta información obligatoria. |
 
 La tabla web muestra al menos 12 filas sin scroll vertical.
@@ -820,7 +835,7 @@ pytest -q
 
 ### Datos
 
-- [ ] Las 20 hojas obligatorias existen con nombres exactos.
+- [ ] Las 21 hojas obligatorias existen con nombres exactos.
 - [ ] Encabezados cumplen contrato.
 - [ ] C7 de Aleph es válido.
 - [ ] Fuentes de 1.2 horas y 24 horas dentro del SLA.
@@ -835,6 +850,7 @@ pytest -q
 - [ ] Ninguna tienda supera CAP_RECIBO.
 - [ ] Tareas ≤ MAX_TASKS.
 - [ ] BLOQUEOS no viajan CDMX → GDL/MTY.
+- [ ] Con el toggle de frecuencia activo, ningún Bulk usa un origen fuera de los días de SCHEDULE.
 - [ ] Tiendas cerradas/excluidas no aparecen.
 - [ ] Rackeados 444 no consumen stock 444.
 - [ ] Owners no se mezclan.
@@ -902,6 +918,7 @@ Ejecute al menos tres fechas históricas y compare:
 | Muchas más tareas que modelo viejo | Hardcodes/engines o uploads duplicados | Compare PLANNING_REASON; concilie Naked solo. |
 | OWNER recorta | Owner insuficiente o división sin tarea | Revise advertencias y owner stock. |
 | No hay Bulk de un origen | No tuvo asignaciones | Revise DETALLE_ASIGNACION. |
+| Un origen no envía y el toggle de frecuencia está activo | Hoy no está en `SCHEDULE.DAYS` para ese destino-origen | Revise `BLOQUEO_FRECUENCIA_<origen>` en BASE_TRANSFERS; confirme el día en SCHEDULE. |
 | COPÉRNICO 856 falla | Falta ZonaPiso | Agregue ZonaPiso. |
 | STORAGE 856 incorrecto | Ambiente dominante COPÉRNICO | Revise saldos E/RCC/RR. |
 | App reinicia con CSV grande | RAM/timeout | Aumente recursos o reduzca concurrencia. |
@@ -947,6 +964,7 @@ Rollback:
 - `INCOMING` no afecta la planeación.
 - `OVER_ORIGEN_STORAGE` está dormido.
 - Solo 444 y 831 tienen HV por origen; otros reportan `REGULAR`.
+- El bloqueo por frecuencia (SCHEDULE) se evalúa contra la fecha real del servidor, no contra una fecha de entrega simulada o histórica.
 
 Para misión crítica agregue SSO, persistencia, auditoría, monitoreo, control de concurrencia, pruebas de carga y una fuente autenticada.
 
@@ -966,6 +984,7 @@ Para misión crítica agregue SSO, persistencia, auditoría, monitoreo, control 
 | OWNER | Propietario/razón social del inventario 425/856. |
 | MOQ | Múltiplo mínimo de envío. |
 | CODEC | Variables compartidas. |
+| SCHEDULE | Hoja de frecuencia de envío permitida por destino–origen. |
 | Outer Heaven | Interfaz táctica de planeación. |
 
 ---

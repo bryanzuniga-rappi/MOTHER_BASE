@@ -115,6 +115,28 @@ GDL = "GDL"
 MTY = "MTY"
 FOREIGN_DESTINATION_CITIES = {GDL, MTY}
 
+# %% SCHEDULE — frecuencia de envío por destino-origen
+
+# date.weekday(): 0 = lunes ... 6 = domingo.
+SPANISH_WEEKDAYS_BY_INDEX = {
+    0: "LUNES",
+    1: "MARTES",
+    2: "MIERCOLES",
+    3: "JUEVES",
+    4: "VIERNES",
+    5: "SABADO",
+    6: "DOMINGO",
+}
+WEEKDAY_DISPLAY_NAMES = {
+    "LUNES": "Lunes",
+    "MARTES": "Martes",
+    "MIERCOLES": "Miércoles",
+    "JUEVES": "Jueves",
+    "VIERNES": "Viernes",
+    "SABADO": "Sábado",
+    "DOMINGO": "Domingo",
+}
+
 
 # %% Utilidades generales
 
@@ -143,6 +165,21 @@ def normalize_city(value: Any) -> str:
     if "MONTERREY" in folded or folded == "MTY":
         return MTY
     return folded
+
+
+def normalize_weekday(value: Any) -> str:
+    """Normaliza un token de día (con o sin acentos, puntos o espacios sueltos).
+
+    Tolera variantes como ``" .Miércoles "`` o ``"lunes"`` y siempre devuelve la
+    forma canónica en mayúsculas sin acentos, p. ej. ``"MIERCOLES"``.
+    """
+    raw = clean_text(value)
+    folded = "".join(
+        char
+        for char in unicodedata.normalize("NFKD", raw)
+        if not unicodedata.combining(char)
+    ).upper()
+    return re.sub(r"[^A-Z]", "", folded)
 
 
 def to_float(value: Any, default: float = 0.0) -> float:
@@ -404,6 +441,67 @@ def iter_sheet_records(
             yield record
 
 
+def _squash_header(value: Any) -> str:
+    """Colapsa un encabezado a solo letras/números para comparar alias.
+
+    Permite que ``WAREHOUSE_ID`` y ``WAREHOUSE ID`` (o cualquier combinación de
+    espacios/guiones bajos) se reconozcan como el mismo campo.
+    """
+    return re.sub(r"[^A-Z0-9]", "", normalize_header(value))
+
+
+def iter_schedule_records(workbook) -> Iterator[dict[str, Any]]:
+    """Lee la hoja SCHEDULE tolerando alias de encabezado.
+
+    Acepta ``WAREHOUSE_ID`` o ``WAREHOUSE ID`` para el destino, y requiere
+    ``ORIGEN`` y ``DAYS``. SCHEDULE es parte del contrato obligatorio (se
+    valida en el panel de salud), pero este loader es defensivo: si la hoja
+    no está presente no interrumpe la carga, simplemente no produce filas y
+    ningún par destino-origen queda restringido por frecuencia.
+    """
+    if "SCHEDULE" not in workbook.sheetnames:
+        return
+    ws = workbook["SCHEDULE"]
+    alias_targets = {
+        "WAREHOUSE_ID": "WAREHOUSEID",
+        "ORIGEN": "ORIGEN",
+        "DAYS": "DAYS",
+    }
+    header_row: int | None = None
+    positions: dict[str, int] = {}
+    for row_number, row in enumerate(
+        ws.iter_rows(min_row=1, max_row=40, values_only=True), start=1
+    ):
+        found: dict[str, int] = {}
+        for column_index, value in enumerate(row):
+            squashed = _squash_header(value)
+            for target, alias in alias_targets.items():
+                if squashed == alias and target not in found:
+                    found[target] = column_index
+        if set(alias_targets) <= set(found):
+            header_row, positions = row_number, found
+            break
+    if header_row is None:
+        raise ValueError(
+            "SCHEDULE: no encontré encabezados WAREHOUSE_ID (o 'WAREHOUSE ID'), "
+            "ORIGEN y DAYS en las primeras 40 filas"
+        )
+    for row in ws.iter_rows(min_row=header_row + 1, values_only=True):
+        record = {
+            "WAREHOUSE_ID": (
+                row[positions["WAREHOUSE_ID"]]
+                if positions["WAREHOUSE_ID"] < len(row)
+                else None
+            ),
+            "ORIGEN": (
+                row[positions["ORIGEN"]] if positions["ORIGEN"] < len(row) else None
+            ),
+            "DAYS": row[positions["DAYS"]] if positions["DAYS"] < len(row) else None,
+        }
+        if any(clean_text(value) for value in record.values()):
+            yield record
+
+
 def put_unique(
     target: dict[Any, Any],
     key: Any,
@@ -648,6 +746,17 @@ class Catalogs:
     golden_products: set[tuple[int, int]] = field(default_factory=set)
     anchor_products: set[tuple[int, int]] = field(default_factory=set)
     owner_stock: dict[tuple[int, int, str], int] = field(default_factory=dict)
+    # SCHEDULE: (WAREHOUSE_ID destino, ORIGEN) -> días permitidos normalizados.
+    # Un par ausente de este diccionario no tiene restricción de frecuencia.
+    schedule_days: dict[tuple[int, int], frozenset[str]] = field(
+        default_factory=dict
+    )
+    # Toggle de CODEC "Bloquear envíos fuera de frecuencia". Apagado por
+    # default para no alterar corridas existentes.
+    schedule_block_enabled: bool = False
+    # Día de hoy (fecha real del sistema al momento de la corrida), normalizado
+    # igual que los tokens de SCHEDULE.DAYS, p. ej. "MIERCOLES".
+    run_weekday_norm: str = ""
 
 
 def load_catalogs(
@@ -963,8 +1072,43 @@ def load_catalogs(
             if sku is not None:
                 value = clean_text(row["STORAGE_NAME"]) or "UNKNOWN"
                 put_unique(storage, sku, value, warnings, "STORAGE", "first")
+
+        # Cada par destino-origen de SCHEDULE es independiente y opcional; la
+        # ausencia de la hoja en sí no bloquea la carga (ver iter_schedule_records).
+        schedule_days: dict[tuple[int, int], frozenset[str]] = {}
+        for row in iter_schedule_records(workbook):
+            destination = to_id(row["WAREHOUSE_ID"], "SCHEDULE.WAREHOUSE_ID", True)
+            origin = to_id(row["ORIGEN"], "SCHEDULE.ORIGEN", True)
+            if destination is None or origin is None:
+                continue
+            days_raw = clean_text(row["DAYS"])
+            if not days_raw:
+                continue
+            days_set = frozenset(
+                token
+                for token in (
+                    normalize_weekday(part) for part in days_raw.split(",")
+                )
+                if token
+            )
+            if not days_set:
+                continue
+            key = (destination, origin)
+            if key in schedule_days and schedule_days[key] != days_set:
+                warnings.append(
+                    f"SCHEDULE: WAREHOUSE_ID {destination} + ORIGEN {origin} "
+                    "aparece más de una vez con días distintos; se combinaron "
+                    "todos los días indicados en sus filas."
+                )
+                schedule_days[key] = schedule_days[key] | days_set
+            else:
+                schedule_days[key] = days_set
     finally:
         workbook.close()
+
+    run_weekday_norm = SPANISH_WEEKDAYS_BY_INDEX[
+        datetime.now(ZoneInfo(config.timezone)).date().weekday()
+    ]
 
     for origin in config.origin_warehouses:
         if origin not in stores:
@@ -999,6 +1143,8 @@ def load_catalogs(
         golden_products=golden_products,
         anchor_products=anchor_products,
         owner_stock=dict(owner_stock),
+        schedule_days=schedule_days,
+        run_weekday_norm=run_weekday_norm,
     )
 
 
@@ -1586,6 +1732,22 @@ def is_regional_block(
     )
 
 
+def is_schedule_blocked(catalogs: Catalogs, source: int, destination: int) -> bool:
+    """Bloquea un origen-destino si hoy no es un día permitido en SCHEDULE.
+
+    Controlado por el toggle de CODEC ``schedule_block_enabled``. Si el toggle
+    está apagado, o si el par (destination, source) no aparece en la hoja
+    SCHEDULE, no aplica ninguna restricción de frecuencia (ver contrato de la
+    hoja SCHEDULE en el README).
+    """
+    if not catalogs.schedule_block_enabled:
+        return False
+    allowed_days = catalogs.schedule_days.get((destination, source))
+    if not allowed_days:
+        return False
+    return catalogs.run_weekday_norm not in allowed_days
+
+
 @dataclass
 class PlanningResult:
     base_rows: list[dict[str, Any]]
@@ -1701,6 +1863,7 @@ def plan_transfers(
         origin_info: dict[int, dict[str, Any]] = {}
         origin_before: dict[int, int] = {}
         regional_blocks: dict[int, bool] = {}
+        schedule_blocks: dict[int, bool] = {}
         for source in config.origin_warehouses:
             info = get_stock_info(source, sku)
             origin_info[source] = info
@@ -1712,6 +1875,9 @@ def plan_transfers(
                 sku,
                 city_norm,
                 is_golden,
+            )
+            schedule_blocks[source] = is_schedule_blocked(
+                catalogs, source, destination
             )
 
         allocations: list[tuple[int, int]] = []
@@ -1754,7 +1920,7 @@ def plan_transfers(
             capacity_limited = capacity_target < target
             remaining_candidate = capacity_target
             for source in config.origin_warehouses:
-                if regional_blocks[source]:
+                if regional_blocks[source] or schedule_blocks[source]:
                     continue
                 available = stock_remaining[(source, sku)]
                 quantity = min(remaining_candidate, available)
@@ -1802,6 +1968,11 @@ def plan_transfers(
                 for source in config.origin_warehouses
                 if regional_blocks[source]
             )
+            schedule_blocked_stock = sum(
+                origin_before[source]
+                for source in config.origin_warehouses
+                if schedule_blocks[source] and not regional_blocks[source]
+            )
 
             if assigned > 0:
                 actual_m3 = assigned * m3_per_unit
@@ -1830,6 +2001,13 @@ def plan_transfers(
             elif assigned > 0 and blocked_stock > 0:
                 tipo_corte = "OK PARCIAL - BLOQUEO REGIONAL"
                 detalle_motivo = f"Asignadas {assigned} de {target}; stock bloqueado CDMX→GDL/MTY"
+            elif assigned > 0 and schedule_blocked_stock > 0:
+                tipo_corte = "OK PARCIAL - BLOQUEO POR FRECUENCIA"
+                detalle_motivo = (
+                    f"Asignadas {assigned} de {target}; parte del stock está en "
+                    f"un origen sin envío programado hoy ({WEEKDAY_DISPLAY_NAMES.get(catalogs.run_weekday_norm, catalogs.run_weekday_norm)}) "
+                    "según SCHEDULE"
+                )
             elif assigned > 0:
                 tipo_corte = "OK PARCIAL - CORTE POR STOCK"
                 detalle_motivo = f"Asignadas {assigned} de {target}; stock permitido insuficiente"
@@ -1843,6 +2021,13 @@ def plan_transfers(
             elif blocked_stock > 0:
                 tipo_corte = "BLOQUEO REGIONAL"
                 detalle_motivo = "El stock disponible está en un origen CDMX bloqueado para GDL/MTY"
+            elif schedule_blocked_stock > 0:
+                tipo_corte = "BLOQUEO POR FRECUENCIA"
+                detalle_motivo = (
+                    "El stock disponible está en un origen sin envío programado "
+                    f"hoy ({WEEKDAY_DISPLAY_NAMES.get(catalogs.run_weekday_norm, catalogs.run_weekday_norm)}) "
+                    "según SCHEDULE"
+                )
             else:
                 tipo_corte = "CORTE POR STOCK"
                 diagnostics: list[str] = []
@@ -1859,7 +2044,7 @@ def plan_transfers(
                 eligible_remaining = sum(
                     origin_before[source]
                     for source in config.origin_warehouses
-                    if not regional_blocks[source]
+                    if not regional_blocks[source] and not schedule_blocks[source]
                 )
                 if stock_insufficient and eligible_remaining > 0:
                     detalle_motivo = (
@@ -1946,6 +2131,7 @@ def plan_transfers(
                     f"STOCK_INICIAL_AJUSTADO_{source}": info["adjusted"],
                     f"STOCK_ANTES_{source}": origin_before[source],
                     f"BLOQUEO_REGIONAL_{source}": regional_blocks[source],
+                    f"BLOQUEO_FRECUENCIA_{source}": schedule_blocks[source],
                     f"VALUE_{source}": source_value_category(catalogs, source, sku),
                     f"STORAGE_{source}": source_storage_type(catalogs, source, sku),
                     f"ASIGNADO_{source}": assigned_by_origin[source],
@@ -1983,6 +2169,7 @@ def plan_transfers(
 
         second_pass_before: dict[int, int] = {}
         second_pass_blocks: dict[int, bool] = {}
+        second_pass_schedule_blocks: dict[int, bool] = {}
         candidates: list[tuple[int, int]] = []
         remaining = second_pass_target
         for source in config.origin_warehouses:
@@ -1995,8 +2182,10 @@ def plan_transfers(
                 row["CITY_NORMALIZED"],
                 row["ES_GOLDEN"],
             )
+            schedule_blocked = is_schedule_blocked(catalogs, source, destination)
             second_pass_blocks[source] = blocked
-            if blocked:
+            second_pass_schedule_blocks[source] = schedule_blocked
+            if blocked or schedule_blocked:
                 continue
             quantity = min(remaining, stock_remaining[(source, sku)])
             if quantity > 0:
@@ -2046,6 +2235,11 @@ def plan_transfers(
             for source in config.origin_warehouses
             if second_pass_blocks[source]
         )
+        schedule_blocked_stock = sum(
+            second_pass_before[source]
+            for source in config.origin_warehouses
+            if second_pass_schedule_blocks[source] and not second_pass_blocks[source]
+        )
         if task_limited:
             tipo_corte = "OK PARCIAL - CORTE POR CAPACIDAD DE TAREAS"
             detalle_motivo = (
@@ -2063,6 +2257,12 @@ def plan_transfers(
             detalle_motivo = (
                 f"Segunda pasada: asignadas {assigned} de {target}; parte del "
                 "stock permanece bloqueada por la regla regional explícita"
+            )
+        elif schedule_blocked_stock > 0:
+            tipo_corte = "OK PARCIAL - BLOQUEO POR FRECUENCIA"
+            detalle_motivo = (
+                f"Segunda pasada: asignadas {assigned} de {target}; parte del "
+                "stock está en un origen sin envío programado hoy según SCHEDULE"
             )
         else:
             tipo_corte = "OK PARCIAL - CORTE POR STOCK"
@@ -2107,6 +2307,9 @@ def plan_transfers(
                 {
                     f"STOCK_ANTES_{source}": second_pass_before[source],
                     f"BLOQUEO_REGIONAL_{source}": second_pass_blocks[source],
+                    f"BLOQUEO_FRECUENCIA_{source}": second_pass_schedule_blocks[
+                        source
+                    ],
                     f"VALUE_{source}": source_value_category(catalogs, source, sku),
                     f"STORAGE_{source}": source_storage_type(catalogs, source, sku),
                     f"ASIGNADO_{source}": assigned_by_origin[source],

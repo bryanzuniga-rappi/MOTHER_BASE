@@ -110,6 +110,7 @@ REQUIRED_DATABASE_SHEETS = (
     "TIENDA",
     "STORAGE",
     "OWNER",
+    "SCHEDULE",
 )
 
 SHEET_DESCRIPTIONS = {
@@ -199,6 +200,13 @@ SHEET_DESCRIPTIONS = {
         "Share general de ventas por tienda. Liquid Engine lo utiliza para "
         "distribuir excedentes cuando ya no puede nivelar por DOH."
     ),
+    "SCHEDULE": (
+        "Frecuencia de envío permitida por combinación de WAREHOUSE_ID destino "
+        "y ORIGEN. El toggle 'Bloquear envíos fuera de frecuencia' de CODEC usa "
+        "esta hoja para impedir que un origen envíe a una tienda en un día no "
+        "programado. Un par destino-origen ausente de SCHEDULE no tiene "
+        "restricción de frecuencia."
+    ),
 }
 
 ALEPH_MAX_AGE_HOURS = {
@@ -255,6 +263,8 @@ BREAKDOWN_ORDER = (
     "OK PARCIAL - CORTE POR CAPACIDAD DE TAREAS",
     "CORTE POR BLOQUEO REGIONAL",
     "OK PARCIAL - CORTE POR BLOQUEO REGIONAL",
+    "CORTE POR FRECUENCIA DE ENVÍO",
+    "OK PARCIAL - CORTE POR FRECUENCIA DE ENVÍO",
     "ERROR DE DATOS",
 )
 
@@ -1602,6 +1612,7 @@ def append_insumos_to_bulk_444(
         "lines_removed": 0,
         "products_cut_stock": 0,
         "lines_blocked_regional": 0,
+        "lines_blocked_schedule": 0,
         "stock_detail": [],
     }
     if not summary["enabled"]:
@@ -1641,6 +1652,9 @@ def append_insumos_to_bulk_444(
             is_golden,
         ):
             summary["lines_blocked_regional"] += 1
+            continue
+        if engine.is_schedule_blocked(catalogs, 444, destination):
+            summary["lines_blocked_schedule"] += 1
             continue
         selected_requested.append(row)
     if not selected_requested:
@@ -2526,6 +2540,10 @@ def apply_reporting_labels(result) -> None:
             "OK PARCIAL - BLOQUEO REGIONAL": (
                 "OK PARCIAL - CORTE POR BLOQUEO REGIONAL"
             ),
+            "BLOQUEO POR FRECUENCIA": "CORTE POR FRECUENCIA DE ENVÍO",
+            "OK PARCIAL - BLOQUEO POR FRECUENCIA": (
+                "OK PARCIAL - CORTE POR FRECUENCIA DE ENVÍO"
+            ),
         }
         current_cut = row.get("TIPO_DE_CORTE")
         if current_cut == "OK":
@@ -2561,6 +2579,67 @@ def apply_reporting_labels(result) -> None:
                 renamed_row["ROQ_ORIGINAL" if key == "MOV_ORIGINAL" else key] = value
             row.clear()
             row.update(renamed_row)
+
+
+SCHEDULE_CUT_LABELS = {
+    "CORTE POR FRECUENCIA DE ENVÍO",
+    "OK PARCIAL - CORTE POR FRECUENCIA DE ENVÍO",
+}
+
+
+def schedule_block_summary(result, catalogs) -> dict[str, Any]:
+    """Resume el efecto del toggle 'Bloquear envíos fuera de frecuencia'.
+
+    Debe llamarse después de ``apply_reporting_labels`` para leer las
+    etiquetas finales de TIPO_DE_CORTE.
+    """
+    weekday_display = engine.WEEKDAY_DISPLAY_NAMES.get(
+        catalogs.run_weekday_norm, catalogs.run_weekday_norm
+    )
+    summary: dict[str, Any] = {
+        "enabled": bool(catalogs.schedule_block_enabled),
+        "weekday": weekday_display,
+        "pairs_configured": len(catalogs.schedule_days),
+        "requirements_full_cut": 0,
+        "requirements_partial_cut": 0,
+        "stores": 0,
+        "products": 0,
+        "units_missing": 0,
+    }
+    if not summary["enabled"]:
+        return summary
+
+    affected_rows = [
+        row
+        for row in result.base_rows
+        if row.get("TIPO_DE_CORTE") in SCHEDULE_CUT_LABELS
+    ]
+    stores: set[int] = set()
+    products: set[int] = set()
+    units_missing = 0
+    full_cut = 0
+    partial_cut = 0
+    for row in affected_rows:
+        stores.add(row["WAREHOUSE_DESTINATION"])
+        products.add(row["RETAIL_ID"])
+        target = int(row.get("CANTIDAD_OBJETIVO", 0) or 0)
+        assigned = int(row.get("CANTIDAD_ASIGNADA", 0) or 0)
+        units_missing += max(target - assigned, 0)
+        if str(row.get("TIPO_DE_CORTE", "")).startswith("OK PARCIAL"):
+            partial_cut += 1
+        else:
+            full_cut += 1
+
+    summary.update(
+        {
+            "requirements_full_cut": full_cut,
+            "requirements_partial_cut": partial_cut,
+            "stores": len(stores),
+            "products": len(products),
+            "units_missing": units_missing,
+        }
+    )
+    return summary
 
 
 def build_golden_analytics(result) -> dict[str, Any]:
@@ -3214,6 +3293,7 @@ def apply_avl_fill(
         origin_info: dict[int, dict[str, Any]] = {}
         origin_before: dict[int, int] = {}
         regional_blocks: dict[int, bool] = {}
+        schedule_blocks: dict[int, bool] = {}
         candidate_allocations: list[tuple[int, int]] = []
         remaining_target = target
         for source in config.origin_warehouses:
@@ -3228,8 +3308,10 @@ def apply_avl_fill(
                 city_norm,
                 is_golden,
             )
+            schedule_block = engine.is_schedule_blocked(catalogs, source, destination)
             regional_blocks[source] = regional_block
-            if regional_block:
+            schedule_blocks[source] = schedule_block
+            if regional_block or schedule_block:
                 continue
             quantity = min(remaining_target, available)
             if quantity > 0:
@@ -3251,6 +3333,9 @@ def apply_avl_fill(
                 sku,
                 city_norm,
                 is_golden,
+            )
+            schedule_blocks[source] = engine.is_schedule_blocked(
+                catalogs, source, destination
             )
 
         available_task_slots = max(config.max_tasks - result.tasks_used, 0)
@@ -3406,6 +3491,7 @@ def apply_avl_fill(
                     f"STOCK_INICIAL_AJUSTADO_{source}": info["adjusted"],
                     f"STOCK_ANTES_{source}": origin_before[source],
                     f"BLOQUEO_REGIONAL_{source}": regional_blocks[source],
+                    f"BLOQUEO_FRECUENCIA_{source}": schedule_blocks[source],
                     f"VALUE_{source}": engine.source_value_category(
                         catalogs,
                         source,
@@ -3460,6 +3546,7 @@ def write_executive_pdf(
     liquid: dict[str, Any],
     shalashaska: dict[str, Any],
     fruver_811: dict[str, Any],
+    schedule_block: dict[str, Any],
     input_consolidation: dict[str, Any],
     outliers_f9: dict[str, Any],
 ) -> None:
@@ -3744,6 +3831,20 @@ def write_executive_pdf(
                     f"{fruver_811.get('products_with_stock_blocked', 0):,} productos."
                     if fruver_811.get("enabled")
                     else "FRUVER 811 sin bloqueo manual."
+                )
+                + " "
+                + (
+                    (
+                        f"Frecuencia SCHEDULE ({schedule_block.get('weekday', '')}): "
+                        f"{schedule_block.get('requirements_full_cut', 0):,} casos "
+                        "cortados por completo y "
+                        f"{schedule_block.get('requirements_partial_cut', 0):,} "
+                        f"parciales; {schedule_block.get('units_missing', 0):,} "
+                        f"unidades sin cubrir en "
+                        f"{schedule_block.get('stores', 0):,} tiendas."
+                    )
+                    if schedule_block.get("enabled")
+                    else "Bloqueo por frecuencia SCHEDULE desactivado."
                 ),
                 body_style,
             ),
@@ -4046,6 +4147,7 @@ def execute_planning(
     include_avl_fill: bool = False,
     avl_doh: float = 3.0,
     block_fruver_811: bool = False,
+    block_off_schedule_shipments: bool = False,
     include_preventive_fill: bool = False,
     include_naked_engine: bool = True,
     include_solidus_engine: bool = True,
@@ -4115,6 +4217,17 @@ def execute_planning(
         catalogs.origin_storage_override_enabled = bool(
             apply_origin_storage_override
         )
+        catalogs.schedule_block_enabled = bool(block_off_schedule_shipments)
+        if catalogs.schedule_block_enabled:
+            weekday_display = engine.WEEKDAY_DISPLAY_NAMES.get(
+                catalogs.run_weekday_norm, catalogs.run_weekday_norm
+            )
+            catalogs.warnings.append(
+                "Bloqueo por frecuencia de envío activo: hoy es "
+                f"{weekday_display}; se omitirán los envíos origen-destino "
+                f"fuera de los días definidos en SCHEDULE "
+                f"({len(catalogs.schedule_days):,} combinaciones configuradas)."
+            )
         excluded_sku_set = set(excluded_skus or ())
         manually_excluded_store_ids = set(excluded_store_ids or ())
         catalogs.excluded_products = excluded_sku_set
@@ -4440,6 +4553,7 @@ def execute_planning(
         normalize_result_storage(result)
         analytics = build_planning_analytics(result, origins)
         apply_reporting_labels(result)
+        schedule_block = schedule_block_summary(result, catalogs)
         analytics["golden"] = build_golden_analytics(result)
         fountain9_zero_rows = build_fountain9_zero_report(
             consolidated_input,
@@ -4528,6 +4642,7 @@ def execute_planning(
             liquid=liquid_summary,
             shalashaska=shalashaska_summary,
             fruver_811=fruver_811_summary,
+            schedule_block=schedule_block,
             input_consolidation=consolidation_summary,
             outliers_f9=outlier_summary,
         )
@@ -4637,6 +4752,7 @@ def execute_planning(
         "liquid": liquid_summary,
         "shalashaska": shalashaska_summary,
         "fruver_811": fruver_811_summary,
+        "schedule_block": schedule_block,
         "input_consolidation": consolidation_summary,
         "engine_selection": engine_selection,
         "excluded_skus": sorted(excluded_sku_set),
@@ -5873,6 +5989,32 @@ def render_results(run: dict[str, Any]) -> None:
             "quedaron fuera de la asignación; los demás orígenes siguieron activos."
         )
 
+    schedule_block = run.get("schedule_block", {})
+    if schedule_block.get("enabled"):
+        total_cases = schedule_block.get(
+            "requirements_full_cut", 0
+        ) + schedule_block.get("requirements_partial_cut", 0)
+        if total_cases > 0:
+            st.warning(
+                "Bloqueo por frecuencia de envío aplicado (hoy es "
+                f"{schedule_block.get('weekday', '')}): "
+                f"{schedule_block.get('requirements_full_cut', 0):,} casos "
+                "cortados por completo y "
+                f"{schedule_block.get('requirements_partial_cut', 0):,} parciales "
+                f"por origen fuera de frecuencia; "
+                f"{schedule_block.get('units_missing', 0):,} unidades sin cubrir "
+                f"en {schedule_block.get('stores', 0):,} tiendas y "
+                f"{schedule_block.get('products', 0):,} SKUs distintos "
+                f"({schedule_block.get('pairs_configured', 0):,} combinaciones "
+                "destino-origen configuradas en SCHEDULE)."
+            )
+        else:
+            st.caption(
+                "Bloqueo por frecuencia de envío activo (hoy es "
+                f"{schedule_block.get('weekday', '')}), pero ningún envío quedó "
+                "fuera de los días configurados en SCHEDULE en esta corrida."
+            )
+
     insumos = run.get("insumos", {})
     if insumos.get("lines_added", 0) > 0:
         st.success(
@@ -6228,7 +6370,7 @@ def render() -> None:
             ),
         )
 
-        support_left, support_center = st.columns(2)
+        support_left, support_center, support_right = st.columns(3)
         with support_left:
             include_insumos = st.toggle(
                 "Agregar insumos al BulkCD_444",
@@ -6245,6 +6387,18 @@ def render() -> None:
                 help=(
                     "El stock FRUVER del 811 queda fuera de los tres engines; los "
                     "demás orígenes permanecen disponibles."
+                ),
+            )
+        with support_right:
+            block_off_schedule_shipments = st.toggle(
+                "Bloquear envíos fuera de frecuencia",
+                value=False,
+                help=(
+                    "Usa la hoja SCHEDULE (WAREHOUSE_ID + ORIGEN + DAYS) para "
+                    "impedir que un origen envíe a una tienda en un día no "
+                    "programado. Aplica a Naked, Solidus, Shalashaska, Liquid e "
+                    "Insumos. Un par destino-origen ausente de SCHEDULE no tiene "
+                    "restricción y se evalúa contra la fecha real del servidor."
                 ),
             )
         # Soporte legado conservado en backend para una futura reactivación.
@@ -6594,6 +6748,11 @@ def render() -> None:
                         "Bloqueo FRUVER 811 activo, pero sin efecto porque el 811 "
                         "no está seleccionado como origen."
                     )
+                if block_off_schedule_shipments:
+                    st.write(
+                        "Validando SCHEDULE: se bloquearán los envíos "
+                        "origen-destino fuera de los días programados para hoy…"
+                    )
                 st.write("Calculando demanda, stock, capacidad y tareas…")
                 if st.session_state.get("mb_profile") == "RAIDEN":
                     st.write(
@@ -6638,6 +6797,7 @@ def render() -> None:
                     include_avl_fill=include_avl_fill,
                     avl_doh=float(avl_doh),
                     block_fruver_811=block_fruver_811,
+                    block_off_schedule_shipments=block_off_schedule_shipments,
                     include_preventive_fill=include_preventive_fill,
                     include_naked_engine=include_naked_engine,
                     include_solidus_engine=include_solidus_engine,
