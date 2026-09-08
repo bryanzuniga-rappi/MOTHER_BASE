@@ -576,6 +576,9 @@ def load_copernico_unusable_csv(
     warehouse_856_ignored_mrm_rows = 0
     warehouse_856_unknown_zone_rows = 0
     warehouse_856_unknown_zones: Counter[str] = Counter()
+    lost_zone_rows = 0
+    lost_zone_units = 0.0
+    lost_zone_warehouses: set[int] = set()
 
     with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as handle:
         sample = handle.read(8192)
@@ -613,6 +616,10 @@ def load_copernico_unusable_csv(
                 "El CSV de COPÉRNICO no contiene las columnas obligatorias: "
                 + ", ".join(missing)
             )
+        # ZonaPiso es opcional para bodegas distintas de 856 (se exige más
+        # abajo, por fila, solo cuando la bodega es 856). Si la columna existe,
+        # se usa en todas las bodegas para excluir saldo marcado como LOST.
+        zone_field = field_lookup.get("ZonaPiso")
 
         for row_number, row in enumerate(reader, start=2):
             total_rows += 1
@@ -633,16 +640,30 @@ def load_copernico_unusable_csv(
                 to_float(row.get(field_lookup["Saldo"]), 0.0),
                 0.0,
             )
+            floor_zone = (
+                clean_text(row.get(zone_field)).upper() if zone_field else ""
+            )
+
+            # ZonaPiso = LOST excluye el saldo sin importar la bodega, igual
+            # que CANCELADOS/RECIBO_444 en Ubicacion. Se evalúa antes que
+            # cualquier otra regla para que nunca se cuente como usable.
+            if floor_zone == "LOST":
+                lost_zone_rows += 1
+                lost_zone_units += balance
+                lost_zone_warehouses.add(warehouse)
+                unusable_rows += 1
+                unusable_stock[(warehouse, sku)] += balance
+                if warehouse == 856:
+                    warehouse_856_rows += 1
+                continue
 
             if warehouse == 856:
                 warehouse_856_rows += 1
-                zone_field = field_lookup.get("ZonaPiso")
                 if zone_field is None:
                     raise ValueError(
                         "El CSV de COPÉRNICO contiene filas de Bodega 856 pero "
                         "no incluye la columna ZonaPiso"
                     )
-                floor_zone = clean_text(row.get(zone_field)).upper()
                 storage_by_zone = {
                     "E": "Room Temperature",
                     "RCC": "Freezer",
@@ -709,6 +730,9 @@ def load_copernico_unusable_csv(
         "warehouse_856_ignored_mrm_rows": warehouse_856_ignored_mrm_rows,
         "warehouse_856_unknown_zone_rows": warehouse_856_unknown_zone_rows,
         "warehouse_856_unknown_zones": dict(warehouse_856_unknown_zones),
+        "lost_zone_rows": lost_zone_rows,
+        "lost_zone_units": lost_zone_units,
+        "lost_zone_warehouses": sorted(lost_zone_warehouses),
     }
     return dict(unusable_stock), storage_overrides, summary
 
@@ -923,6 +947,17 @@ def load_catalogs(
                         )
                     )
                     + "."
+                )
+            if copernico_summary["lost_zone_rows"]:
+                lost_warehouse_text = ", ".join(
+                    map(str, copernico_summary["lost_zone_warehouses"])
+                ) or "sin bodegas"
+                warnings.append(
+                    "COPÉRNICO CSV: se excluyeron "
+                    f"{copernico_summary['lost_zone_rows']:,} filas con "
+                    f"ZonaPiso = LOST ({copernico_summary['lost_zone_units']:,.0f} "
+                    f"unidades) sin importar la bodega. Bodegas afectadas: "
+                    f"{lost_warehouse_text}."
                 )
             if copernico_summary["storage_conflicts_856"]:
                 warnings.append(

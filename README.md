@@ -321,7 +321,7 @@ Se carga antes de Fountain9 y puede omitirse si los orígenes del día no requie
 | Producto | `EAN` o `PRODUCT_ID` |
 | Ubicación | `Ubicacion` o `LOCATION` |
 | Cantidad | `Saldo`, `STOCK` o `QUANTITY` |
-| Zona | `ZonaPiso`; obligatoria si existe Bodega 856 |
+| Zona | `ZonaPiso`; obligatoria si existe Bodega 856; se usa en **todas** las bodegas para excluir `LOST` |
 
 El archivo puede contener varios warehouses. Cada fila se aplica a su propia `Bodega`; no está hardcodeado al 444.
 
@@ -338,10 +338,15 @@ COPÉRNICO no define stock. Solo:
 - `CANCELADOS` y `RECIBO_444`: no utilizables.
 - Otras ubicaciones: utilizables si cumplen la estructura histórica de al menos ocho caracteres.
 
+### ZonaPiso = LOST (todas las bodegas)
+
+Sin importar la bodega, una fila con `ZonaPiso = LOST` **siempre se excluye**, igual que `CANCELADOS`/`RECIBO_444` en Ubicacion. Esta regla se evalúa **antes** que cualquier otra (incluida la clasificación E/RCC/RR/MRM de la bodega 856) y tiene prioridad sobre una Ubicación que por sí sola sería utilizable. `ZonaPiso` sigue siendo opcional para bodegas distintas de 856: si la columna no existe en el archivo, simplemente no hay filas LOST que excluir.
+
 ### Bodega 856
 
 | ZonaPiso | Tratamiento | STORAGE |
 |---|---|---|
+| `LOST` | Se descuenta (sin importar la bodega, ver arriba) | Sin override |
 | `E` | Utilizable | Room Temperature |
 | `RCC` | Utilizable | Freezer |
 | `RR` | Utilizable | Refrigerated |
@@ -450,6 +455,7 @@ Luego:
 - Para 425/856 → mínimo entre cálculo anterior y OWNER total.
 - `STOCK.INCOMING` no participa todavía.
 - `ZonaPiso=MRM` del 856 no se descuenta otra vez.
+- `ZonaPiso=LOST` de COPÉRNICO ya está incluido en `COPERNICO_NO_USABLE`, sin importar la bodega (ver §10).
 
 ---
 
@@ -843,6 +849,7 @@ pytest -q
 - [ ] TIENDAS_CERRADAS con encabezado correcto.
 - [ ] OWNER suficiente para 425/856.
 - [ ] TIENDA contiene orígenes y destinos.
+- [ ] Si se carga COPÉRNICO, revise el saldo excluido por ZonaPiso = LOST en advertencias.
 
 ### Negocio
 
@@ -920,6 +927,7 @@ Ejecute al menos tres fechas históricas y compare:
 | No hay Bulk de un origen | No tuvo asignaciones | Revise DETALLE_ASIGNACION. |
 | Un origen no envía y el toggle de frecuencia está activo | Hoy no está en `SCHEDULE.DAYS` para ese destino-origen | Revise `BLOQUEO_FRECUENCIA_<origen>` en BASE_TRANSFERS; confirme el día en SCHEDULE. |
 | COPÉRNICO 856 falla | Falta ZonaPiso | Agregue ZonaPiso. |
+| Saldo LOST no se descuenta en una bodega distinta de 856 | El CSV no incluye la columna ZonaPiso | Agregue ZonaPiso al CSV; es opcional pero requerida para detectar LOST. |
 | STORAGE 856 incorrecto | Ambiente dominante COPÉRNICO | Revise saldos E/RCC/RR. |
 | App reinicia con CSV grande | RAM/timeout | Aumente recursos o reduzca concurrencia. |
 | GitHub no permite Commit | Archivo idéntico o ruta distinta | Compare diff y confirme el archivo desplegado. |
