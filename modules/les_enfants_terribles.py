@@ -51,6 +51,12 @@ from engines.shalashaska_engine import (
     empty_shalashaska_summary,
     load_expiring_inventory,
 )
+from engines.venom_engine import (
+    SECTION_TYPES as VENOM_SECTION_TYPES,
+    VENOM_CUT,
+    apply_venom_engine,
+    empty_venom_summary,
+)
 from engines.mission_control import select_engine_rows
 from mother_base_theme import (
     inject_mother_base_theme,
@@ -265,6 +271,7 @@ BREAKDOWN_ORDER = (
     "OK PARCIAL - CORTE POR BLOQUEO REGIONAL",
     "CORTE POR FRECUENCIA DE ENVÍO",
     "OK PARCIAL - CORTE POR FRECUENCIA DE ENVÍO",
+    VENOM_CUT,
     "ERROR DE DATOS",
 )
 
@@ -1453,6 +1460,131 @@ def load_closed_store_ids(database_path: Path) -> set[int]:
     finally:
         workbook.close()
     return closed_stores
+
+
+def load_avl_catalog_rows(
+    database_path: Path,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Carga todo el catálogo y consolida una ADU por combinación tienda-SKU."""
+    consolidated: dict[tuple[int, int], float] = {}
+    warnings: list[str] = []
+    workbook = openpyxl.load_workbook(database_path, read_only=True, data_only=True)
+    try:
+        for record in engine.iter_sheet_records(
+            workbook,
+            "CATALOGO",
+            ["WAREHOUSE_ID", "PRODUCT_ID", "ADU"],
+            ["WAREHOUSE_ID", "PRODUCT_ID", "ADU"],
+        ):
+            destination = engine.to_id(
+                record["WAREHOUSE_ID"],
+                "CATALOGO.WAREHOUSE_ID",
+                allow_none=True,
+            )
+            sku = engine.to_id(
+                record["PRODUCT_ID"],
+                "CATALOGO.PRODUCT_ID",
+                allow_none=True,
+            )
+            adu = max(engine.to_float(record["ADU"], 0.0), 0.0)
+            if destination is None or sku is None or adu <= 0:
+                continue
+            key = (destination, sku)
+            if key in consolidated and not math.isclose(
+                consolidated[key], adu, abs_tol=1e-9
+            ):
+                previous = consolidated[key]
+                consolidated[key] = max(previous, adu)
+                if len(warnings) < 20:
+                    warnings.append(
+                        f"CATALOGO: {key} tiene ADU {previous} y {adu}; "
+                        f"se usó la mayor ({consolidated[key]})."
+                    )
+            else:
+                consolidated[key] = adu
+    finally:
+        workbook.close()
+
+    rows = [
+        {
+            "WAREHOUSE_DESTINATION": destination,
+            "RETAIL_ID": sku,
+            "ADU": adu,
+        }
+        for (destination, sku), adu in consolidated.items()
+    ]
+    return rows, warnings
+
+
+def load_venom_catalog_lookup(
+    database_path: Path,
+) -> tuple[dict[tuple[int, int], dict[str, Any]], list[str]]:
+    """Carga CATALOGO completo (ADU + LIST_TYPE) para el Venom Engine.
+
+    A diferencia de ``load_avl_catalog_rows``, esta función NO descarta filas
+    con ADU <= 0: Venom necesita saber que una tienda-SKU está en CATALOGO
+    aunque su ADU sea cero, y necesita LIST_TYPE para identificar productos
+    ``BL``. LIST_TYPE es opcional: si la columna no existe en CATALOGO, todas
+    las filas quedan con LIST_TYPE vacío (ningún producto califica como BL).
+    """
+    consolidated: dict[tuple[int, int], dict[str, Any]] = {}
+    warnings: list[str] = []
+    workbook = openpyxl.load_workbook(database_path, read_only=True, data_only=True)
+    try:
+        has_list_type = False
+        if "CATALOGO" in workbook.sheetnames:
+            try:
+                _header_row_number, header_positions = engine.find_header_row(
+                    workbook["CATALOGO"], ["WAREHOUSE_ID", "PRODUCT_ID", "ADU"]
+                )
+                has_list_type = "LIST_TYPE" in header_positions
+            except ValueError:
+                has_list_type = False
+        required = ["WAREHOUSE_ID", "PRODUCT_ID", "ADU"]
+        optional = ["LIST_TYPE"] if has_list_type else []
+        for record in engine.iter_sheet_records(
+            workbook,
+            "CATALOGO",
+            required,
+            required + optional,
+        ):
+            destination = engine.to_id(
+                record["WAREHOUSE_ID"],
+                "CATALOGO.WAREHOUSE_ID",
+                allow_none=True,
+            )
+            sku = engine.to_id(
+                record["PRODUCT_ID"],
+                "CATALOGO.PRODUCT_ID",
+                allow_none=True,
+            )
+            if destination is None or sku is None:
+                continue
+            adu = max(engine.to_float(record["ADU"], 0.0), 0.0)
+            list_type = (
+                engine.clean_text(record.get("LIST_TYPE")).upper()
+                if has_list_type
+                else ""
+            )
+            key = (destination, sku)
+            existing = consolidated.get(key)
+            if existing is None:
+                consolidated[key] = {"adu": adu, "list_type": list_type}
+            else:
+                if adu > existing["adu"]:
+                    existing["adu"] = adu
+                if list_type and not existing["list_type"]:
+                    existing["list_type"] = list_type
+    finally:
+        workbook.close()
+
+    if not has_list_type:
+        warnings.append(
+            "Venom Engine: CATALOGO no tiene columna LIST_TYPE; ningún "
+            "producto calificará como BL (el resto de tipos de sección no se "
+            "ve afectado)."
+        )
+    return consolidated, warnings
 
 
 def load_avl_catalog_rows(
@@ -3547,6 +3679,7 @@ def write_executive_pdf(
     shalashaska: dict[str, Any],
     fruver_811: dict[str, Any],
     schedule_block: dict[str, Any],
+    venom: dict[str, Any],
     input_consolidation: dict[str, Any],
     outliers_f9: dict[str, Any],
 ) -> None:
@@ -3813,6 +3946,17 @@ def write_executive_pdf(
                     )
                     if liquid.get("enabled")
                     else " Liquid Engine desactivado."
+                )
+                + (
+                    (
+                        f" Venom Engine (DDMRP, LT {venom.get('lead_time_days', 0):g}d): "
+                        f"{venom.get('lines_sent_ddmrp', 0):,} líneas DDMRP + "
+                        f"{venom.get('lines_sent_oowl', 0):,} OOWL, "
+                        f"{venom.get('units_sent', 0):,} unidades adicionales en "
+                        f"{venom.get('tasks_added', 0):,} tareas nuevas."
+                    )
+                    if venom.get("enabled")
+                    else " Venom Engine desactivado."
                 ),
                 body_style,
             ),
@@ -4162,6 +4306,12 @@ def execute_planning(
     excluded_store_ids: set[int] | None = None,
     apply_origin_storage_override: bool = False,
     exclude_fountain9_outlier_stores: bool = True,
+    include_venom_engine: bool = False,
+    venom_origins: tuple[int, ...] = (),
+    venom_destinations: tuple[int, ...] = (),
+    venom_section_types: frozenset[str] = frozenset(),
+    venom_lead_time_days: float = 7.0,
+    venom_consider_current_planning: bool = True,
 ) -> dict[str, Any]:
     clear_previous_workspace()
     workspace = Path(tempfile.mkdtemp(prefix="transfer_planner_"))
@@ -4545,6 +4695,61 @@ def execute_planning(
                 f"{liquid_summary['stock_exhausted_cases']:,} saldos de "
                 "origen-SKU quedaron agotados."
             )
+        venom_summary = empty_venom_summary(include_venom_engine)
+        if include_venom_engine:
+            venom_catalog_lookup, venom_catalog_warnings = load_venom_catalog_lookup(
+                data_path
+            )
+            catalogs.warnings.extend(venom_catalog_warnings)
+            effective_venom_origins = tuple(
+                source for source in venom_origins if source in origins
+            )
+            effective_venom_destinations = tuple(
+                destination
+                for destination in venom_destinations
+                if destination not in engine_blocked_store_ids
+            )
+            if not effective_venom_origins:
+                result.warnings.append(
+                    "Venom Engine: activo, pero sin orígenes válidos "
+                    "seleccionados (deben estar entre los orígenes de CODEC). "
+                    "No se generaron líneas."
+                )
+            elif not effective_venom_destinations:
+                result.warnings.append(
+                    "Venom Engine: activo, pero ninguna tienda destino "
+                    "seleccionada quedó disponible (revisa exclusiones y "
+                    "ciudades bloqueadas). No se generaron líneas."
+                )
+            elif not venom_section_types:
+                result.warnings.append(
+                    "Venom Engine: activo, pero no se seleccionó ningún tipo "
+                    "de sección. No se generaron líneas."
+                )
+            else:
+                venom_summary = apply_venom_engine(
+                    result,
+                    catalogs,
+                    config,
+                    venom_origins=effective_venom_origins,
+                    venom_destinations=effective_venom_destinations,
+                    section_types=set(venom_section_types),
+                    lead_time_days=float(venom_lead_time_days),
+                    consider_current_planning=venom_consider_current_planning,
+                    catalog_lookup=venom_catalog_lookup,
+                    closed_or_excluded_store_ids=engine_blocked_store_ids,
+                    blocked_cities=blocked_cities,
+                    reason_column=PLANNING_REASON_COLUMN,
+                )
+                result.warnings.append(
+                    "Venom Engine (DDMRP post-planeación, lead time "
+                    f"{venom_lead_time_days:g}d): "
+                    f"{venom_summary['lines_sent_ddmrp']:,} líneas DDMRP y "
+                    f"{venom_summary['lines_sent_oowl']:,} líneas OOWL; "
+                    f"{venom_summary['units_sent']:,} unidades adicionales en "
+                    f"{venom_summary['tasks_added']:,} tareas nuevas del "
+                    "presupuesto compartido."
+                )
         owner_summary = engine.apply_owner_inventory_partition(
             result,
             catalogs,
@@ -4643,6 +4848,7 @@ def execute_planning(
             shalashaska=shalashaska_summary,
             fruver_811=fruver_811_summary,
             schedule_block=schedule_block,
+            venom=venom_summary,
             input_consolidation=consolidation_summary,
             outliers_f9=outlier_summary,
         )
@@ -4753,6 +4959,7 @@ def execute_planning(
         "shalashaska": shalashaska_summary,
         "fruver_811": fruver_811_summary,
         "schedule_block": schedule_block,
+        "venom": venom_summary,
         "input_consolidation": consolidation_summary,
         "engine_selection": engine_selection,
         "excluded_skus": sorted(excluded_sku_set),
@@ -5980,6 +6187,91 @@ def render_results(run: dict[str, Any]) -> None:
             columns_count=4,
         )
 
+    venom = run.get("venom", {})
+    if venom.get("enabled"):
+        st.markdown(
+            '<span class="section-label">VENOM ENGINE · DDMRP POST-PLANEACIÓN'
+            '</span>',
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            "Corrió al final, sobre los remanentes post-allocation. Sus líneas "
+            "nunca se consolidan con lo ya planeado: aparecen separadas en "
+            "DETALLE_ASIGNACION y en los CSV, marcadas con "
+            f"'{VENOM_CUT}'."
+        )
+        render_kpi_cards(
+            [
+                {
+                    "category": "TAREAS · VENOM",
+                    "label": "TAREAS NUEVAS UTILIZADAS",
+                    "value": f"{venom.get('tasks_added', 0):,}",
+                    "description": (
+                        "Nuevas líneas de Venom, del mismo presupuesto compartido "
+                        "de tareas que Naked/Solidus/Shalashaska/Liquid. Cuentan "
+                        "aunque dupliquen un trío origen-destino-SKU ya usado."
+                    ),
+                    "tone": "blue",
+                },
+                {
+                    "category": "UNIDADES · DDMRP",
+                    "label": "UNIDADES POR BUFFER DDMRP",
+                    "value": f"{venom.get('units_sent_ddmrp', 0):,}",
+                    "description": (
+                        "Unidades enviadas para subir el Net Flow Position hasta "
+                        "el techo de la zona verde (Top of Green), calculado con "
+                        "factores medios (LTF=0.5, VF=0.5) y el lead time "
+                        f"capturado ({venom.get('lead_time_days', 0):g} días)."
+                    ),
+                    "tone": "acid",
+                },
+                {
+                    "category": "UNIDADES · OOWL",
+                    "label": "UNIDADES POR MÍNIMO OOWL",
+                    "value": f"{venom.get('units_sent_oowl', 0):,}",
+                    "description": (
+                        "Tienda-SKU con stock en origen, cero stock/incoming en "
+                        "destino y sin ADU en CATALOGO: se manda el mínimo "
+                        "operativo directo, sin calcular buffer."
+                    ),
+                    "tone": "coral",
+                },
+                {
+                    "category": "TIENDAS Y SKUS",
+                    "label": "TIENDAS / SKUS DISTINTOS",
+                    "value": f"{venom.get('stores', 0):,} / {venom.get('products', 0):,}",
+                    "description": (
+                        "Tiendas y productos distintos que recibieron una línea de "
+                        "Venom en esta corrida."
+                    ),
+                },
+            ],
+            columns_count=4,
+        )
+        skipped_total = sum(
+            venom.get(key, 0)
+            for key in (
+                "skipped_no_adu",
+                "skipped_no_stock",
+                "skipped_no_capacity",
+                "skipped_task_limit",
+                "skipped_regional_block",
+                "skipped_schedule_block",
+                "skipped_closed_store",
+                "skipped_blocked_city",
+                "skipped_route_cost",
+                "skipped_excluded_sku",
+            )
+        )
+        if skipped_total > 0:
+            st.warning(
+                f"Venom evaluó {venom.get('candidates_ddmrp', 0):,} candidatos "
+                f"DDMRP y {venom.get('candidates_oowl', 0):,} candidatos OOWL, "
+                f"pero {skipped_total:,} quedaron sin línea por stock "
+                "insuficiente, capacidad, tareas, bloqueos o falta de ADU "
+                "(ver advertencias para el detalle)."
+            )
+
     fruver_811 = run.get("fruver_811", {})
     if fruver_811.get("enabled"):
         st.warning(
@@ -6412,6 +6704,7 @@ def render() -> None:
     st.session_state.setdefault("mb_engine_solidus_enabled", True)
     st.session_state.setdefault("mb_engine_shalashaska_enabled", False)
     st.session_state.setdefault("mb_engine_liquid_enabled", False)
+    st.session_state.setdefault("mb_engine_venom_enabled", False)
 
     with st.container(border=True, key="engine_naked_module"):
         include_naked_engine = bool(
@@ -6651,6 +6944,112 @@ def render() -> None:
                 "de SKUs no están disponibles para esta corrida."
             )
 
+    with st.container(border=True, key="engine_venom_module"):
+        include_venom_engine = bool(st.session_state["mb_engine_venom_enabled"])
+        if render_action_card(
+            key="engine_venom_card",
+            eyebrow="ENGINE / 05 · DDMRP POST-PLANEACIÓN",
+            title="VENOM ENGINE",
+            description=(
+                "Corre al final, sobre los remanentes post-allocation y lo ya "
+                "incoming de esta corrida. Aplica un modelo DDMRP simplificado "
+                "para llenar buffers; sus líneas nunca se consolidan con lo ya "
+                "planeado."
+            ),
+            active=include_venom_engine,
+            tone="blue",
+            status="ACTIVO" if include_venom_engine else "INACTIVO · CLIC PARA ACTIVAR",
+            min_height=150,
+            help_text="Haz clic en la tarjeta para activar o desactivar Venom Engine.",
+        ):
+            st.session_state["mb_engine_venom_enabled"] = not include_venom_engine
+            st.rerun()
+        if include_venom_engine:
+            venom_left, venom_right = st.columns([2, 1])
+            with venom_left:
+                venom_origins = st.multiselect(
+                    "Warehouses origen — Venom",
+                    options=list(selected_origins),
+                    default=list(selected_origins),
+                    format_func=format_origin,
+                    help=(
+                        "Solo puede usar orígenes ya seleccionados arriba en "
+                        "CODEC, en el mismo orden de prioridad."
+                    ),
+                )
+                venom_destinations = st.multiselect(
+                    "Tiendas destino — Venom",
+                    options=list(store_labels),
+                    default=[],
+                    format_func=lambda warehouse: store_labels.get(
+                        warehouse, str(warehouse)
+                    ),
+                    help=(
+                        "Venom solo evalúa buffers DDMRP para las tiendas "
+                        "seleccionadas aquí. Respeta TIENDAS_CERRADAS, "
+                        "exclusiones, ciudades bloqueadas y outliers Fountain9 "
+                        "igual que el resto de los engines."
+                    ),
+                )
+            with venom_right:
+                venom_lead_time_days = st.number_input(
+                    "Lead time (días)",
+                    min_value=0.1,
+                    max_value=365.0,
+                    value=7.0,
+                    step=0.5,
+                    help=(
+                        "Días de cobertura usados para construir las zonas "
+                        "roja/amarilla/verde del buffer DDMRP."
+                    ),
+                )
+                venom_consider_current_planning = st.toggle(
+                    "Considerar planeación actual",
+                    value=True,
+                    help=(
+                        "Activo: el On-Order del Net Flow Position incluye lo ya "
+                        "asignado por Naked/Solidus/AVL/Preventivo/Shalashaska/"
+                        "Liquid/Insumos en esta misma corrida. Apagado: Venom "
+                        "evalúa el buffer como si nada más hubiera corrido hoy."
+                    ),
+                )
+            venom_section_type_labels = {
+                "IS_INFALTABLE": "Infaltable",
+                "IS_GOLDEN": "Golden",
+                "IS_ANCHOR": "Anchor",
+                "BL": "BL (CATALOGO.LIST_TYPE)",
+                "OOWL": "OOWL — sin pronóstico, mínimo operativo",
+            }
+            venom_section_types = st.multiselect(
+                "Tipo de sección — Venom",
+                options=list(VENOM_SECTION_TYPES),
+                default=[],
+                format_func=lambda value: venom_section_type_labels.get(
+                    value, value
+                ),
+                help=(
+                    "Venom solo construye buffer para tienda-SKU que califiquen "
+                    "en al menos uno de los tipos marcados aquí. OOWL es la "
+                    "excepción: no usa DDMRP, manda el mínimo operativo cuando "
+                    "hay stock en origen y cero stock/incoming en destino."
+                ),
+            )
+            if not venom_section_types:
+                st.info(
+                    "Selecciona al menos un tipo de sección para que Venom "
+                    "genere líneas."
+                )
+        else:
+            venom_origins = []
+            venom_destinations = []
+            venom_section_types = []
+            venom_lead_time_days = 7.0
+            venom_consider_current_planning = True
+            st.caption(
+                "Venom Engine está apagado. No se ejecutará ningún llenado "
+                "DDMRP posterior a la planeación."
+            )
+
     submitted = st.button(
         "EJECUTAR PLANEACIÓN →",
         use_container_width=True,
@@ -6669,6 +7068,7 @@ def render() -> None:
             or include_solidus_engine
             or include_shalashaska_engine
             or include_liquid_engine
+            or include_venom_engine
         ):
             st.error("Activa al menos un engine para ejecutar la misión.")
             st.stop()
@@ -6769,11 +7169,17 @@ def render() -> None:
                             (include_solidus_engine, "Solidus"),
                             (include_shalashaska_engine, "Shalashaska"),
                             (include_liquid_engine, "Liquid"),
+                            (include_venom_engine, "Venom"),
                         )
                         if enabled
                     )
                     + "."
                 )
+                if include_venom_engine:
+                    st.write(
+                        "Reservando la última pasada para el llenado DDMRP de "
+                        f"Venom (lead time {venom_lead_time_days:g}d)…"
+                    )
                 if include_avl_fill:
                     st.write(
                         f"Reservando una pasada para stockouts AVL a "
@@ -6817,6 +7223,14 @@ def render() -> None:
                     apply_origin_storage_override=apply_origin_storage_override,
                     exclude_fountain9_outlier_stores=(
                         exclude_fountain9_outlier_stores
+                    ),
+                    include_venom_engine=include_venom_engine,
+                    venom_origins=tuple(venom_origins),
+                    venom_destinations=tuple(venom_destinations),
+                    venom_section_types=frozenset(venom_section_types),
+                    venom_lead_time_days=float(venom_lead_time_days),
+                    venom_consider_current_planning=(
+                        venom_consider_current_planning
                     ),
                 )
                 status.update(label="Planeación finalizada", state="complete", expanded=False)

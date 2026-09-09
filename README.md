@@ -20,6 +20,7 @@ Mother Base es una aplicación web construida con Streamlit. Su módulo operativ
 - Interfaz de planeación **Outer Heaven**.
 - Panel de variables compartidas **CODEC**.
 - Cuatro engines activables: Naked, Solidus, Shalashaska y Liquid.
+- **Venom Engine**: quinto engine opcional, llenado DDMRP posterior a toda la planeación.
 - Lectura automática del Google Sheet público `DATA_TRANSFERS`.
 - Panel visual de salud de todas las fuentes.
 - Carga opcional de un CSV de COPÉRNICO.
@@ -564,6 +565,55 @@ ADU estimado = Predicted Demand / días del horizonte
 
 Primero nivela hasta un máximo fijo de 14 DOH. Después distribuye el resto por SHARE_VENTAS, en enteros, usando piso y residuos mayores. Respeta stock, capacidad, tareas y restricciones.
 
+### Venom Engine
+
+Quinto engine, **opcional y desactivado por default**. Corre al final de absolutamente todo (después de Naked, Solidus, AVL, Preventivo, Shalashaska, Liquid e Insumos, y antes de la partición por OWNER), sobre los remanentes de stock post-allocation y lo ya asignado ("incoming") en esa misma corrida. Aplica un modelo **DDMRP (Demand Driven MRP)** simplificado para decidir si hace falta un envío adicional de llenado de buffer.
+
+**Variables de Venom en CODEC:**
+
+| Variable | Formato | Nota |
+|---|---|---|
+| Warehouses origen — Venom | Multiselección, mismo estilo que CODEC | Restringido a un subconjunto de los orígenes ya elegidos arriba. |
+| Tiendas destino — Venom | Multiselección | Respeta TIENDAS_CERRADAS, exclusiones, ciudades bloqueadas y outliers Fountain9. |
+| Tipo de sección | Multiselección: Infaltable, Golden, Anchor, BL, OOWL | Un par tienda-SKU entra si cumple **al menos uno** de los tipos marcados. |
+| Lead time (días) | Numérico libre | Alimenta las zonas roja/amarilla/verde. |
+| Considerar planeación actual | Toggle, activo por default | Ver "On-Order" abajo. |
+
+**Modelo DDMRP simplificado**, con factores medios estándar (`LTF = 0.5`, `VF = 0.5`):
+
+```text
+ADU           = CATALOGO.ADU de esa tienda-SKU
+Red Base      = ADU x Lead Time x LTF
+Red Safety    = Red Base x VF
+Red Zone      = Red Base + Red Safety
+Yellow Zone   = ADU x Lead Time
+Green Zone    = max(ADU x Lead Time x LTF, mínimo operativo de 3)
+Top of Red    = Red Zone
+Top of Yellow = Red Zone + Yellow Zone
+Top of Green  = Top of Yellow + Green Zone
+
+On-Hand       = STOCK_DISPONIBLE_FINAL remanente en la tienda destino
+On-Order      = unidades ya asignadas a esa tienda-SKU en esta misma corrida
+                (Naked+Solidus+AVL+Preventivo+Shalashaska+Liquid+Insumos),
+                solo si "Considerar planeación actual" está activo; si no, 0.
+Demanda Calif.= ADU x Lead Time
+NFP           = On-Hand + On-Order - Demanda Calificada
+```
+
+Si `NFP >= Top of Yellow` el buffer está sano y no se genera envío. Si no, Venom ordena hasta el techo de la zona verde: `Cantidad = ceil(Top of Green - NFP)`.
+
+**Tipos de sección:**
+
+- `IS_INFALTABLE`, `IS_GOLDEN`, `IS_ANCHOR`: mismos flags que ya usa el resto del proyecto (`GOLDEN_INFALTABLES_ANCHOR`).
+- `BL`: tienda-SKU con `CATALOGO.LIST_TYPE = "BL"`. `LIST_TYPE` es una columna opcional en `CATALOGO`; si no existe, ningún producto califica como BL y Venom avisa con una advertencia (el resto de tipos de sección no se ve afectado).
+- `OOWL`: **no es una clasificación estática**, es una condición evaluada en tiempo de corrida — combinaciones tienda-SKU con stock disponible en alguno de los orígenes de Venom, **cero stock/incoming en la tienda destino**, sin importar si tienen ADU o no. En ese caso Venom no calcula ningún buffer: manda directamente el mínimo operativo (`config.minimum_positive_quantity`, 3 unidades por default), sujeto a stock, capacidad y tareas.
+
+**No consolidación (regla mandante de Venom):** a diferencia de Liquid/Shalashaska/AVL, Venom **nunca** revisa si el trío origen-destino-SKU ya tiene una línea de otro engine para sumarle cantidad. Siempre agrega una fila **nueva y separada** a `DETALLE_ASIGNACION` y a los CSV, marcada con `PLANNING_REASON = "ENVIADO POR VENOM ENGINE"` y `TIPO_DE_CORTE = "ENVIADOS POR VENOM ENGINE"`. Si Naked ya mandó 10 unidades del SKU X a la tienda Y y Venom decide mandar 18 más, el reporte muestra **dos líneas** (10 y 18), nunca una consolidada de 28.
+
+**Presupuesto de tareas:** cada línea de Venom consume una tarea del mismo `MAX_TASKS` compartido con Naked/Solidus/Shalashaska/Liquid, incluso cuando duplica un trío origen-destino-SKU ya usado por otro engine.
+
+**Restricciones heredadas:** TIENDAS_CERRADAS, exclusiones manuales, outliers Fountain9, ciudades bloqueadas, RUTA_COSTOS, BLOQUEOS regionales, CAP_RECIBO y el toggle de frecuencia SCHEDULE — igual que el resto de los engines.
+
 ---
 
 ## 18. INSUMOS
@@ -643,6 +693,12 @@ BulkCD_856_CHEDRAUI.csv
 | Liquid | Orígenes automáticos | Todos seleccionados |
 | Liquid | Horizonte forecast | 7 días |
 | Liquid | SKUs manuales | Lista por origen |
+| Venom | Activar | Inactivo |
+| Venom | Warehouses origen | Subconjunto de los orígenes de CODEC |
+| Venom | Tiendas destino | Ninguna (hay que seleccionar) |
+| Venom | Tipo de sección | Ninguno (hay que seleccionar al menos uno) |
+| Venom | Lead time (días) | 7 |
+| Venom | Considerar planeación actual | Activo |
 
 ### Orígenes disponibles
 
@@ -733,6 +789,7 @@ Los resultados son temporales: deben descargarse antes de que expire la sesión.
 | OK PARCIAL - CORTE POR BLOQUEO REGIONAL | Otro origen cubrió parte. |
 | CORTE POR FRECUENCIA DE ENVÍO | Todos los orígenes elegibles no tienen envío programado hoy según SCHEDULE. |
 | OK PARCIAL - CORTE POR FRECUENCIA DE ENVÍO | Otro origen sí tenía envío programado hoy y cubrió parte o el total. |
+| ENVIADOS POR VENOM ENGINE | Línea de llenado DDMRP post-planeación. Nunca se consolida con otra línea del mismo trío origen-destino-SKU; siempre es una fila adicional y separada. |
 | ERROR DE DATOS | Falta información obligatoria. |
 
 La tabla web muestra al menos 12 filas sin scroll vertical.
@@ -863,6 +920,7 @@ pytest -q
 - [ ] Owners no se mezclan.
 - [ ] INSUMOS respeta MOQ y stock 444.
 - [ ] PLANNING_REASON coincide con el engine.
+- [ ] Si Venom está activo, sus líneas aparecen SEPARADAS (nunca consolidadas) en DETALLE_ASIGNACION y en los CSV, marcadas "ENVIADO POR VENOM ENGINE".
 
 ### Conciliación de go-live
 
@@ -993,6 +1051,13 @@ Para misión crítica agregue SSO, persistencia, auditoría, monitoreo, control 
 | MOQ | Múltiplo mínimo de envío. |
 | CODEC | Variables compartidas. |
 | SCHEDULE | Hoja de frecuencia de envío permitida por destino–origen. |
+| DDMRP | Demand Driven MRP; metodología de buffers roja/amarilla/verde que usa Venom Engine. |
+| NFP | Net Flow Position; On-Hand + On-Order − Demanda Calificada. |
+| LTF | Lead Time Factor; tamaño de la zona roja/verde según el lead time. Venom usa el factor medio (0.5). |
+| VF | Variability Factor; tamaño de la zona de seguridad roja. Venom usa el factor medio (0.5). |
+| Top of Green (TOG) | Techo de la zona verde de un buffer DDMRP; el objetivo de llenado de Venom. |
+| Top of Yellow (TOY) | Techo de la zona amarilla; si el NFP cae por debajo, se dispara un reabasto. |
+| OOWL | En Venom, tienda-SKU con stock en origen y cero stock/incoming en destino, sin ADU para construir un buffer; se manda el mínimo operativo. |
 | Outer Heaven | Interfaz táctica de planeación. |
 
 ---
