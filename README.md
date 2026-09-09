@@ -518,7 +518,7 @@ Ejecuta casos con ROQ original positivo. Consume stock, capacidad y tareas. Sus 
 
 ### Solidus Engine
 
-Procesa hardcodes de forecast/opening/Net Transfer y dos coberturas opcionales:
+Procesa hardcodes de forecast/opening/Net Transfer y tres coberturas opcionales:
 
 **AVL:** busca catálogo con stock final cero y sin servicio positivo previo. Objetivo:
 
@@ -528,7 +528,15 @@ max(ceil(ADU × DOH objetivo), 3)
 
 **Prevención:** busca inventario positivo con menos de 1 DOH o menos de 3 unidades, sin recomendación positiva Fountain9, e intenta llevarlo al DOH configurado.
 
-Ambas usan únicamente stock, capacidad y tareas remanentes.
+**Refuerzo Golden/Infaltable/Anchor:** busca en el catálogo combinaciones tienda-SKU marcadas `IS_GOLDEN`, `IS_INFALTABLE` o `IS_ANCHOR` cuyo DOH actual esté por debajo de un **objetivo independiente** (variable propia en CODEC, default 21 DOH — no comparte el número con AVL/prevención), sin recomendación positiva de Fountain9. Objetivo:
+
+```text
+max(ceil(ADU × DOH objetivo Golden/Infaltable/Anchor) − stock destino, 0)
+```
+
+A diferencia de AVL y prevención, **no** aplica el mínimo forzado de 3 unidades: si a un producto especial le faltan menos de 3 para llegar al DOH objetivo, se le manda exactamente lo que falta. `PLANNING_REASON = "REFUERZO GOLDEN/INFALTABLE/ANCHOR · SOLIDUS ENGINE"`, `TIPO_DE_CORTE = "ENVIADOS PARA REFORZAR GOLDEN/INFALTABLE/ANCHOR"`.
+
+Las tres coberturas usan únicamente stock, capacidad y tareas remanentes, en el orden: AVL → Prevención → Refuerzo Golden/Infaltable/Anchor — cada una solo ve las tareas que dejaron libres las anteriores.
 
 ### Shalashaska Engine
 
@@ -701,7 +709,9 @@ BulkCD_856_CHEDRAUI.csv
 | Solidus | Activar | Activo |
 | Solidus | Cubrir AVL | Inactivo |
 | Solidus | Prevenir quiebres | Inactivo |
-| Solidus | DOH objetivo | 3 |
+| Solidus | DOH objetivo (AVL y prevención) | 3 |
+| Solidus | Reforzar Golden/Infaltable/Anchor | Inactivo |
+| Solidus | DOH objetivo (Golden/Infaltable/Anchor) | 21 |
 | Shalashaska | Activar | Inactivo |
 | Shalashaska | DOH primera pasada | 7 |
 | Liquid | Activar | Inactivo |
@@ -793,6 +803,7 @@ Los resultados son temporales: deben descargarse antes de que expire la sesión.
 | OK PARCIAL - CORTE POR STOCK | Unidades menores al objetivo por stock. |
 | ENVIADOS PARA CUBRIR AVL | Cobertura de stockout de CATALOGO. |
 | ENVIADOS PARA PREVENIR QUIEBRE | Refuerzo preventivo Solidus. |
+| ENVIADOS PARA REFORZAR GOLDEN/INFALTABLE/ANCHOR | Refuerzo de DOH para productos especiales Solidus. |
 | ENVIADOS POR SHALASHASKA ENGINE | Evacuación próxima a caducar. |
 | ENVIADOS POR LIQUID ENGINE | Liquidación de remanente. |
 | SIN RECOMENDACIÓN | No hubo necesidad positiva; no equivale necesariamente a forecast cero. |

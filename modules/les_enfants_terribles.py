@@ -258,6 +258,7 @@ BREAKDOWN_ORDER = (
     "OK PARCIAL - CORTE POR STOCK",
     "ENVIADOS PARA CUBRIR AVL",
     "ENVIADOS PARA PREVENIR QUIEBRE",
+    "ENVIADOS PARA REFORZAR GOLDEN/INFALTABLE/ANCHOR",
     SHALASHASKA_CUT,
     LIQUID_CUT,
     "SIN RECOMENDACIÓN",
@@ -291,6 +292,8 @@ PLANNING_REASON_FOUNTAIN9 = "FOUNTAIN9 · NAKED ENGINE"
 PLANNING_REASON_MANUAL_FORECAST_ZERO = "PROTECCIÓN · SOLIDUS ENGINE"
 PLANNING_REASON_AVL = "CUBRIR AVL · SOLIDUS ENGINE"
 PLANNING_REASON_PREVENTIVE = "EVITAR QUIEBRES · SOLIDUS ENGINE"
+PLANNING_REASON_SPECIAL_DOH = "REFUERZO GOLDEN/INFALTABLE/ANCHOR · SOLIDUS ENGINE"
+SPECIAL_DOH_CUT = "ENVIADOS PARA REFORZAR GOLDEN/INFALTABLE/ANCHOR"
 PLANNING_REASON_INSUMOS = "INSUMOS"
 BULK_OUTPUT_COLUMNS = [*engine.OUTPUT_COLUMNS, PLANNING_REASON_COLUMN]
 
@@ -3259,6 +3262,7 @@ def empty_avl_summary(enabled: bool, doh: float) -> dict[str, Any]:
         "catalog_rows": 0,
         "stockout_candidates": 0,
         "preventive_candidates": 0,
+        "special_candidates": 0,
         "cases_sent": 0,
         "cases_full": 0,
         "cases_partial": 0,
@@ -3273,6 +3277,8 @@ def empty_avl_summary(enabled: bool, doh: float) -> dict[str, Any]:
         "skipped_blocked_city": 0,
         "skipped_missing_stock": 0,
         "skipped_not_stockout": 0,
+        "skipped_not_special": 0,
+        "skipped_doh_sufficient": 0,
         "skipped_already_served": 0,
         "skipped_route_cost": 0,
         "skipped_capacity": 0,
@@ -3292,8 +3298,9 @@ def apply_avl_fill(
     candidate_mode: str = "stockout",
     excluded_keys: set[tuple[int, int]] | None = None,
 ) -> dict[str, Any]:
-    """Usa tareas remanentes para stockouts o inventario preventivo del catálogo."""
-    if candidate_mode not in {"stockout", "preventive"}:
+    """Usa tareas remanentes para stockouts, inventario preventivo o refuerzo
+    de Golden/Infaltable/Anchor del catálogo."""
+    if candidate_mode not in {"stockout", "preventive", "special_doh"}:
         raise ValueError(f"Modo de cobertura de catálogo inválido: {candidate_mode}")
     summary = empty_avl_summary(True, doh)
     summary["mode"] = candidate_mode
@@ -3365,13 +3372,20 @@ def apply_avl_fill(
         destination_stock = max(float(catalogs.stock_base[key]), 0.0)
         adu = float(catalog_row["ADU"])
         current_doh = destination_stock / adu if adu > 0 else math.inf
+        priority_profile = engine.product_priority_profile(
+            catalogs,
+            destination,
+            sku,
+        )
+        is_golden = priority_profile["is_golden"]
+        is_kvi = priority_profile["is_kvi"]
         if candidate_mode == "stockout":
             if destination_stock > 0:
                 summary["skipped_not_stockout"] += 1
                 continue
             target = max(int(math.ceil(adu * doh)), 3)
             summary["stockout_candidates"] += 1
-        else:
+        elif candidate_mode == "preventive":
             if destination_stock <= 0 or not (
                 destination_stock < 3 or current_doh < 1
             ):
@@ -3382,6 +3396,22 @@ def apply_avl_fill(
                 3,
             )
             summary["preventive_candidates"] += 1
+        else:  # special_doh — refuerzo de Golden/Infaltable/Anchor
+            if not (
+                priority_profile["is_infaltable"]
+                or priority_profile["is_golden"]
+                or priority_profile["is_anchor"]
+            ):
+                summary["skipped_not_special"] += 1
+                continue
+            if adu <= 0 or current_doh >= doh:
+                summary["skipped_doh_sufficient"] += 1
+                continue
+            target = int(math.ceil(max((adu * doh) - destination_stock, 0.0)))
+            if target <= 0:
+                summary["skipped_doh_sufficient"] += 1
+                continue
+            summary["special_candidates"] += 1
         if key in assigned_keys or key in excluded_key_set:
             summary["skipped_already_served"] += 1
             continue
@@ -3389,13 +3419,6 @@ def apply_avl_fill(
             summary["skipped_route_cost"] += 1
             continue
 
-        priority_profile = engine.product_priority_profile(
-            catalogs,
-            destination,
-            sku,
-        )
-        is_golden = priority_profile["is_golden"]
-        is_kvi = priority_profile["is_kvi"]
         candidates.append(
             {
                 "WAREHOUSE_DESTINATION": destination,
@@ -3559,7 +3582,11 @@ def apply_avl_fill(
                     PLANNING_REASON_COLUMN: (
                         PLANNING_REASON_AVL
                         if candidate_mode == "stockout"
-                        else PLANNING_REASON_PREVENTIVE
+                        else (
+                            PLANNING_REASON_PREVENTIVE
+                            if candidate_mode == "preventive"
+                            else PLANNING_REASON_SPECIAL_DOH
+                        )
                     ),
                 }
             )
@@ -3605,7 +3632,13 @@ def apply_avl_fill(
             "CURRENT_INVENTORY": candidate["DESTINATION_STOCK"],
             "MOV_ORIGINAL": 0,
             "REGLA_DEMANDA": (
-                "AVL_DOH" if candidate_mode == "stockout" else "PREVENTIVO_DOH"
+                "AVL_DOH"
+                if candidate_mode == "stockout"
+                else (
+                    "PREVENTIVO_DOH"
+                    if candidate_mode == "preventive"
+                    else "REFUERZO_ESPECIALES_DOH"
+                )
             ),
             "ADU_CATALOGO": candidate["ADU"],
             "DOH_AVL": doh,
@@ -3653,7 +3686,11 @@ def apply_avl_fill(
             "TIPO_DE_CORTE": (
                 "ENVIADOS PARA CUBRIR AVL"
                 if candidate_mode == "stockout"
-                else "ENVIADOS PARA PREVENIR QUIEBRE"
+                else (
+                    "ENVIADOS PARA PREVENIR QUIEBRE"
+                    if candidate_mode == "preventive"
+                    else SPECIAL_DOH_CUT
+                )
             ),
             "DETALLE_MOTIVO": (
                 (
@@ -3662,6 +3699,12 @@ def apply_avl_fill(
                     else (
                         f"Inventario preventivo: {candidate['DESTINATION_STOCK']:g} "
                         f"unidades y {candidate['CURRENT_DOH']:.3f} DOH antes del envío"
+                        if candidate_mode == "preventive"
+                        else (
+                            "Refuerzo Golden/Infaltable/Anchor: "
+                            f"{candidate['DESTINATION_STOCK']:g} unidades y "
+                            f"{candidate['CURRENT_DOH']:.3f} DOH antes del envío"
+                        )
                     )
                 )
                 + f"; objetivo de cobertura {doh:g} DOH con ADU "
@@ -3734,6 +3777,7 @@ def write_executive_pdf(
     insumos: dict[str, Any],
     avl: dict[str, Any],
     preventive: dict[str, Any],
+    special_doh: dict[str, Any],
     liquid: dict[str, Any],
     shalashaska: dict[str, Any],
     fruver_811: dict[str, Any],
@@ -3986,6 +4030,16 @@ def write_executive_pdf(
                     )
                     if preventive.get("enabled")
                     else "Blindaje preventivo desactivado."
+                )
+                + (
+                    (
+                        f" Refuerzo Golden/Infaltable/Anchor a "
+                        f"{special_doh.get('doh', 0):g} DOH: "
+                        f"{special_doh['cases_sent']:,} casos y "
+                        f"{special_doh['units_added']:,} unidades."
+                    )
+                    if special_doh.get("enabled")
+                    else " Refuerzo Golden/Infaltable/Anchor desactivado."
                 )
                 + (
                     (
@@ -4352,6 +4406,8 @@ def execute_planning(
     block_fruver_811: bool = False,
     block_off_schedule_shipments: bool = False,
     include_preventive_fill: bool = False,
+    include_special_doh_fill: bool = False,
+    special_doh_target: float = 21.0,
     include_naked_engine: bool = True,
     include_solidus_engine: bool = True,
     include_shalashaska_engine: bool = False,
@@ -4674,7 +4730,10 @@ def execute_planning(
         include_preventive_fill = (
             include_solidus_engine and include_preventive_fill
         )
-        if include_avl_fill or include_preventive_fill:
+        include_special_doh_fill = (
+            include_solidus_engine and include_special_doh_fill
+        )
+        if include_avl_fill or include_preventive_fill or include_special_doh_fill:
             if catalog_fill_rows_cache is None:
                 avl_catalog_rows, avl_warnings = load_avl_catalog_rows(data_path)
                 result.warnings.extend(avl_warnings)
@@ -4729,6 +4788,32 @@ def execute_planning(
                 f"{preventive_summary['units_added']:,} unidades para inventarios "
                 "con menos de 1 DOH o menos de 3 unidades, sin recomendación "
                 "positiva de Fountain9."
+            )
+
+        special_doh_summary = empty_avl_summary(
+            include_special_doh_fill,
+            special_doh_target,
+        )
+        special_doh_summary["mode"] = "special_doh"
+        if include_special_doh_fill:
+            special_doh_summary = apply_avl_fill(
+                result,
+                catalog_fill_rows,
+                catalogs,
+                config,
+                engine_blocked_store_ids,
+                blocked_cities,
+                special_doh_target,
+                candidate_mode="special_doh",
+                excluded_keys=fountain_recommended_keys,
+            )
+            result.warnings.append(
+                f"Refuerzo Golden/Infaltable/Anchor ({special_doh_target:g} DOH): "
+                f"se agregaron {special_doh_summary['cases_sent']:,} casos, "
+                f"{special_doh_summary['tasks_added']:,} tareas y "
+                f"{special_doh_summary['units_added']:,} unidades para subir "
+                "productos Golden, Infaltable o Anchor por debajo del DOH "
+                "objetivo, sin recomendación positiva de Fountain9."
             )
 
         attach_consolidated_input_to_result(result, consolidated_input)
@@ -4948,6 +5033,7 @@ def execute_planning(
             insumos=insumos_summary,
             avl=avl_summary,
             preventive=preventive_summary,
+            special_doh=special_doh_summary,
             liquid=liquid_summary,
             shalashaska=shalashaska_summary,
             fruver_811=fruver_811_summary,
@@ -5059,6 +5145,7 @@ def execute_planning(
         "insumos": insumos_summary,
         "avl": avl_summary,
         "preventive": preventive_summary,
+        "special_doh": special_doh_summary,
         "liquid": liquid_summary,
         "shalashaska": shalashaska_summary,
         "fruver_811": fruver_811_summary,
@@ -6180,6 +6267,69 @@ def render_results(run: dict[str, Any]) -> None:
             f"{preventive.get('units_added', 0):,} unidades adicionales."
         )
 
+    special_doh = run.get("special_doh", {})
+    if special_doh.get("enabled"):
+        st.markdown(
+            '<span class="section-label">REFUERZO GOLDEN/INFALTABLE/ANCHOR · '
+            'ÚLTIMA PASADA</span>',
+            unsafe_allow_html=True,
+        )
+        render_kpi_cards(
+            [
+                {
+                    "category": "CASOS · REFUERZO",
+                    "label": "TIENDA-SKU REFORZADOS",
+                    "value": f"{special_doh.get('cases_sent', 0):,}",
+                    "description": (
+                        "Combinaciones tienda-SKU marcadas Golden, Infaltable o "
+                        "Anchor con DOH por debajo del objetivo, que recibieron "
+                        "envío adicional. No tenían recomendación positiva de "
+                        "Fountain9."
+                    ),
+                    "tone": "acid",
+                },
+                {
+                    "category": "TAREAS · REFUERZO",
+                    "label": "TAREAS SOBRANTES UTILIZADAS",
+                    "value": f"{special_doh.get('tasks_added', 0):,}",
+                    "description": (
+                        "Líneas operativas adicionales creadas por este refuerzo. "
+                        "Solo utiliza las tareas que quedaron disponibles después "
+                        "de Fountain9, AVL y el blindaje preventivo."
+                    ),
+                    "tone": "blue",
+                },
+                {
+                    "category": "UNIDADES · REFUERZO",
+                    "label": "UNIDADES DE REFUERZO",
+                    "value": f"{special_doh.get('units_added', 0):,}",
+                    "description": (
+                        f"Unidades adicionales para subir Golden/Infaltable/Anchor "
+                        f"hasta {special_doh.get('doh', 0):g} DOH, sin mínimo "
+                        "forzado de 3 unidades (a diferencia de AVL/preventivo)."
+                    ),
+                    "tone": "coral",
+                },
+                {
+                    "category": "CASOS · CANDIDATOS",
+                    "label": "CANDIDATOS DETECTADOS",
+                    "value": f"{special_doh.get('special_candidates', 0):,}",
+                    "description": (
+                        "Tienda-SKU Golden/Infaltable/Anchor por debajo del DOH "
+                        "objetivo antes de revisar si ya fueron atendidos, rutas, "
+                        "capacidad, stock de origen y tareas disponibles."
+                    ),
+                },
+            ],
+            columns_count=4,
+        )
+        st.success(
+            f"Refuerzo Golden/Infaltable/Anchor a {special_doh.get('doh', 0):g} DOH: "
+            f"{special_doh.get('cases_sent', 0):,} casos, "
+            f"{special_doh.get('tasks_added', 0):,} tareas y "
+            f"{special_doh.get('units_added', 0):,} unidades adicionales."
+        )
+
     shalashaska = run.get("shalashaska", {})
     if shalashaska.get("enabled"):
         st.markdown(
@@ -6883,7 +7033,9 @@ def render() -> None:
 
     include_avl_fill = False
     include_preventive_fill = False
+    include_special_doh_fill = False
     avl_doh = 3.0
+    special_doh_target = 21.0
     with st.container(border=True, key="engine_solidus_module"):
         include_solidus_engine = bool(
             st.session_state["mb_engine_solidus_enabled"]
@@ -6893,8 +7045,8 @@ def render() -> None:
             eyebrow="ENGINE / 02 · PROTECTION",
             title="SOLIDUS ENGINE",
             description=(
-                "Protecciones manuales, forecast 0, cobertura AVL y prevención "
-                "de posibles quiebres."
+                "Protecciones manuales, forecast 0, cobertura AVL, prevención "
+                "de posibles quiebres y refuerzo de Golden/Infaltable/Anchor."
             ),
             active=include_solidus_engine,
             tone="blue",
@@ -6905,7 +7057,7 @@ def render() -> None:
             st.session_state["mb_engine_solidus_enabled"] = not include_solidus_engine
             st.rerun()
         if include_solidus_engine:
-            avl_left, preventive_right = st.columns(2)
+            avl_left, preventive_mid, special_right = st.columns(3)
             with avl_left:
                 include_avl_fill = st.toggle(
                     "Cubrir stockouts del catálogo (AVL)",
@@ -6915,7 +7067,7 @@ def render() -> None:
                         "exclusivamente tareas sobrantes."
                     ),
                 )
-            with preventive_right:
+            with preventive_mid:
                 include_preventive_fill = st.toggle(
                     "Blindar posibles quiebres del catálogo",
                     value=False,
@@ -6924,18 +7076,45 @@ def render() -> None:
                         "sin recomendación positiva de Fountain9."
                     ),
                 )
-            avl_doh = st.number_input(
-                "DOH objetivo de Solidus",
-                min_value=0.5,
-                max_value=30.0,
-                value=3.0,
-                step=0.5,
-                disabled=not (include_avl_fill or include_preventive_fill),
-                help=(
-                    "Aplica a cobertura AVL y prevención. Se envían al menos 3 "
-                    "unidades salvo falta de stock o capacidad."
-                ),
-            )
+            with special_right:
+                include_special_doh_fill = st.toggle(
+                    "Reforzar Golden / Infaltable / Anchor",
+                    value=False,
+                    help=(
+                        "Sube el DOH de productos Golden, Infaltable o Anchor que "
+                        "estén por debajo del objetivo, sin recomendación positiva "
+                        "de Fountain9. Usa su propio DOH objetivo, independiente "
+                        "del de AVL/preventivo."
+                    ),
+                )
+            doh_left, doh_right = st.columns(2)
+            with doh_left:
+                avl_doh = st.number_input(
+                    "DOH objetivo — AVL y preventivo",
+                    min_value=0.5,
+                    max_value=30.0,
+                    value=3.0,
+                    step=0.5,
+                    disabled=not (include_avl_fill or include_preventive_fill),
+                    help=(
+                        "Aplica a cobertura AVL y prevención. Se envían al menos 3 "
+                        "unidades salvo falta de stock o capacidad."
+                    ),
+                )
+            with doh_right:
+                special_doh_target = st.number_input(
+                    "DOH objetivo — Golden/Infaltable/Anchor",
+                    min_value=0.5,
+                    max_value=90.0,
+                    value=21.0,
+                    step=0.5,
+                    disabled=not include_special_doh_fill,
+                    help=(
+                        "Solo aplica a productos marcados Golden, Infaltable o "
+                        "Anchor. Sin mínimo forzado de 3 unidades: si ya están "
+                        "cerca del objetivo, sube exactamente lo que falta."
+                    ),
+                )
         else:
             st.caption(
                 "Solidus Engine está apagado. Sus protecciones y parámetros no "
@@ -7371,6 +7550,8 @@ def render() -> None:
                     block_fruver_811=block_fruver_811,
                     block_off_schedule_shipments=block_off_schedule_shipments,
                     include_preventive_fill=include_preventive_fill,
+                    include_special_doh_fill=include_special_doh_fill,
+                    special_doh_target=float(special_doh_target),
                     include_naked_engine=include_naked_engine,
                     include_solidus_engine=include_solidus_engine,
                     include_shalashaska_engine=include_shalashaska_engine,
