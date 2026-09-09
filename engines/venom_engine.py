@@ -42,6 +42,16 @@ Top of Yellow, Venom ordena hasta el techo de la zona verde:
 LTF (Factor de Lead Time) y VF (Factor de Variabilidad) usan el perfil medio
 estándar de DDMRP (0.5 cada uno) — ver ``LTF_MEDIUM``/``VF_MEDIUM``.
 
+## Ontop manual: sin restricción de CAP_RECIBO
+
+Venom es, en la práctica, un "ontop manual" sobre la planeación normal: sí
+respeta el stock remanente por origen y el presupuesto compartido de tareas
+(``MAX_TASKS``), pero **no** se limita por la capacidad de recibo de la
+tienda (``CAP_RECIBO``). Sus unidades nunca se descuentan de
+``result.capacity_rows`` ni cuentan para "capacidad cerrada"; los campos
+informativos ``M3_CAPACIDAD_ANTES``/``M3_CAPACIDAD_DESPUES`` del reporte
+reflejan lo que otros engines ya usaron, no lo que Venom decide agregar.
+
 ## OOWL — sin pronóstico
 
 "OOWL" no es una clasificación estática: son combinaciones tienda-SKU con
@@ -173,36 +183,19 @@ def _allocate_across_origins(
     sku: int,
     quantity_needed: int,
     consumed_by_origin_sku: Counter,
-    capacity_by_store: dict[int, dict[str, Any]],
-    m3_per_unit: float,
     summary: dict[str, Any],
 ) -> list[tuple[int, int]]:
     """Reparte ``quantity_needed`` entre ``source_candidates`` en orden.
 
     No valida bloqueos de tienda/ciudad/ruta/regional/frecuencia: eso ya se
     resolvió antes de llamar esta función (por SKU-tienda, no por origen).
-    Sí respeta stock remanente por origen, capacidad de la tienda y el
-    presupuesto compartido de tareas. Devuelve la lista de (origen, cantidad)
-    realmente asignada; puede ser menor a lo pedido o vacía.
+    Venom es un "ontop manual": respeta el stock remanente por origen y el
+    presupuesto compartido de tareas, pero **no** se limita por CAP_RECIBO —
+    a propósito no cuenta contra la capacidad de recibo de la tienda.
+    Devuelve la lista de (origen, cantidad) realmente asignada; puede ser
+    menor a lo pedido o vacía.
     """
-    capacity_row = capacity_by_store.get(destination)
-    capacity_m3 = catalogs.store_capacity.get(
-        destination, config.default_store_capacity_m3
-    )
-    used_m3 = (
-        float(capacity_row["M3_CONTABILIZADO_CAPACIDAD"]) if capacity_row else 0.0
-    )
-    remaining_m3 = max(capacity_m3 - used_m3, 0.0)
-    capacity_units = (
-        int(math.floor((remaining_m3 / m3_per_unit) + 1e-9))
-        if m3_per_unit > 0
-        else quantity_needed
-    )
-    if capacity_units <= 0:
-        summary["skipped_no_capacity"] += 1
-        return []
-
-    remaining = min(quantity_needed, capacity_units)
+    remaining = quantity_needed
     picks: list[tuple[int, int]] = []
     tentative_tasks_used = result.tasks_used
     for source in source_candidates:
@@ -444,8 +437,6 @@ def apply_venom_engine(
             sku=sku,
             quantity_needed=quantity_needed,
             consumed_by_origin_sku=consumed_by_origin_sku,
-            capacity_by_store=capacity_by_store,
-            m3_per_unit=m3_per_unit,
             summary=summary,
         )
         if not picks:
@@ -464,6 +455,8 @@ def apply_venom_engine(
         profile = engine.product_priority_profile(catalogs, destination, sku)
         origenes_usados = ", ".join(f"{source}:{qty}" for source, qty in picks)
         assigned_m3 = assigned_total * m3_per_unit
+        # Informativo únicamente: Venom no escribe en result.capacity_rows,
+        # así que esto no refleja ni afecta ningún gasto real de CAP_RECIBO.
         cap_row = capacity_by_store.get(destination)
         cap_before = float(cap_row["M3_CONTABILIZADO_CAPACIDAD"]) if cap_row else 0.0
         base_row.update(
@@ -493,7 +486,7 @@ def apply_venom_engine(
                     destination, config.default_store_capacity_m3
                 ),
                 "M3_CAPACIDAD_ANTES": cap_before,
-                "M3_CAPACIDAD_DESPUES": cap_before + assigned_m3,
+                "M3_CAPACIDAD_DESPUES": cap_before,
                 "EXCEDE_CAPACIDAD_EN_ESTA_LINEA": False,
                 "PASA_CAPACIDAD": True,
                 "ORIGENES_USADOS": origenes_usados,
@@ -506,19 +499,18 @@ def apply_venom_engine(
                     f"(On-Hand={on_hand:.0f}, On-Order={on_order:.0f} "
                     f"{'considerado' if consider_current_planning else 'ignorado'}, "
                     f"Demanda calificada={qualified_demand:.2f}). "
-                    f"Objetivo {quantity_needed}, asignado {assigned_total}."
+                    f"Objetivo {quantity_needed}, asignado {assigned_total}. "
+                    "Ontop manual: no cuenta contra CAP_RECIBO de la tienda."
                 ),
             }
         )
-        _append_allocations_and_capacity(
+        _append_allocations(
             result=result,
             picks=picks,
             destination=destination,
             sku=sku,
             store=store,
             catalogs=catalogs,
-            capacity_by_store=capacity_by_store,
-            m3_per_unit=m3_per_unit,
             reason_column=reason_column,
         )
         result.base_rows.append(base_row)
@@ -606,8 +598,6 @@ def apply_venom_engine(
                     sku=sku,
                     quantity_needed=config.minimum_positive_quantity,
                     consumed_by_origin_sku=consumed_by_origin_sku,
-                    capacity_by_store=capacity_by_store,
-                    m3_per_unit=m3_per_unit,
                     summary=summary,
                 )
                 if not picks:
@@ -627,6 +617,8 @@ def apply_venom_engine(
                     f"{source}:{qty}" for source, qty in picks
                 )
                 assigned_m3 = assigned_total * m3_per_unit
+                # Informativo únicamente: Venom no escribe en
+                # result.capacity_rows (ver _allocate_across_origins).
                 cap_row = capacity_by_store.get(destination)
                 cap_before = (
                     float(cap_row["M3_CONTABILIZADO_CAPACIDAD"]) if cap_row else 0.0
@@ -664,7 +656,7 @@ def apply_venom_engine(
                             destination, config.default_store_capacity_m3
                         ),
                         "M3_CAPACIDAD_ANTES": cap_before,
-                        "M3_CAPACIDAD_DESPUES": cap_before + assigned_m3,
+                        "M3_CAPACIDAD_DESPUES": cap_before,
                         "EXCEDE_CAPACIDAD_EN_ESTA_LINEA": False,
                         "PASA_CAPACIDAD": True,
                         "ORIGENES_USADOS": origenes_usados,
@@ -673,19 +665,18 @@ def apply_venom_engine(
                             "en destino, sin ADU en CATALOGO para construir un "
                             "buffer DDMRP. Se envía el mínimo operativo de "
                             f"{config.minimum_positive_quantity} unidades. "
-                            f"Asignado {assigned_total}."
+                            f"Asignado {assigned_total}. Ontop manual: no cuenta "
+                            "contra CAP_RECIBO de la tienda."
                         ),
                     }
                 )
-                _append_allocations_and_capacity(
+                _append_allocations(
                     result=result,
                     picks=picks,
                     destination=destination,
                     sku=sku,
                     store=store,
                     catalogs=catalogs,
-                    capacity_by_store=capacity_by_store,
-                    m3_per_unit=m3_per_unit,
                     reason_column=reason_column,
                 )
                 result.base_rows.append(base_row)
@@ -715,7 +706,7 @@ def apply_venom_engine(
     return summary
 
 
-def _append_allocations_and_capacity(
+def _append_allocations(
     *,
     result,
     picks: list[tuple[int, int]],
@@ -723,8 +714,6 @@ def _append_allocations_and_capacity(
     sku: int,
     store: dict[str, Any],
     catalogs: engine.Catalogs,
-    capacity_by_store: dict[int, dict[str, Any]],
-    m3_per_unit: float,
     reason_column: str,
 ) -> None:
     """Agrega una fila NUEVA de allocation por cada origen usado.
@@ -732,6 +721,10 @@ def _append_allocations_and_capacity(
     A propósito nunca busca ni reutiliza una fila existente del mismo trío
     origen-destino-SKU: Venom siempre queda como una línea separada y
     adicional, nunca consolidada con lo que ya había planeado.
+
+    A propósito tampoco toca ``result.capacity_rows``/CAP_RECIBO: Venom es
+    un "ontop manual" que no cuenta contra la capacidad de recibo de la
+    tienda, aunque sí cuenta contra el presupuesto compartido de tareas.
     """
     for source, quantity in picks:
         result.allocation_rows.append(
@@ -750,30 +743,3 @@ def _append_allocations_and_capacity(
             }
         )
         result.tasks_used += 1
-
-        assigned_m3 = quantity * m3_per_unit
-        capacity_row = capacity_by_store.get(destination)
-        if capacity_row is None:
-            capacity_row = {
-                "WAREHOUSE_DESTINATION": destination,
-                "WAREHOUSE_NAME": store.get("warehouse_name", ""),
-                "CITY": store.get("city", ""),
-                "CAPACIDAD_M3": catalogs.store_capacity.get(
-                    destination, 10.0
-                ),
-                "M3_CONTABILIZADO_CAPACIDAD": 0.0,
-                "M3_TOTAL_ASIGNADO_INCLUYE_GOLDEN": 0.0,
-                "CAPACIDAD_CERRADA": False,
-                "CAPACIDAD_SUPERADA_POR_LINEA": False,
-            }
-            result.capacity_rows.append(capacity_row)
-            capacity_by_store[destination] = capacity_row
-        cap_before = float(capacity_row["M3_CONTABILIZADO_CAPACIDAD"])
-        cap_after = cap_before + assigned_m3
-        capacity_row["M3_CONTABILIZADO_CAPACIDAD"] = cap_after
-        capacity_row["M3_TOTAL_ASIGNADO_INCLUYE_GOLDEN"] = (
-            float(capacity_row["M3_TOTAL_ASIGNADO_INCLUYE_GOLDEN"]) + assigned_m3
-        )
-        capacity_row["CAPACIDAD_CERRADA"] = (
-            cap_after >= float(capacity_row["CAPACIDAD_M3"]) - 1e-9
-        )
