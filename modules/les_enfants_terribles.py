@@ -4318,14 +4318,26 @@ def execute_planning(
     st.session_state["last_workspace"] = str(workspace)
     input_dir = workspace / "input"
     data_path = input_dir / "DATA_TRANSFERS.xlsx"
-    copernico_path: Path | None = None
     canonical_plan_path = input_dir / (
         f"Plan_Consolidado_{run_date:%d-%m-%Y}.csv"
     )
 
-    if uploaded_copernico is not None:
-        copernico_path = input_dir / "COPERNICO.csv"
-        save_uploaded_file(uploaded_copernico, copernico_path)
+    uploaded_copernico_list = list(uploaded_copernico or [])
+    copernico_paths: list[Path] = []
+    copernico_used_names: Counter[str] = Counter()
+    for index, uploaded_file in enumerate(uploaded_copernico_list, start=1):
+        raw_name = engine.safe_filename(Path(uploaded_file.name).name) or (
+            f"copernico_{index}.csv"
+        )
+        copernico_used_names[raw_name] += 1
+        saved_name = (
+            raw_name
+            if copernico_used_names[raw_name] == 1
+            else f"{index:02d}_{raw_name}"
+        )
+        copernico_path = input_dir / saved_name
+        save_uploaded_file(uploaded_file, copernico_path)
+        copernico_paths.append(copernico_path)
 
     uploaded_plan_list = list(uploaded_plans or [])
     plan_paths: list[Path] = []
@@ -4362,7 +4374,7 @@ def execute_planning(
         catalogs = engine.load_catalogs(
             data_path,
             config,
-            copernico_csv_path=copernico_path,
+            copernico_csv_path=copernico_paths,
         )
         catalogs.origin_storage_override_enabled = bool(
             apply_origin_storage_override
@@ -6473,17 +6485,18 @@ def render() -> None:
         unsafe_allow_html=True,
     )
     uploaded_copernico = st.file_uploader(
-        "Archivo COPÉRNICO (.csv) — opcional",
+        "Archivo(s) COPÉRNICO (.csv) — opcional",
         type=["csv"],
-        accept_multiple_files=False,
+        accept_multiple_files=True,
         max_upload_size=MAX_UPLOAD_MB,
         key="copernico_csv_upload",
         help=(
-            "Si lo cargas, este archivo sustituye completamente la hoja COPERNICO "
-            "de la base. "
+            "Si cargas uno o más archivos, sustituyen completamente la hoja "
+            "COPERNICO de la base; sus filas se combinan como si fuera un solo "
+            "archivo. "
             "Se utiliza para descontar las ubicaciones no usables del warehouse "
-            "indicado en la columna Bodega. Si no lo cargas, la planeación continúa "
-            "sin realizar este descuento."
+            "indicado en la columna Bodega. Si no cargas ninguno, la planeación "
+            "continúa sin realizar este descuento."
         ),
     )
     with st.expander("Columnas requeridas del CSV de COPÉRNICO"):
@@ -6498,8 +6511,8 @@ def render() -> None:
             **Bodega + EAN** correspondiente. Por ejemplo, una fila con Bodega 856
             afectará al origen 856 y no al 444. El archivo se lee en streaming al
             ejecutar para soportar archivos grandes. La hoja `COPERNICO` de
-            `DATA_TRANSFERS` ya no participa en el cálculo. Si no cargas un archivo,
-            no se aplicará ningún descuento por ubicaciones no pickeables.
+            `DATA_TRANSFERS` ya no participa en el cálculo. Si no cargas ningún
+            archivo, no se aplicará ningún descuento por ubicaciones no pickeables.
 
             **Reglas especiales para Bodega 856 usando `ZonaPiso`:**
 
@@ -6513,11 +6526,19 @@ def render() -> None:
             tiene prioridad sobre el storage general y el override manual por origen.
             """
         )
-    if uploaded_copernico is not None:
-        st.success(
-            f"COPÉRNICO listo · {uploaded_copernico.name} · "
-            f"{uploaded_copernico.size / (1024 ** 2):,.1f} MB"
-        )
+    if uploaded_copernico:
+        total_mb = sum(file.size for file in uploaded_copernico) / (1024 ** 2)
+        if len(uploaded_copernico) == 1:
+            st.success(
+                f"COPÉRNICO listo · {uploaded_copernico[0].name} · "
+                f"{total_mb:,.1f} MB"
+            )
+        else:
+            names = ", ".join(file.name for file in uploaded_copernico)
+            st.success(
+                f"COPÉRNICO listo · {len(uploaded_copernico)} archivos "
+                f"({total_mb:,.1f} MB en total): {names}"
+            )
 
     st.markdown(
         '<span class="section-label">03 — ARCHIVOS FOUNTAIN9</span>',
@@ -7082,9 +7103,11 @@ def render() -> None:
                 and (parsed := parse_manual_skus(raw_value))
             }
             with st.status("Ejecutando motor de planeación…", expanded=True) as status:
-                if uploaded_copernico is not None:
+                if uploaded_copernico:
                     st.write(
-                        "Guardando y procesando el inventario COPÉRNICO cargado…"
+                        "Guardando y procesando "
+                        f"{len(uploaded_copernico):,} archivo(s) de inventario "
+                        "COPÉRNICO cargado(s)…"
                     )
                 else:
                     st.write(
