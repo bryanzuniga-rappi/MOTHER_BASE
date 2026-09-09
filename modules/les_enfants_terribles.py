@@ -271,6 +271,8 @@ BREAKDOWN_ORDER = (
     "OK PARCIAL - CORTE POR BLOQUEO REGIONAL",
     "CORTE POR FRECUENCIA DE ENVÍO",
     "OK PARCIAL - CORTE POR FRECUENCIA DE ENVÍO",
+    "CORTE POR COPÉRNICO",
+    "OK PARCIAL - CORTE POR COPÉRNICO",
     VENOM_CUT,
     "ERROR DE DATOS",
 )
@@ -2718,6 +2720,63 @@ SCHEDULE_CUT_LABELS = {
     "OK PARCIAL - CORTE POR FRECUENCIA DE ENVÍO",
 }
 
+COPERNICO_CUT_LABELS = {
+    "CORTE POR COPÉRNICO",
+    "OK PARCIAL - CORTE POR COPÉRNICO",
+}
+
+
+def copernico_cut_summary(result) -> dict[str, Any]:
+    """Cuantifica cuánta demanda no se planificó por exclusiones de COPÉRNICO
+    (ubicación no usable, LOST, etc.) — no confundir con COPERNICO_NO_USABLE
+    como dato informativo suelto: aquí se aísla como motivo de corte cuando,
+    sin esa exclusión, el requerimiento habría tenido stock elegible.
+
+    Debe llamarse después de ``apply_reporting_labels`` para leer las
+    etiquetas finales de TIPO_DE_CORTE.
+    """
+    affected_rows = [
+        row
+        for row in result.base_rows
+        if row.get("TIPO_DE_CORTE") in COPERNICO_CUT_LABELS
+    ]
+    summary: dict[str, Any] = {
+        "requirements_full_cut": 0,
+        "requirements_partial_cut": 0,
+        "stores": 0,
+        "products": 0,
+        "units_missing": 0,
+    }
+    if not affected_rows:
+        return summary
+
+    stores: set[int] = set()
+    products: set[int] = set()
+    units_missing = 0
+    full_cut = 0
+    partial_cut = 0
+    for row in affected_rows:
+        stores.add(row["WAREHOUSE_DESTINATION"])
+        products.add(row["RETAIL_ID"])
+        target = int(row.get("CANTIDAD_OBJETIVO", 0) or 0)
+        assigned = int(row.get("CANTIDAD_ASIGNADA", 0) or 0)
+        units_missing += max(target - assigned, 0)
+        if str(row.get("TIPO_DE_CORTE", "")).startswith("OK PARCIAL"):
+            partial_cut += 1
+        else:
+            full_cut += 1
+
+    summary.update(
+        {
+            "requirements_full_cut": full_cut,
+            "requirements_partial_cut": partial_cut,
+            "stores": len(stores),
+            "products": len(products),
+            "units_missing": units_missing,
+        }
+    )
+    return summary
+
 
 def schedule_block_summary(result, catalogs) -> dict[str, Any]:
     """Resume el efecto del toggle 'Bloquear envíos fuera de frecuencia'.
@@ -4300,6 +4359,7 @@ def execute_planning(
     include_liquid_engine: bool = False,
     liquid_automatic_tail: bool = True,
     liquid_automatic_tail_origins: set[int] | None = None,
+    liquid_tail_threshold: int = 10,
     liquid_manual_skus_by_origin: dict[int, set[int]] | None = None,
     forecast_horizon_days: int = 7,
     excluded_skus: set[int] | None = None,
@@ -4698,6 +4758,7 @@ def execute_planning(
                 ),
                 forecast_horizon_days=forecast_horizon_days,
                 max_doh=14.0,
+                tail_threshold=int(liquid_tail_threshold),
                 reason_column=PLANNING_REASON_COLUMN,
             )
             result.warnings.append(
@@ -4707,6 +4768,24 @@ def execute_planning(
                 f"{liquid_summary['stock_exhausted_cases']:,} saldos de "
                 "origen-SKU quedaron agotados."
             )
+            liquid_not_sent = (
+                liquid_summary["candidate_origin_skus"]
+                - liquid_summary["origin_skus_sent"]
+            )
+            if liquid_not_sent > 0:
+                result.warnings.append(
+                    "Liquid Engine: de "
+                    f"{liquid_summary['candidate_origin_skus']:,} candidatos "
+                    f"(remanente < {liquid_summary['tail_threshold']:,} unidades o "
+                    f"SKU manual), {liquid_not_sent:,} no se enviaron. Motivo: "
+                    f"{liquid_summary['skipped_no_destination_eligible']:,} sin "
+                    "ningún destino elegible ese día (BLOQUEOS/RUTA_COSTOS/"
+                    "SCHEDULE/ciudad bloqueada/tienda cerrada), "
+                    f"{liquid_summary['skipped_capacity_full']:,} con destinos "
+                    "elegibles pero sin capacidad de recibo disponible, "
+                    f"{liquid_summary['skipped_task_limit']:,} sin presupuesto de "
+                    "tareas restante."
+                )
         venom_summary = empty_venom_summary(include_venom_engine)
         if include_venom_engine:
             venom_catalog_lookup, venom_catalog_warnings = load_venom_catalog_lookup(
@@ -4771,6 +4850,19 @@ def execute_planning(
         analytics = build_planning_analytics(result, origins)
         apply_reporting_labels(result)
         schedule_block = schedule_block_summary(result, catalogs)
+        copernico_cuts = copernico_cut_summary(result)
+        if copernico_cuts["requirements_full_cut"] or copernico_cuts["requirements_partial_cut"]:
+            result.warnings.append(
+                "COPÉRNICO como motivo de corte: "
+                f"{copernico_cuts['requirements_full_cut']:,} requerimientos "
+                "quedaron sin ninguna unidad y "
+                f"{copernico_cuts['requirements_partial_cut']:,} quedaron "
+                "parciales por ubicaciones excluidas (LOST, no usable, etc.) — "
+                f"{copernico_cuts['units_missing']:,} unidades sin cubrir en "
+                f"{copernico_cuts['stores']:,} tiendas y "
+                f"{copernico_cuts['products']:,} SKUs distintos. Sin esa "
+                "exclusión, esas líneas habrían tenido stock elegible."
+            )
         analytics["golden"] = build_golden_analytics(result)
         fountain9_zero_rows = build_fountain9_zero_report(
             consolidated_input,
@@ -4971,6 +5063,7 @@ def execute_planning(
         "shalashaska": shalashaska_summary,
         "fruver_811": fruver_811_summary,
         "schedule_block": schedule_block,
+        "copernico_cuts": copernico_cuts,
         "venom": venom_summary,
         "input_consolidation": consolidation_summary,
         "engine_selection": engine_selection,
@@ -6192,12 +6285,28 @@ def render_results(run: dict[str, Any]) -> None:
                     "value": f"{liquid.get('products', 0):,}",
                     "description": (
                         "Productos diferentes intervenidos por Liquid, ya sea por "
-                        "selección manual o por remanente automático menor a 10."
+                        "selección manual o por remanente automático menor al "
+                        f"umbral configurado ({liquid.get('tail_threshold', 10):,} "
+                        "unidades)."
                     ),
                 },
             ],
             columns_count=4,
         )
+        liquid_not_sent = (
+            liquid.get("candidate_origin_skus", 0) - liquid.get("origin_skus_sent", 0)
+        )
+        if liquid_not_sent > 0:
+            st.warning(
+                f"{liquid_not_sent:,} de {liquid.get('candidate_origin_skus', 0):,} "
+                "candidatos de Liquid no se enviaron: "
+                f"{liquid.get('skipped_no_destination_eligible', 0):,} sin destino "
+                "elegible ese día, "
+                f"{liquid.get('skipped_capacity_full', 0):,} con destinos "
+                "elegibles pero sin capacidad de recibo, "
+                f"{liquid.get('skipped_task_limit', 0):,} sin presupuesto de "
+                "tareas restante."
+            )
 
     venom = run.get("venom", {})
     if venom.get("enabled"):
@@ -6318,6 +6427,23 @@ def render_results(run: dict[str, Any]) -> None:
                 f"{schedule_block.get('weekday', '')}), pero ningún envío quedó "
                 "fuera de los días configurados en SCHEDULE en esta corrida."
             )
+
+    copernico_cuts = run.get("copernico_cuts", {})
+    copernico_cut_total = copernico_cuts.get(
+        "requirements_full_cut", 0
+    ) + copernico_cuts.get("requirements_partial_cut", 0)
+    if copernico_cut_total > 0:
+        st.warning(
+            "COPÉRNICO como motivo de corte: "
+            f"{copernico_cuts.get('requirements_full_cut', 0):,} requerimientos "
+            "sin ninguna unidad y "
+            f"{copernico_cuts.get('requirements_partial_cut', 0):,} parciales por "
+            "ubicaciones excluidas (LOST, no usable, etc.) — "
+            f"{copernico_cuts.get('units_missing', 0):,} unidades sin cubrir en "
+            f"{copernico_cuts.get('stores', 0):,} tiendas y "
+            f"{copernico_cuts.get('products', 0):,} SKUs distintos. Sin esa "
+            "exclusión, esas líneas habrían tenido stock elegible."
+        )
 
     insumos = run.get("insumos", {})
     if insumos.get("lines_added", 0) > 0:
@@ -6876,6 +7002,7 @@ def render() -> None:
     liquid_manual_skus_by_origin_raw: dict[int, str] = {}
     liquid_automatic_tail = False
     liquid_automatic_tail_origins: set[int] = set()
+    liquid_tail_threshold = 10
     forecast_horizon_days = 7
     with st.container(border=True, key="engine_liquid_module"):
         include_liquid_engine = bool(
@@ -6901,12 +7028,25 @@ def render() -> None:
             liquid_left, liquid_right = st.columns([2, 1])
             with liquid_left:
                 liquid_automatic_tail = st.toggle(
-                    "Agotar automáticamente remanentes menores a 10 unidades",
+                    "Agotar automáticamente remanentes bajo el umbral",
                     value=True,
                     help=(
                         "Evalúa el stock que quede después de Naked, Solidus, "
                         "Shalashaska y las coberturas activas. Solo crea tareas "
                         "mientras exista cupo global."
+                    ),
+                )
+                liquid_tail_threshold = st.number_input(
+                    "Umbral de remanente (unidades) — menos de X se agota",
+                    min_value=1,
+                    max_value=1000,
+                    value=10,
+                    step=1,
+                    disabled=not liquid_automatic_tail,
+                    help=(
+                        "Un origen-SKU entra a la cola automática cuando su "
+                        "remanente es mayor a 0 y menor a este valor. Antes estaba "
+                        "fijo en 10; ahora es ajustable por corrida."
                     ),
                 )
                 liquid_automatic_tail_origins = set(
@@ -6917,8 +7057,9 @@ def render() -> None:
                         format_func=format_origin,
                         disabled=not liquid_automatic_tail,
                         help=(
-                            "Liquid solo agotará automáticamente saldos menores a 10 "
-                            "en los orígenes marcados aquí."
+                            "Liquid solo agotará automáticamente saldos por debajo "
+                            f"del umbral ({int(liquid_tail_threshold):,} unidades) en "
+                            "los orígenes marcados aquí."
                         ),
                     )
                 )
@@ -6935,8 +7076,10 @@ def render() -> None:
                     ),
                 )
                 st.info(
-                    "Liquid solo considera tiendas que aparecen en los archivos "
-                    "cargados ese día. No exige que el SKU esté en CATALOGO."
+                    "Liquid solo considera tiendas que ya recibieron unidades "
+                    "reales de otro engine en esta misma corrida (Naked, Solidus, "
+                    "AVL, Preventivo o Shalashaska) — nunca introduce tiendas "
+                    "nuevas. No exige que el SKU esté en CATALOGO."
                 )
 
             st.markdown("#### SKUs MANUALES A AGOTAR POR ORIGEN")
@@ -7239,6 +7382,7 @@ def render() -> None:
                         if include_liquid_engine and liquid_automatic_tail
                         else set()
                     ),
+                    liquid_tail_threshold=int(liquid_tail_threshold),
                     liquid_manual_skus_by_origin=liquid_manual_skus_by_origin,
                     forecast_horizon_days=int(forecast_horizon_days),
                     excluded_skus=excluded_skus,

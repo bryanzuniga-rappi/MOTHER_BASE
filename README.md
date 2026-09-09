@@ -361,6 +361,10 @@ Si un SKU tiene saldo utilizable en varios ambientes, se usa el ambiente con may
 
 Sin archivo COPÉRNICO no hay descuento por ubicaciones ni override 856; STOCK y NO_DISPONIBLE siguen operando.
 
+### Visibilidad como motivo de corte
+
+Cuando el saldo excluido por COPÉRNICO en un origen (que de otra forma sería elegible) explica por qué un requerimiento no se cubrió, la línea recibe su propio `TIPO_DE_CORTE`: `CORTE POR COPÉRNICO` (nada asignado) u `OK PARCIAL - CORTE POR COPÉRNICO` (cobertura parcial) — en vez de caer en el bucket genérico `CORTE POR STOCK`. Esto permite cuantificar, en el breakdown y en una advertencia dedicada (`COPÉRNICO como motivo de corte`), cuántos requerimientos y unidades se dejaron de planificar específicamente por exclusiones de COPÉRNICO, separado de un stockout genuino. Un `BLOQUEO REGIONAL` o `BLOQUEO POR FRECUENCIA` en el mismo origen sigue teniendo prioridad sobre este bucket.
+
 ---
 
 ## 11. Archivos Fountain9
@@ -552,9 +556,9 @@ Primero nivela las tiendas hacia el mismo DOH. Si queda inventario y hay al meno
 
 Corre al final para agotar inventario remanente:
 
-- automático: saldo >0 y <10 unidades en orígenes habilitados;
+- automático: saldo >0 y menor al **umbral configurable** (`tail_threshold`, default 10 unidades) en orígenes habilitados;
 - manual: SKUs capturados independientemente por origen;
-- solo considera destinos presentes en los archivos Fountain9 del día;
+- solo considera destinos que **ya recibieron unidades reales** de otro engine en la misma corrida (Naked, Solidus, AVL, Preventivo o Shalashaska) — no cualquier tienda con un renglón de Fountain9, y nunca una tienda nueva fuera de lo que la planeación ya generó ese día;
 - no exige que el SKU esté en CATALOGO.
 
 Convierte el forecast a ADU:
@@ -564,6 +568,18 @@ ADU estimado = Predicted Demand / días del horizonte
 ```
 
 Primero nivela hasta un máximo fijo de 14 DOH. Después distribuye el resto por SHARE_VENTAS, en enteros, usando piso y residuos mayores. Respeta stock, capacidad, tareas y restricciones.
+
+### Por qué un candidato de Liquid puede no enviarse
+
+Un origen-SKU dentro del umbral (`0 < remanente < tail_threshold`) es un **candidato**, no una garantía de envío. Puede quedar sin línea por tres motivos, contados por separado en el resumen de advertencias:
+
+- **Sin destino elegible** (`skipped_no_destination_eligible`): todo destino del día quedó descartado por BLOQUEOS regional, RUTA_COSTOS, el toggle de frecuencia SCHEDULE, ciudad bloqueada o tienda cerrada, antes de siquiera revisar capacidad.
+- **Sin capacidad** (`skipped_capacity_full`): había al menos un destino elegible, pero ninguno tenía m³ libres para ni una sola unidad de ese SKU.
+- **Sin tareas** (`skipped_task_limit`): se agotó el presupuesto compartido de `MAX_TASKS` antes de llegar a este candidato.
+
+Antes de esta versión, estos tres motivos se colapsaban en un solo contador interno sin visibilidad en el reporte; ahora aparecen desglosados en la advertencia de Liquid y en las tarjetas KPI de la web. Nota importante: un saldo que ya fue excluido por COPÉRNICO (`LOST`/`RECIBO_444`/`CANCELADOS`/etc.) o marcado `RACKEADO_444` **nunca llega a ser candidato** — no es una falla de Liquid, es stock que el sistema correctamente nunca consideró disponible.
+
+El reparto por SHARE_VENTAS (`_weighted_integer_allocation`) ya redistribuye automáticamente entre las tiendas candidatas con espacio disponible: cuando una se llena, sale del cálculo de pesos y su parte se reparte entre las que quedan, iterando hasta agotar el remanente o quedarse sin tiendas con capacidad. `skipped_capacity_full` solo se dispara cuando **todas** las tiendas candidatas están llenas para ese SKU específico, no cuando algunas lo están.
 
 ### Venom Engine
 
@@ -689,7 +705,8 @@ BulkCD_856_CHEDRAUI.csv
 | Shalashaska | Activar | Inactivo |
 | Shalashaska | DOH primera pasada | 7 |
 | Liquid | Activar | Inactivo |
-| Liquid | Remanentes <10 | Activo al abrir engine |
+| Liquid | Remanentes bajo el umbral | Activo al abrir engine |
+| Liquid | Umbral de remanente (unidades) | 10 |
 | Liquid | Orígenes automáticos | Todos seleccionados |
 | Liquid | Horizonte forecast | 7 días |
 | Liquid | SKUs manuales | Lista por origen |
@@ -789,6 +806,8 @@ Los resultados son temporales: deben descargarse antes de que expire la sesión.
 | OK PARCIAL - CORTE POR BLOQUEO REGIONAL | Otro origen cubrió parte. |
 | CORTE POR FRECUENCIA DE ENVÍO | Todos los orígenes elegibles no tienen envío programado hoy según SCHEDULE. |
 | OK PARCIAL - CORTE POR FRECUENCIA DE ENVÍO | Otro origen sí tenía envío programado hoy y cubrió parte o el total. |
+| CORTE POR COPÉRNICO | Toda la demanda quedó sin cubrir porque las unidades excluidas por COPÉRNICO (ubicación no usable, LOST, etc.) habrían sido suficientes para tener stock elegible. |
+| OK PARCIAL - CORTE POR COPÉRNICO | Se cubrió parte de la demanda; el resto quedó en unidades excluidas por COPÉRNICO en orígenes que de otra forma eran elegibles. |
 | ENVIADOS POR VENOM ENGINE | Línea de llenado DDMRP post-planeación. Nunca se consolida con otra línea del mismo trío origen-destino-SKU; siempre es una fila adicional y separada. |
 | ERROR DE DATOS | Falta información obligatoria. |
 

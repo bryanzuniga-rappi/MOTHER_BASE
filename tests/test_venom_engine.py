@@ -147,6 +147,51 @@ def test_venom_shares_max_tasks_budget_and_stops_when_exhausted():
     assert summary["skipped_task_limit"] >= 1
 
 
+def test_venom_ignores_store_capacity_ceiling():
+    """Venom es un 'ontop manual': no se limita por CAP_RECIBO."""
+    catalogs = make_catalogs(store_capacity={100: 0.001})  # capacidad casi nula
+    config = engine.Config(origin_warehouses=(444,), max_tasks=100)
+    result = make_result()
+    summary = apply_venom_engine(
+        result, catalogs, config,
+        venom_origins=(444,), venom_destinations=(100,),
+        section_types={"IS_GOLDEN"}, lead_time_days=5,
+        consider_current_planning=True,
+        catalog_lookup={(100, 10): {"adu": 2.0, "list_type": ""}},
+        closed_or_excluded_store_ids=set(), blocked_cities=(),
+    )
+    assert len(result.allocation_rows) == 1
+    assert result.allocation_rows[0]["QUANTITY"] == 28  # no se recorta por capacidad
+    assert summary["skipped_no_capacity"] == 0
+    assert result.capacity_rows == [], "Venom no debe escribir en el ledger de CAP_RECIBO"
+
+
+def test_venom_does_not_pollute_capacity_ledger_used_by_other_engines():
+    """Una fila previa de otro engine ya reservó capacidad; Venom no la toca."""
+    catalogs = make_catalogs(store_capacity={100: 1.0})
+    config = engine.Config(origin_warehouses=(444,), max_tasks=100)
+    result = make_result(
+        capacity_rows=[{
+            "WAREHOUSE_DESTINATION": 100, "WAREHOUSE_NAME": "Tienda Test",
+            "CITY": "CDMX", "CAPACIDAD_M3": 1.0,
+            "M3_CONTABILIZADO_CAPACIDAD": 0.9, "M3_TOTAL_ASIGNADO_INCLUYE_GOLDEN": 0.9,
+            "CAPACIDAD_CERRADA": False, "CAPACIDAD_SUPERADA_POR_LINEA": False,
+        }],
+    )
+    apply_venom_engine(
+        result, catalogs, config,
+        venom_origins=(444,), venom_destinations=(100,),
+        section_types={"IS_GOLDEN"}, lead_time_days=5,
+        consider_current_planning=True,
+        catalog_lookup={(100, 10): {"adu": 2.0, "list_type": ""}},
+        closed_or_excluded_store_ids=set(), blocked_cities=(),
+    )
+    assert len(result.allocation_rows) == 1  # sí envía, aunque la capacidad ya esté casi al tope
+    # El ledger de capacidad queda exactamente igual que antes de correr Venom.
+    assert result.capacity_rows[0]["M3_CONTABILIZADO_CAPACIDAD"] == 0.9
+    assert len(result.capacity_rows) == 1
+
+
 def test_venom_toggle_off_ignores_on_order():
     catalogs = make_catalogs()
     config = engine.Config(origin_warehouses=(444,), max_tasks=100)

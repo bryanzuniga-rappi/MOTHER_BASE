@@ -2037,6 +2037,15 @@ def plan_transfers(
                 for source in config.origin_warehouses
                 if schedule_blocks[source] and not regional_blocks[source]
             )
+            # Unidades excluidas por COPÉRNICO (ubicación no usable, LOST,
+            # etc.) en orígenes que de otra forma serían elegibles — para
+            # separar "no se planificó por COPÉRNICO" de un corte genérico
+            # por falta de stock.
+            copernico_unusable_stock = sum(
+                origin_info[source].get("copernico_unusable", 0)
+                for source in config.origin_warehouses
+                if not regional_blocks[source] and not schedule_blocks[source]
+            )
 
             if assigned > 0:
                 actual_m3 = assigned * m3_per_unit
@@ -2072,6 +2081,14 @@ def plan_transfers(
                     f"un origen sin envío programado hoy ({WEEKDAY_DISPLAY_NAMES.get(catalogs.run_weekday_norm, catalogs.run_weekday_norm)}) "
                     "según SCHEDULE"
                 )
+            elif assigned > 0 and copernico_unusable_stock > 0:
+                tipo_corte = "OK PARCIAL - CORTE POR COPÉRNICO"
+                detalle_motivo = (
+                    f"Asignadas {assigned} de {target}; "
+                    f"{copernico_unusable_stock:.0f} unidades adicionales quedaron "
+                    "excluidas por COPÉRNICO (ubicación no usable, LOST, etc.) en "
+                    "los orígenes configurados"
+                )
             elif assigned > 0:
                 tipo_corte = "OK PARCIAL - CORTE POR STOCK"
                 detalle_motivo = f"Asignadas {assigned} de {target}; stock permitido insuficiente"
@@ -2091,6 +2108,18 @@ def plan_transfers(
                     "El stock disponible está en un origen sin envío programado "
                     f"hoy ({WEEKDAY_DISPLAY_NAMES.get(catalogs.run_weekday_norm, catalogs.run_weekday_norm)}) "
                     "según SCHEDULE"
+                )
+            elif copernico_unusable_stock > 0:
+                tipo_corte = "CORTE POR COPÉRNICO"
+                diagnostics = ["COPERNICO_NO_USABLE"]
+                if origin_info.get(444, {}).get("rackeado"):
+                    diagnostics.append("RACKEADO_444")
+                suffix = f" ({', '.join(diagnostics)})" if len(diagnostics) > 1 else ""
+                detalle_motivo = (
+                    f"{copernico_unusable_stock:.0f} unidades excluidas por "
+                    "COPÉRNICO (ubicación no usable, LOST, etc.) en los orígenes "
+                    "configurados; sin ese descuento habría stock elegible"
+                    + suffix
                 )
             else:
                 tipo_corte = "CORTE POR STOCK"
@@ -2304,6 +2333,11 @@ def plan_transfers(
             for source in config.origin_warehouses
             if second_pass_schedule_blocks[source] and not second_pass_blocks[source]
         )
+        copernico_unusable_stock = sum(
+            source_stock_components(catalogs, source, sku)["copernico_unusable"]
+            for source in config.origin_warehouses
+            if not second_pass_blocks[source] and not second_pass_schedule_blocks[source]
+        )
         if task_limited:
             tipo_corte = "OK PARCIAL - CORTE POR CAPACIDAD DE TAREAS"
             detalle_motivo = (
@@ -2327,6 +2361,13 @@ def plan_transfers(
             detalle_motivo = (
                 f"Segunda pasada: asignadas {assigned} de {target}; parte del "
                 "stock está en un origen sin envío programado hoy según SCHEDULE"
+            )
+        elif copernico_unusable_stock > 0:
+            tipo_corte = "OK PARCIAL - CORTE POR COPÉRNICO"
+            detalle_motivo = (
+                f"Segunda pasada: asignadas {assigned} de {target}; "
+                f"{copernico_unusable_stock:.0f} unidades adicionales excluidas "
+                "por COPÉRNICO (ubicación no usable, LOST, etc.)"
             )
         else:
             tipo_corte = "OK PARCIAL - CORTE POR STOCK"

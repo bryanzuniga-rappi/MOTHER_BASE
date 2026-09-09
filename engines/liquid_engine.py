@@ -19,6 +19,7 @@ def empty_liquid_summary(enabled: bool) -> dict[str, Any]:
         "enabled": enabled,
         "manual_skus": 0,
         "automatic_tail_enabled": False,
+        "tail_threshold": 10,
         "candidate_origin_skus": 0,
         "origin_skus_sent": 0,
         "tasks_before": 0,
@@ -29,9 +30,15 @@ def empty_liquid_summary(enabled: bool) -> dict[str, Any]:
         "stores": 0,
         "products": 0,
         "stock_exhausted_cases": 0,
+        # Un candidato (origen-SKU dentro del umbral) puede no enviarse por
+        # tres motivos distintos y mutuamente excluyentes; se cuentan por
+        # separado para poder diagnosticar sin releer todo BASE_TRANSFERS:
+        "skipped_no_destination_eligible": 0,  # todo destino bloqueado
+        "skipped_capacity_full": 0,  # había destino, pero sin m3 disponible
+        "skipped_task_limit": 0,  # se acabó el presupuesto de tareas
+        # Alias retrocompatible: suma de los tres motivos "sin envío".
         "skipped_no_store": 0,
         "skipped_no_capacity": 0,
-        "skipped_task_limit": 0,
     }
 
 
@@ -274,10 +281,21 @@ def apply_liquid_engine(
     automatic_tail_origins: set[int] | None = None,
     forecast_horizon_days: int,
     max_doh: float = 14.0,
+    tail_threshold: int = 10,
     reason_column: str = "PLANNING_REASON",
 ) -> dict[str, Any]:
-    """Agota stock remanente sin rebasar stock, capacidad o tareas globales."""
+    """Agota stock remanente sin rebasar stock, capacidad o tareas globales.
+
+    ``tail_threshold`` es el umbral de la cola automática: un origen-SKU
+    entra como candidato cuando su remanente cumple
+    ``0 < remaining < tail_threshold`` (antes fijo en 10 unidades).
+    """
     summary = empty_liquid_summary(True)
+    if tail_threshold <= 0:
+        raise ValueError(
+            "Liquid Engine: el umbral de la cola automática debe ser mayor a cero."
+        )
+    summary["tail_threshold"] = int(tail_threshold)
     unknown_origins = set(manual_skus_by_origin) - set(config.origin_warehouses)
     if unknown_origins:
         raise ValueError(
@@ -309,13 +327,24 @@ def apply_liquid_engine(
         (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"]): row
         for row in plan_rows
     }
+    # Universo de destinos elegibles para Liquid: SOLO tiendas que ya
+    # recibieron unidades reales de algún engine anterior en esta misma
+    # corrida (Naked, Solidus, AVL, Preventivo, Shalashaska), tomado como una
+    # foto fija antes de que Liquid agregue nada. A propósito NO se usa
+    # "cualquier tienda con un renglón de requerimiento ese día" (que podía
+    # incluir tiendas con corte total o SIN RECOMENDACIÓN): dado que la
+    # planeación es secuencial, Liquid no debe introducir tiendas nuevas que
+    # la planeación normal no haya tocado de verdad.
+    funded_destinations = {
+        int(allocation["WAREHOUSE_DESTINATION"])
+        for allocation in result.allocation_rows
+        if int(allocation["QUANTITY"]) > 0
+    }
     daily_destinations = {
-        row["WAREHOUSE_DESTINATION"]
-        for row in plan_rows
-        if row["WAREHOUSE_DESTINATION"] not in closed_store_ids
-        and catalogs.stores.get(row["WAREHOUSE_DESTINATION"], {}).get(
-            "city_norm", ""
-        )
+        destination
+        for destination in funded_destinations
+        if destination not in closed_store_ids
+        and catalogs.stores.get(destination, {}).get("city_norm", "")
         not in blocked_city_set
     }
 
@@ -352,7 +381,7 @@ def apply_liquid_engine(
             is_tail = (
                 automatic_tail
                 and source in tail_origins
-                and 0 < remaining < 10
+                and 0 < remaining < tail_threshold
             )
             if remaining > 0 and (is_manual or is_tail):
                 priority_rank = 4
@@ -426,6 +455,7 @@ def apply_liquid_engine(
             continue
         m3_per_unit = catalogs.volume_m3.get(sku, config.default_m3_per_unit)
         options: list[dict[str, Any]] = []
+        capacity_blocked_destinations = 0
         for destination in daily_destinations:
             if destination == source:
                 continue
@@ -471,6 +501,7 @@ def apply_liquid_engine(
                 else available_stock
             )
             if capacity_units <= 0:
+                capacity_blocked_destinations += 1
                 continue
 
             plan_row = plan_by_key.get((destination, sku), {})
@@ -508,6 +539,15 @@ def apply_liquid_engine(
             )
 
         if not options:
+            if capacity_blocked_destinations > 0:
+                # Había al menos un destino que pasó todos los bloqueos, pero
+                # ninguno tenía m3 libres para ni una sola unidad de este SKU.
+                summary["skipped_capacity_full"] += 1
+            else:
+                # Todo destino del día quedó eliminado por BLOQUEOS/RUTA_COSTOS/
+                # SCHEDULE/ciudad bloqueada/tienda cerrada, antes de llegar a
+                # revisar capacidad.
+                summary["skipped_no_destination_eligible"] += 1
             summary["skipped_no_store"] += 1
             continue
 
