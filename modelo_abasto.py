@@ -538,13 +538,25 @@ def copernico_is_usable(location: Any) -> bool:
 
 
 def load_copernico_unusable_csv(
-    path: Path,
+    paths: Path | Iterable[Path],
 ) -> tuple[
     dict[tuple[int, int], float],
     dict[tuple[int, int], str],
     dict[str, Any],
 ]:
-    """Resuelve saldo no usable y storage por Bodega + producto."""
+    """Resuelve saldo no usable y storage por Bodega + producto.
+
+    Acepta una sola ruta o una lista de rutas: si se cargan varios CSV de
+    COPÉRNICO en la misma corrida, sus filas se combinan exactamente como si
+    fueran un solo archivo. Cada archivo puede tener su propio delimitador y
+    no necesita traer las mismas columnas opcionales (p. ej. ZonaPiso); el
+    contrato de columnas obligatorias (Bodega, EAN, Ubicacion, Saldo) se
+    valida por separado en cada uno.
+    """
+    path_list = [paths] if isinstance(paths, Path) else list(paths)
+    if not path_list:
+        raise ValueError("COPÉRNICO: no se proporcionó ningún archivo CSV")
+
     header_aliases = {
         "Bodega": {"BODEGA", "WAREHOUSE ID", "WAREHOUSE_ID"},
         "EAN": {"EAN", "PRODUCT ID", "PRODUCT_ID"},
@@ -579,119 +591,124 @@ def load_copernico_unusable_csv(
     lost_zone_rows = 0
     lost_zone_units = 0.0
     lost_zone_warehouses: set[int] = set()
+    files_processed = 0
 
-    with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as handle:
-        sample = handle.read(8192)
-        handle.seek(0)
-        try:
-            dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
-        except csv.Error:
-            dialect = csv.excel
-        reader = csv.DictReader(handle, dialect=dialect)
-        if reader.fieldnames is None:
-            raise ValueError("El CSV de COPÉRNICO no contiene encabezados")
+    for path in path_list:
+        with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as handle:
+            sample = handle.read(8192)
+            handle.seek(0)
+            try:
+                dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
+            except csv.Error:
+                dialect = csv.excel
+            reader = csv.DictReader(handle, dialect=dialect)
+            if reader.fieldnames is None:
+                raise ValueError(
+                    f"COPÉRNICO ({path.name}): el CSV no contiene encabezados"
+                )
 
-        normalized_fields = {
-            normalized_csv_header(field_name): field_name
-            for field_name in reader.fieldnames
-            if clean_text(field_name)
-        }
-        field_lookup: dict[str, str] = {}
-        missing: list[str] = []
-        for canonical, aliases in normalized_aliases.items():
-            match = next(
-                (
-                    normalized_fields[alias]
-                    for alias in aliases
-                    if alias in normalized_fields
-                ),
-                None,
-            )
-            if match is None and canonical != "ZonaPiso":
-                missing.append(canonical)
-            elif match is not None:
-                field_lookup[canonical] = match
-        if missing:
-            raise ValueError(
-                "El CSV de COPÉRNICO no contiene las columnas obligatorias: "
-                + ", ".join(missing)
-            )
-        # ZonaPiso es opcional para bodegas distintas de 856 (se exige más
-        # abajo, por fila, solo cuando la bodega es 856). Si la columna existe,
-        # se usa en todas las bodegas para excluir saldo marcado como LOST.
-        zone_field = field_lookup.get("ZonaPiso")
+            normalized_fields = {
+                normalized_csv_header(field_name): field_name
+                for field_name in reader.fieldnames
+                if clean_text(field_name)
+            }
+            field_lookup: dict[str, str] = {}
+            missing: list[str] = []
+            for canonical, aliases in normalized_aliases.items():
+                match = next(
+                    (
+                        normalized_fields[alias]
+                        for alias in aliases
+                        if alias in normalized_fields
+                    ),
+                    None,
+                )
+                if match is None and canonical != "ZonaPiso":
+                    missing.append(canonical)
+                elif match is not None:
+                    field_lookup[canonical] = match
+            if missing:
+                raise ValueError(
+                    f"COPÉRNICO ({path.name}): faltan columnas obligatorias: "
+                    + ", ".join(missing)
+                )
+            # ZonaPiso es opcional para bodegas distintas de 856 (se exige más
+            # abajo, por fila, solo cuando la bodega es 856). Si la columna
+            # existe, se usa en todas las bodegas para excluir saldo LOST.
+            zone_field = field_lookup.get("ZonaPiso")
 
-        for row_number, row in enumerate(reader, start=2):
-            total_rows += 1
-            warehouse = to_id(
-                row.get(field_lookup["Bodega"]),
-                f"COPÉRNICO CSV fila {row_number}.Bodega",
-                allow_none=True,
-            )
-            sku = to_id(
-                row.get(field_lookup["EAN"]),
-                f"COPÉRNICO CSV fila {row_number}.EAN",
-                allow_none=True,
-            )
-            if warehouse is None or sku is None:
-                continue
-            source_rows += 1
-            balance = max(
-                to_float(row.get(field_lookup["Saldo"]), 0.0),
-                0.0,
-            )
-            floor_zone = (
-                clean_text(row.get(zone_field)).upper() if zone_field else ""
-            )
+            for row_number, row in enumerate(reader, start=2):
+                total_rows += 1
+                warehouse = to_id(
+                    row.get(field_lookup["Bodega"]),
+                    f"COPÉRNICO ({path.name}) fila {row_number}.Bodega",
+                    allow_none=True,
+                )
+                sku = to_id(
+                    row.get(field_lookup["EAN"]),
+                    f"COPÉRNICO ({path.name}) fila {row_number}.EAN",
+                    allow_none=True,
+                )
+                if warehouse is None or sku is None:
+                    continue
+                source_rows += 1
+                balance = max(
+                    to_float(row.get(field_lookup["Saldo"]), 0.0),
+                    0.0,
+                )
+                floor_zone = (
+                    clean_text(row.get(zone_field)).upper() if zone_field else ""
+                )
 
-            # ZonaPiso = LOST excluye el saldo sin importar la bodega, igual
-            # que CANCELADOS/RECIBO_444 en Ubicacion. Se evalúa antes que
-            # cualquier otra regla para que nunca se cuente como usable.
-            if floor_zone == "LOST":
-                lost_zone_rows += 1
-                lost_zone_units += balance
-                lost_zone_warehouses.add(warehouse)
-                unusable_rows += 1
-                unusable_stock[(warehouse, sku)] += balance
+                # ZonaPiso = LOST excluye el saldo sin importar la bodega, igual
+                # que CANCELADOS/RECIBO_444 en Ubicacion. Se evalúa antes que
+                # cualquier otra regla para que nunca se cuente como usable.
+                if floor_zone == "LOST":
+                    lost_zone_rows += 1
+                    lost_zone_units += balance
+                    lost_zone_warehouses.add(warehouse)
+                    unusable_rows += 1
+                    unusable_stock[(warehouse, sku)] += balance
+                    if warehouse == 856:
+                        warehouse_856_rows += 1
+                    continue
+
                 if warehouse == 856:
                     warehouse_856_rows += 1
-                continue
+                    if zone_field is None:
+                        raise ValueError(
+                            f"COPÉRNICO ({path.name}): contiene filas de Bodega "
+                            "856 pero no incluye la columna ZonaPiso"
+                        )
+                    storage_by_zone = {
+                        "E": "Room Temperature",
+                        "RCC": "Freezer",
+                        "RR": "Refrigerated",
+                    }
+                    if floor_zone == "MRM":
+                        # Este saldo ya fue descontado en STOCK_DISPONIBLE_FINAL.
+                        warehouse_856_ignored_mrm_rows += 1
+                        continue
+                    if floor_zone in storage_by_zone:
+                        storage_balances_856[(warehouse, sku)][
+                            storage_by_zone[floor_zone]
+                        ] += balance
+                        continue
 
-            if warehouse == 856:
-                warehouse_856_rows += 1
-                if zone_field is None:
-                    raise ValueError(
-                        "El CSV de COPÉRNICO contiene filas de Bodega 856 pero "
-                        "no incluye la columna ZonaPiso"
-                    )
-                storage_by_zone = {
-                    "E": "Room Temperature",
-                    "RCC": "Freezer",
-                    "RR": "Refrigerated",
-                }
-                if floor_zone == "MRM":
-                    # Este saldo ya fue descontado en STOCK_DISPONIBLE_FINAL.
-                    warehouse_856_ignored_mrm_rows += 1
-                    continue
-                if floor_zone in storage_by_zone:
-                    storage_balances_856[(warehouse, sku)][
-                        storage_by_zone[floor_zone]
-                    ] += balance
+                    # BIN, DIF y RC no son inventario pickeable. Una zona vacía
+                    # o desconocida también se excluye de forma conservadora.
+                    unusable_rows += 1
+                    unusable_stock[(warehouse, sku)] += balance
+                    if floor_zone not in {"BIN", "DIF", "RC"}:
+                        warehouse_856_unknown_zone_rows += 1
+                        warehouse_856_unknown_zones[floor_zone or "<VACIA>"] += 1
                     continue
 
-                # BIN, DIF y RC no son inventario pickeable. Una zona vacía o
-                # desconocida también se excluye de forma conservadora.
+                if copernico_is_usable(row.get(field_lookup["Ubicacion"])):
+                    continue
                 unusable_rows += 1
                 unusable_stock[(warehouse, sku)] += balance
-                if floor_zone not in {"BIN", "DIF", "RC"}:
-                    warehouse_856_unknown_zone_rows += 1
-                    warehouse_856_unknown_zones[floor_zone or "<VACIA>"] += 1
-                continue
-
-            if copernico_is_usable(row.get(field_lookup["Ubicacion"])):
-                continue
-            unusable_rows += 1
-            unusable_stock[(warehouse, sku)] += balance
+        files_processed += 1
 
     storage_overrides: dict[tuple[int, int], str] = {}
     storage_conflicts: list[dict[str, Any]] = []
@@ -718,6 +735,7 @@ def load_copernico_unusable_csv(
 
     warehouses = sorted({warehouse for warehouse, _ in unusable_stock})
     summary = {
+        "files_processed": files_processed,
         "total_rows": total_rows,
         "source_rows": source_rows,
         "unusable_rows": unusable_rows,
@@ -787,9 +805,14 @@ def load_catalogs(
     path: Path,
     config: Config,
     *,
-    copernico_csv_path: Path | None = None,
+    copernico_csv_path: Path | Iterable[Path] | None = None,
 ) -> Catalogs:
     warnings: list[str] = []
+    copernico_paths: list[Path] = (
+        [copernico_csv_path]
+        if isinstance(copernico_csv_path, Path)
+        else list(copernico_csv_path or [])
+    )
     workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
     try:
         volume_m3: dict[int, float] = {}
@@ -906,13 +929,13 @@ def load_catalogs(
                 "min",
             )
 
-        if copernico_csv_path is not None:
+        if copernico_paths:
             (
                 copernico_unusable_by_warehouse,
                 copernico_storage_by_warehouse,
                 copernico_summary,
             ) = (
-                load_copernico_unusable_csv(copernico_csv_path)
+                load_copernico_unusable_csv(copernico_paths)
             )
             copernico_unusable_444 = {
                 sku: quantity
@@ -924,8 +947,14 @@ def load_catalogs(
             warehouse_text = ", ".join(
                 map(str, copernico_summary["unusable_warehouses"])
             ) or "sin bodegas con saldo no usable"
+            files_text = (
+                f"{copernico_summary['files_processed']:,} archivo(s), "
+                if copernico_summary.get("files_processed", 1) != 1
+                else ""
+            )
             warnings.append(
                 "COPÉRNICO CSV: se procesaron "
+                f"{files_text}"
                 f"{copernico_summary['total_rows']:,} filas; "
                 f"{copernico_summary['unusable_rows']:,} ubicaciones no usables de "
                 f"{copernico_summary['unusable_warehouse_skus']:,} combinaciones "
