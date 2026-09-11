@@ -222,16 +222,19 @@ def inject_mother_base_theme() -> None:
         .st-key-engine_solidus_module,
         .st-key-engine_shalashaska_module,
         .st-key-engine_liquid_module,
+        .st-key-engine_venom_module,
         .st-key-mission_control_shared > div,
         .st-key-engine_naked_module > div,
         .st-key-engine_solidus_module > div,
         .st-key-engine_shalashaska_module > div,
         .st-key-engine_liquid_module > div,
+        .st-key-engine_venom_module > div,
         .st-key-mission_control_shared [data-testid="stVerticalBlockBorderWrapper"],
         .st-key-engine_naked_module [data-testid="stVerticalBlockBorderWrapper"],
         .st-key-engine_solidus_module [data-testid="stVerticalBlockBorderWrapper"],
         .st-key-engine_shalashaska_module [data-testid="stVerticalBlockBorderWrapper"],
-        .st-key-engine_liquid_module [data-testid="stVerticalBlockBorderWrapper"] {
+        .st-key-engine_liquid_module [data-testid="stVerticalBlockBorderWrapper"],
+        .st-key-engine_venom_module [data-testid="stVerticalBlockBorderWrapper"] {
             background: #fffdf7 !important;
             background-color: #fffdf7 !important;
         }
@@ -308,7 +311,7 @@ def render_action_card(
         "coral": ("#ff5a47", "#111111"),
         "blue": ("#5e7cff", "#fffdf7"),
         "orange": ("#ffb000", "#111111"),
-        "purple": ("#9b5cff", "#fffdf7"),
+        "purple": ("#8a3ffc", "#fffdf7"),
         "white": ("#fffdf7", "#111111"),
     }
     active_background, active_foreground = tone_colors.get(
@@ -355,6 +358,8 @@ def render_action_card(
         .st-key-{css_key} div.stButton > button,
         .st-key-{css_key} [data-testid="stButton"] > button,
         .st-key-{css_key} [data-testid="stButton"] button,
+        .st-key-{css_key} [data-testid="stBaseButton-secondary"],
+        .st-key-{css_key} [data-testid="baseButton-secondary"],
         .st-key-{css_key} button {{
             display: flex !important;
             width: 100% !important;
@@ -368,8 +373,19 @@ def render_action_card(
             color: {foreground} !important;
             background: {background} !important;
             background-color: {background} !important;
+            background-image: none !important;
+            opacity: 1 !important;
+            backdrop-filter: none !important;
+            -webkit-backdrop-filter: none !important;
             text-align: left !important;
             text-transform: none !important;
+        }}
+
+        .st-key-{css_key} button::before,
+        .st-key-{css_key} button::after {{
+            content: none !important;
+            display: none !important;
+            background: none !important;
         }}
 
         .st-key-{css_key} div.stButton > button:hover,
@@ -378,12 +394,17 @@ def render_action_card(
         .st-key-{css_key} [data-testid="stButton"] button:hover,
         .st-key-{css_key} [data-testid="stButton"] button:focus,
         .st-key-{css_key} [data-testid="stButton"] button:active,
+        .st-key-{css_key} [data-testid="stBaseButton-secondary"]:hover,
+        .st-key-{css_key} [data-testid="stBaseButton-secondary"]:focus,
+        .st-key-{css_key} [data-testid="stBaseButton-secondary"]:active,
         .st-key-{css_key} button:hover,
         .st-key-{css_key} button:focus,
         .st-key-{css_key} button:active {{
             color: {foreground} !important;
             background: {background} !important;
             background-color: {background} !important;
+            background-image: none !important;
+            opacity: 1 !important;
             border-color: #111111 !important;
         }}
 
