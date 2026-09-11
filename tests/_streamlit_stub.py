@@ -39,6 +39,7 @@ def install() -> None:
 
     stub.cache_data = _decorator_factory
     stub.cache_resource = _decorator_factory
+    stub.dialog = _decorator_factory
     stub.session_state = {}
 
     sys.modules["streamlit"] = stub

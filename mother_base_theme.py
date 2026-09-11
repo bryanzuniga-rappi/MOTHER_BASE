@@ -308,6 +308,7 @@ def render_action_card(
         "coral": ("#ff5a47", "#111111"),
         "blue": ("#5e7cff", "#fffdf7"),
         "orange": ("#ffb000", "#111111"),
+        "purple": ("#9b5cff", "#fffdf7"),
         "white": ("#fffdf7", "#111111"),
     }
     active_background, active_foreground = tone_colors.get(

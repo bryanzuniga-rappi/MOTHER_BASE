@@ -293,7 +293,9 @@ def test_venom_bl_uses_catalogo_list_type():
 
 # --- OOWL --------------------------------------------------------------
 
-def test_venom_oowl_sends_minimum_without_adu():
+def test_venom_oowl_is_blocked_at_engine_level():
+    """OOWL está bloqueado a pedido de negocio: aunque se pida explícitamente
+    en section_types, apply_venom_engine no debe generar ninguna línea OOWL."""
     catalogs = make_catalogs()
     config = engine.Config(origin_warehouses=(444,), max_tasks=100)
     result = make_result()
@@ -302,15 +304,13 @@ def test_venom_oowl_sends_minimum_without_adu():
         venom_origins=(444,), venom_destinations=(100,),
         section_types={"OOWL"}, lead_time_days=5,
         consider_current_planning=True,
-        catalog_lookup={},  # SKU 20 no aparece en CATALOGO en absoluto
+        catalog_lookup={},
         closed_or_excluded_store_ids=set(), blocked_cities=(),
     )
-    assert len(result.allocation_rows) == 1
-    row = result.allocation_rows[0]
-    assert row["RETAIL_ID"] == 20  # único SKU con stock en 444 y cero en 100
-    assert row["QUANTITY"] == 3
-    assert row["PLANNING_REASON"] == VENOM_REASON
-    assert summary["lines_sent_oowl"] == 1
+    assert result.allocation_rows == []
+    assert summary["lines_sent_oowl"] == 0
+    assert summary["candidates_oowl"] == 0
+    assert "OOWL" not in summary["section_types"]
 
 
 def test_venom_oowl_skips_sku_with_destination_stock():

@@ -289,6 +289,13 @@ def apply_venom_engine(
     y debe incluir TODAS las filas de CATALOGO (sin filtrar por ADU > 0), a
     diferencia del loader que usan AVL/Preventivo/Shalashaska.
     """
+    # OOWL bloqueado a nivel motor, a pedido de negocio: no se calcula ningún
+    # envío de mínimo operativo sin pronóstico, sin importar lo que llegue en
+    # section_types. Es la tercera capa de defensa (la UI ya no lo ofrece y
+    # el llamador en les_enfants_terribles.py ya lo filtra antes de llegar
+    # aquí), para que ninguna ruta de código pueda reactivarlo por accidente.
+    section_types = set(section_types) - {"OOWL"}
+
     summary = empty_venom_summary(True)
     summary["tasks_before"] = result.tasks_used
     summary["lead_time_days"] = float(lead_time_days)

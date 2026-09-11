@@ -288,6 +288,11 @@ INPUT_PLAN_COLUMNS = (
 )
 
 PLANNING_REASON_COLUMN = "PLANNING_REASON"
+
+# SKUs excluidos siempre, a nivel backend, sin importar lo que el usuario
+# capture en el campo "Excluir SKUs" de CODEC. No aparecen en la UI: se unen
+# incondicionalmente al set de exclusión en cada corrida.
+BACKEND_EXCLUDED_SKUS: frozenset[int] = frozenset({92462, 92463, 9151})
 PLANNING_REASON_FOUNTAIN9 = "FOUNTAIN9 · NAKED ENGINE"
 PLANNING_REASON_MANUAL_FORECAST_ZERO = "PROTECCIÓN · SOLIDUS ENGINE"
 PLANNING_REASON_AVL = "CUBRIR AVL · SOLIDUS ENGINE"
@@ -309,7 +314,7 @@ INSUMOS_COLUMNS = [
 
 INSUMO_STOCK_RULES = {
     85097: {"name": "BOLSA 1", "target_stock": 7_000, "moq": 1_000},
-    86195: {"name": "BOLSA 2", "target_stock": 2_100, "moq": 350},
+    86195: {"name": "BOLSA 2", "target_stock": 2_100, "moq": 200},
     76491: {"name": "STICKER", "target_stock": 10_000, "moq": 1_000},
 }
 
@@ -1089,6 +1094,58 @@ def save_uploaded_file(uploaded_file, destination: Path) -> None:
     with destination.open("wb") as handle:
         shutil.copyfileobj(uploaded_file, handle, length=8 * 1024 * 1024)
     uploaded_file.seek(0)
+
+
+# Los únicos warehouses que hoy tienen COPÉRNICO propio. Si alguno de estos
+# se selecciona como origen, la corrida exige tener cargado un archivo
+# COPÉRNICO que cubra ese warehouse específico.
+COPERNICO_REQUIRED_WAREHOUSES: frozenset[int] = frozenset({444, 831, 856})
+COPERNICO_BODEGA_HEADER_ALIASES = {"BODEGA", "WAREHOUSE ID", "WAREHOUSE_ID"}
+
+
+def detect_copernico_warehouses(uploaded_files) -> set[int]:
+    """Lee la columna Bodega de cada archivo COPÉRNICO cargado, sin guardar
+    nada en disco, para saber qué warehouses cubre antes de validar la
+    corrida. Tolerante a variantes de encabezado y delimitador, igual que
+    ``load_copernico_unusable_csv``."""
+    warehouses: set[int] = set()
+    for uploaded_file in uploaded_files or ():
+        try:
+            uploaded_file.seek(0)
+            raw_bytes = uploaded_file.getvalue()
+        except Exception:
+            continue
+        try:
+            text = raw_bytes.decode("utf-8-sig", errors="replace")
+        except Exception:
+            continue
+        try:
+            dialect = csv.Sniffer().sniff(text[:8192], delimiters=",;\t")
+        except csv.Error:
+            dialect = csv.excel
+        reader = csv.DictReader(io.StringIO(text), dialect=dialect)
+        if not reader.fieldnames:
+            continue
+        bodega_field = next(
+            (
+                field_name
+                for field_name in reader.fieldnames
+                if engine.clean_text(field_name).upper()
+                in COPERNICO_BODEGA_HEADER_ALIASES
+            ),
+            None,
+        )
+        if bodega_field is None:
+            continue
+        for row in reader:
+            value = engine.to_id(row.get(bodega_field), "Bodega", allow_none=True)
+            if value is not None:
+                warehouses.add(value)
+        try:
+            uploaded_file.seek(0)
+        except Exception:
+            pass
+    return warehouses
 
 
 def consolidate_plan_files(
@@ -4506,13 +4563,17 @@ def execute_planning(
                 f"fuera de los días definidos en SCHEDULE "
                 f"({len(catalogs.schedule_days):,} combinaciones configuradas)."
             )
-        excluded_sku_set = set(excluded_skus or ())
+        excluded_sku_set = set(excluded_skus or ()) | BACKEND_EXCLUDED_SKUS
         manually_excluded_store_ids = set(excluded_store_ids or ())
         catalogs.excluded_products = excluded_sku_set
         if excluded_sku_set:
+            user_excluded_count = len(set(excluded_skus or ()))
             catalogs.warnings.append(
                 "Exclusión general: se bloquearon completamente "
-                f"{len(excluded_sku_set):,} SKUs ingresados en CODEC."
+                f"{len(excluded_sku_set):,} SKUs ("
+                f"{user_excluded_count:,} ingresados en CODEC + "
+                f"{len(BACKEND_EXCLUDED_SKUS):,} excluidos permanentemente "
+                "a nivel backend)."
             )
         fruver_811_summary = apply_fruver_811_block(
             catalogs,
@@ -6714,10 +6775,44 @@ def render_results(run: dict[str, Any]) -> None:
         st.code(run["logs"] or "Ejecución completada sin mensajes adicionales.")
 
 
+RAIDEN_PROTECTED_CITIES: frozenset[str] = frozenset(
+    {"CDMX", "GDL", "MTY", "PUEBLA", "QUERETARO", "SALTILLO"}
+)
+RAIDEN_DEFAULT_ORIGINS: tuple[int, ...] = (444, 831)
+
+
+@st.dialog("Confirmación antes de ejecutar")
+def render_pre_run_confirmation_dialog() -> None:
+    st.markdown(
+        "**CONFIRMA QUE SE VALIDÓ LA CAPACIDAD DE RECIBO Y SE TIENEN EN "
+        "CUENTA LAS TIENDAS QUE SE ENCUENTRAN EN RESGUARDO**"
+    )
+    confirm_col, cancel_col = st.columns(2)
+    with confirm_col:
+        if st.button(
+            "Confirmar y ejecutar",
+            type="primary",
+            use_container_width=True,
+            key="mb_confirm_run_btn",
+        ):
+            st.session_state["mb_pending_confirmation"] = False
+            st.session_state["mb_run_confirmed"] = True
+            st.rerun()
+    with cancel_col:
+        if st.button(
+            "Cancelar",
+            use_container_width=True,
+            key="mb_cancel_run_btn",
+        ):
+            st.session_state["mb_pending_confirmation"] = False
+            st.rerun()
+
+
 def render() -> None:
     inject_styles()
     inject_mother_base_theme()
     render_system_stamp("MODULE 01 / OUTER HEAVEN")
+    is_raiden = st.session_state.get("mb_profile") == "RAIDEN"
 
     st.markdown(
         """
@@ -6864,11 +6959,23 @@ def render() -> None:
 
     st.markdown('<span class="section-label">04 — VARIABLES</span>', unsafe_allow_html=True)
     run_date = datetime.now(ZoneInfo("America/Mexico_City")).date()
-    default_origins = [
-        origin
-        for origin in engine.CONFIG.origin_warehouses
-        if origin in ORIGIN_WAREHOUSES
-    ] or [811, 834]
+    if is_raiden:
+        default_origins = [
+            origin for origin in RAIDEN_DEFAULT_ORIGINS if origin in ORIGIN_WAREHOUSES
+        ]
+    else:
+        default_origins = [
+            origin
+            for origin in engine.CONFIG.origin_warehouses
+            if origin in ORIGIN_WAREHOUSES
+        ] or [811, 834]
+
+    blockable_city_options = list(city_labels)
+    if is_raiden:
+        blockable_city_options = [
+            city for city in blockable_city_options
+            if city not in RAIDEN_PROTECTED_CITIES
+        ]
 
     with st.container(border=True, key="mission_control_shared"):
         st.markdown(
@@ -6899,13 +7006,19 @@ def render() -> None:
 
         selected_blocked_cities = st.multiselect(
             "Bloquear ciudades completas — opcional",
-            options=list(city_labels),
+            options=blockable_city_options,
             default=[],
             format_func=lambda city: city_labels.get(city, city),
             help=(
                 "No se generarán envíos hacia las ciudades seleccionadas. Sus "
                 "requerimientos se eliminan antes de asignar, por lo que ese stock "
                 "queda disponible para otras tiendas."
+                + (
+                    " El perfil Raiden no puede bloquear Ciudad de México, "
+                    "Guadalajara, Monterrey, Puebla, Querétaro ni Saltillo."
+                    if is_raiden
+                    else ""
+                )
             ),
         )
         if selected_blocked_cities:
@@ -7037,6 +7150,8 @@ def render() -> None:
     avl_doh = 3.0
     special_doh_target = 21.0
     with st.container(border=True, key="engine_solidus_module"):
+        if is_raiden:
+            st.session_state["mb_engine_solidus_enabled"] = False
         include_solidus_engine = bool(
             st.session_state["mb_engine_solidus_enabled"]
         )
@@ -7047,16 +7162,32 @@ def render() -> None:
             description=(
                 "Protecciones manuales, forecast 0, cobertura AVL, prevención "
                 "de posibles quiebres y refuerzo de Golden/Infaltable/Anchor."
+                if not is_raiden
+                else "Bloqueado para el perfil Raiden."
             ),
             active=include_solidus_engine,
             tone="blue",
-            status="ACTIVO" if include_solidus_engine else "INACTIVO · CLIC PARA ACTIVAR",
+            status=(
+                "BLOQUEADO · SOLO BIG BOSS"
+                if is_raiden
+                else ("ACTIVO" if include_solidus_engine else "INACTIVO · CLIC PARA ACTIVAR")
+            ),
             min_height=150,
-            help_text="Haz clic en la tarjeta para activar o desactivar Solidus Engine.",
+            help_text=(
+                "El perfil Raiden no puede activar Solidus Engine."
+                if is_raiden
+                else "Haz clic en la tarjeta para activar o desactivar Solidus Engine."
+            ),
         ):
-            st.session_state["mb_engine_solidus_enabled"] = not include_solidus_engine
-            st.rerun()
-        if include_solidus_engine:
+            if not is_raiden:
+                st.session_state["mb_engine_solidus_enabled"] = not include_solidus_engine
+                st.rerun()
+        if is_raiden:
+            st.caption(
+                "Solidus Engine está bloqueado para el perfil Raiden. Inicia "
+                "sesión como Big Boss para usarlo."
+            )
+        elif include_solidus_engine:
             avl_left, preventive_mid, special_right = st.columns(3)
             with avl_left:
                 include_avl_fill = st.toggle(
@@ -7184,6 +7315,8 @@ def render() -> None:
     liquid_tail_threshold = 10
     forecast_horizon_days = 7
     with st.container(border=True, key="engine_liquid_module"):
+        if is_raiden:
+            st.session_state["mb_engine_liquid_enabled"] = False
         include_liquid_engine = bool(
             st.session_state["mb_engine_liquid_enabled"]
         )
@@ -7194,16 +7327,32 @@ def render() -> None:
             description=(
                 "Agota remanentes por origen. Primero nivela DOH y después utiliza "
                 "el share de ventas de las tiendas."
+                if not is_raiden
+                else "Bloqueado para el perfil Raiden."
             ),
             active=include_liquid_engine,
             tone="coral",
-            status="ACTIVO" if include_liquid_engine else "INACTIVO · CLIC PARA ACTIVAR",
+            status=(
+                "BLOQUEADO · SOLO BIG BOSS"
+                if is_raiden
+                else ("ACTIVO" if include_liquid_engine else "INACTIVO · CLIC PARA ACTIVAR")
+            ),
             min_height=150,
-            help_text="Haz clic en la tarjeta para activar o desactivar Liquid Engine.",
+            help_text=(
+                "El perfil Raiden no puede activar Liquid Engine."
+                if is_raiden
+                else "Haz clic en la tarjeta para activar o desactivar Liquid Engine."
+            ),
         ):
-            st.session_state["mb_engine_liquid_enabled"] = not include_liquid_engine
-            st.rerun()
-        if include_liquid_engine:
+            if not is_raiden:
+                st.session_state["mb_engine_liquid_enabled"] = not include_liquid_engine
+                st.rerun()
+        if is_raiden:
+            st.caption(
+                "Liquid Engine está bloqueado para el perfil Raiden. Inicia "
+                "sesión como Big Boss para usarlo."
+            )
+        elif include_liquid_engine:
             liquid_left, liquid_right = st.columns([2, 1])
             with liquid_left:
                 liquid_automatic_tail = st.toggle(
@@ -7300,7 +7449,7 @@ def render() -> None:
                 "planeado."
             ),
             active=include_venom_engine,
-            tone="blue",
+            tone="purple",
             status="ACTIVO" if include_venom_engine else "INACTIVO · CLIC PARA ACTIVAR",
             min_height=150,
             help_text="Haz clic en la tarjeta para activar o desactivar Venom Engine.",
@@ -7361,20 +7510,21 @@ def render() -> None:
                 "IS_GOLDEN": "Golden",
                 "IS_ANCHOR": "Anchor",
                 "BL": "BL (CATALOGO.LIST_TYPE)",
-                "OOWL": "OOWL — sin pronóstico, mínimo operativo",
             }
+            venom_section_type_options = [
+                value for value in VENOM_SECTION_TYPES if value != "OOWL"
+            ]
             venom_section_types = st.multiselect(
                 "Tipo de sección — Venom",
-                options=list(VENOM_SECTION_TYPES),
+                options=venom_section_type_options,
                 default=[],
                 format_func=lambda value: venom_section_type_labels.get(
                     value, value
                 ),
                 help=(
                     "Venom solo construye buffer para tienda-SKU que califiquen "
-                    "en al menos uno de los tipos marcados aquí. OOWL es la "
-                    "excepción: no usa DDMRP, manda el mínimo operativo cuando "
-                    "hay stock en origen y cero stock/incoming en destino."
+                    "en al menos uno de los tipos marcados aquí. OOWL está "
+                    "bloqueado en esta corrida y no se puede seleccionar."
                 ),
             )
             if not venom_section_types:
@@ -7393,11 +7543,18 @@ def render() -> None:
                 "DDMRP posterior a la planeación."
             )
 
-    submitted = st.button(
+    submitted_click = st.button(
         "EJECUTAR PLANEACIÓN →",
         use_container_width=True,
         type="primary",
     )
+    if submitted_click:
+        st.session_state["mb_pending_confirmation"] = True
+
+    if st.session_state.get("mb_pending_confirmation"):
+        render_pre_run_confirmation_dialog()
+
+    submitted = st.session_state.pop("mb_run_confirmed", False)
 
     if submitted:
         if not uploaded_plans:
@@ -7406,6 +7563,23 @@ def render() -> None:
         if not selected_origins:
             st.error("Selecciona al menos un warehouse origen.")
             st.stop()
+        origins_needing_copernico = (
+            set(selected_origins) & COPERNICO_REQUIRED_WAREHOUSES
+        )
+        if origins_needing_copernico:
+            copernico_warehouses = detect_copernico_warehouses(uploaded_copernico)
+            missing_copernico = sorted(
+                origins_needing_copernico - copernico_warehouses
+            )
+            if missing_copernico:
+                missing_text = ", ".join(str(w) for w in missing_copernico)
+                st.error(
+                    "Faltan archivos de COPÉRNICO para los warehouses "
+                    f"seleccionados como origen: {missing_text}. Los orígenes "
+                    "444, 831 y 856 requieren su propio archivo COPÉRNICO "
+                    "cargado (columna Bodega) antes de ejecutar la planeación."
+                )
+                st.stop()
         if not (
             include_naked_engine
             or include_solidus_engine
@@ -7575,7 +7749,7 @@ def render() -> None:
                     include_venom_engine=include_venom_engine,
                     venom_origins=tuple(venom_origins),
                     venom_destinations=tuple(venom_destinations),
-                    venom_section_types=frozenset(venom_section_types),
+                    venom_section_types=frozenset(venom_section_types) - {"OOWL"},
                     venom_lead_time_days=float(venom_lead_time_days),
                     venom_consider_current_planning=(
                         venom_consider_current_planning

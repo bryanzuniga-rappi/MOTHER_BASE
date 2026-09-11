@@ -28,6 +28,10 @@ Mother Base es una aplicación web construida con Streamlit. Su módulo operativ
 - Restricciones de stock, capacidad, tareas, rutas, ciudades, tiendas y productos.
 - Bloqueo opcional de envíos fuera de frecuencia según la hoja `SCHEDULE`.
 - Separación de entregables por owner para los orígenes 425 y 856.
+- Diferenciación funcional entre Big Boss y Raiden (ver §5): Raiden no puede activar Solidus ni Liquid, no puede bloquear seis ciudades protegidas, y tiene otros orígenes default.
+- Exclusión permanente de tres SKUs a nivel backend, sin importar el campo de exclusión de CODEC.
+- Validación obligatoria de COPÉRNICO por warehouse (444/831/856) antes de poder ejecutar.
+- Diálogo de confirmación obligatorio antes de ejecutar la planeación.
 - Reporte Excel, PDF ejecutivo, archivos CSV por origen/owner y ZIP consolidado.
 
 ### En construcción o reservado
@@ -35,7 +39,7 @@ Mother Base es una aplicación web construida con Streamlit. Su módulo operativ
 - **Militaires Sans Frontières**: módulo de reporting histórico. Su tarjeta existe, pero continúa como `WORK IN PROGRESS`.
 - Uso futuro de `STOCK.INCOMING`.
 - `OVER_ORIGEN_STORAGE`: su compatibilidad permanece en backend, pero no es obligatorio y la interfaz lo mantiene desactivado.
-- Diferenciación funcional completa entre Big Boss y Raiden. Hoy ambos pueden ejecutar las mismas operaciones; Raiden utiliza una espera operativa adicional de 10 segundos antes de ejecutar.
+- `OOWL` en Venom Engine: lógica presente en el código pero bloqueada a nivel motor; no se ofrece en la UI.
 
 ---
 
@@ -136,18 +140,22 @@ Los ZIP y archivos `*_BUILD_*` de la raíz son artefactos históricos. No son im
 
 ## 5. Acceso y perfiles
 
+### Raiden
+
+- No requiere contraseña.
+- Antes de ejecutar se aplica una espera operativa adicional de 10 segundos.
+- **Restricciones exclusivas de este perfil** (Big Boss no las tiene):
+  - No puede activar **Solidus Engine** ni **Liquid Engine**; sus tarjetas aparecen bloqueadas ("BLOQUEADO · SOLO BIG BOSS") y el clic no hace nada.
+  - No puede bloquear las ciudades Ciudad de México, Guadalajara, Monterrey, Puebla, Querétaro ni Saltillo — desaparecen de las opciones del multiselect "Bloquear ciudades".
+  - Los warehouses origen que aparecen seleccionados por default al abrir el módulo son **444 y 831** (Big Boss conserva el default general del sistema).
+
 ### Big Boss
 
 - Requiere contraseña.
 - Se lee de `st.secrets["BIG_BOSS_PASSWORD"]`.
 - Existe un fallback de compatibilidad con valor `Admin`.
 - En producción **no debe usarse el fallback**; configure un secreto largo y único.
-
-### Raiden
-
-- No requiere contraseña.
-- Hoy tiene las mismas funciones operativas que Big Boss.
-- Antes de ejecutar se aplica una espera operativa adicional de 10 segundos.
+- Sin restricciones adicionales: acceso completo a todos los engines y ciudades.
 
 ### Sesión
 
@@ -360,6 +368,10 @@ Sin importar la bodega, una fila con `ZonaPiso = LOST` **siempre se excluye**, i
 Si un SKU tiene saldo utilizable en varios ambientes, se usa el ambiente con mayor saldo.
 
 Sin archivo COPÉRNICO no hay descuento por ubicaciones ni override 856; STOCK y NO_DISPONIBLE siguen operando.
+
+### Validación obligatoria por warehouse
+
+Los warehouses **444, 831 y 856** son los únicos con COPÉRNICO propio hoy. Si alguno de ellos está seleccionado como origen, la corrida **no avanza** sin que exista un archivo COPÉRNICO cargado que cubra específicamente ese warehouse (se detecta leyendo la columna `Bodega`/`WAREHOUSE_ID` de cada archivo, sin guardar nada a disco, antes de ejecutar). Otros orígenes (por ejemplo 425) no requieren COPÉRNICO para avanzar.
 
 ### Visibilidad como motivo de corte
 
@@ -599,7 +611,7 @@ Quinto engine, **opcional y desactivado por default**. Corre al final de absolut
 |---|---|---|
 | Warehouses origen — Venom | Multiselección, mismo estilo que CODEC | Restringido a un subconjunto de los orígenes ya elegidos arriba. |
 | Tiendas destino — Venom | Multiselección | Respeta TIENDAS_CERRADAS, exclusiones, ciudades bloqueadas y outliers Fountain9. |
-| Tipo de sección | Multiselección: Infaltable, Golden, Anchor, BL, OOWL | Un par tienda-SKU entra si cumple **al menos uno** de los tipos marcados. |
+| Tipo de sección | Multiselección: Infaltable, Golden, Anchor, BL | Un par tienda-SKU entra si cumple **al menos uno** de los tipos marcados. `OOWL` está **bloqueado**: no aparece como opción y el motor lo descarta aunque llegara en `section_types`, en tres capas (UI, llamador, y dentro del propio `apply_venom_engine`). |
 | Lead time (días) | Numérico libre | Alimenta las zonas roja/amarilla/verde. |
 | Considerar planeación actual | Toggle, activo por default | Ver "On-Order" abajo. |
 
@@ -630,7 +642,7 @@ Si `NFP >= Top of Yellow` el buffer está sano y no se genera envío. Si no, Ven
 
 - `IS_INFALTABLE`, `IS_GOLDEN`, `IS_ANCHOR`: mismos flags que ya usa el resto del proyecto (`GOLDEN_INFALTABLES_ANCHOR`).
 - `BL`: tienda-SKU con `CATALOGO.LIST_TYPE = "BL"`. `LIST_TYPE` es una columna opcional en `CATALOGO`; si no existe, ningún producto califica como BL y Venom avisa con una advertencia (el resto de tipos de sección no se ve afectado).
-- `OOWL`: **no es una clasificación estática**, es una condición evaluada en tiempo de corrida — combinaciones tienda-SKU con stock disponible en alguno de los orígenes de Venom, **cero stock/incoming en la tienda destino**, sin importar si tienen ADU o no. En ese caso Venom no calcula ningún buffer: manda directamente el mínimo operativo (`config.minimum_positive_quantity`, 3 unidades por default), sujeto a stock, capacidad y tareas.
+- `OOWL`: **bloqueado en esta versión** a pedido de negocio (ver nota arriba). Antes de bloquearse, no era una clasificación estática sino una condición evaluada en tiempo de corrida — combinaciones tienda-SKU con stock disponible en alguno de los orígenes de Venom, cero stock/incoming en la tienda destino, sin importar si tenían ADU o no; en ese caso Venom no calculaba ningún buffer, mandaba directamente el mínimo operativo. La lógica sigue en el código (inactiva) por si se reactiva más adelante.
 
 **No consolidación (regla mandante de Venom):** a diferencia de Liquid/Shalashaska/AVL, Venom **nunca** revisa si el trío origen-destino-SKU ya tiene una línea de otro engine para sumarle cantidad. Siempre agrega una fila **nueva y separada** a `DETALLE_ASIGNACION` y a los CSV, marcada con `PLANNING_REASON = "ENVIADO POR VENOM ENGINE"` y `TIPO_DE_CORTE = "ENVIADOS POR VENOM ENGINE"`. Si Naked ya mandó 10 unidades del SKU X a la tienda Y y Venom decide mandar 18 más, el reporte muestra **dos líneas** (10 y 18), nunca una consolidada de 28.
 
@@ -653,7 +665,7 @@ El toggle **Agregar insumos al BulkCD_444** controla la fase.
 | PRODUCT_ID | Insumo | Target informativo | MOQ |
 |---:|---|---:|---:|
 | 85097 | Bolsa 1 | 7,000 | 1,000 |
-| 86195 | Bolsa 2 | 2,100 | 350 |
+| 86195 | Bolsa 2 | 2,100 | 200 |
 | 76491 | Sticker | 10,000 | 1,000 |
 
 Si falta stock, recorta por prioridad de tienda en múltiplos del MOQ. Una solicitud que no sea múltiplo también se reduce. Para SKU no configurado usa MOQ 1 y genera advertencia.
@@ -696,7 +708,7 @@ BulkCD_856_CHEDRAUI.csv
 | Bloquear ciudades | Todos | Temporal. |
 | Excluir tiendas | Todos | Temporal; `ID - Nombre`. |
 | Excluir outliers F9 | Todos | Activo por default. |
-| Excluir SKUs | Todos e Insumos | Comas o saltos. |
+| Excluir SKUs | Todos e Insumos | Comas o saltos. Se une a `BACKEND_EXCLUDED_SKUS` (92462, 92463, 9151), fijos y no visibles en la UI. |
 | Agregar insumos | Postproceso 444 | Activo por default. |
 | Bloquear FRUVER 811 | Stock origen | Apagado por default. |
 | Bloquear envíos fuera de frecuencia | Todos (Naked, Solidus, Shalashaska, Liquid, Insumos) | Apagado por default; usa SCHEDULE y la fecha real del sistema. |
@@ -937,6 +949,7 @@ pytest -q
 - [ ] OWNER suficiente para 425/856.
 - [ ] TIENDA contiene orígenes y destinos.
 - [ ] Si se carga COPÉRNICO, revise el saldo excluido por ZonaPiso = LOST en advertencias.
+- [ ] Si el origen es 444, 831 o 856, confirme que su archivo COPÉRNICO específico está cargado (la corrida no avanza sin él).
 
 ### Negocio
 
@@ -951,6 +964,12 @@ pytest -q
 - [ ] INSUMOS respeta MOQ y stock 444.
 - [ ] PLANNING_REASON coincide con el engine.
 - [ ] Si Venom está activo, sus líneas aparecen SEPARADAS (nunca consolidadas) en DETALLE_ASIGNACION y en los CSV, marcadas "ENVIADO POR VENOM ENGINE".
+- [ ] SKU 86195 (BOLSA 2) sale únicamente en múltiplos de 200 en INSUMOS.
+- [ ] SKUs 92462, 92463 y 9151 no aparecen en ningún Bulk (exclusión backend, no depende de CODEC).
+
+### Antes de hacer clic en "EJECUTAR PLANEACIÓN"
+
+Un diálogo de confirmación obligatorio interrumpe la ejecución con el texto: *"CONFIRMA QUE SE VALIDÓ LA CAPACIDAD DE RECIBO Y SE TIENEN EN CUENTA LAS TIENDAS QUE SE ENCUENTRAN EN RESGUARDO"*. La persona debe hacer clic en "Confirmar y ejecutar" dentro del diálogo; "Cancelar" o cerrar el diálogo no ejecuta nada.
 
 ### Conciliación de go-live
 
