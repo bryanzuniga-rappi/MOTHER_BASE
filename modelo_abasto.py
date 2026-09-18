@@ -526,12 +526,20 @@ def put_unique(
         raise ValueError(message)
 
 
-def copernico_is_usable(location: Any) -> bool:
-    """Replica las fórmulas históricas de ubicación y USABLE?."""
+def copernico_is_usable(location: Any, warehouse: int | None = None) -> bool:
+    """Replica las fórmulas históricas de ubicación y USABLE?.
+
+    ``RECIBO_444`` dejó de excluirse para las bodegas 444 y 831 (a pedido de
+    negocio): ese saldo ahora se considera usable en esas dos bodegas. Para
+    cualquier otra bodega que use esta regla general (todo lo que no sea
+    856), ``RECIBO_444`` se sigue excluyendo como antes.
+    """
     value = clean_text(location).upper()
     if value.startswith("Z"):
         return True
-    if value in {"CANCELADOS", "RECIBO_444"}:
+    if value == "CANCELADOS":
+        return False
+    if value == "RECIBO_444" and warehouse not in {444, 831}:
         return False
     # REGEXEXTRACT("(.)(.)(.)(..)(.)(..)") requiere al menos 8 caracteres.
     return len(value) >= 8
@@ -704,7 +712,7 @@ def load_copernico_unusable_csv(
                         warehouse_856_unknown_zones[floor_zone or "<VACIA>"] += 1
                     continue
 
-                if copernico_is_usable(row.get(field_lookup["Ubicacion"])):
+                if copernico_is_usable(row.get(field_lookup["Ubicacion"]), warehouse):
                     continue
                 unusable_rows += 1
                 unusable_stock[(warehouse, sku)] += balance
