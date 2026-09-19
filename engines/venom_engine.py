@@ -451,6 +451,8 @@ def apply_venom_engine(
 
         handled_pairs.add((destination, sku))
         assigned_total = sum(quantity for _, quantity in picks)
+        tasks_before = result.tasks_used
+        tasks_generated = len(picks)
         base_row = _new_base_row_template(
             order=next_order,
             destination=destination,
@@ -496,6 +498,10 @@ def apply_venom_engine(
                 "M3_CAPACIDAD_DESPUES": cap_before,
                 "EXCEDE_CAPACIDAD_EN_ESTA_LINEA": False,
                 "PASA_CAPACIDAD": True,
+                "TAREAS_ANTES": tasks_before,
+                "TAREAS_GENERADAS": tasks_generated,
+                "TAREAS_ACUMULADAS": tasks_before + tasks_generated,
+                "PASA_TAREAS": True,
                 "ORIGENES_USADOS": origenes_usados,
                 "DETALLE_MOTIVO": (
                     "Venom DDMRP: ADU="
@@ -612,6 +618,8 @@ def apply_venom_engine(
 
                 handled_pairs.add(pair)
                 assigned_total = sum(quantity for _, quantity in picks)
+                tasks_before = result.tasks_used
+                tasks_generated = len(picks)
                 base_row = _new_base_row_template(
                     order=next_order,
                     destination=destination,
@@ -666,6 +674,10 @@ def apply_venom_engine(
                         "M3_CAPACIDAD_DESPUES": cap_before,
                         "EXCEDE_CAPACIDAD_EN_ESTA_LINEA": False,
                         "PASA_CAPACIDAD": True,
+                        "TAREAS_ANTES": tasks_before,
+                        "TAREAS_GENERADAS": tasks_generated,
+                        "TAREAS_ACUMULADAS": tasks_before + tasks_generated,
+                        "PASA_TAREAS": True,
                         "ORIGENES_USADOS": origenes_usados,
                         "DETALLE_MOTIVO": (
                             "Venom OOWL: hay stock en origen y cero stock/incoming "
