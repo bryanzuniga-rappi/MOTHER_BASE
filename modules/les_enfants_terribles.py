@@ -293,6 +293,26 @@ PLANNING_REASON_COLUMN = "PLANNING_REASON"
 # capture en el campo "Excluir SKUs" de CODEC. No aparecen en la UI: se unen
 # incondicionalmente al set de exclusión en cada corrida.
 BACKEND_EXCLUDED_SKUS: frozenset[int] = frozenset({92462, 92463, 9151})
+
+# REGLA_DEMANDA que solo generan los engines de cobertura (AVL, Preventivo,
+# Refuerzo Golden/Infaltable/Anchor, Shalashaska, Liquid, Venom) — nunca la
+# necesidad original de Fountain9. "Requerido" en Planeación Lista se calcula
+# EXCLUYENDO estas filas, para que siempre refleje solo la necesidad de
+# Naked/Solidus (la pasada base), sin mezclar con lo que el modelo decide
+# agregar después como cobertura. Se compara ANTES de que
+# apply_reporting_labels renombre REGLA_DEMANDA, así que estos valores nunca
+# cambian sin importar en qué momento se lea la fila.
+ENGINE_TOPUP_REGLA_DEMANDA: frozenset[str] = frozenset(
+    {
+        "AVL_DOH",
+        "PREVENTIVO_DOH",
+        "REFUERZO_ESPECIALES_DOH",
+        "LIQUID_ENGINE",
+        "SHALASHASKA_ENGINE",
+        "VENOM_DDMRP",
+        "VENOM_OOWL_MINIMO",
+    }
+)
 PLANNING_REASON_FOUNTAIN9 = "FOUNTAIN9 · NAKED ENGINE"
 PLANNING_REASON_MANUAL_FORECAST_ZERO = "PROTECCIÓN · SOLIDUS ENGINE"
 PLANNING_REASON_AVL = "CUBRIR AVL · SOLIDUS ENGINE"
@@ -2206,6 +2226,14 @@ def build_planning_analytics(
         return max(int(math.ceil(max(float(row["MOV_ORIGINAL"]), 0.0))), 0)
 
     eligible_rows = [row for row in base_rows if row["CANTIDAD_OBJETIVO"] > 0]
+    # "Requerido" en Planeación Lista debe reflejar SOLO la necesidad original
+    # de Naked/Solidus (la pasada base con Fountain9), nunca lo que los
+    # engines de cobertura agregan después como objetivo propio.
+    naked_eligible_rows = [
+        row
+        for row in eligible_rows
+        if row.get("REGLA_DEMANDA") not in ENGINE_TOPUP_REGLA_DEMANDA
+    ]
     assigned_rows = [row for row in eligible_rows if row["CANTIDAD_ASIGNADA"] > 0]
     fully_covered_rows = [
         row
@@ -2604,6 +2632,16 @@ def build_planning_analytics(
     target_units = sum(int(row["CANTIDAD_OBJETIVO"]) for row in eligible_rows)
     assigned_units = sum(int(row["CANTIDAD_ASIGNADA"]) for row in eligible_rows)
     target_m3 = sum(float(row["M3_OBJETIVO"]) for row in eligible_rows)
+    # Solo Naked/Solidus (necesidad original de Fountain9) — para las
+    # tarjetas "Requerido" de Planeación Lista, que nunca deben incluir lo
+    # que AVL/Shalashaska/Liquid/Venom agregan como su propia cobertura.
+    naked_eligible_cases = len(naked_eligible_rows)
+    naked_target_units = sum(
+        int(row["CANTIDAD_OBJETIVO"]) for row in naked_eligible_rows
+    )
+    naked_target_m3 = sum(
+        float(row["M3_OBJETIVO"]) for row in naked_eligible_rows
+    )
     original_roq_total = sum(original_roq_units(row) for row in eligible_rows)
     original_roq_fulfilled = sum(
         min(int(row["CANTIDAD_ASIGNADA"]), original_roq_units(row))
@@ -2636,6 +2674,9 @@ def build_planning_analytics(
             "target_units": target_units,
             "assigned_units": assigned_units,
             "target_m3": round(target_m3, 3),
+            "naked_eligible_cases": naked_eligible_cases,
+            "naked_target_units": naked_target_units,
+            "naked_target_m3": round(naked_target_m3, 3),
             "case_compliance_pct": percentage(
                 len(fully_covered_rows), len(eligible_rows)
             ),
@@ -6078,9 +6119,11 @@ def render_results(run: dict[str, Any]) -> None:
     st.markdown(
         """
         <div class="report-note">
-            REQUERIDO = lo que pedían los requerimientos evaluados · PLANEACIÓN FINAL =
-            lo que realmente se asignó. PALLETS usa el mismo dato que M³ (columna
-            PALLETS de VOLUMETRIA), solo se muestra con esta etiqueta.
+            REQUERIDO = solo la necesidad original de Naked/Solidus (Fountain9 + reglas
+            de mínimo/hardcode), sin la cobertura que agregan AVL, Shalashaska, Liquid o
+            Venom · PLANEACIÓN FINAL = todo lo realmente asignado, con todos los
+            engines. PALLETS usa el mismo dato que M³ (columna PALLETS de VOLUMETRIA),
+            solo se muestra con esta etiqueta.
         </div>
         """,
         unsafe_allow_html=True,
@@ -6088,25 +6131,34 @@ def render_results(run: dict[str, Any]) -> None:
     render_kpi_cards(
         [
             {
-                "category": "REQUERIDO",
+                "category": "REQUERIDO · NAKED",
                 "label": "UNIDADES",
-                "value": f"{planning_summary.get('target_units', 0):,}",
-                "description": "Suma de CANTIDAD_OBJETIVO de los requerimientos evaluados.",
-            },
-            {
-                "category": "REQUERIDO",
-                "label": "TAREAS",
-                "value": f"{planning_summary.get('eligible_cases', run['requirements']):,}",
+                "value": f"{planning_summary.get('naked_target_units', 0):,}",
                 "description": (
-                    "Casos tienda–SKU evaluados; el máximo de tareas si cada caso se "
-                    "cubriera con una sola línea."
+                    "Suma de CANTIDAD_OBJETIVO SOLO de la pasada base Naked/Solidus "
+                    "(necesidad original de Fountain9). No incluye lo que AVL, "
+                    "Shalashaska, Liquid o Venom agregan como cobertura propia."
                 ),
+                "tone": "blue",
             },
             {
-                "category": "REQUERIDO",
+                "category": "REQUERIDO · NAKED",
+                "label": "TAREAS",
+                "value": f"{planning_summary.get('naked_eligible_cases', 0):,}",
+                "description": (
+                    "Casos tienda–SKU evaluados solo por Naked/Solidus; el máximo de "
+                    "tareas si cada caso se cubriera con una sola línea."
+                ),
+                "tone": "blue",
+            },
+            {
+                "category": "REQUERIDO · NAKED",
                 "label": "PALLETS",
-                "value": f"{planning_summary.get('target_m3', 0):,.3f}",
-                "description": "Suma de M3_OBJETIVO de los requerimientos evaluados.",
+                "value": f"{planning_summary.get('naked_target_m3', 0):,.3f}",
+                "description": (
+                    "Suma de M3_OBJETIVO SOLO de la pasada base Naked/Solidus."
+                ),
+                "tone": "blue",
             },
         ],
         columns_count=3,
@@ -6167,6 +6219,7 @@ def render_results(run: dict[str, Any]) -> None:
                     "reciben producto normal desde 444. No consumen tareas, pero "
                     "sí están limitadas por stock ajustado y MOQ."
                 ),
+                "tone": "blue",
             },
             {
                 "category": "UNIDADES · INSUMOS",
@@ -6197,6 +6250,7 @@ def render_results(run: dict[str, Any]) -> None:
                     "Número de ciudades distintas con al menos una unidad de producto "
                     "asignada. No incluye insumos."
                 ),
+                "tone": "blue",
             },
             {
                 "category": "COBERTURA · TIENDAS",
