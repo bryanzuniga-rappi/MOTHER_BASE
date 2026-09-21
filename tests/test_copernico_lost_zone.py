@@ -48,23 +48,35 @@ def test_lost_takes_priority_over_usable_ubicacion():
     assert engine.copernico_is_usable("ZABCDEFG") is True  # referencia: sería usable
 
 
-def test_existing_ubicacion_rules_unaffected(tmp_path):
-    """RECIBO_444/CANCELADOS en Ubicacion se siguen excluyendo igual que antes."""
+def test_recibo_444_is_usable_for_warehouses_444_and_831(tmp_path):
+    """A pedido de negocio: RECIBO_444 ya NO se excluye en 444 ni 831."""
     path = tmp_path / "copernico.csv"
     _write_copernico_csv(
         path,
         [
             [444, 12, "RECIBO_444", 3, ""],
+            [831, 15, "RECIBO_444", 4, ""],
             [444, 13, "CANCELADOS", 2, ""],
             [444, 14, "ZABCDEFG", 9, ""],
         ],
     )
     unusable, _storage_overrides, summary = engine.load_copernico_unusable_csv(path)
 
-    assert unusable[(444, 12)] == 3.0
-    assert unusable[(444, 13)] == 2.0
+    assert (444, 12) not in unusable  # RECIBO_444 en 444: ahora usable
+    assert (831, 15) not in unusable  # RECIBO_444 en 831: ahora usable
+    assert unusable[(444, 13)] == 2.0  # CANCELADOS se sigue excluyendo
     assert (444, 14) not in unusable
     assert summary["lost_zone_rows"] == 0
+
+
+def test_recibo_444_still_excluded_for_other_warehouses(tmp_path):
+    """La excepción es solo para 444 y 831; cualquier otra bodega conserva
+    la regla histórica (RECIBO_444 sigue excluido ahí)."""
+    path = tmp_path / "copernico.csv"
+    _write_copernico_csv(path, [[425, 20, "RECIBO_444", 6, ""]])
+    unusable, _storage_overrides, _summary = engine.load_copernico_unusable_csv(path)
+
+    assert unusable[(425, 20)] == 6.0
 
 
 def test_lost_in_warehouse_856_bypasses_zone_classification(tmp_path):
@@ -114,7 +126,7 @@ def test_csv_without_zonapiso_column_still_works_for_non_856(tmp_path):
         path,
         [
             [444, 50, "ZABCDEFG", 5],
-            [444, 51, "RECIBO_444", 2],
+            [444, 51, "CANCELADOS", 2],
         ],
         header=("Bodega", "EAN", "Ubicacion", "Saldo"),
     )
@@ -127,7 +139,7 @@ def test_csv_without_zonapiso_column_still_works_for_non_856(tmp_path):
 
 def test_accepts_single_path_for_backward_compatibility(tmp_path):
     path = tmp_path / "copernico.csv"
-    _write_copernico_csv(path, [[444, 10, "RECIBO_444", 5, ""]])
+    _write_copernico_csv(path, [[444, 10, "CANCELADOS", 5, ""]])
     unusable, _storage_overrides, summary = engine.load_copernico_unusable_csv(path)
 
     assert unusable[(444, 10)] == 5.0
@@ -344,7 +356,8 @@ def test_load_catalogs_accepts_multiple_copernico_files(tmp_path):
     xlsx_path = tmp_path / "DATA_TRANSFERS.xlsx"
     wb.save(xlsx_path)
 
-    # Dos archivos, cada uno descuenta un SKU distinto.
+    # Dos archivos: uno con RECIBO_444 (ya usable en 444) y otro con LOST
+    # (sigue excluido siempre, sin importar la bodega).
     copernico_path_1 = tmp_path / "copernico_1.csv"
     _write_copernico_csv(copernico_path_1, [[444, 10, "RECIBO_444", 5, ""]])
     copernico_path_2 = tmp_path / "copernico_2.csv"
@@ -359,9 +372,9 @@ def test_load_catalogs_accepts_multiple_copernico_files(tmp_path):
 
     info_10 = engine.source_stock_components(catalogs, 444, 10)
     info_11 = engine.source_stock_components(catalogs, 444, 11)
-    assert info_10["copernico_unusable"] == 5.0
-    assert info_10["adjusted"] == 15.0
-    assert info_11["copernico_unusable"] == 8.0
+    assert info_10["copernico_unusable"] == 0.0  # RECIBO_444 ya no excluye en 444
+    assert info_10["adjusted"] == 20.0
+    assert info_11["copernico_unusable"] == 8.0  # LOST se sigue excluyendo
     assert info_11["adjusted"] == 12.0
     assert any(
         "2 archivo(s)" in warning for warning in catalogs.warnings

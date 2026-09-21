@@ -2603,6 +2603,7 @@ def build_planning_analytics(
 
     target_units = sum(int(row["CANTIDAD_OBJETIVO"]) for row in eligible_rows)
     assigned_units = sum(int(row["CANTIDAD_ASIGNADA"]) for row in eligible_rows)
+    target_m3 = sum(float(row["M3_OBJETIVO"]) for row in eligible_rows)
     original_roq_total = sum(original_roq_units(row) for row in eligible_rows)
     original_roq_fulfilled = sum(
         min(int(row["CANTIDAD_ASIGNADA"]), original_roq_units(row))
@@ -2634,6 +2635,7 @@ def build_planning_analytics(
             "not_assigned_cases": len(not_assigned_rows),
             "target_units": target_units,
             "assigned_units": assigned_units,
+            "target_m3": round(target_m3, 3),
             "case_compliance_pct": percentage(
                 len(fully_covered_rows), len(eligible_rows)
             ),
@@ -5010,6 +5012,30 @@ def execute_planning(
                 "exclusión, esas líneas habrían tenido stock elegible."
             )
         analytics["golden"] = build_golden_analytics(result)
+        naked_allocation_rows = [
+            row
+            for row in result.allocation_rows
+            if row.get(PLANNING_REASON_COLUMN) == PLANNING_REASON_FOUNTAIN9
+        ]
+        naked_summary = {
+            "enabled": True,
+            "units": sum(int(row["QUANTITY"]) for row in naked_allocation_rows),
+            "tasks": len(naked_allocation_rows),
+            "stores": len(
+                {row["WAREHOUSE_DESTINATION"] for row in naked_allocation_rows}
+            ),
+            "products": len({row["RETAIL_ID"] for row in naked_allocation_rows}),
+            "m3": round(
+                sum(
+                    int(row["QUANTITY"])
+                    * catalogs.volume_m3.get(
+                        int(row["RETAIL_ID"]), config.default_m3_per_unit
+                    )
+                    for row in naked_allocation_rows
+                ),
+                3,
+            ),
+        }
         fountain9_zero_rows = build_fountain9_zero_report(
             consolidated_input,
             catalogs,
@@ -5211,6 +5237,7 @@ def execute_planning(
         "shalashaska": shalashaska_summary,
         "fruver_811": fruver_811_summary,
         "schedule_block": schedule_block,
+        "naked": naked_summary,
         "copernico_cuts": copernico_cuts,
         "venom": venom_summary,
         "input_consolidation": consolidation_summary,
@@ -5625,18 +5652,19 @@ def render_golden_report(analytics: dict[str, Any]) -> None:
     )
 
 
-def render_planning_analytics(analytics: dict[str, Any]) -> None:
+def render_planning_analytics(analytics: dict[str, Any], run: dict[str, Any]) -> None:
     summary = analytics["summary"]
 
     st.markdown(
-        '<div class="report-title">CIUDADES + TIENDAS.</div>',
+        '<div class="report-title">DETALLE DE PLANEACIÓN.</div>',
         unsafe_allow_html=True,
     )
     st.markdown(
         """
         <div class="report-note">
-            PRODUCTOS = SKUs distintos con al menos una unidad asignada · M³ = volumen
-            realmente planeado · TAREAS = líneas generadas considerando cada origen.
+            PRODUCTOS = SKUs distintos con al menos una unidad asignada · M³/PALLETS =
+            mismo dato, volumen realmente planeado · TAREAS = líneas generadas
+            considerando cada origen · UNIDADES = CANTIDAD_ASIGNADA total.
         </div>
         """,
         unsafe_allow_html=True,
@@ -5673,6 +5701,16 @@ def render_planning_analytics(analytics: dict[str, Any]) -> None:
                 ),
             },
             {
+                "category": "TAREAS",
+                "label": "TAREAS GENERADAS",
+                "value": f"{run.get('tasks', 0):,}",
+                "description": (
+                    "Líneas operativas de transferencia generadas por el modelo. "
+                    "Las líneas de insumos no cuentan aquí."
+                ),
+                "tone": "blue",
+            },
+            {
                 "category": "VOLUMEN · PRODUCTO",
                 "label": "M³ PLANEADOS",
                 "value": f"{summary['m3_assigned']:,.3f}",
@@ -5682,7 +5720,25 @@ def render_planning_analytics(analytics: dict[str, Any]) -> None:
                 ),
                 "tone": "blue",
             },
-        ]
+            {
+                "category": "VOLUMEN · PRODUCTO",
+                "label": "PALLETS PLANEADOS",
+                "value": f"{summary['m3_assigned']:,.3f}",
+                "description": (
+                    "Mismo dato que M³ PLANEADOS (columna PALLETS de VOLUMETRIA), "
+                    "mostrado aparte."
+                ),
+                "tone": "blue",
+            },
+            {
+                "category": "UNIDADES",
+                "label": "UNIDADES ASIGNADAS",
+                "value": f"{summary['assigned_units']:,}",
+                "description": "Suma de CANTIDAD_ASIGNADA de todos los requerimientos evaluados.",
+                "tone": "acid",
+            },
+        ],
+        columns_count=4,
     )
 
     st.markdown('<span class="section-label">RESUMEN POR CIUDAD</span>', unsafe_allow_html=True)
@@ -5694,7 +5750,7 @@ def render_planning_analytics(analytics: dict[str, Any]) -> None:
         max_height=360,
     )
 
-    st.markdown('<span class="section-label">DETALLE POR TIENDA</span>', unsafe_allow_html=True)
+    st.markdown('<span class="section-label">RESUMEN POR TIENDA</span>', unsafe_allow_html=True)
     report_table(
         analytics["store_rows"],
         column_config={
@@ -6017,7 +6073,77 @@ def render_planning_analytics(analytics: dict[str, Any]) -> None:
 
 
 def render_results(run: dict[str, Any]) -> None:
+    planning_summary = run.get("analytics", {}).get("summary", {})
     st.markdown('<div class="result-title">PLANEACIÓN LISTA.</div>', unsafe_allow_html=True)
+    st.markdown(
+        """
+        <div class="report-note">
+            REQUERIDO = lo que pedían los requerimientos evaluados · PLANEACIÓN FINAL =
+            lo que realmente se asignó. PALLETS usa el mismo dato que M³ (columna
+            PALLETS de VOLUMETRIA), solo se muestra con esta etiqueta.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    render_kpi_cards(
+        [
+            {
+                "category": "REQUERIDO",
+                "label": "UNIDADES",
+                "value": f"{planning_summary.get('target_units', 0):,}",
+                "description": "Suma de CANTIDAD_OBJETIVO de los requerimientos evaluados.",
+            },
+            {
+                "category": "REQUERIDO",
+                "label": "TAREAS",
+                "value": f"{planning_summary.get('eligible_cases', run['requirements']):,}",
+                "description": (
+                    "Casos tienda–SKU evaluados; el máximo de tareas si cada caso se "
+                    "cubriera con una sola línea."
+                ),
+            },
+            {
+                "category": "REQUERIDO",
+                "label": "PALLETS",
+                "value": f"{planning_summary.get('target_m3', 0):,.3f}",
+                "description": "Suma de M3_OBJETIVO de los requerimientos evaluados.",
+            },
+        ],
+        columns_count=3,
+    )
+    render_kpi_cards(
+        [
+            {
+                "category": "PLANEACIÓN FINAL",
+                "label": "UNIDADES",
+                "value": f"{run['units']:,}",
+                "description": (
+                    "Suma de QUANTITY de las transferencias normales de producto. "
+                    "No incluye insumos."
+                ),
+                "tone": "acid",
+            },
+            {
+                "category": "PLANEACIÓN FINAL",
+                "label": "TAREAS",
+                "value": f"{run['tasks']:,}",
+                "description": (
+                    "Líneas operativas de transferencia generadas por el modelo. "
+                    "Un caso puede crear dos tareas si se divide entre dos orígenes. "
+                    "Las líneas de insumos no cuentan aquí."
+                ),
+                "tone": "acid",
+            },
+            {
+                "category": "PLANEACIÓN FINAL",
+                "label": "PALLETS",
+                "value": f"{planning_summary.get('m3_assigned', 0):,.3f}",
+                "description": "Suma de M3_ASIGNADO realmente planeado.",
+                "tone": "acid",
+            },
+        ],
+        columns_count=3,
+    )
     render_kpi_cards(
         [
             {
@@ -6031,36 +6157,6 @@ def render_results(run: dict[str, Any]) -> None:
                     "de aplicar exclusiones."
                 ),
                 "tone": "acid",
-            },
-            {
-                "category": "CASOS · MODELO",
-                "label": "REQUERIMIENTOS EVALUADOS",
-                "value": f"{run['requirements']:,}",
-                "description": (
-                    "Casos tienda–SKU que llegaron al motor después de quitar "
-                    "TIENDAS_CERRADAS, outliers Fountain9 y los bloqueos "
-                    "opcionales de ciudad."
-                ),
-            },
-            {
-                "category": "TAREAS · OPERACIÓN",
-                "label": "TAREAS DE ABASTO",
-                "value": f"{run['tasks']:,}",
-                "description": (
-                    "Líneas operativas de transferencia generadas por el modelo. "
-                    "Un caso puede crear dos tareas si se divide entre dos orígenes. "
-                    "Las líneas de insumos no cuentan aquí."
-                ),
-                "tone": "blue",
-            },
-            {
-                "category": "UNIDADES · ABASTO",
-                "label": "UNIDADES DE PRODUCTO",
-                "value": f"{run['units']:,}",
-                "description": (
-                    "Suma de QUANTITY de las transferencias normales de producto. "
-                    "No incluye insumos."
-                ),
             },
             {
                 "category": "LÍNEAS · INSUMOS",
@@ -6085,6 +6181,35 @@ def render_results(run: dict[str, Any]) -> None:
             },
         ],
         columns_count=3,
+    )
+
+    st.markdown(
+        '<div class="result-title">CIUDADES + TIENDAS ATENDIDAS.</div>',
+        unsafe_allow_html=True,
+    )
+    render_kpi_cards(
+        [
+            {
+                "category": "COBERTURA · GEOGRAFÍA",
+                "label": "CIUDADES ATENDIDAS",
+                "value": f"{planning_summary.get('cities_served', 0):,}",
+                "description": (
+                    "Número de ciudades distintas con al menos una unidad de producto "
+                    "asignada. No incluye insumos."
+                ),
+            },
+            {
+                "category": "COBERTURA · TIENDAS",
+                "label": "TIENDAS ATENDIDAS",
+                "value": f"{planning_summary.get('stores_served', 0):,}",
+                "description": (
+                    "Warehouses destino distintos que reciben al menos una unidad de "
+                    "producto normal."
+                ),
+                "tone": "acid",
+            },
+        ],
+        columns_count=2,
     )
 
     storage_override = run.get("origin_storage_override", {})
@@ -6215,6 +6340,213 @@ def render_results(run: dict[str, Any]) -> None:
                 f"de {outliers['stores_excluded']:,} tiendas anómalas. El detalle "
                 "completo está en el CSV Outliers_Fountain9_Excluidos."
             )
+
+    closed_stores = run.get("closed_stores", {})
+    if closed_stores.get("requirements", 0) > 0:
+        store_ids = ", ".join(map(str, closed_stores.get("store_ids", [])))
+        st.warning(
+            "Bloqueo backend TIENDAS_CERRADAS aplicado: se excluyeron "
+            f"{closed_stores['requirements']:,} requerimientos de "
+            f"{closed_stores['stores']:,} tiendas ({store_ids}) antes de asignar stock."
+        )
+
+    city_block = run.get("city_block", {})
+    if city_block.get("requirements", 0) > 0:
+        city_names = ", ".join(
+            item["name"] for item in city_block.get("cities", [])
+        )
+        st.warning(
+            f"Bloqueo de ciudad aplicado: {city_names}. Se excluyeron "
+            f"{city_block['requirements']:,} requerimientos, "
+            f"{city_block['stores']:,} tiendas y "
+            f"{city_block['products']:,} productos antes de asignar stock."
+        )
+    st.markdown('<span class="section-label">DESCARGAR TODO</span>', unsafe_allow_html=True)
+    zip_path = Path(run["zip"])
+    st.download_button(
+        "Descargar planeación completa (.zip)",
+        data=zip_path.read_bytes(),
+        file_name=zip_path.name,
+        mime="application/zip",
+        use_container_width=True,
+    )
+
+    st.markdown('<span class="section-label">ARCHIVOS INDIVIDUALES</span>', unsafe_allow_html=True)
+
+    def _download_button(path: Path, label: str, key: str) -> None:
+        mime = (
+            "text/csv"
+            if path.suffix.lower() == ".csv"
+            else "application/pdf"
+            if path.suffix.lower() == ".pdf"
+            else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+        st.markdown(f'<span class="file-pill">{path.name}</span>', unsafe_allow_html=True)
+        st.download_button(
+            label,
+            data=path.read_bytes(),
+            file_name=path.name,
+            mime=mime,
+            key=key,
+            use_container_width=True,
+        )
+
+    all_paths = [Path(raw_path) for raw_path in run["files"]]
+    bulk_pattern = re.compile(r"^BulkCD_(\d+)(?:_(.+))?\.csv$")
+    report_paths = [p for p in all_paths if p.name.startswith("Reporte_Planeacion_")]
+    bulk_paths = sorted(
+        (p for p in all_paths if bulk_pattern.match(p.name)),
+        key=lambda p: (
+            int(bulk_pattern.match(p.name).group(1)),
+            bulk_pattern.match(p.name).group(2) or "",
+        ),
+    )
+    fountain9_zero_paths = [
+        p for p in all_paths if p.name.startswith("Fountain9_Sin_Recomendacion_")
+    ]
+    outlier_paths = [
+        p for p in all_paths if p.name.startswith("Outliers_Fountain9_Excluidos_")
+    ]
+    pdf_paths = [
+        p for p in all_paths if p.name.startswith("Reporte_Ejecutivo_Planeacion_")
+    ]
+    categorized = (
+        set(report_paths)
+        | set(bulk_paths)
+        | set(fountain9_zero_paths)
+        | set(outlier_paths)
+        | set(pdf_paths)
+    )
+    other_paths = [p for p in all_paths if p not in categorized]
+
+    if report_paths:
+        st.caption("Reporte de planeación (Excel)")
+        for index, path in enumerate(report_paths):
+            _download_button(
+                path, "Descargar reporte de planeación", f"download_report_{index}"
+            )
+
+    if bulk_paths:
+        # No asumas una cantidad fija: hay tantos Bulk como orígenes
+        # seleccionados hayan generado al menos una línea (más owner splits
+        # de 425/856), así que esto siempre se acomoda al número real.
+        st.caption(f"Bulk por origen ({len(bulk_paths):,})")
+        bulk_columns = st.columns(min(max(len(bulk_paths), 1), 3))
+        for index, path in enumerate(bulk_paths):
+            match = bulk_pattern.match(path.name)
+            origin_label = match.group(1) if match else ""
+            owner_label = f" · {match.group(2)}" if match and match.group(2) else ""
+            with bulk_columns[index % len(bulk_columns)]:
+                _download_button(
+                    path,
+                    f"Descargar Bulk {origin_label}{owner_label}",
+                    f"download_bulk_{index}",
+                )
+
+    if fountain9_zero_paths:
+        st.caption("Sin recomendación Fountain9")
+        for index, path in enumerate(fountain9_zero_paths):
+            _download_button(
+                path,
+                "Descargar sin recomendación Fountain9",
+                f"download_f9zero_{index}",
+            )
+
+    if outlier_paths:
+        st.caption("Outliers Fountain9")
+        for index, path in enumerate(outlier_paths):
+            _download_button(
+                path, "Descargar outliers Fountain9", f"download_outliers_{index}"
+            )
+
+    if pdf_paths:
+        st.caption("Reporte ejecutivo de planeación (PDF)")
+        for index, path in enumerate(pdf_paths):
+            _download_button(
+                path,
+                "Descargar reporte ejecutivo de planeación",
+                f"download_pdf_{index}",
+            )
+
+    if other_paths:
+        st.caption("Otros archivos")
+        other_columns = st.columns(min(max(len(other_paths), 1), 3))
+        for index, path in enumerate(other_paths):
+            with other_columns[index % len(other_columns)]:
+                _download_button(
+                    path, f"Descargar {path.name}", f"download_other_{index}"
+                )
+
+    st.markdown('<span class="section-label">BREAKDOWN</span>', unsafe_allow_html=True)
+    breakdown = ordered_breakdown_rows(run["status_counts"])
+    visible_breakdown_rows = max(12, len(breakdown))
+    breakdown_height = (visible_breakdown_rows + 1) * 36 + 4
+    st.dataframe(
+        breakdown,
+        use_container_width=True,
+        hide_index=True,
+        height=breakdown_height,
+    )
+
+    if run.get("analytics"):
+        render_planning_analytics(run["analytics"], run)
+
+    st.markdown(
+        '<div class="report-title">REPORTE POR ENGINE.</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        """
+        <div class="report-note">
+            Un bloque por cada engine que corrió esta planeación. Naked es la base
+            (demanda natural de Fountain9); el resto son coberturas opcionales que
+            se apilan encima, en el orden en que se ejecutaron.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    naked = run.get("naked", {})
+    if naked.get("enabled"):
+        st.markdown(
+            '<span class="section-label">REPORTE NAKED · DEMANDA NATURAL FOUNTAIN9</span>',
+            unsafe_allow_html=True,
+        )
+        render_kpi_cards(
+            [
+                {
+                    "category": "TAREAS · NAKED",
+                    "label": "TAREAS GENERADAS",
+                    "value": f"{naked.get('tasks', 0):,}",
+                    "description": (
+                        "Líneas de asignación con PLANNING_REASON = "
+                        "'FOUNTAIN9 · NAKED ENGINE': demanda natural, sin hardcodes "
+                        "de Solidus ni coberturas adicionales."
+                    ),
+                    "tone": "acid",
+                },
+                {
+                    "category": "UNIDADES · NAKED",
+                    "label": "UNIDADES ASIGNADAS",
+                    "value": f"{naked.get('units', 0):,}",
+                    "description": "Suma de QUANTITY de esas líneas.",
+                },
+                {
+                    "category": "COBERTURA · NAKED",
+                    "label": "TIENDAS / SKUS",
+                    "value": f"{naked.get('stores', 0):,} / {naked.get('products', 0):,}",
+                    "description": "Tiendas y productos distintos atendidos solo por Naked.",
+                },
+                {
+                    "category": "VOLUMEN · NAKED",
+                    "label": "M³ / PALLETS",
+                    "value": f"{naked.get('m3', 0):,.3f}",
+                    "description": "Volumen de esas líneas (mismo dato que pallets).",
+                    "tone": "blue",
+                },
+            ],
+            columns_count=4,
+        )
 
     avl = run.get("avl", {})
     if avl.get("enabled"):
@@ -6699,73 +7031,6 @@ def render_results(run: dict[str, Any]) -> None:
                 },
                 max_height=280,
             )
-
-    closed_stores = run.get("closed_stores", {})
-    if closed_stores.get("requirements", 0) > 0:
-        store_ids = ", ".join(map(str, closed_stores.get("store_ids", [])))
-        st.warning(
-            "Bloqueo backend TIENDAS_CERRADAS aplicado: se excluyeron "
-            f"{closed_stores['requirements']:,} requerimientos de "
-            f"{closed_stores['stores']:,} tiendas ({store_ids}) antes de asignar stock."
-        )
-
-    city_block = run.get("city_block", {})
-    if city_block.get("requirements", 0) > 0:
-        city_names = ", ".join(
-            item["name"] for item in city_block.get("cities", [])
-        )
-        st.warning(
-            f"Bloqueo de ciudad aplicado: {city_names}. Se excluyeron "
-            f"{city_block['requirements']:,} requerimientos, "
-            f"{city_block['stores']:,} tiendas y "
-            f"{city_block['products']:,} productos antes de asignar stock."
-        )
-
-    st.markdown('<span class="section-label">DESCARGAR TODO</span>', unsafe_allow_html=True)
-    zip_path = Path(run["zip"])
-    st.download_button(
-        "Descargar planeación completa (.zip)",
-        data=zip_path.read_bytes(),
-        file_name=zip_path.name,
-        mime="application/zip",
-        use_container_width=True,
-    )
-
-    st.markdown('<span class="section-label">ARCHIVOS INDIVIDUALES</span>', unsafe_allow_html=True)
-    columns = st.columns(min(max(len(run["files"]), 1), 3))
-    for index, raw_path in enumerate(run["files"]):
-        path = Path(raw_path)
-        mime = (
-            "text/csv"
-            if path.suffix.lower() == ".csv"
-            else "application/pdf"
-            if path.suffix.lower() == ".pdf"
-            else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
-        with columns[index % len(columns)]:
-            st.markdown(f'<span class="file-pill">{path.name}</span>', unsafe_allow_html=True)
-            st.download_button(
-                f"Descargar {path.name}",
-                data=path.read_bytes(),
-                file_name=path.name,
-                mime=mime,
-                key=f"download_{index}_{path.name}",
-                use_container_width=True,
-            )
-
-    st.markdown('<span class="section-label">BREAKDOWN</span>', unsafe_allow_html=True)
-    breakdown = ordered_breakdown_rows(run["status_counts"])
-    visible_breakdown_rows = max(12, len(breakdown))
-    breakdown_height = (visible_breakdown_rows + 1) * 36 + 4
-    st.dataframe(
-        breakdown,
-        use_container_width=True,
-        hide_index=True,
-        height=breakdown_height,
-    )
-
-    if run.get("analytics"):
-        render_planning_analytics(run["analytics"])
 
     if run["warnings"]:
         with st.expander(f"Advertencias de calidad ({len(run['warnings'])})"):

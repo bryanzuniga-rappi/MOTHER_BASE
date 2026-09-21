@@ -344,12 +344,13 @@ COPÉRNICO no define stock. Solo:
 ### Regla general histórica
 
 - Ubicación que inicia con `Z`: utilizable.
-- `CANCELADOS` y `RECIBO_444`: no utilizables.
+- `CANCELADOS`: no utilizable, en cualquier bodega.
+- `RECIBO_444`: no utilizable, **excepto en las bodegas 444 y 831**, donde se considera utilizable (cambio de negocio; antes se excluía siempre). Cualquier otra bodega que use esta regla general conserva la exclusión histórica.
 - Otras ubicaciones: utilizables si cumplen la estructura histórica de al menos ocho caracteres.
 
 ### ZonaPiso = LOST (todas las bodegas)
 
-Sin importar la bodega, una fila con `ZonaPiso = LOST` **siempre se excluye**, igual que `CANCELADOS`/`RECIBO_444` en Ubicacion. Esta regla se evalúa **antes** que cualquier otra (incluida la clasificación E/RCC/RR/MRM de la bodega 856) y tiene prioridad sobre una Ubicación que por sí sola sería utilizable. `ZonaPiso` sigue siendo opcional para bodegas distintas de 856: si la columna no existe en el archivo, simplemente no hay filas LOST que excluir.
+Sin importar la bodega, una fila con `ZonaPiso = LOST` **siempre se excluye**, igual que `CANCELADOS` en Ubicacion (y que `RECIBO_444` fuera de 444/831). Esta regla se evalúa **antes** que cualquier otra (incluida la clasificación E/RCC/RR/MRM de la bodega 856) y tiene prioridad sobre una Ubicación que por sí sola sería utilizable. `ZonaPiso` sigue siendo opcional para bodegas distintas de 856: si la columna no existe en el archivo, simplemente no hay filas LOST que excluir.
 
 ### Bodega 856
 
@@ -597,7 +598,7 @@ Un origen-SKU dentro del umbral (`0 < remanente < tail_threshold`) es un **candi
 - **Sin capacidad** (`skipped_capacity_full`): había al menos un destino elegible, pero ninguno tenía m³ libres para ni una sola unidad de ese SKU.
 - **Sin tareas** (`skipped_task_limit`): se agotó el presupuesto compartido de `MAX_TASKS` antes de llegar a este candidato.
 
-Antes de esta versión, estos tres motivos se colapsaban en un solo contador interno sin visibilidad en el reporte; ahora aparecen desglosados en la advertencia de Liquid y en las tarjetas KPI de la web. Nota importante: un saldo que ya fue excluido por COPÉRNICO (`LOST`/`RECIBO_444`/`CANCELADOS`/etc.) o marcado `RACKEADO_444` **nunca llega a ser candidato** — no es una falla de Liquid, es stock que el sistema correctamente nunca consideró disponible.
+Antes de esta versión, estos tres motivos se colapsaban en un solo contador interno sin visibilidad en el reporte; ahora aparecen desglosados en la advertencia de Liquid y en las tarjetas KPI de la web. Nota importante: un saldo que ya fue excluido por COPÉRNICO (`LOST`, `CANCELADOS`, o `RECIBO_444` fuera de 444/831) o marcado `RACKEADO_444` **nunca llega a ser candidato** — no es una falla de Liquid, es stock que el sistema correctamente nunca consideró disponible.
 
 El reparto por SHARE_VENTAS (`_weighted_integer_allocation`) ya redistribuye automáticamente entre las tiendas candidatas con espacio disponible: cuando una se llena, sale del cálculo de pesos y su parte se reparte entre las que quedan, iterando hasta agotar el remanente o quedarse sin tiendas con capacidad. `skipped_capacity_full` solo se dispara cuando **todas** las tiendas candidatas están llenas para ese SKU específico, no cuando algunas lo están.
 

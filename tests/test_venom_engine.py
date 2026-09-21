@@ -400,6 +400,71 @@ def test_venom_after_real_plan_transfers_keeps_lines_separate():
     assert len(venom_base_rows) == 1
 
 
+def test_venom_base_row_has_same_schema_as_naked_solidus():
+    """Regresión: build_planning_analytics lee TAREAS_GENERADAS (y otras
+    columnas) con corchetes directos, sin .get(), en todas las filas
+    asignadas. Si el esquema de Venom se queda corto, esto revienta con
+    KeyError en producción apenas Venom asigna algo — justo lo que pasó."""
+    catalogs = make_catalogs()
+    config = engine.Config(origin_warehouses=(444,), max_tasks=1000)
+    naked_rows = [{
+        "WAREHOUSE_DESTINATION": 100, "RETAIL_ID": 10, "SKU_NAME": "",
+        "PREDICTED_OPENING_INVENTORY": 0.0, "PREDICTED_DEMAND": 0.0,
+        "CURRENT_INVENTORY": 0, "MOV_ORIGINAL": 8, "INPUT_ROW": 1,
+        "ES_MANUAL_FORECAST_ZERO": False,
+    }]
+    result = engine.plan_transfers(naked_rows, catalogs, config)
+    apply_venom_engine(
+        result, catalogs, config,
+        venom_origins=(444,), venom_destinations=(100,),
+        section_types={"IS_GOLDEN"}, lead_time_days=5,
+        consider_current_planning=True,
+        catalog_lookup={(100, 10): {"adu": 2.0, "list_type": ""}},
+        closed_or_excluded_store_ids=set(), blocked_cities=(),
+    )
+    venom_row = next(r for r in result.base_rows if r["TIPO_DE_CORTE"] == VENOM_CUT)
+    naked_row = next(r for r in result.base_rows if r["TIPO_DE_CORTE"] != VENOM_CUT)
+    missing = set(naked_row) - set(venom_row)
+    # STORAGE/VALUE se normalizan aparte (normalize_result_storage) y
+    # STOCK_ANTES_*/STOCK_REMANENTE_* nunca se leen con corchetes en otra
+    # parte del código; el resto de columnas de Naked/Solidus SÍ deben
+    # existir en la fila de Venom.
+    allowed_missing = {"STORAGE", "VALUE", "STOCK_ANTES_444", "STOCK_REMANENTE_444"}
+    assert missing <= allowed_missing, (
+        "Venom no tiene columnas de Naked/Solidus que no están en la lista "
+        f"de excepciones conocidas: {missing - allowed_missing}"
+    )
+    for key in ("TAREAS_ANTES", "TAREAS_GENERADAS", "TAREAS_ACUMULADAS", "PASA_TAREAS"):
+        assert key in venom_row, f"falta {key} en la fila de Venom"
+
+
+def test_venom_full_pipeline_with_analytics_does_not_raise():
+    """Reproduce el pipeline real: Naked -> Venom -> normalize_result_storage
+    -> build_planning_analytics -> apply_reporting_labels, sin mockear nada."""
+    import modules.les_enfants_terribles as les_enfants_terribles
+
+    catalogs = make_catalogs()
+    config = engine.Config(origin_warehouses=(444,), max_tasks=1000)
+    naked_rows = [{
+        "WAREHOUSE_DESTINATION": 100, "RETAIL_ID": 10, "SKU_NAME": "",
+        "PREDICTED_OPENING_INVENTORY": 0.0, "PREDICTED_DEMAND": 0.0,
+        "CURRENT_INVENTORY": 0, "MOV_ORIGINAL": 8, "INPUT_ROW": 1,
+        "ES_MANUAL_FORECAST_ZERO": False,
+    }]
+    result = engine.plan_transfers(naked_rows, catalogs, config)
+    apply_venom_engine(
+        result, catalogs, config,
+        venom_origins=(444,), venom_destinations=(100,),
+        section_types={"IS_GOLDEN"}, lead_time_days=5,
+        consider_current_planning=True,
+        catalog_lookup={(100, 10): {"adu": 2.0, "list_type": ""}},
+        closed_or_excluded_store_ids=set(), blocked_cities=(),
+    )
+    les_enfants_terribles.normalize_result_storage(result)
+    les_enfants_terribles.build_planning_analytics(result, (444,))
+    les_enfants_terribles.apply_reporting_labels(result)
+
+
 # --- Loader de CATALOGO con LIST_TYPE -----------------------------------
 
 def _build_catalogo_workbook(path: Path, with_list_type: bool) -> None:
