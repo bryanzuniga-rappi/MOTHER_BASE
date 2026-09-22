@@ -21,6 +21,9 @@ def inject_mother_base_theme() -> None:
             --orange: #ffb000;
             --white: #fffdf7;
             --muted: #6f6b63;
+            --yellow: #fff000;
+            --violet: #bd00ff;
+            --pink: #ff007f;
         }
 
         html,
@@ -312,6 +315,9 @@ def render_action_card(
         "blue": ("#5e7cff", "#fffdf7"),
         "orange": ("#ffb000", "#111111"),
         "purple": ("#8a3ffc", "#fffdf7"),
+        "yellow": ("#fff000", "#111111"),
+        "violet": ("#bd00ff", "#fffdf7"),
+        "pink": ("#ff007f", "#fffdf7"),
         "white": ("#fffdf7", "#111111"),
     }
     active_background, active_foreground = tone_colors.get(

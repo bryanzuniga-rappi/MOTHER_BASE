@@ -780,5 +780,5 @@ def apply_liquid_engine(
     summary["tasks_after"] = result.tasks_used
     summary["stores"] = len(stores_sent)
     summary["products"] = len(products_sent)
-    summary["m3_added"] = round(summary["m3_added"], 3)
+    summary["m3_added"] = round(summary["m3_added"], 2)
     return summary

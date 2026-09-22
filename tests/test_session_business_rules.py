@@ -8,11 +8,13 @@
 """
 
 import io
+from types import SimpleNamespace
 
 from tests._streamlit_stub import install as _install_streamlit_stub
 
 _install_streamlit_stub()
 
+import modelo_abasto as engine  # noqa: E402
 import modules.les_enfants_terribles as m  # noqa: E402
 
 
@@ -159,3 +161,91 @@ def test_sku_86195_quantities_round_down_to_multiples_of_200():
 def test_other_insumo_rules_unaffected_by_86195_change():
     assert m.INSUMO_STOCK_RULES[85097]["moq"] == 1_000
     assert m.INSUMO_STOCK_RULES[76491]["moq"] == 1_000
+
+
+# --- Nuevos SKUs de INSUMOS: 82126 y 90532 --------------------------------
+
+def test_sku_82126_target_and_moq():
+    rule = m.INSUMO_STOCK_RULES[82126]
+    assert rule["target_stock"] == 1_050
+    assert rule["moq"] == 350
+
+
+def test_sku_90532_target_and_moq():
+    rule = m.INSUMO_STOCK_RULES[90532]
+    assert rule["target_stock"] == 1_050
+    assert rule["moq"] == 350
+
+
+def test_sku_76491_target_updated_to_5000():
+    assert m.INSUMO_STOCK_RULES[76491]["target_stock"] == 5_000
+
+
+def test_sku_82126_has_no_city_restriction():
+    assert 82126 not in m.INSUMO_CITY_RESTRICTIONS
+
+
+def test_sku_90532_restricted_to_cdmx_only():
+    assert m.INSUMO_CITY_RESTRICTIONS[90532] == frozenset({"CDMX"})
+
+
+def test_append_insumos_blocks_90532_outside_cdmx(tmp_path):
+    catalogs = engine.Catalogs(
+        volume_m3={82126: 0.001, 90532: 0.001},
+        blocked_products=set(),
+        route_cost_blocks=set(),
+        store_priority={100: 1, 200: 1},
+        high_value={},
+        rackeados_444=set(),
+        store_capacity={100: 100.0, 200: 100.0},
+        copernico_unusable_444={},
+        unavailable_stock={},
+        stock_base={
+            (444, 82126): 10_000.0,
+            (444, 90532): 10_000.0,
+        },
+        golden_infaltables=set(),
+        stores={
+            444: {"city": "CDMX", "city_norm": "CDMX", "warehouse_name": "O444"},
+            100: {"city": "CDMX", "city_norm": "CDMX", "warehouse_name": "STORE CDMX"},
+            200: {"city": "Guadalajara", "city_norm": "GDL", "warehouse_name": "STORE GDL"},
+        },
+        storage={},
+        warnings=[],
+        excluded_products=set(),
+    )
+    result = SimpleNamespace(
+        allocation_rows=[
+            {"WAREHOUSE_DESTINATION": 100, "WAREHOUSE_SOURCE": 444, "RETAIL_ID": 999, "QUANTITY": 1},
+            {"WAREHOUSE_DESTINATION": 200, "WAREHOUSE_SOURCE": 444, "RETAIL_ID": 999, "QUANTITY": 1},
+        ],
+        base_rows=[],
+        warnings=[],
+    )
+    insumos_rows = [
+        {"WAREHOUSE_DESTINATION": 100, "RETAIL_ID": 90532, "QUANTITY": 1050},
+        {"WAREHOUSE_DESTINATION": 200, "RETAIL_ID": 90532, "QUANTITY": 1050},
+        {"WAREHOUSE_DESTINATION": 100, "RETAIL_ID": 82126, "QUANTITY": 1050},
+        {"WAREHOUSE_DESTINATION": 200, "RETAIL_ID": 82126, "QUANTITY": 1050},
+    ]
+
+    bulk_path = tmp_path / "BulkCD_444.csv"
+    engine.write_csv(bulk_path, [], engine.OUTPUT_COLUMNS)
+
+    summary = m.append_insumos_to_bulk_444(
+        [bulk_path], result, catalogs, insumos_rows, (444,), True
+    )
+
+    import csv as csv_module
+    with bulk_path.open(newline="", encoding="utf-8-sig") as handle:
+        written_rows = list(csv_module.DictReader(handle))
+    dest_by_sku = {
+        (int(row["WAREHOUSE_DESTINATION"]), int(row["RETAIL_ID"]))
+        for row in written_rows
+        if int(row["RETAIL_ID"]) in (82126, 90532)
+    }
+    assert (100, 90532) in dest_by_sku  # CDMX: permitido
+    assert (200, 90532) not in dest_by_sku  # GDL: bloqueado
+    assert (100, 82126) in dest_by_sku  # 82126 sin restricción: ambas tiendas
+    assert (200, 82126) in dest_by_sku
+    assert summary["lines_blocked_city_restriction"] == 1

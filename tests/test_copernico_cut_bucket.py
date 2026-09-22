@@ -168,3 +168,88 @@ def test_copernico_cut_summary_empty_when_no_cuts():
     assert summary["requirements_full_cut"] == 0
     assert summary["requirements_partial_cut"] == 0
     assert summary["units_missing"] == 0
+
+
+def test_copernico_cut_label_includes_specific_reason_end_to_end(tmp_path):
+    """Con el loader real (no sintético), el TIPO_DE_CORTE debe llevar el
+    motivo específico como sufijo: LOST, CANCELADOS, RECIBO, etc."""
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+
+    def add(name, headers, rows):
+        ws = wb.create_sheet(name)
+        ws.append(headers)
+        for r in rows:
+            ws.append(r)
+
+    add("VOLUMETRIA", ["SKU", "PALLETS"], [[10, 1.0]])
+    add("BLOQUEOS", ["SKU"], [])
+    add("RUTA_COSTOS", ["Destination", "Catalog ID"], [])
+    add("PRIORIDAD", ["WAREHOUSE_ID", "PRIORIDAD"], [[100, 1]])
+    add("444_HV", ["EAN", "Category"], [])
+    add("831_HV", ["EAN", "Category"], [])
+    add("RACKEADOS", ["WHS", "SYNC"], [])
+    add("CAP_RECIBO", ["WH_ID", "CAP"], [[100, 50]])
+    add("CATALOGO", ["WAREHOUSE_ID", "PRODUCT_ID", "ADU"], [])
+    add("KVI", ["WAREHOUSE_ID", "PRODUCT_ID", "KVI"], [])
+    add("SHARE_VENTAS", ["WAREHOUSE_ID", "SHARE"], [])
+    add("NO_DISPONIBLE", ["WAREHOUSE_ID", "PRODUCT_ID", "STOCK"], [])
+    add(
+        "POR_MERMAR",
+        [
+            "WAREHOUSE_ID", "PRODUCT_ID", "STOCK_AVAILABLE", "VALUE_STOCK",
+            "ARRIVAL_DATE", "EXPIRATION_DATE",
+        ],
+        [],
+    )
+    add("STOCK", ["WAREHOUSE_ID", "PRODUCT_ID", "STOCK_DISPONIBLE_FINAL"], [[444, 10, 5]])
+    add("OWNER", ["WAREHOUSE_ID", "PRODUCT_ID", "OWNER_NAME", "STOCK_DISPONIBLE_FINAL"], [])
+    add(
+        "INSUMOS",
+        [
+            "WAREHOUSE_DESTINATION", "WAREHOUSE_SOURCE", "RETAIL_ID", "QUANTITY",
+            "PLANNED_DATE", "ROUTE", "DELIVERY_PRIORITY",
+        ],
+        [],
+    )
+    add(
+        "GOLDEN_INFALTABLES_ANCHOR",
+        ["WAREHOUSE_ID", "PRODUCT_ID_SYNC", "IS_INFALTABLE", "IS_GOLDEN", "IS_ANCHOR"],
+        [],
+    )
+    add(
+        "TIENDA",
+        ["CITY", "WAREHOUSE_ID", "WAREHOUSE_NAME"],
+        [
+            ["Ciudad de México", 100, "Tienda Test"],
+            ["Ciudad de México", 444, "O444"],
+        ],
+    )
+    add("STORAGE", ["PRODUCT_ID", "STORAGE_NAME"], [])
+    add("TIENDAS_CERRADAS", ["WAREHOUSE_ID"], [])
+    add("SCHEDULE", ["CITY", "WAREHOUSE_ID", "WAREHOUSE_NAME", "ORIGEN", "DAYS"], [])
+    xlsx_path = tmp_path / "DATA_TRANSFERS.xlsx"
+    wb.save(xlsx_path)
+
+    copernico_path = tmp_path / "copernico.csv"
+    with copernico_path.open("w", newline="", encoding="utf-8") as f:
+        import csv as csv_module
+        writer = csv_module.writer(f)
+        writer.writerow(["Bodega", "EAN", "Ubicacion", "Saldo", "ZonaPiso"])
+        writer.writerow([444, 10, "CANCELADOS", 5, ""])
+
+    config = engine.Config(origin_warehouses=(444,), max_tasks=100)
+    catalogs = engine.load_catalogs(
+        xlsx_path, config, copernico_csv_path=copernico_path
+    )
+    rows = [make_row(100, 10, mov=8)]
+    result = engine.plan_transfers(rows, catalogs, config)
+
+    base_row = result.base_rows[0]
+    assert base_row["TIPO_DE_CORTE"] == "CORTE POR COPÉRNICO CANCELADOS"
+    assert "CANCELADOS" in base_row["DETALLE_MOTIVO"]
+
+    # El nuevo bucket sigue detectándose correctamente pese al sufijo.
+    assert les_enfants_terribles.is_copernico_cut_label(base_row["TIPO_DE_CORTE"])

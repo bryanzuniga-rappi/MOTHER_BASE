@@ -274,6 +274,16 @@ BREAKDOWN_ORDER = (
     "OK PARCIAL - CORTE POR FRECUENCIA DE ENVÍO",
     "CORTE POR COPÉRNICO",
     "OK PARCIAL - CORTE POR COPÉRNICO",
+    "CORTE POR COPÉRNICO LOST",
+    "OK PARCIAL - CORTE POR COPÉRNICO LOST",
+    "CORTE POR COPÉRNICO CANCELADOS",
+    "OK PARCIAL - CORTE POR COPÉRNICO CANCELADOS",
+    "CORTE POR COPÉRNICO RECIBO",
+    "OK PARCIAL - CORTE POR COPÉRNICO RECIBO",
+    "CORTE POR COPÉRNICO ZONA 856",
+    "OK PARCIAL - CORTE POR COPÉRNICO ZONA 856",
+    "CORTE POR COPÉRNICO OTRO",
+    "OK PARCIAL - CORTE POR COPÉRNICO OTRO",
     VENOM_CUT,
     "ERROR DE DATOS",
 )
@@ -335,7 +345,16 @@ INSUMOS_COLUMNS = [
 INSUMO_STOCK_RULES = {
     85097: {"name": "BOLSA 1", "target_stock": 7_000, "moq": 1_000},
     86195: {"name": "BOLSA 2", "target_stock": 2_100, "moq": 200},
-    76491: {"name": "STICKER", "target_stock": 10_000, "moq": 1_000},
+    76491: {"name": "STICKER", "target_stock": 5_000, "moq": 1_000},
+    82126: {"name": "INSUMO 82126", "target_stock": 1_050, "moq": 350},
+    90532: {"name": "INSUMO 90532", "target_stock": 1_050, "moq": 350},
+}
+
+# SKUs de INSUMOS restringidos a un subconjunto de ciudades — un renglón de
+# la hoja INSUMOS para una tienda fuera de este set se descarta aunque la
+# tienda ya esté fondeada por el 444. Vacío u omitido = sin restricción.
+INSUMO_CITY_RESTRICTIONS: dict[int, frozenset[str]] = {
+    90532: frozenset({"CDMX"}),
 }
 
 CITY_DISPLAY_NAMES = {
@@ -680,6 +699,10 @@ def inject_styles() -> None:
         .kpi-card.acid { background: var(--acid); }
         .kpi-card.blue { background: var(--blue); color: var(--white); }
         .kpi-card.coral { background: var(--coral); }
+        .kpi-card.purple { background: #8a3ffc; color: #fffdf7; }
+        .kpi-card.yellow { background: #fff000; }
+        .kpi-card.violet { background: #bd00ff; color: #fffdf7; }
+        .kpi-card.pink { background: #ff007f; color: #fffdf7; }
 
         .kpi-card-category {
             font-size: .62rem;
@@ -824,7 +847,7 @@ def render_kpi_cards(
         columns = st.columns(columns_count)
         for column, card in zip(columns, cards[start : start + columns_count]):
             tone = str(card.get("tone", ""))
-            if tone not in {"acid", "blue", "coral"}:
+            if tone not in {"acid", "blue", "coral", "purple", "yellow", "violet", "pink"}:
                 tone = ""
             class_name = f"kpi-card {tone}".strip()
             card_html = (
@@ -1827,6 +1850,7 @@ def append_insumos_to_bulk_444(
         "products_cut_stock": 0,
         "lines_blocked_regional": 0,
         "lines_blocked_schedule": 0,
+        "lines_blocked_city_restriction": 0,
         "stock_detail": [],
     }
     if not summary["enabled"]:
@@ -1851,6 +1875,10 @@ def append_insumos_to_bulk_444(
             continue
         store = catalogs.stores.get(destination, {})
         city_norm = store.get("city_norm", "")
+        allowed_cities = INSUMO_CITY_RESTRICTIONS.get(sku)
+        if allowed_cities is not None and city_norm not in allowed_cities:
+            summary["lines_blocked_city_restriction"] += 1
+            continue
         priority_profile = engine.product_priority_profile(
             catalogs,
             destination,
@@ -2138,6 +2166,119 @@ def ordered_breakdown_rows(
     ]
 
 
+# TIPO_DE_CORTE que solo generan los engines de cobertura opcional. Cualquier
+# TIPO_DE_CORTE que NO aparezca aquí se le atribuye a la pasada base
+# Naked/Solidus (la cascada principal de plan_transfers).
+ENGINE_CUT_ATTRIBUTION: dict[str, str] = {
+    "ENVIADOS PARA CUBRIR AVL": "AVL",
+    "ENVIADOS PARA PREVENIR QUIEBRE": "Preventivo",
+    SPECIAL_DOH_CUT: "Refuerzo Golden/Infaltable/Anchor",
+    SHALASHASKA_CUT: "Shalashaska",
+    LIQUID_CUT: "Liquid",
+    VENOM_CUT: "Venom",
+}
+
+
+def attribute_engine(tipo_de_corte: str) -> str:
+    """Engine que generó esta línea de BASE_TRANSFERS. Todo lo que no sea de
+    un engine de cobertura opcional viene de la pasada base Naked/Solidus."""
+    return ENGINE_CUT_ATTRIBUTION.get(tipo_de_corte, "Naked/Solidus")
+
+
+def build_planned_by_engine_rows(
+    result, insumos_summary: dict[str, Any] | None = None
+) -> list[dict[str, Any]]:
+    """Tabla 1: lo efectivamente planeado (CANTIDAD_ASIGNADA > 0), agrupado
+    por engine y, dentro de cada engine, por la causal (TIPO_DE_CORTE).
+    INSUMOS no vive en base_rows (es un anexo directo al CSV, sin tareas),
+    así que se agrega aparte con lo que ya reporta su propio resumen."""
+    counts: Counter[tuple[str, str]] = Counter()
+    units: Counter[tuple[str, str]] = Counter()
+    for row in result.base_rows:
+        if int(row.get("CANTIDAD_ASIGNADA", 0) or 0) <= 0:
+            continue
+        tipo = str(row.get("TIPO_DE_CORTE", ""))
+        engine_name = attribute_engine(tipo)
+        key = (engine_name, tipo)
+        counts[key] += 1
+        units[key] += int(row.get("CANTIDAD_ASIGNADA", 0) or 0)
+
+    if insumos_summary and insumos_summary.get("lines_added"):
+        key = ("Insumos", "INSUMOS")
+        counts[key] += int(insumos_summary["lines_added"])
+        units[key] += int(insumos_summary.get("units_added", 0))
+
+    engine_order = ["Naked/Solidus", "AVL", "Preventivo",
+                     "Refuerzo Golden/Infaltable/Anchor", "Shalashaska",
+                     "Liquid", "Venom", "Insumos"]
+    cut_order = {label: index for index, label in enumerate(BREAKDOWN_ORDER)}
+
+    def sort_key(item: tuple[tuple[str, str], int]) -> tuple[int, int, str]:
+        (engine_name, tipo), _count = item
+        engine_index = (
+            engine_order.index(engine_name)
+            if engine_name in engine_order
+            else len(engine_order)
+        )
+        return (engine_index, cut_order.get(tipo, len(cut_order)), tipo)
+
+    return [
+        {
+            "ENGINE": engine_name,
+            "CAUSAL": tipo,
+            "CASOS": count,
+            "UNIDADES": units[(engine_name, tipo)],
+        }
+        for (engine_name, tipo), count in sorted(counts.items(), key=sort_key)
+        if count
+    ]
+
+
+def build_cuts_detail_rows(
+    result,
+    closed_summary: dict[str, Any] | None = None,
+    block_summary: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Tabla 2: todo lo que NO se mandó (CANTIDAD_ASIGNADA == 0), con el
+    motivo específico (incluye los sub-motivos de COPÉRNICO: LOST,
+    CANCELADOS, RECIBO, etc., no solo el bucket genérico). TIENDAS_CERRADAS
+    y ciudades bloqueadas se excluyen ANTES de llegar a base_rows, así que
+    se agregan aparte con lo que ya reportan sus propios resúmenes."""
+    counts: Counter[str] = Counter()
+    units_missing: Counter[str] = Counter()
+    for row in result.base_rows:
+        if int(row.get("CANTIDAD_ASIGNADA", 0) or 0) > 0:
+            continue
+        tipo = str(row.get("TIPO_DE_CORTE", ""))
+        counts[tipo] += 1
+        units_missing[tipo] += int(row.get("CANTIDAD_OBJETIVO", 0) or 0)
+
+    if closed_summary and closed_summary.get("requirements"):
+        counts["CORTE POR TIENDA CERRADA"] += int(closed_summary["requirements"])
+        units_missing["CORTE POR TIENDA CERRADA"] += int(
+            closed_summary.get("target_units", 0)
+        )
+    if block_summary and block_summary.get("requirements"):
+        counts["CORTE POR CIUDAD BLOQUEADA"] += int(block_summary["requirements"])
+        units_missing["CORTE POR CIUDAD BLOQUEADA"] += int(
+            block_summary.get("target_units", 0)
+        )
+
+    order = {label: index for index, label in enumerate(BREAKDOWN_ORDER)}
+    return [
+        {
+            "CAUSAL": tipo,
+            "CASOS": count,
+            "UNIDADES_SIN_CUBRIR": units_missing[tipo],
+        }
+        for tipo, count in sorted(
+            counts.items(),
+            key=lambda item: (order.get(item[0], len(order)), item[0]),
+        )
+        if count
+    ]
+
+
 def clear_previous_workspace() -> None:
     previous = st.session_state.pop("last_workspace", "")
     if not previous:
@@ -2290,7 +2431,7 @@ def build_planning_analytics(
             "TIENDAS_ATENDIDAS": len(data["stores"]),
             "PRODUCTOS_DISTINTOS": len(data["products"]),
             "UNIDADES": data["units"],
-            "M3": round(data["m3"], 3),
+            "M3": round(data["m3"], 2),
             "TAREAS": data["tasks"],
         }
         for city, data in sorted(city_accumulators.items())
@@ -2302,7 +2443,7 @@ def build_planning_analytics(
             "TIENDA": warehouse_name,
             "PRODUCTOS_DISTINTOS": len(data["products"]),
             "UNIDADES": data["units"],
-            "M3": round(data["m3"], 3),
+            "M3": round(data["m3"], 2),
             "TAREAS": data["tasks"],
         }
         for (city, destination, warehouse_name), data in store_accumulators.items()
@@ -2546,7 +2687,7 @@ def build_planning_analytics(
                 "UNIDADES": data["units"],
                 "PRODUCTOS_DISTINTOS": len(data["products"]),
                 "TIENDAS_ATENDIDAS": len(data["stores"]),
-                "M3": round(data["m3"], 3),
+                "M3": round(data["m3"], 2),
                 "UNIDADES_POR_TAREA": round(
                     data["units"] / data["tasks"], 2
                 )
@@ -2570,7 +2711,7 @@ def build_planning_analytics(
                 "PRODUCTOS_DISTINTOS": len(data["products"]),
                 "TAREAS": data["tasks"],
                 "UNIDADES": data["units"],
-                "M3": round(data["m3"], 3),
+                "M3": round(data["m3"], 2),
             }
             for (row_source, city), data in source_city_accumulators.items()
             if row_source == source
@@ -2585,7 +2726,7 @@ def build_planning_analytics(
                 "PRODUCTOS_DISTINTOS": len(data["products"]),
                 "TAREAS": data["tasks"],
                 "UNIDADES": data["units"],
-                "M3": round(data["m3"], 3),
+                "M3": round(data["m3"], 2),
             }
             for (
                 row_source,
@@ -2606,7 +2747,7 @@ def build_planning_analytics(
                 "TIENDAS_ATENDIDAS": len(data["stores"]),
                 "TAREAS": data["tasks"],
                 "UNIDADES": data["units"],
-                "M3": round(data["m3"], 3),
+                "M3": round(data["m3"], 2),
             }
             for (
                 row_source,
@@ -2673,10 +2814,10 @@ def build_planning_analytics(
             "not_assigned_cases": len(not_assigned_rows),
             "target_units": target_units,
             "assigned_units": assigned_units,
-            "target_m3": round(target_m3, 3),
+            "target_m3": round(target_m3, 2),
             "naked_eligible_cases": naked_eligible_cases,
             "naked_target_units": naked_target_units,
-            "naked_target_m3": round(naked_target_m3, 3),
+            "naked_target_m3": round(naked_target_m3, 2),
             "case_compliance_pct": percentage(
                 len(fully_covered_rows), len(eligible_rows)
             ),
@@ -2823,10 +2964,13 @@ SCHEDULE_CUT_LABELS = {
     "OK PARCIAL - CORTE POR FRECUENCIA DE ENVÍO",
 }
 
-COPERNICO_CUT_LABELS = {
-    "CORTE POR COPÉRNICO",
-    "OK PARCIAL - CORTE POR COPÉRNICO",
-}
+def is_copernico_cut_label(tipo_de_corte: str) -> bool:
+    """True si el TIPO_DE_CORTE es cualquier variante de corte por COPÉRNICO,
+    con o sin el motivo específico como sufijo (LOST, CANCELADOS, RECIBO,
+    ZONA 856, OTRO)."""
+    return tipo_de_corte.startswith("CORTE POR COPÉRNICO") or tipo_de_corte.startswith(
+        "OK PARCIAL - CORTE POR COPÉRNICO"
+    )
 
 
 def copernico_cut_summary(result) -> dict[str, Any]:
@@ -2841,7 +2985,7 @@ def copernico_cut_summary(result) -> dict[str, Any]:
     affected_rows = [
         row
         for row in result.base_rows
-        if row.get("TIPO_DE_CORTE") in COPERNICO_CUT_LABELS
+        if is_copernico_cut_label(str(row.get("TIPO_DE_CORTE", "")))
     ]
     summary: dict[str, Any] = {
         "requirements_full_cut": 0,
@@ -3853,7 +3997,7 @@ def apply_avl_fill(
         products_sent.add(sku)
 
     result.capacity_rows.sort(key=lambda row: row["WAREHOUSE_DESTINATION"])
-    summary["m3_added"] = round(summary["m3_added"], 3)
+    summary["m3_added"] = round(summary["m3_added"], 2)
     summary["stores"] = len(stores_sent)
     summary["products"] = len(products_sent)
     summary["task_slots_after"] = max(config.max_tasks - result.tasks_used, 0)
@@ -3985,7 +4129,7 @@ def write_executive_pdf(
         return f"{float(value or 0):,.1f}%"
 
     def fmt_m3(value: Any) -> str:
-        return f"{float(value or 0):,.3f}"
+        return f"{float(value or 0):,.2f}"
 
     def report_table_pdf(
         rows: list[dict[str, Any]],
@@ -5129,6 +5273,12 @@ def execute_planning(
         status_counts = Counter(
             row["TIPO_DE_CORTE"] for row in result.base_rows
         )
+        planned_by_engine_rows = build_planned_by_engine_rows(
+            result, insumos_summary
+        )
+        cuts_detail_rows = build_cuts_detail_rows(
+            result, closed_summary, block_summary
+        )
         if closed_summary["requirements"]:
             status_counts["CORTE POR TIENDA CERRADA"] += closed_summary[
                 "requirements"
@@ -5263,6 +5413,8 @@ def execute_planning(
         "requirements": requirements,
         "input_requirements": consolidation_summary["unique_requirements"],
         "status_counts": dict(status_counts),
+        "planned_by_engine_rows": planned_by_engine_rows,
+        "cuts_detail_rows": cuts_detail_rows,
         "warnings": list(result.warnings),
         "logs": captured.getvalue(),
         "origins": list(origins),
@@ -5388,7 +5540,7 @@ def render_source_analysis(analytics: dict[str, Any]) -> None:
                 {
                     "category": "M³ · ORIGEN",
                     "label": "VOLUMEN PLANEADO",
-                    "value": f"{summary['M3']:,.3f}",
+                    "value": f"{summary['M3']:,.2f}",
                     "description": (
                         "Volumen de producto normal asignado desde este origen: unidades "
                         "por metros cúbicos por unidad."
@@ -5452,7 +5604,7 @@ def render_source_analysis(analytics: dict[str, Any]) -> None:
                         "UNIDADES", format="%d", width="small"
                     ),
                     "M3": st.column_config.NumberColumn(
-                        "M³", format="%.3f", width="small"
+                        "M³", format="%.2f", width="small"
                     ),
                 },
                 max_height=340,
@@ -5484,7 +5636,7 @@ def render_source_analysis(analytics: dict[str, Any]) -> None:
                         "UNIDADES", format="%d", width="small"
                     ),
                     "M3": st.column_config.NumberColumn(
-                        "M³", format="%.3f", width="small"
+                        "M³", format="%.2f", width="small"
                     ),
                 },
                 max_height=340,
@@ -5500,7 +5652,7 @@ def render_source_analysis(analytics: dict[str, Any]) -> None:
                 "WAREHOUSE_ID": st.column_config.NumberColumn(
                     "WAREHOUSE ID", format="%d"
                 ),
-                "M3": st.column_config.NumberColumn("M³", format="%.3f"),
+                "M3": st.column_config.NumberColumn("M³", format="%.2f"),
             },
             max_height=520,
         )
@@ -5754,7 +5906,7 @@ def render_planning_analytics(analytics: dict[str, Any], run: dict[str, Any]) ->
             {
                 "category": "VOLUMEN · PRODUCTO",
                 "label": "M³ PLANEADOS",
-                "value": f"{summary['m3_assigned']:,.3f}",
+                "value": f"{summary['m3_assigned']:,.2f}",
                 "description": (
                     "Suma del volumen de producto normal asignado: QUANTITY por metros "
                     "cúbicos por unidad. No incluye insumos."
@@ -5764,7 +5916,7 @@ def render_planning_analytics(analytics: dict[str, Any], run: dict[str, Any]) ->
             {
                 "category": "VOLUMEN · PRODUCTO",
                 "label": "PALLETS PLANEADOS",
-                "value": f"{summary['m3_assigned']:,.3f}",
+                "value": f"{summary['m3_assigned']:,.2f}",
                 "description": (
                     "Mismo dato que M³ PLANEADOS (columna PALLETS de VOLUMETRIA), "
                     "mostrado aparte."
@@ -5786,7 +5938,7 @@ def render_planning_analytics(analytics: dict[str, Any], run: dict[str, Any]) ->
     report_table(
         analytics["city_rows"],
         column_config={
-            "M3": st.column_config.NumberColumn("M³", format="%.3f"),
+            "M3": st.column_config.NumberColumn("M³", format="%.2f"),
         },
         max_height=360,
     )
@@ -5798,7 +5950,7 @@ def render_planning_analytics(analytics: dict[str, Any], run: dict[str, Any]) ->
             "WAREHOUSE_ID": st.column_config.NumberColumn(
                 "WAREHOUSE ID", format="%d"
             ),
-            "M3": st.column_config.NumberColumn("M³", format="%.3f"),
+            "M3": st.column_config.NumberColumn("M³", format="%.2f"),
         },
         max_height=600,
     )
@@ -6096,7 +6248,7 @@ def render_planning_analytics(analytics: dict[str, Any], run: dict[str, Any]) ->
             "WAREHOUSE_SOURCE": st.column_config.NumberColumn(
                 "WAREHOUSE SOURCE", format="%d"
             ),
-            "M3": st.column_config.NumberColumn("M³", format="%.3f"),
+            "M3": st.column_config.NumberColumn("M³", format="%.2f"),
             "UNIDADES_POR_TAREA": st.column_config.NumberColumn(
                 "UNIDADES / TAREA", format="%.2f"
             ),
@@ -6154,7 +6306,7 @@ def render_results(run: dict[str, Any]) -> None:
             {
                 "category": "REQUERIDO · NAKED",
                 "label": "PALLETS",
-                "value": f"{planning_summary.get('naked_target_m3', 0):,.3f}",
+                "value": f"{planning_summary.get('naked_target_m3', 0):,.2f}",
                 "description": (
                     "Suma de M3_OBJETIVO SOLO de la pasada base Naked/Solidus."
                 ),
@@ -6189,7 +6341,7 @@ def render_results(run: dict[str, Any]) -> None:
             {
                 "category": "PLANEACIÓN FINAL",
                 "label": "PALLETS",
-                "value": f"{planning_summary.get('m3_assigned', 0):,.3f}",
+                "value": f"{planning_summary.get('m3_assigned', 0):,.2f}",
                 "description": "Suma de M3_ASIGNADO realmente planeado.",
                 "tone": "acid",
             },
@@ -6532,6 +6684,40 @@ def render_results(run: dict[str, Any]) -> None:
                 )
 
     st.markdown('<span class="section-label">BREAKDOWN</span>', unsafe_allow_html=True)
+    st.markdown(
+        """
+        <div class="report-note">
+            EFECTIVAMENTE PLANEADO = casos que sí recibieron al menos una unidad,
+            agrupados por engine y su causal · CORTES = todo lo que se quedó sin
+            enviar, con el motivo específico (incluye COPÉRNICO desglosado por
+            LOST/CANCELADOS/RECIBO/etc.) · OVERVIEW = las dos tablas anteriores
+            combinadas en una sola, para una vista general.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("##### Efectivamente planeado — por engine y causal")
+    planned_by_engine_rows = run.get("planned_by_engine_rows", [])
+    planned_height = (max(6, len(planned_by_engine_rows)) + 1) * 36 + 4
+    st.dataframe(
+        planned_by_engine_rows,
+        use_container_width=True,
+        hide_index=True,
+        height=planned_height,
+    )
+
+    st.markdown("##### Cortes — todo lo que no se mandó, por motivo")
+    cuts_detail_rows = run.get("cuts_detail_rows", [])
+    cuts_height = (max(6, len(cuts_detail_rows)) + 1) * 36 + 4
+    st.dataframe(
+        cuts_detail_rows,
+        use_container_width=True,
+        hide_index=True,
+        height=cuts_height,
+    )
+
+    st.markdown("##### Overview general")
     breakdown = ordered_breakdown_rows(run["status_counts"])
     visible_breakdown_rows = max(12, len(breakdown))
     breakdown_height = (visible_breakdown_rows + 1) * 36 + 4
@@ -6594,7 +6780,7 @@ def render_results(run: dict[str, Any]) -> None:
                 {
                     "category": "VOLUMEN · NAKED",
                     "label": "M³ / PALLETS",
-                    "value": f"{naked.get('m3', 0):,.3f}",
+                    "value": f"{naked.get('m3', 0):,.2f}",
                     "description": "Volumen de esas líneas (mismo dato que pallets).",
                     "tone": "blue",
                 },

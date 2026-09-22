@@ -586,6 +586,12 @@ def load_copernico_unusable_csv(
         for canonical, aliases in header_aliases.items()
     }
     unusable_stock: dict[tuple[int, int], float] = defaultdict(float)
+    unusable_by_reason: dict[str, dict[tuple[int, int], float]] = {
+        "LOST": defaultdict(float),
+        "CANCELADOS": defaultdict(float),
+        "RECIBO_444": defaultdict(float),
+        "ZONA_856": defaultdict(float),  # BIN/DIF/RC/zona vacía o desconocida
+    }
     storage_balances_856: dict[tuple[int, int], dict[str, float]] = defaultdict(
         lambda: defaultdict(float)
     )
@@ -677,6 +683,7 @@ def load_copernico_unusable_csv(
                     lost_zone_warehouses.add(warehouse)
                     unusable_rows += 1
                     unusable_stock[(warehouse, sku)] += balance
+                    unusable_by_reason["LOST"][(warehouse, sku)] += balance
                     if warehouse == 856:
                         warehouse_856_rows += 1
                     continue
@@ -707,6 +714,7 @@ def load_copernico_unusable_csv(
                     # o desconocida también se excluye de forma conservadora.
                     unusable_rows += 1
                     unusable_stock[(warehouse, sku)] += balance
+                    unusable_by_reason["ZONA_856"][(warehouse, sku)] += balance
                     if floor_zone not in {"BIN", "DIF", "RC"}:
                         warehouse_856_unknown_zone_rows += 1
                         warehouse_856_unknown_zones[floor_zone or "<VACIA>"] += 1
@@ -716,6 +724,17 @@ def load_copernico_unusable_csv(
                     continue
                 unusable_rows += 1
                 unusable_stock[(warehouse, sku)] += balance
+                ubicacion_value = clean_text(
+                    row.get(field_lookup["Ubicacion"])
+                ).upper()
+                if ubicacion_value == "CANCELADOS":
+                    unusable_by_reason["CANCELADOS"][(warehouse, sku)] += balance
+                elif ubicacion_value == "RECIBO_444":
+                    unusable_by_reason["RECIBO_444"][(warehouse, sku)] += balance
+                else:
+                    unusable_by_reason.setdefault(
+                        "OTRO_NO_USABLE", defaultdict(float)
+                    )[(warehouse, sku)] += balance
         files_processed += 1
 
     storage_overrides: dict[tuple[int, int], str] = {}
@@ -759,6 +778,11 @@ def load_copernico_unusable_csv(
         "lost_zone_rows": lost_zone_rows,
         "lost_zone_units": lost_zone_units,
         "lost_zone_warehouses": sorted(lost_zone_warehouses),
+        # Saldo no usable, desglosado por motivo específico — para el
+        # breakdown detallado ("CORTE POR COPÉRNICO LOST/CANCELADOS/RECIBO").
+        "unusable_by_reason": {
+            reason: dict(by_key) for reason, by_key in unusable_by_reason.items()
+        },
     }
     return dict(unusable_stock), storage_overrides, summary
 
@@ -807,6 +831,12 @@ class Catalogs:
     # Día de hoy (fecha real del sistema al momento de la corrida), normalizado
     # igual que los tokens de SCHEDULE.DAYS, p. ej. "MIERCOLES".
     run_weekday_norm: str = ""
+    # Saldo no usable de COPÉRNICO por motivo específico: "LOST",
+    # "CANCELADOS", "RECIBO_444", "ZONA_856", "OTRO_NO_USABLE" ->
+    # {(warehouse, sku): unidades}. Para el breakdown detallado de cortes.
+    copernico_unusable_by_reason: dict[str, dict[tuple[int, int], float]] = field(
+        default_factory=dict
+    )
 
 
 def load_catalogs(
@@ -945,6 +975,9 @@ def load_catalogs(
             ) = (
                 load_copernico_unusable_csv(copernico_paths)
             )
+            copernico_unusable_by_reason = copernico_summary.get(
+                "unusable_by_reason", {}
+            )
             copernico_unusable_444 = {
                 sku: quantity
                 for (warehouse, sku), quantity in (
@@ -1010,6 +1043,7 @@ def load_catalogs(
             copernico_unusable_444 = {}
             copernico_unusable_by_warehouse = {}
             copernico_storage_by_warehouse = {}
+            copernico_unusable_by_reason = {}
 
         unavailable_stock: dict[tuple[int, int], float] = defaultdict(float)
         for row in iter_sheet_records(
@@ -1217,6 +1251,7 @@ def load_catalogs(
         owner_stock=dict(owner_stock),
         schedule_days=schedule_days,
         run_weekday_norm=run_weekday_norm,
+        copernico_unusable_by_reason=copernico_unusable_by_reason,
     )
 
 
@@ -1820,6 +1855,44 @@ def is_schedule_blocked(catalogs: Catalogs, source: int, destination: int) -> bo
     return catalogs.run_weekday_norm not in allowed_days
 
 
+# Etiquetas cortas para el TIPO_DE_CORTE detallado de COPÉRNICO. Deben
+# combinar con las claves de ``Catalogs.copernico_unusable_by_reason``.
+COPERNICO_REASON_LABELS: dict[str, str] = {
+    "LOST": "LOST",
+    "CANCELADOS": "CANCELADOS",
+    "RECIBO_444": "RECIBO",
+    "ZONA_856": "ZONA 856",
+    "OTRO_NO_USABLE": "OTRO",
+}
+
+
+def dominant_copernico_reason(
+    catalogs: Catalogs, sku: int, sources: Iterable[int]
+) -> str | None:
+    """Motivo de COPÉRNICO que explica la mayor parte del saldo no usable de
+    ``sku`` sumando los orígenes dados (ignora los que ya están bloqueados
+    por otra regla, para no atribuir el corte a COPÉRNICO si el verdadero
+    motivo es otro). Devuelve la etiqueta corta ("LOST", "CANCELADOS",
+    "RECIBO", "ZONA 856", "OTRO") o ``None`` si no hay saldo excluido por
+    COPÉRNICO en esos orígenes.
+
+    ``sources`` se materializa a una tupla de entrada: el cálculo itera sobre
+    ella una vez por cada motivo posible, así que un generador de un solo
+    uso se agotaría después del primer motivo y arrojaría un resultado
+    incorrecto (silencioso) para el resto.
+    """
+    source_list = tuple(sources)
+    totals: dict[str, float] = {}
+    for reason, by_key in catalogs.copernico_unusable_by_reason.items():
+        amount = sum(by_key.get((source, sku), 0.0) for source in source_list)
+        if amount > 0:
+            totals[reason] = amount
+    if not totals:
+        return None
+    dominant = max(totals, key=totals.get)
+    return COPERNICO_REASON_LABELS.get(dominant, dominant)
+
+
 @dataclass
 class PlanningResult:
     base_rows: list[dict[str, Any]]
@@ -2054,6 +2127,23 @@ def plan_transfers(
                 for source in config.origin_warehouses
                 if not regional_blocks[source] and not schedule_blocks[source]
             )
+            copernico_reason = (
+                dominant_copernico_reason(
+                    catalogs,
+                    sku,
+                    (
+                        source
+                        for source in config.origin_warehouses
+                        if not regional_blocks[source]
+                        and not schedule_blocks[source]
+                    ),
+                )
+                if copernico_unusable_stock > 0
+                else None
+            )
+            copernico_tipo_suffix = (
+                f" {copernico_reason}" if copernico_reason else ""
+            )
 
             if assigned > 0:
                 actual_m3 = assigned * m3_per_unit
@@ -2090,11 +2180,11 @@ def plan_transfers(
                     "según SCHEDULE"
                 )
             elif assigned > 0 and copernico_unusable_stock > 0:
-                tipo_corte = "OK PARCIAL - CORTE POR COPÉRNICO"
+                tipo_corte = f"OK PARCIAL - CORTE POR COPÉRNICO{copernico_tipo_suffix}"
                 detalle_motivo = (
                     f"Asignadas {assigned} de {target}; "
                     f"{copernico_unusable_stock:.0f} unidades adicionales quedaron "
-                    "excluidas por COPÉRNICO (ubicación no usable, LOST, etc.) en "
+                    f"excluidas por COPÉRNICO ({copernico_reason or 'ubicación no usable'}) en "
                     "los orígenes configurados"
                 )
             elif assigned > 0:
@@ -2118,14 +2208,14 @@ def plan_transfers(
                     "según SCHEDULE"
                 )
             elif copernico_unusable_stock > 0:
-                tipo_corte = "CORTE POR COPÉRNICO"
+                tipo_corte = f"CORTE POR COPÉRNICO{copernico_tipo_suffix}"
                 diagnostics = ["COPERNICO_NO_USABLE"]
                 if origin_info.get(444, {}).get("rackeado"):
                     diagnostics.append("RACKEADO_444")
                 suffix = f" ({', '.join(diagnostics)})" if len(diagnostics) > 1 else ""
                 detalle_motivo = (
                     f"{copernico_unusable_stock:.0f} unidades excluidas por "
-                    "COPÉRNICO (ubicación no usable, LOST, etc.) en los orígenes "
+                    f"COPÉRNICO ({copernico_reason or 'ubicación no usable'}) en los orígenes "
                     "configurados; sin ese descuento habría stock elegible"
                     + suffix
                 )
@@ -2346,6 +2436,20 @@ def plan_transfers(
             for source in config.origin_warehouses
             if not second_pass_blocks[source] and not second_pass_schedule_blocks[source]
         )
+        copernico_reason = (
+            dominant_copernico_reason(
+                catalogs,
+                sku,
+                (
+                    source
+                    for source in config.origin_warehouses
+                    if not second_pass_blocks[source]
+                    and not second_pass_schedule_blocks[source]
+                ),
+            )
+            if copernico_unusable_stock > 0
+            else None
+        )
         if task_limited:
             tipo_corte = "OK PARCIAL - CORTE POR CAPACIDAD DE TAREAS"
             detalle_motivo = (
@@ -2371,11 +2475,14 @@ def plan_transfers(
                 "stock está en un origen sin envío programado hoy según SCHEDULE"
             )
         elif copernico_unusable_stock > 0:
-            tipo_corte = "OK PARCIAL - CORTE POR COPÉRNICO"
+            tipo_corte = (
+                "OK PARCIAL - CORTE POR COPÉRNICO"
+                + (f" {copernico_reason}" if copernico_reason else "")
+            )
             detalle_motivo = (
                 f"Segunda pasada: asignadas {assigned} de {target}; "
                 f"{copernico_unusable_stock:.0f} unidades adicionales excluidas "
-                "por COPÉRNICO (ubicación no usable, LOST, etc.)"
+                f"por COPÉRNICO ({copernico_reason or 'ubicación no usable'})"
             )
         else:
             tipo_corte = "OK PARCIAL - CORTE POR STOCK"

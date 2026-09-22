@@ -666,7 +666,7 @@ def apply_shalashaska_engine(
     summary["units_not_evacuated"] = max(
         summary["units_at_risk"] - summary["units_evacuated"], 0
     )
-    summary["m3_added"] = round(summary["m3_added"], 3)
+    summary["m3_added"] = round(summary["m3_added"], 2)
     summary["value_at_risk"] = round(summary["value_at_risk"], 2)
     summary["value_protected"] = round(summary["value_protected"], 2)
     summary["stores"] = len(stores_sent)
