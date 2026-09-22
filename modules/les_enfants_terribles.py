@@ -98,6 +98,7 @@ MANUAL_BACKEND_SHEETS = {"TIENDAS_CERRADAS"}
 REQUIRED_DATABASE_SHEETS = (
     "TIENDAS_CERRADAS",
     "VOLUMETRIA",
+    "BLOQUEOS_FORANEAS",
     "BLOQUEOS",
     "RUTA_COSTOS",
     "PRIORIDAD",
@@ -129,9 +130,16 @@ SHEET_DESCRIPTIONS = {
         "Volumen en metros cúbicos por unidad de cada SKU. Se utiliza para "
         "calcular el consumo de capacidad de recibo de las tiendas."
     ),
-    "BLOQUEOS": (
+    "BLOQUEOS_FORANEAS": (
         "Productos con restricciones regionales de envío, especialmente desde "
-        "orígenes de CDMX hacia Guadalajara o Monterrey."
+        "orígenes de CDMX hacia Guadalajara o Monterrey. Antes se llamaba "
+        "BLOQUEOS; el nombre cambió, el comportamiento no."
+    ),
+    "BLOQUEOS": (
+        "Lista de exclusión global de SKUs (columna PRODUCT_ID, un SKU por "
+        "fila), mantenida directamente por negocio. Ningún SKU de esta lista "
+        "se envía a ningún lugar; se une al campo \"Excluir SKUs\" de CODEC "
+        "en cada corrida. No confundir con BLOQUEOS_FORANEAS."
     ),
     "RUTA_COSTOS": (
         "Combinaciones de tienda destino y producto que no cuentan con una ruta "
