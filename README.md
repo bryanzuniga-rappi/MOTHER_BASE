@@ -575,6 +575,24 @@ Las tres coberturas de Solidus usan únicamente stock, capacidad y tareas remane
 
 Nuevo en esta sesión (`build_golden_infaltable_anchor_health_check`). Corre al final del pipeline, **después** de Shalashaska, Liquid y Venom — no solo después del Refuerzo. Para cada tienda-SKU del universo Golden/Infaltable/Anchor con ADU resoluble (misma cascada de arriba), compara el **DOH final real** (stock inicial + todo lo asignado por cualquier engine en la corrida) contra el objetivo del Refuerzo, y reporta cualquier caso que haya quedado por debajo — típicamente porque un engine que corre después del Refuerzo (Shalashaska, Liquid, Venom) consumió stock del mismo origen y nadie volvió a revisarlo. Es puramente informativo: no mueve nada ni vuelve a planear, solo avisa antes de que la corrida se entregue. Se muestra en la web como tabla dedicada, justo antes de "Reporte por engine".
 
+### Reporte de universo Golden / Infaltable / Anchor
+
+Nuevo en esta sesión (`build_bucket_universe_report`). A diferencia del check de salud (que solo mira lo que quedó por debajo del objetivo entre lo evaluable), este reporte cubre el **universo completo** de cada bucket — toda tienda-SKU marcada en `GOLDEN_INFALTABLES_ANCHOR`, sin importar si algún engine la tocó hoy o si ni siquiera apareció en el Fountain9 del día. Son **3 reportes independientes** (Golden, Infaltable, Anchor); una misma tienda-SKU marcada en más de un bucket aparece en cada reporte por separado.
+
+El umbral de riesgo es fijo en **3 DOH** (`GOLDEN_INFALTABLE_ANCHOR_RISK_DOH`), independiente del DOH objetivo del Refuerzo (21 por default) — aquí la pregunta es "¿está en riesgo real de quiebre?", no "¿llegó al nivel de cobertura que queremos mantener?".
+
+**3 niveles:**
+
+1. **General**: conteo por categoría, usando DOH inicial (antes de cualquier engine) vs DOH final (con todo lo asignado hoy):
+   - `SIN_PROBLEMA`: nunca bajó de 3 DOH.
+   - `IBA_A_QUEBRAR_Y_SE_SALVO`: arrancó con stock > 0 pero < 3 DOH, terminó en ≥ 3.
+   - `QUEBRADO_Y_SE_SALVO`: arrancó en 0 unidades, terminó en ≥ 3 DOH.
+   - `NO_CUBIERTO`: seguía por debajo de 3 DOH al final.
+2. **General con detalle**: la tabla completa, una fila por tienda-SKU del universo, con ADU (y su origen: propio o promedio de ciudad), stock/DOH inicial y final, unidades asignadas hoy, y categoría.
+3. **Micro-detalle**: solo para `NO_CUBIERTO`, el motivo exacto (`_diagnose_uncovered_bucket_reason`). Revisa primero motivos a nivel tienda (SKU excluido globalmente, tienda cerrada, ciudad bloqueada, capacidad **real restante** llena, sin ADU en ningún lado); si ninguno aplica, revisa origen por origen (rackeado, COPÉRNICO con motivo específico, bloqueo regional, SCHEDULE, RUTA_COSTOS, sin stock ajustado). Si de verdad no encuentra ningún bloqueo pero el caso sigue sin cubrirse, el motivo es literalmente `"SIN MOTIVO DE BLOQUEO IDENTIFICADO"` — no se inventa una explicación; queda visible para revisión manual caso por caso.
+
+Un SKU sin ADU resoluble (ni propio ni de la ciudad) **siempre** cae en `NO_CUBIERTO`: un DOH "infinito" por falta de dato no es lo mismo que "sin riesgo", así que nunca se le da esa confianza.
+
 ### Shalashaska Engine
 
 Evacúa inventario próximo a caducar de POR_MERMAR.

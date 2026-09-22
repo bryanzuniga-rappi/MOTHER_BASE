@@ -1832,6 +1832,224 @@ def build_golden_infaltable_anchor_health_check(
     }
 
 
+GOLDEN_INFALTABLE_ANCHOR_RISK_DOH = 3.0
+
+
+def _diagnose_uncovered_bucket_reason(
+    destination: int,
+    sku: int,
+    catalogs,
+    config: engine.Config,
+    closed_store_ids: set[int],
+    blocked_cities: tuple[str, ...],
+    capacity_by_store: dict[int, dict[str, Any]],
+) -> str:
+    """Determina por qué una tienda-SKU del reporte de universo Golden/
+    Infaltable/Anchor sigue sin cubrirse. Revisa primero motivos a nivel
+    tienda (bloquean sin importar el origen); si ninguno aplica, revisa
+    origen por origen. Si de verdad no encuentra nada, regresa el texto
+    literal "SIN MOTIVO DE BLOQUEO IDENTIFICADO" — no inventa una
+    explicación, queda visible para revisión manual."""
+    if sku in catalogs.excluded_products:
+        return "SKU EXCLUIDO GLOBALMENTE"
+    if destination in closed_store_ids:
+        return "TIENDA CERRADA"
+    store = catalogs.stores.get(destination, {})
+    city_norm = store.get("city_norm", "")
+    if city_norm in set(blocked_cities):
+        return "CIUDAD BLOQUEADA"
+
+    capacity_row = capacity_by_store.get(destination)
+    capacity_total = catalogs.store_capacity.get(
+        destination, config.default_store_capacity_m3
+    )
+    capacity_used = (
+        float(capacity_row["M3_CONTABILIZADO_CAPACIDAD"])
+        if capacity_row is not None
+        else 0.0
+    )
+    m3_per_unit = catalogs.volume_m3.get(sku, config.default_m3_per_unit)
+    remaining_capacity_m3 = max(capacity_total - capacity_used, 0.0)
+    if m3_per_unit > 0 and remaining_capacity_m3 < m3_per_unit:
+        return "CAPACIDAD DE TIENDA LLENA (real restante)"
+
+    per_origin_reasons: list[str] = []
+    any_origin_open = False
+    for source in config.origin_warehouses:
+        info = engine.source_stock_components(catalogs, source, sku)
+        if info["rackeado"]:
+            per_origin_reasons.append(f"{source}: RACKEADO")
+            continue
+        if info["copernico_unusable"] > 0 and info["adjusted"] <= 0:
+            reason = engine.dominant_copernico_reason(catalogs, sku, [source])
+            per_origin_reasons.append(
+                f"{source}: COPÉRNICO {reason or 'NO USABLE'}"
+            )
+            continue
+        if engine.is_regional_block(
+            catalogs, source, destination, sku, city_norm, False
+        ):
+            per_origin_reasons.append(f"{source}: BLOQUEO REGIONAL")
+            continue
+        if engine.is_schedule_blocked(catalogs, source, destination):
+            per_origin_reasons.append(f"{source}: BLOQUEO POR FRECUENCIA")
+            continue
+        if (destination, sku) in catalogs.route_cost_blocks:
+            per_origin_reasons.append(f"{source}: SIN RUTA DE COSTOS")
+            continue
+        if info["adjusted"] <= 0:
+            per_origin_reasons.append(f"{source}: SIN STOCK")
+            continue
+        any_origin_open = True
+
+    if any_origin_open:
+        return "SIN MOTIVO DE BLOQUEO IDENTIFICADO"
+    if per_origin_reasons:
+        return " | ".join(per_origin_reasons)
+    return "SIN MOTIVO DE BLOQUEO IDENTIFICADO"
+
+
+def build_bucket_universe_report(
+    bucket_keys: set[tuple[int, int]],
+    result,
+    catalogs,
+    config: engine.Config,
+    closed_store_ids: set[int],
+    blocked_cities: tuple[str, ...],
+    catalog_rows: list[dict[str, Any]],
+    target_doh: float = GOLDEN_INFALTABLE_ANCHOR_RISK_DOH,
+) -> dict[str, Any]:
+    """Reporte del universo COMPLETO de un bucket (Golden, Infaltable o
+    Anchor) — no solo lo que algún engine tocó hoy. Para cada tienda-SKU
+    marcada en la hoja GOLDEN_INFALTABLES_ANCHOR, compara DOH inicial vs
+    DOH final (con todo lo asignado por cualquier engine esta corrida) y
+    clasifica en una de 4 categorías. Para lo que sigue sin cubrirse,
+    agrega el motivo detallado (micro-detalle).
+    """
+    if not bucket_keys:
+        return {
+            "enabled": False,
+            "summary": {},
+            "rows": [],
+        }
+
+    adu_by_key, adu_source_by_key = resolve_adu_with_city_fallback(
+        catalog_rows, catalogs, keys_to_resolve=bucket_keys
+    )
+    assigned_by_key: Counter[tuple[int, int]] = Counter()
+    for allocation in result.allocation_rows:
+        assigned_by_key[
+            (allocation["WAREHOUSE_DESTINATION"], allocation["RETAIL_ID"])
+        ] += int(allocation.get("QUANTITY", 0) or 0)
+    capacity_by_store = {
+        row["WAREHOUSE_DESTINATION"]: row for row in result.capacity_rows
+    }
+
+    rows: list[dict[str, Any]] = []
+    summary_counts: Counter[str] = Counter()
+    for destination, sku in bucket_keys:
+        store = catalogs.stores.get(destination, {})
+        adu = adu_by_key.get(key := (destination, sku), 0.0)
+        stock_initial = max(float(catalogs.stock_base.get(key, 0.0)), 0.0)
+        assigned_today = assigned_by_key.get(key, 0)
+        stock_final = stock_initial + assigned_today
+
+        if adu > 0:
+            doh_initial = stock_initial / adu
+            doh_final = stock_final / adu
+            was_at_risk = doh_initial < target_doh
+            was_stocked_out = stock_initial <= 0
+            is_saved = doh_final >= target_doh
+
+            if not was_at_risk:
+                categoria = "SIN_PROBLEMA"
+            elif is_saved and was_stocked_out:
+                categoria = "QUEBRADO_Y_SE_SALVO"
+            elif is_saved:
+                categoria = "IBA_A_QUEBRAR_Y_SE_SALVO"
+            else:
+                categoria = "NO_CUBIERTO"
+        else:
+            # Sin ADU (ni propio ni de la ciudad) no hay forma de calcular
+            # un DOH real. "Infinito porque no sabemos" NO es lo mismo que
+            # "sin riesgo" — se trata siempre como NO_CUBIERTO para que
+            # quede visible y alguien lo revise, en vez de darle una
+            # confianza que no tenemos.
+            doh_initial = None
+            doh_final = None
+            categoria = "NO_CUBIERTO"
+        summary_counts[categoria] += 1
+
+        motivo = ""
+        if categoria == "NO_CUBIERTO":
+            if adu <= 0:
+                motivo = "SIN ADU PARA CALCULAR DOH (ni propio ni de la ciudad)"
+            else:
+                motivo = _diagnose_uncovered_bucket_reason(
+                    destination,
+                    sku,
+                    catalogs,
+                    config,
+                    closed_store_ids,
+                    blocked_cities,
+                    capacity_by_store,
+                )
+
+        rows.append(
+            {
+                "WAREHOUSE_DESTINATION": destination,
+                "WAREHOUSE_NAME": store.get("warehouse_name", ""),
+                "RETAIL_ID": sku,
+                "ADU": round(adu, 4),
+                "ADU_ORIGEN": adu_source_by_key.get(key, "SIN_DATO"),
+                "STOCK_INICIAL": int(stock_initial),
+                "DOH_INICIAL": (
+                    round(doh_initial, 3)
+                    if doh_initial is not None and math.isfinite(doh_initial)
+                    else None
+                ),
+                "UNIDADES_ASIGNADAS_HOY": int(assigned_today),
+                "STOCK_FINAL": int(stock_final),
+                "DOH_FINAL": (
+                    round(doh_final, 3)
+                    if doh_final is not None and math.isfinite(doh_final)
+                    else None
+                ),
+                "CATEGORIA": categoria,
+                "MOTIVO_NO_CUBIERTO": motivo,
+            }
+        )
+
+    rows.sort(
+        key=lambda row: (
+            {
+                "NO_CUBIERTO": 0,
+                "QUEBRADO_Y_SE_SALVO": 1,
+                "IBA_A_QUEBRAR_Y_SE_SALVO": 2,
+                "SIN_PROBLEMA": 3,
+            }[row["CATEGORIA"]],
+            row["DOH_FINAL"] if row["DOH_FINAL"] is not None else -1,
+            row["WAREHOUSE_DESTINATION"],
+            row["RETAIL_ID"],
+        )
+    )
+
+    return {
+        "enabled": True,
+        "universe_size": len(bucket_keys),
+        "target_doh": target_doh,
+        "summary": {
+            "sin_problema": summary_counts.get("SIN_PROBLEMA", 0),
+            "iba_a_quebrar_y_se_salvo": summary_counts.get(
+                "IBA_A_QUEBRAR_Y_SE_SALVO", 0
+            ),
+            "quebrado_y_se_salvo": summary_counts.get("QUEBRADO_Y_SE_SALVO", 0),
+            "no_cubierto": summary_counts.get("NO_CUBIERTO", 0),
+        },
+        "rows": rows,
+    }
+
+
 def load_insumos_rows(
     database_path: Path,
     catalogs,
@@ -5393,6 +5611,49 @@ def execute_planning(
                 "origen después de que se les aseguró su cobertura. Revisa el "
                 "detalle antes de entregar esta planeación."
             )
+
+        golden_universe_report = build_bucket_universe_report(
+            catalogs.golden_products,
+            result,
+            catalogs,
+            config,
+            closed_store_ids,
+            blocked_cities,
+            health_check_catalog_rows,
+        )
+        infaltable_universe_report = build_bucket_universe_report(
+            catalogs.infaltable_products,
+            result,
+            catalogs,
+            config,
+            closed_store_ids,
+            blocked_cities,
+            health_check_catalog_rows,
+        )
+        anchor_universe_report = build_bucket_universe_report(
+            catalogs.anchor_products,
+            result,
+            catalogs,
+            config,
+            closed_store_ids,
+            blocked_cities,
+            health_check_catalog_rows,
+        )
+        for bucket_label, bucket_report in (
+            ("Golden", golden_universe_report),
+            ("Infaltable", infaltable_universe_report),
+            ("Anchor", anchor_universe_report),
+        ):
+            if bucket_report["enabled"] and bucket_report["summary"]["no_cubierto"]:
+                result.warnings.append(
+                    f"Universo {bucket_label}: "
+                    f"{bucket_report['summary']['no_cubierto']:,} de "
+                    f"{bucket_report['universe_size']:,} tienda-SKU siguen sin "
+                    f"cubrirse por debajo de {bucket_report['target_doh']:g} DOH. "
+                    "Ver el reporte de universo completo para el motivo "
+                    "detallado de cada caso."
+                )
+
         normalize_result_storage(result)
         analytics = build_planning_analytics(result, origins)
         apply_reporting_labels(result)
@@ -5670,6 +5931,9 @@ def execute_planning(
         "schedule_block": schedule_block,
         "naked": naked_summary,
         "golden_health_check": golden_health_check,
+        "golden_universe_report": golden_universe_report,
+        "infaltable_universe_report": infaltable_universe_report,
+        "anchor_universe_report": anchor_universe_report,
         "copernico_cuts": copernico_cuts,
         "venom": venom_summary,
         "input_consolidation": consolidation_summary,
@@ -6504,6 +6768,133 @@ def render_planning_analytics(analytics: dict[str, Any], run: dict[str, Any]) ->
     render_source_analysis(analytics)
 
 
+CATEGORIA_DISPLAY_LABELS = {
+    "SIN_PROBLEMA": "Sin problema",
+    "IBA_A_QUEBRAR_Y_SE_SALVO": "Iba a quebrar y se salvó",
+    "QUEBRADO_Y_SE_SALVO": "Quebrado y se salvó",
+    "NO_CUBIERTO": "No cubierto",
+}
+
+
+def render_bucket_universe_report(bucket_label: str, report: dict[str, Any]) -> None:
+    """Renderiza los 3 niveles del reporte de universo completo de un
+    bucket (Golden, Infaltable o Anchor): general, general con detalle, y
+    micro-detalle para lo que sigue sin cubrirse."""
+    if not report or not report.get("enabled"):
+        return
+
+    st.markdown(
+        f'<div class="report-title">UNIVERSO {bucket_label}.</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f"""
+        <div class="report-note">
+            Las {report['universe_size']:,} combinaciones tienda-SKU marcadas
+            {bucket_label} en GOLDEN_INFALTABLES_ANCHOR, evaluadas completas —
+            sin importar si algún engine las tocó hoy. Objetivo de riesgo:
+            {report['target_doh']:g} DOH.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    summary = report["summary"]
+    render_kpi_cards(
+        [
+            {
+                "category": f"{bucket_label} · SIN RIESGO",
+                "label": "SIN PROBLEMA",
+                "value": f"{summary['sin_problema']:,}",
+                "description": (
+                    f"Nunca bajaron de {report['target_doh']:g} DOH — no "
+                    "necesitaron ayuda de ningún engine."
+                ),
+                "tone": "blue",
+            },
+            {
+                "category": f"{bucket_label} · SE SALVÓ",
+                "label": "IBA A QUEBRAR Y SE SALVÓ",
+                "value": f"{summary['iba_a_quebrar_y_se_salvo']:,}",
+                "description": (
+                    "Arrancaron con stock > 0 pero por debajo del objetivo; "
+                    "algún engine las llevó de vuelta al objetivo."
+                ),
+                "tone": "acid",
+            },
+            {
+                "category": f"{bucket_label} · SE SALVÓ",
+                "label": "QUEBRADO Y SE SALVÓ",
+                "value": f"{summary['quebrado_y_se_salvo']:,}",
+                "description": (
+                    "Arrancaron en 0 unidades; algún engine las llevó al "
+                    "objetivo de DOH."
+                ),
+                "tone": "acid",
+            },
+            {
+                "category": f"{bucket_label} · SIN CUBRIR",
+                "label": "NO CUBIERTO",
+                "value": f"{summary['no_cubierto']:,}",
+                "description": (
+                    "Siguen por debajo del objetivo al final de la corrida. "
+                    "Ver el detalle de motivo más abajo."
+                ),
+                "tone": "coral",
+            },
+        ],
+        columns_count=4,
+    )
+
+    rows = report.get("rows", [])
+    with st.expander(
+        f"{bucket_label} — general con detalle ({len(rows):,} tienda-SKU)"
+    ):
+        display_rows = [
+            {**row, "CATEGORIA": CATEGORIA_DISPLAY_LABELS.get(
+                row["CATEGORIA"], row["CATEGORIA"]
+            )}
+            for row in rows
+        ]
+        detail_height = (max(6, min(len(display_rows), 30)) + 1) * 36 + 4
+        st.dataframe(
+            display_rows,
+            use_container_width=True,
+            hide_index=True,
+            height=detail_height,
+            column_config={
+                "MOTIVO_NO_CUBIERTO": st.column_config.TextColumn(
+                    "MOTIVO NO CUBIERTO", width="large"
+                ),
+            },
+        )
+
+    no_cubierto_rows = [row for row in rows if row["CATEGORIA"] == "NO_CUBIERTO"]
+    if no_cubierto_rows:
+        st.markdown(f"###### {bucket_label} — micro-detalle: por qué no se cubrió")
+        micro_height = (max(6, min(len(no_cubierto_rows), 30)) + 1) * 36 + 4
+        st.dataframe(
+            [
+                {
+                    "WAREHOUSE_DESTINATION": row["WAREHOUSE_DESTINATION"],
+                    "WAREHOUSE_NAME": row["WAREHOUSE_NAME"],
+                    "RETAIL_ID": row["RETAIL_ID"],
+                    "DOH_FINAL": row["DOH_FINAL"],
+                    "MOTIVO_NO_CUBIERTO": row["MOTIVO_NO_CUBIERTO"],
+                }
+                for row in no_cubierto_rows
+            ],
+            use_container_width=True,
+            hide_index=True,
+            height=micro_height,
+            column_config={
+                "MOTIVO_NO_CUBIERTO": st.column_config.TextColumn(
+                    "MOTIVO NO CUBIERTO", width="large"
+                ),
+            },
+        )
+
+
 def render_results(run: dict[str, Any]) -> None:
     planning_summary = run.get("analytics", {}).get("summary", {})
     st.markdown('<div class="result-title">PLANEACIÓN LISTA.</div>', unsafe_allow_html=True)
@@ -7022,6 +7413,16 @@ def render_results(run: dict[str, Any]) -> None:
                 f"{golden_health_check['no_adu']:,} combinaciones no se "
                 "evaluaron por falta de ADU (ni propio ni de la ciudad)."
             )
+
+    render_bucket_universe_report(
+        "GOLDEN", run.get("golden_universe_report", {})
+    )
+    render_bucket_universe_report(
+        "INFALTABLE", run.get("infaltable_universe_report", {})
+    )
+    render_bucket_universe_report(
+        "ANCHOR", run.get("anchor_universe_report", {})
+    )
 
     st.markdown(
         '<div class="report-title">REPORTE POR ENGINE.</div>',
