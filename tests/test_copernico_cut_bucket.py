@@ -185,7 +185,8 @@ def test_copernico_cut_label_includes_specific_reason_end_to_end(tmp_path):
             ws.append(r)
 
     add("VOLUMETRIA", ["SKU", "PALLETS"], [[10, 1.0]])
-    add("BLOQUEOS", ["SKU"], [])
+    add("BLOQUEOS_FORANEAS", ["SKU"], [])
+    add("BLOQUEOS", ["PRODUCT_ID"], [])
     add("RUTA_COSTOS", ["Destination", "Catalog ID"], [])
     add("PRIORIDAD", ["WAREHOUSE_ID", "PRIORIDAD"], [[100, 1]])
     add("444_HV", ["EAN", "Category"], [])

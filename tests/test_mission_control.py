@@ -22,7 +22,7 @@ def test_loadout_routes_natural_and_manual_independently():
         [natural, manual, no_recommendation],
         config,
         include_naked=True,
-        include_solidus=False,
+        include_hardcodes=False,
     )
     assert naked_rows == [natural, no_recommendation]
     assert naked_summary["solidus_requirements"] == 1
@@ -31,7 +31,7 @@ def test_loadout_routes_natural_and_manual_independently():
         [natural, manual, no_recommendation],
         config,
         include_naked=False,
-        include_solidus=True,
+        include_hardcodes=True,
     )
     assert solidus_rows == [manual]
 

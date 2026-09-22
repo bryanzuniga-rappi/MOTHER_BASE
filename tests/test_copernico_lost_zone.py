@@ -220,7 +220,8 @@ def test_load_catalogs_end_to_end_applies_lost_exclusion(tmp_path):
             ws.append(r)
 
     add("VOLUMETRIA", ["SKU", "PALLETS"], [[10, 0.01]])
-    add("BLOQUEOS", ["SKU"], [])
+    add("BLOQUEOS_FORANEAS", ["SKU"], [])
+    add("BLOQUEOS", ["PRODUCT_ID"], [])
     add("RUTA_COSTOS", ["Destination", "Catalog ID"], [])
     add("PRIORIDAD", ["WAREHOUSE_ID", "PRIORIDAD"], [[100, 1]])
     add("444_HV", ["EAN", "Category"], [])
@@ -304,7 +305,8 @@ def test_load_catalogs_accepts_multiple_copernico_files(tmp_path):
             ws.append(r)
 
     add("VOLUMETRIA", ["SKU", "PALLETS"], [[10, 0.01], [11, 0.01]])
-    add("BLOQUEOS", ["SKU"], [])
+    add("BLOQUEOS_FORANEAS", ["SKU"], [])
+    add("BLOQUEOS", ["PRODUCT_ID"], [])
     add("RUTA_COSTOS", ["Destination", "Catalog ID"], [])
     add("PRIORIDAD", ["WAREHOUSE_ID", "PRIORIDAD"], [[100, 1]])
     add("444_HV", ["EAN", "Category"], [])

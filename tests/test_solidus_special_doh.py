@@ -69,16 +69,17 @@ def test_special_doh_tops_up_golden_product_below_target():
 
 
 def test_special_doh_ignores_non_special_products():
-    """SKU 20 no es Golden/Infaltable/Anchor -> no debe recibir refuerzo."""
+    """SKU 20 no es Golden/Infaltable/Anchor -> no debe recibir refuerzo.
+    Con el rediseño (universo desde GOLDEN_INFALTABLES_ANCHOR, no CATALOGO),
+    SKU 20 ni siquiera entra al pool de candidatos."""
     catalogs = make_catalogs()  # solo (100,10) está en golden_products
     config = engine.Config(origin_warehouses=(444,), max_tasks=100)
     result = make_result()
-    summary = m.apply_avl_fill(
+    m.apply_avl_fill(
         result, catalog_rows(), catalogs, config, set(), (), 10.0,
         candidate_mode="special_doh",
     )
     assert all(row["RETAIL_ID"] != 20 for row in result.allocation_rows)
-    assert summary["skipped_not_special"] == 1
 
 
 def test_special_doh_skips_when_already_above_target():
@@ -192,3 +193,259 @@ def test_invalid_candidate_mode_still_raises():
         assert "inválido" in str(exc)
     else:
         raise AssertionError("debía lanzar ValueError con un modo inválido")
+
+
+# --- Rediseño: universo desde GOLDEN_INFALTABLES_ANCHOR, on-top y cascada --
+
+def test_special_doh_candidate_exists_without_catalogo_row():
+    """Un SKU Golden en una tienda que NO tiene fila en CATALOGO para esa
+    tienda debe seguir evaluándose (antes era invisible por completo)."""
+    catalogs = make_catalogs(
+        stock_base={(444, 30): 100.0, (100, 30): 2.0},
+        golden_products={(100, 30)},
+    )
+    config = engine.Config(origin_warehouses=(444,), max_tasks=100)
+    result = make_result()
+    # catalog_rows() no incluye el SKU 30 en absoluto.
+    summary = m.apply_avl_fill(
+        result, catalog_rows(), catalogs, config, set(), (), 10.0,
+        candidate_mode="special_doh",
+    )
+    assert any(r["RETAIL_ID"] == 30 for r in result.allocation_rows)
+    assert summary["special_candidates_no_adu"] == 1
+
+
+def test_special_doh_on_top_over_prior_engine_assignment():
+    """AVL ya mandó 2 unidades esta corrida (stock inicial 2 + AVL 2 = 4).
+    Con ADU=1 y objetivo 10 DOH, el refuerzo debe mandar solo 6 (10-4), no
+    10 de nuevo ni saltarse el caso por 'ya recibió algo'."""
+    catalogs = make_catalogs()  # SKU 10 Golden, stock inicial 2, ADU=1
+    config = engine.Config(origin_warehouses=(444,), max_tasks=100)
+    result = make_result(
+        allocation_rows=[
+            {
+                "WAREHOUSE_DESTINATION": 100, "WAREHOUSE_SOURCE": 444,
+                "RETAIL_ID": 10, "QUANTITY": 2,
+            }
+        ]
+    )
+    m.apply_avl_fill(
+        result, catalog_rows(), catalogs, config, set(), (), 10.0,
+        candidate_mode="special_doh",
+    )
+    refuerzo_rows = [
+        r for r in result.allocation_rows
+        if r["RETAIL_ID"] == 10 and r.get(m.PLANNING_REASON_COLUMN) == m.PLANNING_REASON_SPECIAL_DOH
+    ]
+    assert sum(r["QUANTITY"] for r in refuerzo_rows) == 6
+
+
+def test_special_doh_never_touches_fountain9_recommended_even_with_prior_assignment():
+    """Aunque AVL ya haya mandado algo, si Fountain9 SÍ pidió esa tienda-SKU
+    (excluded_keys), el refuerzo nunca la toca — la señal de Fountain9 manda
+    siempre sobre cualquier on-top."""
+    catalogs = make_catalogs()
+    config = engine.Config(origin_warehouses=(444,), max_tasks=100)
+    result = make_result(
+        allocation_rows=[
+            {
+                "WAREHOUSE_DESTINATION": 100, "WAREHOUSE_SOURCE": 444,
+                "RETAIL_ID": 10, "QUANTITY": 2,
+            }
+        ]
+    )
+    m.apply_avl_fill(
+        result, catalog_rows(), catalogs, config, set(), (), 10.0,
+        candidate_mode="special_doh",
+        excluded_keys={(100, 10)},
+    )
+    refuerzo_rows = [
+        r for r in result.allocation_rows
+        if r.get(m.PLANNING_REASON_COLUMN) == m.PLANNING_REASON_SPECIAL_DOH
+    ]
+    assert refuerzo_rows == []
+
+
+def test_special_doh_uses_city_average_adu_when_own_missing():
+    """SKU 40 en tienda 100 no tiene ADU propio, pero la tienda 200 (misma
+    ciudad) sí tiene ADU=2.0 para ese SKU -> debe usarse ese promedio."""
+    catalogs = make_catalogs(
+        stock_base={(444, 40): 100.0, (100, 40): 0.0, (200, 40): 5.0},
+        store_capacity={100: 100.0, 200: 100.0},
+        stores={
+            444: {"city": "CDMX", "city_norm": "CDMX", "warehouse_name": "O444"},
+            100: {"city": "CDMX", "city_norm": "CDMX", "warehouse_name": "STORE"},
+            200: {"city": "CDMX", "city_norm": "CDMX", "warehouse_name": "STORE2"},
+        },
+        golden_products={(100, 40)},
+    )
+    config = engine.Config(origin_warehouses=(444,), max_tasks=100)
+    result = make_result()
+    rows_with_city_mirror = catalog_rows() + [
+        {"WAREHOUSE_DESTINATION": 200, "RETAIL_ID": 40, "ADU": 2.0},
+    ]
+    m.apply_avl_fill(
+        result, rows_with_city_mirror, catalogs, config, set(), (), 10.0,
+        candidate_mode="special_doh",
+    )
+    refuerzo_rows = [r for r in result.allocation_rows if r["RETAIL_ID"] == 40]
+    assert refuerzo_rows, "debió usar el ADU promedio de la ciudad"
+    # objetivo = ceil(2.0 * 10) = 20; posición inicial = 0 -> manda 20
+    assert sum(r["QUANTITY"] for r in refuerzo_rows) == 20
+
+
+def test_special_doh_no_adu_anywhere_falls_back_to_minimum_3():
+    """Ninguna tienda de ninguna ciudad tiene ADU para el SKU -> mínimo
+    operativo de 3 unidades, sin piso de DOH."""
+    catalogs = make_catalogs(
+        stock_base={(444, 50): 100.0, (100, 50): 0.0},
+        golden_products={(100, 50)},
+    )
+    config = engine.Config(origin_warehouses=(444,), max_tasks=100)
+    result = make_result()
+    m.apply_avl_fill(
+        result, catalog_rows(), catalogs, config, set(), (), 10.0,
+        candidate_mode="special_doh",
+    )
+    refuerzo_rows = [r for r in result.allocation_rows if r["RETAIL_ID"] == 50]
+    assert sum(r["QUANTITY"] for r in refuerzo_rows) == 3
+
+
+def test_special_doh_no_adu_minimum_3_accounts_for_prior_assignment():
+    """Mismo caso sin ADU, pero ya se le asignó 1 unidad antes -> el mínimo
+    de 3 se completa con solo 2 más, no 3 de nuevo."""
+    catalogs = make_catalogs(
+        stock_base={(444, 50): 100.0, (100, 50): 0.0},
+        golden_products={(100, 50)},
+    )
+    config = engine.Config(origin_warehouses=(444,), max_tasks=100)
+    result = make_result(
+        allocation_rows=[
+            {
+                "WAREHOUSE_DESTINATION": 100, "WAREHOUSE_SOURCE": 444,
+                "RETAIL_ID": 50, "QUANTITY": 1,
+            }
+        ]
+    )
+    m.apply_avl_fill(
+        result, catalog_rows(), catalogs, config, set(), (), 10.0,
+        candidate_mode="special_doh",
+    )
+    refuerzo_rows = [
+        r for r in result.allocation_rows
+        if r["RETAIL_ID"] == 50 and r.get(m.PLANNING_REASON_COLUMN) == m.PLANNING_REASON_SPECIAL_DOH
+    ]
+    assert sum(r["QUANTITY"] for r in refuerzo_rows) == 2
+
+
+def test_avl_stockout_mode_still_uses_only_own_catalogo_adu_when_present():
+    """Regresión: AVL/Preventivo siguen funcionando igual cuando el ADU
+    propio existe — la cascada no debe alterar el caso normal."""
+    catalogs = make_catalogs(stock_base={(444, 10): 100.0, (100, 10): 0.0})
+    config = engine.Config(origin_warehouses=(444,), max_tasks=100)
+    result = make_result()
+    m.apply_avl_fill(
+        result, catalog_rows(adu_10=2.0), catalogs, config, set(), (), 5.0,
+        candidate_mode="stockout",
+    )
+    avl_rows = [r for r in result.allocation_rows if r["RETAIL_ID"] == 10]
+    assert sum(r["QUANTITY"] for r in avl_rows) == 10  # ceil(2.0*5)=10
+
+
+def test_resolve_adu_with_city_fallback_direct():
+    catalogs = make_catalogs(
+        stores={
+            444: {"city": "CDMX", "city_norm": "CDMX", "warehouse_name": "O444"},
+            100: {"city": "CDMX", "city_norm": "CDMX", "warehouse_name": "A"},
+            200: {"city": "CDMX", "city_norm": "CDMX", "warehouse_name": "B"},
+            300: {"city": "Guadalajara", "city_norm": "GDL", "warehouse_name": "C"},
+        },
+    )
+    rows = [
+        {"WAREHOUSE_DESTINATION": 100, "RETAIL_ID": 99, "ADU": 0.0},  # sin propio
+        {"WAREHOUSE_DESTINATION": 200, "RETAIL_ID": 99, "ADU": 4.0},
+        {"WAREHOUSE_DESTINATION": 300, "RETAIL_ID": 99, "ADU": 100.0},  # otra ciudad
+    ]
+    resolved, source = m.resolve_adu_with_city_fallback(rows, catalogs)
+    assert resolved[(100, 99)] == 4.0  # promedio de CDMX (solo la 200 aporta)
+    assert source[(100, 99)] == "PROMEDIO_CIUDAD"
+    assert resolved[(200, 99)] == 4.0
+    assert source[(200, 99)] == "PROPIO"
+    assert resolved[(300, 99)] == 100.0
+    assert source[(300, 99)] == "PROPIO"
+
+
+# --- Check de salud post-corrida (punto D) --------------------------------
+
+def test_health_check_flags_store_below_target_doh():
+    catalogs = make_catalogs(
+        stock_base={(100, 10): 5.0},  # solo 5 unidades, ADU=1 -> 5 DOH
+        golden_products={(100, 10)},
+    )
+    result = make_result()
+    check = m.build_golden_infaltable_anchor_health_check(
+        result, catalogs, 10.0, catalog_rows()
+    )
+    assert check["enabled"] is True
+    assert check["checked"] == 1
+    assert len(check["below_target"]) == 1
+    row = check["below_target"][0]
+    assert row["WAREHOUSE_DESTINATION"] == 100
+    assert row["RETAIL_ID"] == 10
+    assert row["DOH_FINAL"] == 5.0
+    assert row["UNIDADES_FALTANTES"] == 5  # (10-5)*1
+
+
+def test_health_check_accounts_for_allocations_from_any_engine():
+    """Si Shalashaska/Liquid/Venom ya mandaron algo después, el check debe
+    verlo reflejado en la posición final — no solo el stock inicial."""
+    catalogs = make_catalogs(
+        stock_base={(100, 10): 5.0},
+        golden_products={(100, 10)},
+    )
+    result = make_result(
+        allocation_rows=[
+            {"WAREHOUSE_DESTINATION": 100, "WAREHOUSE_SOURCE": 444, "RETAIL_ID": 10, "QUANTITY": 5},
+        ]
+    )
+    check = m.build_golden_infaltable_anchor_health_check(
+        result, catalogs, 10.0, catalog_rows()
+    )
+    # posición final = 5 (inicial) + 5 (asignado) = 10 -> DOH=10, ya no baja
+    assert check["below_target"] == []
+
+
+def test_health_check_passes_when_at_or_above_target():
+    catalogs = make_catalogs(
+        stock_base={(100, 10): 50.0},  # ADU=1 -> 50 DOH, muy por encima de 10
+        golden_products={(100, 10)},
+    )
+    result = make_result()
+    check = m.build_golden_infaltable_anchor_health_check(
+        result, catalogs, 10.0, catalog_rows()
+    )
+    assert check["below_target"] == []
+
+
+def test_health_check_skips_combinations_without_any_adu():
+    catalogs = make_catalogs(
+        stock_base={(100, 60): 1.0},
+        golden_products={(100, 60)},
+    )
+    result = make_result()
+    # SKU 60 no aparece en catalog_rows() ni en ninguna tienda -> sin ADU.
+    check = m.build_golden_infaltable_anchor_health_check(
+        result, catalogs, 10.0, catalog_rows()
+    )
+    assert check["no_adu"] == 1
+    assert check["below_target"] == []
+
+
+def test_health_check_disabled_when_no_golden_infaltable_anchor_universe():
+    catalogs = make_catalogs(golden_products=set())
+    result = make_result()
+    check = m.build_golden_infaltable_anchor_health_check(
+        result, catalogs, 10.0, catalog_rows()
+    )
+    assert check["enabled"] is False
+    assert check["checked"] == 0

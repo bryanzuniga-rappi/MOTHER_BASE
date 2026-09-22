@@ -828,6 +828,10 @@ class Catalogs:
     # Toggle de CODEC "Bloquear envíos fuera de frecuencia". Apagado por
     # default para no alterar corridas existentes.
     schedule_block_enabled: bool = False
+    # Toggle de CODEC para el bloqueo regional explícito (hoja
+    # BLOQUEOS_FORANEAS, CDMX→GDL/MTY). Activo por default, igual que
+    # siempre ha funcionado.
+    regional_block_enabled: bool = True
     # Día de hoy (fecha real del sistema al momento de la corrida), normalizado
     # igual que los tokens de SCHEDULE.DAYS, p. ej. "MIERCOLES".
     run_weekday_norm: str = ""
@@ -837,6 +841,9 @@ class Catalogs:
     copernico_unusable_by_reason: dict[str, dict[tuple[int, int], float]] = field(
         default_factory=dict
     )
+    # SKUs de la hoja BLOQUEOS (columna PRODUCT_ID) que nunca se envían a
+    # ningún lugar, mantenidos directamente por negocio en DATA_TRANSFERS.
+    globally_blocked_skus: set[int] = field(default_factory=set)
 
 
 def load_catalogs(
@@ -870,9 +877,18 @@ def load_catalogs(
             put_unique(volume_m3, sku, volume, warnings, "VOLUMETRIA", "first")
 
         blocked_products = {
-            to_id(row["SKU"], "BLOQUEOS.SKU")
-            for row in iter_sheet_records(workbook, "BLOQUEOS", ["SKU"])
+            to_id(row["SKU"], "BLOQUEOS_FORANEAS.SKU")
+            for row in iter_sheet_records(workbook, "BLOQUEOS_FORANEAS", ["SKU"])
         }
+
+        # Lista de exclusión global mantenida directamente por negocio en
+        # DATA_TRANSFERS: cualquier SKU aquí nunca se envía a ningún lugar,
+        # en ningún engine. Una sola columna (PRODUCT_ID), un SKU por fila.
+        globally_blocked_skus = {
+            to_id(row["PRODUCT_ID"], "BLOQUEOS.PRODUCT_ID", True)
+            for row in iter_sheet_records(workbook, "BLOQUEOS", ["PRODUCT_ID"])
+        }
+        globally_blocked_skus.discard(None)
 
         route_cost_blocks: set[tuple[int, int]] = set()
         for row in iter_sheet_records(
@@ -1252,6 +1268,7 @@ def load_catalogs(
         schedule_days=schedule_days,
         run_weekday_norm=run_weekday_norm,
         copernico_unusable_by_reason=copernico_unusable_by_reason,
+        globally_blocked_skus=globally_blocked_skus,
     )
 
 
@@ -1349,73 +1366,20 @@ def detect_fountain9_store_outliers(
     consolidated: dict[tuple[int, int], dict[str, Any]],
     catalogs: Catalogs,
 ) -> dict[str, Any]:
-    """Detecta tiendas con una cobertura de líneas F9 anormalmente baja."""
-    line_counts = Counter(destination for destination, _ in consolidated)
-    median_lines = float(statistics.median(line_counts.values())) if line_counts else 0.0
-    threshold = int(math.floor(median_lines * 0.50))
-    detection_enabled = len(line_counts) >= 5 and median_lines >= 20
-    outlier_store_ids = {
-        destination
-        for destination, count in line_counts.items()
-        if detection_enabled and count <= threshold
-    }
-    stores: list[dict[str, Any]] = []
-    for destination in sorted(outlier_store_ids, key=lambda value: (line_counts[value], value)):
-        store = catalogs.stores.get(destination, {})
-        count = int(line_counts[destination])
-        stores.append(
-            {
-                "WAREHOUSE_DESTINATION": destination,
-                "WAREHOUSE_NAME": store.get("warehouse_name", ""),
-                "CITY": store.get("city", ""),
-                "LINEAS_F9_UNICAS": count,
-                "MEDIANA_LINEAS_TIENDAS": round(median_lines, 1),
-                "UMBRAL_OUTLIER_50_PCT": threshold,
-                "PORCENTAJE_DE_LA_MEDIANA": round(
-                    (count / median_lines) * 100,
-                    1,
-                ) if median_lines else 0.0,
-                "ACCION": "EXCLUIDA DE LA PLANEACION",
-            }
-        )
-    details: list[dict[str, Any]] = []
-    for (destination, sku), record in sorted(consolidated.items()):
-        if destination not in outlier_store_ids:
-            continue
-        store = catalogs.stores.get(destination, {})
-        details.append(
-            {
-                "WAREHOUSE_DESTINATION": destination,
-                "WAREHOUSE_NAME": store.get("warehouse_name", ""),
-                "CITY": store.get("city", ""),
-                "RETAIL_ID": sku,
-                "PREDICTED_DEMAND": record["PREDICTED_DEMAND"],
-                "PREDICTED_OPENING_INVENTORY": record[
-                    "PREDICTED_OPENING_INVENTORY"
-                ],
-                "ROQ_INPUT": record["ROQ_INPUT"],
-                "NET_INTER_STORE_TRANSFERS": record[
-                    "NET_INTER_STORE_TRANSFERS"
-                ],
-                "ARCHIVOS_INPUT": " | ".join(sorted(record["SOURCE_FILES"])),
-                "FILAS_INPUT_SUMADAS": record["SOURCE_ROWS"],
-                "MOTIVO_EXCLUSION": (
-                    f"La tienda solo contiene {line_counts[destination]} líneas "
-                    f"únicas frente a una mediana de {median_lines:g}; umbral "
-                    f"automático: {threshold}."
-                ),
-            }
-        )
+    """Deprecado: la detección de tiendas con cobertura F9 anómalamente baja
+    se eliminó a pedido de negocio. Se conserva como stub inerte (siempre
+    deshabilitado, cero tiendas excluidas) por si algún llamador viejo la
+    invoca todavía; no hace ningún cálculo real."""
     return {
-        "enabled": detection_enabled,
-        "stores_evaluated": len(line_counts),
-        "median_lines": median_lines,
-        "threshold": threshold,
-        "store_ids": sorted(outlier_store_ids),
-        "stores": stores,
-        "details": details,
-        "stores_excluded": len(outlier_store_ids),
-        "requirements_excluded": len(details),
+        "enabled": False,
+        "stores_evaluated": 0,
+        "median_lines": 0.0,
+        "threshold": 0,
+        "store_ids": [],
+        "stores": [],
+        "details": [],
+        "stores_excluded": 0,
+        "requirements_excluded": 0,
     }
 
 
@@ -1830,6 +1794,8 @@ def is_regional_block(
     """
     if source == destination:
         return True
+    if not catalogs.regional_block_enabled:
+        return False
     source_city_norm = catalogs.stores[source]["city_norm"]
     restricted_product = sku in catalogs.blocked_products
     return (

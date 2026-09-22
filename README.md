@@ -94,7 +94,7 @@ La aplicación trabaja por sesión de Streamlit:
 4. Carga de uno o varios CSV de Fountain9.
 5. Captura de CODEC y activación de engines.
 6. Consolidación de Fountain9 por destino–SKU.
-7. Exclusión de outliers, tiendas, ciudades y SKUs.
+7. Exclusión de tiendas, ciudades y SKUs.
 8. Planeación base Naked y protecciones manuales Solidus.
 9. Ejecución opcional de Shalashaska.
 10. Cobertura opcional AVL y prevención de quiebres de Solidus.
@@ -147,7 +147,7 @@ Los ZIP y archivos `*_BUILD_*` de la raíz son artefactos históricos. No son im
 - **Restricciones exclusivas de este perfil** (Big Boss no las tiene):
   - No puede activar **Solidus Engine** ni **Liquid Engine**; sus tarjetas aparecen bloqueadas ("BLOQUEADO · SOLO BIG BOSS") y el clic no hace nada.
   - No puede bloquear las ciudades Ciudad de México, Guadalajara, Monterrey, Puebla, Querétaro ni Saltillo — desaparecen de las opciones del multiselect "Bloquear ciudades".
-  - Los warehouses origen que aparecen seleccionados por default al abrir el módulo son **444 y 831** (Big Boss conserva el default general del sistema).
+  - No ve el toggle de **Modo simulación** (exclusivo de Big Boss).
 
 ### Big Boss
 
@@ -155,7 +155,11 @@ Los ZIP y archivos `*_BUILD_*` de la raíz son artefactos históricos. No son im
 - Se lee de `st.secrets["BIG_BOSS_PASSWORD"]`.
 - Existe un fallback de compatibilidad con valor `Admin`.
 - En producción **no debe usarse el fallback**; configure un secreto largo y único.
-- Sin restricciones adicionales: acceso completo a todos los engines y ciudades.
+- Sin restricciones de engines o ciudades; es el único perfil que ve el toggle de **Modo simulación** (ver §17 y §20).
+
+### Ambos perfiles
+
+- Los warehouses origen que aparecen seleccionados por default al abrir el módulo son **444 y 831**, sin importar el perfil.
 
 ### Sesión
 
@@ -239,7 +243,8 @@ Los encabezados se buscan dinámicamente en las primeras 40 filas. Esto permite 
 |---|---|---|
 | `TIENDAS_CERRADAS` | A1=`WAREHOUSE_ID`; IDs debajo | Bloqueo permanente de destinos. |
 | `VOLUMETRIA` | `SKU`, `PALLETS` | M³ por unidad. |
-| `BLOQUEOS` | `SKU` | Productos con bloqueo explícito CDMX → GDL/MTY. |
+| `BLOQUEOS_FORANEAS` | `SKU` | Productos con bloqueo explícito CDMX → GDL/MTY (hasta esta sesión se llamaba `BLOQUEOS`; el nombre cambió, el comportamiento no). |
+| `BLOQUEOS` | `PRODUCT_ID` | **Nueva**: lista de exclusión global de SKUs, mantenida directamente por negocio. Un SKU por fila; se une al campo "Excluir SKUs" de CODEC en cada corrida. No confundir con `BLOQUEOS_FORANEAS` — mismo nombre viejo, contenido y propósito distintos. |
 | `RUTA_COSTOS` | `Destination`, `Catalog ID` | Pares destino–SKU sin ruta. |
 | `PRIORIDAD` | `WAREHOUSE_ID`, `PRIORIDAD` | Orden de tiendas; 1 es prioridad máxima. |
 | `444_HV` | `EAN`, `Category` | VALUE por SKU al salir de 444. EAN representa PRODUCT_ID. |
@@ -267,7 +272,7 @@ Los encabezados se buscan dinámicamente en las primeras 40 filas. Esto permite 
 
 - Una fila define los días permitidos para un par **WAREHOUSE_ID destino + ORIGEN**. `DAYS` acepta los nombres de día en español separados por coma (`Lunes, Miércoles, Viernes`), tolera acentos, mayúsculas/minúsculas y puntos sueltos (`.Miércoles`).
 - El encabezado del destino acepta tanto `WAREHOUSE_ID` como `WAREHOUSE ID` (con espacio); el resto de las columnas usa los nombres exactos `ORIGEN` y `DAYS`.
-- La hoja es parte del contrato obligatorio (aparece en el panel de salud igual que `RUTA_COSTOS` o `BLOQUEOS`), pero el motor la trata de forma defensiva: si por algún motivo no está presente al momento de cargar, no bloquea la ejecución, simplemente no aplica ninguna restricción de frecuencia.
+- La hoja es parte del contrato obligatorio (aparece en el panel de salud igual que `RUTA_COSTOS` o `BLOQUEOS_FORANEAS`), pero el motor la trata de forma defensiva: si por algún motivo no está presente al momento de cargar, no bloquea la ejecución, simplemente no aplica ninguna restricción de frecuencia.
 - Dentro de la hoja, cada **par destino–origen es independiente y opcional**: un par que **no aparece** en SCHEDULE **no tiene restricción de frecuencia**, incluso con el toggle activo.
 - Filas duplicadas para el mismo par se combinan (unión de días) y generan una advertencia; no producen error.
 - El bloqueo lo activa el toggle de CODEC **"Bloquear envíos fuera de frecuencia"**, apagado por default. Se evalúa contra la **fecha real del sistema** al momento de la corrida (zona horaria `America/Mexico_City`), no contra una fecha capturada manualmente.
@@ -502,24 +507,17 @@ Separar OWNER puede requerir otra línea; si no hay cupo, se recorta la cantidad
 
 ## 16. Restricciones
 
-- **TIENDAS_CERRADAS:** bloqueo permanente de backend.
+- **TIENDAS_CERRADAS:** bloqueo permanente de backend. Toggle en CODEC (activo por default); apagarlo hace que ninguna tienda se excluya por esta regla.
 - **Tiendas excluidas en CODEC:** bloqueo temporal para todos los engines; formato `247 - Carso`.
 - **Ciudades bloqueadas:** bloqueo temporal. Solo se contabiliza el corte si había necesidad positiva; el resto sigue como SIN RECOMENDACIÓN.
-- **SKUs excluidos:** lista por coma/salto; afecta engines e Insumos.
-- **RUTA_COSTOS:** bloquea el par destino–SKU.
-- **BLOQUEOS regionales:** solo si el SKU está en BLOQUEOS, el origen es CDMX y el destino GDL/MTY. Golden/Infaltable/Anchor/KVI no crean este bloqueo.
+- **SKUs excluidos:** el campo de CODEC (por coma/salto) se une con la hoja `BLOQUEOS` de DATA_TRANSFERS (columna `PRODUCT_ID`, mantenida por negocio); afecta engines e Insumos. Ver §8.
+- **RUTA_COSTOS:** bloquea el par destino–SKU. Toggle en CODEC (activo por default); apagarlo hace que ninguna combinación se bloquee por ruta.
+- **BLOQUEOS regionales:** solo si el SKU está en `BLOQUEOS_FORANEAS`, el origen es CDMX y el destino GDL/MTY. Golden/Infaltable/Anchor/KVI no crean este bloqueo. Toggle en CODEC (activo por default); apagarlo desactiva el bloqueo CDMX→GDL/MTY por completo.
+- **RACKEADOS:** excluye stock rackeado de 444 (hoja `RACKEADOS`). Toggle en CODEC (activo por default); apagarlo deja de tratar cualquier SKU como rackeado.
 - **SCHEDULE (toggle "Bloquear envíos fuera de frecuencia"):** bloquea el par origen–destino si el día real de la corrida no está en `SCHEDULE.DAYS` para ese `WAREHOUSE_ID` + `ORIGEN`. Un par ausente de SCHEDULE no tiene restricción. Apagado por default; aplica a Naked, Solidus (incluye AVL y prevención de quiebres), Shalashaska, Liquid e Insumos. Si todos los orígenes elegibles quedan bloqueados por frecuencia, la línea corta completa; si solo algunos, se asigna con los orígenes disponibles y queda como parcial.
 - **FRUVER 811:** toggle que retira ese stock del 811 sin afectar otros orígenes.
 
-### Outliers Fountain9
-
-Control activable en CODEC:
-
-- cuenta combinaciones destino–SKU por tienda;
-- calcula la mediana;
-- marca tiendas con líneas ≤50% de la mediana;
-- solo se activa con al menos 5 tiendas y mediana ≥20;
-- si el toggle está activo, excluye esas tiendas y genera reporte CSV.
+Las cuatro reglas con toggle (RACKEADOS, TIENDAS_CERRADAS, BLOQUEOS regional, RUTA_COSTOS) se implementan vaciando el set/estructura correspondiente en `Catalogs` cuando el toggle está apagado, no verificando el toggle en cada punto de uso — así que cualquier código que ya consulte esos sets respeta el toggle automáticamente.
 
 ---
 
@@ -529,9 +527,11 @@ Control activable en CODEC:
 
 Ejecuta casos con ROQ original positivo. Consume stock, capacidad y tareas. Sus resultados incluyen `OK COMPLETO POR FOUNTAIN9` y cortes parciales o totales.
 
+**Toggle "Cubrir a Fountain9"** (en la propia tarjeta de Naked, activo por default): controla los hardcodes `HARDCODE_4_CERO_TOTAL` y `HARDCODE_3_INVENTARIO_MENOR_DEMANDA` — casos donde Fountain9 no dio un ROQ positivo (MOV ≤ 0) pero el modelo igual arma un objetivo de 3 o 4 unidades según inventario/demanda en destino. Conceptualmente esto es Naked tomando la necesidad cuando Fountain9 no opinó, **no** Solidus — antes de esta sesión ambos vivían bajo el mismo toggle "Solidus Engine", lo cual mezclaba dos responsabilidades distintas. Si se apaga, esos casos quedan completamente sin cubrir por Naked (Solidus puede seguir cubriéndolos por su cuenta si aplica AVL/Preventivo/Refuerzo).
+
 ### Solidus Engine
 
-Procesa hardcodes de forecast/opening/Net Transfer y tres coberturas opcionales:
+Desde esta sesión, Solidus **ya no incluye los hardcodes de Fountain9** (ver arriba) — son tres coberturas opcionales, todas apoyadas en CATALOGO:
 
 **AVL:** busca catálogo con stock final cero y sin servicio positivo previo. Objetivo:
 
@@ -541,15 +541,39 @@ max(ceil(ADU × DOH objetivo), 3)
 
 **Prevención:** busca inventario positivo con menos de 1 DOH o menos de 3 unidades, sin recomendación positiva Fountain9, e intenta llevarlo al DOH configurado.
 
-**Refuerzo Golden/Infaltable/Anchor:** busca en el catálogo combinaciones tienda-SKU marcadas `IS_GOLDEN`, `IS_INFALTABLE` o `IS_ANCHOR` cuyo DOH actual esté por debajo de un **objetivo independiente** (variable propia en CODEC, default 21 DOH — no comparte el número con AVL/prevención), sin recomendación positiva de Fountain9. Objetivo:
+Ambas ya **no descartan** combinaciones tienda-SKU con ADU ≤ 0 en CATALOGO desde el arranque — usan la cascada de ADU compartida (ver abajo) antes de decidir si hay o no dato suficiente.
 
-```text
-max(ceil(ADU × DOH objetivo Golden/Infaltable/Anchor) − stock destino, 0)
-```
+### Cascada de ADU compartida (AVL, Preventivo, Refuerzo)
 
-A diferencia de AVL y prevención, **no** aplica el mínimo forzado de 3 unidades: si a un producto especial le faltan menos de 3 para llegar al DOH objetivo, se le manda exactamente lo que falta. `PLANNING_REASON = "REFUERZO GOLDEN/INFALTABLE/ANCHOR · SOLIDUS ENGINE"`, `TIPO_DE_CORTE = "ENVIADOS PARA REFORZAR GOLDEN/INFALTABLE/ANCHOR"`.
+Las tres coberturas de Solidus resuelven el ADU de cada tienda-SKU con la misma lógica de respaldo, implementada en `resolve_adu_with_city_fallback`:
 
-Las tres coberturas usan únicamente stock, capacidad y tareas remanentes, en el orden: AVL → Prevención → Refuerzo Golden/Infaltable/Anchor — cada una solo ve las tareas que dejaron libres las anteriores.
+1. **ADU propio** en CATALOGO para esa tienda-SKU → se usa tal cual.
+2. **Sin ADU propio** (ausente o ≤ 0) → promedio de ADU del mismo SKU en otras tiendas de la **misma ciudad** que sí tengan ADU > 0 en CATALOGO.
+3. **Ninguna tienda de la misma ciudad tiene ADU** para ese SKU → sin dato. AVL y Preventivo caen naturalmente al mínimo de 3 por su propia fórmula (`max(..., 3)`); el Refuerzo Golden/Infaltable/Anchor lo maneja de forma explícita (ver abajo), porque su fórmula no tiene ese piso por diseño.
+
+### Refuerzo Golden/Infaltable/Anchor
+
+Rediseñado por completo en esta sesión. Diferencias clave frente a AVL/Preventivo:
+
+- **Universo de candidatos**: sale de la hoja `GOLDEN_INFALTABLES_ANCHOR` (`catalogs.golden_products | infaltable_products | anchor_products`), **no** de CATALOGO. Un SKU marcado Golden/Infaltable/Anchor sin fila propia en CATALOGO para esa tienda igual se evalúa (con ADU de respaldo o, en último caso, el mínimo de 3).
+- **Fountain9 nunca se toca**: si Fountain9 pidió algo para esa tienda-SKU (`CANTIDAD_OBJETIVO > 0` en la pasada base), el Refuerzo no genera ninguna línea para ella, sin importar si esa recomendación se cubrió o se cortó por stock. El objetivo es no restarle confiabilidad a lo que Fountain9 decidió — el trabajo de cubrir esos casos lo mejor posible con el inventario de los orígenes es responsabilidad de Naked/Solidus (la cascada de asignación multi-origen normal), no del Refuerzo.
+- **On-top sobre otros engines de cobertura, no sobre Fountain9**: si Fountain9 no pidió nada para esa tienda-SKU, pero AVL o Preventivo ya le asignaron algo antes en la misma corrida, el Refuerzo calcula la **posición acumulada** (stock inicial + lo ya asignado por cualquier engine en esta corrida) y manda solo la diferencia hasta el DOH objetivo — ya no descarta el caso por "ya recibió algo".
+- **Objetivo independiente** (variable propia en CODEC, default 21 DOH — no comparte el número con AVL/Preventivo):
+
+  ```text
+  target = ceil(ADU × DOH objetivo Golden/Infaltable/Anchor)
+  a_enviar = max(target − posición_acumulada, 0)
+  ```
+
+- **Sin ADU en ninguna tienda de la ciudad**: mínimo operativo de 3 unidades (descontando lo ya asignado), sin piso de DOH, marcado en `DETALLE_MOTIVO` y contado en `special_candidates_no_adu`. A diferencia de AVL/Preventivo, esta rama es explícita porque la fórmula del Refuerzo no tiene un `max(..., 3)` incorporado — no queremos forzar 3 unidades a cada Golden/Infaltable/Anchor sin ADU salvo cuando de verdad haga falta.
+
+`PLANNING_REASON = "REFUERZO GOLDEN/INFALTABLE/ANCHOR · SOLIDUS ENGINE"`, `TIPO_DE_CORTE = "ENVIADOS PARA REFORZAR GOLDEN/INFALTABLE/ANCHOR"`.
+
+Las tres coberturas de Solidus usan únicamente stock, capacidad y tareas remanentes, en el orden: AVL → Prevención → Refuerzo Golden/Infaltable/Anchor — cada una solo ve las tareas que dejaron libres las anteriores.
+
+### Check de salud Golden/Infaltable/Anchor (post-corrida)
+
+Nuevo en esta sesión (`build_golden_infaltable_anchor_health_check`). Corre al final del pipeline, **después** de Shalashaska, Liquid y Venom — no solo después del Refuerzo. Para cada tienda-SKU del universo Golden/Infaltable/Anchor con ADU resoluble (misma cascada de arriba), compara el **DOH final real** (stock inicial + todo lo asignado por cualquier engine en la corrida) contra el objetivo del Refuerzo, y reporta cualquier caso que haya quedado por debajo — típicamente porque un engine que corre después del Refuerzo (Shalashaska, Liquid, Venom) consumió stock del mismo origen y nadie volvió a revisarlo. Es puramente informativo: no mueve nada ni vuelve a planear, solo avisa antes de que la corrida se entregue. Se muestra en la web como tabla dedicada, justo antes de "Reporte por engine".
 
 ### Shalashaska Engine
 
@@ -611,7 +635,7 @@ Quinto engine, **opcional y desactivado por default**. Corre al final de absolut
 | Variable | Formato | Nota |
 |---|---|---|
 | Warehouses origen — Venom | Multiselección, mismo estilo que CODEC | Restringido a un subconjunto de los orígenes ya elegidos arriba. |
-| Tiendas destino — Venom | Multiselección | Respeta TIENDAS_CERRADAS, exclusiones, ciudades bloqueadas y outliers Fountain9. |
+| Tiendas destino — Venom | Multiselección | Respeta TIENDAS_CERRADAS, exclusiones y ciudades bloqueadas. |
 | Tipo de sección | Multiselección: Infaltable, Golden, Anchor, BL | Un par tienda-SKU entra si cumple **al menos uno** de los tipos marcados. `OOWL` está **bloqueado**: no aparece como opción y el motor lo descarta aunque llegara en `section_types`, en tres capas (UI, llamador, y dentro del propio `apply_venom_engine`). |
 | Lead time (días) | Numérico libre | Alimenta las zonas roja/amarilla/verde. |
 | Considerar planeación actual | Toggle, activo por default | Ver "On-Order" abajo. |
@@ -649,7 +673,7 @@ Si `NFP >= Top of Yellow` el buffer está sano y no se genera envío. Si no, Ven
 
 **Presupuesto de tareas:** cada línea de Venom consume una tarea del mismo `MAX_TASKS` compartido con Naked/Solidus/Shalashaska/Liquid, incluso cuando duplica un trío origen-destino-SKU ya usado por otro engine.
 
-**Restricciones heredadas:** TIENDAS_CERRADAS, exclusiones manuales, outliers Fountain9, ciudades bloqueadas, RUTA_COSTOS, BLOQUEOS regionales, CAP_RECIBO y el toggle de frecuencia SCHEDULE — igual que el resto de los engines.
+**Restricciones heredadas:** TIENDAS_CERRADAS, exclusiones manuales, ciudades bloqueadas, RUTA_COSTOS, BLOQUEOS regionales, CAP_RECIBO y el toggle de frecuencia SCHEDULE — igual que el resto de los engines.
 
 ---
 
@@ -698,17 +722,28 @@ BulkCD_856_CHEDRAUI.csv
 
 ---
 
+## 19.1 Modo simulación
+
+Toggle exclusivo de **Big Boss** ("Modo simulación — solo calcular, no generar archivos"), apagado por default. Corre el pipeline completo con números reales y exactos (incluida la escritura temporal de todos los CSV/Excel/PDF, necesaria porque INSUMOS escribe directamente sobre el Bulk físico del 444), pero al terminar **borra todo lo que se acaba de escribir a disco** antes de devolver el resultado — ningún archivo queda disponible para descarga. La sección "Descargar todo" se reemplaza por un aviso de que la corrida fue una simulación. Pensado para probar parámetros (por ejemplo, un DOH distinto del Refuerzo) sin comprometer una entrega real. Raiden no ve este toggle.
+
+---
+
 ## 20. Variables de CODEC
 
 ### Compartidas
 
 | Variable | Alcance | Default / comportamiento |
 |---|---|---|
+| RACKEADOS | Todos | Activo por default; toggle vacía `catalogs.rackeados_444` si se apaga. |
+| TIENDAS_CERRADAS | Todos | Activo por default; toggle evita cargar `closed_store_ids` si se apaga. |
+| BLOQUEOS regional | Todos | Activo por default; toggle vacía `catalogs.blocked_products` si se apaga. |
+| RUTA_COSTOS | Todos | Activo por default; toggle vacía `catalogs.route_cost_blocks` si se apaga. |
+| Cubrir a Fountain9 | Naked | Activo por default; controla los hardcodes HARDCODE_4/HARDCODE_3 (ver §17). |
+| Modo simulación | Solo Big Boss | Apagado por default; ver §19.1. |
 | Warehouses origen | Todos | Orden = prioridad de consumo. |
 | Máximo de tareas | Todos | Presupuesto global; normalmente 14,000. |
 | Bloquear ciudades | Todos | Temporal. |
 | Excluir tiendas | Todos | Temporal; `ID - Nombre`. |
-| Excluir outliers F9 | Todos | Activo por default. |
 | Excluir SKUs | Todos e Insumos | Comas o saltos. Se une a `BACKEND_EXCLUDED_SKUS` (92462, 92463, 9151), fijos y no visibles en la UI. |
 | Agregar insumos | Postproceso 444 | Activo por default. |
 | Bloquear FRUVER 811 | Stock origen | Apagado por default. |
@@ -719,6 +754,7 @@ BulkCD_856_CHEDRAUI.csv
 | Engine | Variable | Default |
 |---|---|---:|
 | Naked | Activar | Activo |
+| Naked | Cubrir a Fountain9 | Activo (visible solo con Naked activo) |
 | Solidus | Activar | Activo |
 | Solidus | Cubrir AVL | Inactivo |
 | Solidus | Prevenir quiebres | Inactivo |
@@ -788,10 +824,6 @@ BulkCD_856_CHEDRAUI.csv
 `Fountain9_Sin_Recomendacion_DD-MM-YYYY.csv`
 
 Incluye combinaciones originales con demanda, opening y ROQ/MOV exactamente en cero. Conserva inventario actual, objetivo manual 4, enviado real, resultado, exclusión manual, archivos fuente y filas consolidadas. Se genera incluso vacío.
-
-### CSV de outliers
-
-`Outliers_Fountain9_Excluidos_DD-MM-YYYY.csv`, solo si el control activo encontró detalle.
 
 ### PDF y ZIP
 
@@ -892,7 +924,7 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-La suite cubre selección de engines, prioridad, exclusiones, bloqueos regionales, diferimiento de solicitudes grandes, outliers, Liquid, Shalashaska, tareas y capacidad.
+La suite cubre selección de engines, prioridad, exclusiones, bloqueos regionales, diferimiento de solicitudes grandes, Liquid, Shalashaska, tareas y capacidad.
 
 ---
 
@@ -1003,7 +1035,6 @@ Ejecute al menos tres fechas históricas y compare:
 1. Orígenes en orden de consumo.
 2. Máximo de tareas.
 3. Bloqueos temporales de ciudad/tienda.
-4. Toggle de outliers.
 5. SKUs excluidos.
 6. Insumos y FRUVER 811.
 7. Engines y parámetros.

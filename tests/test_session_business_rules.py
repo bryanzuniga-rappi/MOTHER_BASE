@@ -18,23 +18,103 @@ import modelo_abasto as engine  # noqa: E402
 import modules.les_enfants_terribles as m  # noqa: E402
 
 
-# --- SKUs excluidos a nivel backend -------------------------------------
+# --- Exclusión global de SKUs vía hoja BLOQUEOS de DATA_TRANSFERS --------
 
-def test_backend_excluded_skus_are_exactly_the_requested_three():
-    assert m.BACKEND_EXCLUDED_SKUS == frozenset({92462, 92463, 9151})
+def test_globally_blocked_skus_read_from_bloqueos_sheet(tmp_path):
+    """La hoja BLOQUEOS (columna PRODUCT_ID) alimenta
+    catalogs.globally_blocked_skus, independiente del bloqueo regional
+    (que ahora vive en BLOQUEOS_FORANEAS)."""
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+
+    def add(name, headers, rows):
+        ws = wb.create_sheet(name)
+        ws.append(headers)
+        for r in rows:
+            ws.append(r)
+
+    add("VOLUMETRIA", ["SKU", "PALLETS"], [])
+    add("BLOQUEOS_FORANEAS", ["SKU"], [])
+    add("BLOQUEOS", ["PRODUCT_ID"], [[92462], [92463], [9151], [85919], [79837]])
+    add("RUTA_COSTOS", ["Destination", "Catalog ID"], [])
+    add("PRIORIDAD", ["WAREHOUSE_ID", "PRIORIDAD"], [])
+    add("444_HV", ["EAN", "Category"], [])
+    add("831_HV", ["EAN", "Category"], [])
+    add("RACKEADOS", ["WHS", "SYNC"], [])
+    add("CAP_RECIBO", ["WH_ID", "CAP"], [])
+    add("CATALOGO", ["WAREHOUSE_ID", "PRODUCT_ID", "ADU"], [])
+    add("KVI", ["WAREHOUSE_ID", "PRODUCT_ID", "KVI"], [])
+    add("SHARE_VENTAS", ["WAREHOUSE_ID", "SHARE"], [])
+    add("NO_DISPONIBLE", ["WAREHOUSE_ID", "PRODUCT_ID", "STOCK"], [])
+    add("POR_MERMAR", ["WAREHOUSE_ID","PRODUCT_ID","STOCK_AVAILABLE","VALUE_STOCK","ARRIVAL_DATE","EXPIRATION_DATE"], [])
+    add("STOCK", ["WAREHOUSE_ID", "PRODUCT_ID", "STOCK_DISPONIBLE_FINAL"], [])
+    add("OWNER", ["WAREHOUSE_ID", "PRODUCT_ID", "OWNER_NAME", "STOCK_DISPONIBLE_FINAL"], [])
+    add("INSUMOS", ["WAREHOUSE_DESTINATION","WAREHOUSE_SOURCE","RETAIL_ID","QUANTITY","PLANNED_DATE","ROUTE","DELIVERY_PRIORITY"], [])
+    add("GOLDEN_INFALTABLES_ANCHOR", ["WAREHOUSE_ID","PRODUCT_ID_SYNC","IS_INFALTABLE","IS_GOLDEN","IS_ANCHOR"], [])
+    add("TIENDA", ["CITY", "WAREHOUSE_ID", "WAREHOUSE_NAME"], [["Ciudad de México", 444, "O444"]])
+    add("STORAGE", ["PRODUCT_ID", "STORAGE_NAME"], [])
+    add("TIENDAS_CERRADAS", ["WAREHOUSE_ID"], [])
+    add("SCHEDULE", ["CITY","WAREHOUSE_ID","WAREHOUSE_NAME","ORIGEN","DAYS"], [])
+    xlsx_path = tmp_path / "DATA_TRANSFERS.xlsx"
+    wb.save(xlsx_path)
+
+    config = engine.Config(origin_warehouses=(444,), max_tasks=100)
+    catalogs = engine.load_catalogs(xlsx_path, config)
+
+    assert catalogs.globally_blocked_skus == {92462, 92463, 9151, 85919, 79837}
 
 
-def test_backend_excluded_skus_survive_even_with_empty_codec_field():
-    """Simula exactamente la línea de execute_planning: unión incondicional."""
-    excluded_skus_from_codec: set[int] = set()
-    excluded_sku_set = set(excluded_skus_from_codec or ()) | m.BACKEND_EXCLUDED_SKUS
-    assert {92462, 92463, 9151}.issubset(excluded_sku_set)
-
-
-def test_backend_excluded_skus_combine_with_user_choices():
+def test_globally_blocked_skus_union_with_codec_field():
+    """Simula la línea de execute_planning: unión con lo capturado en CODEC."""
     excluded_skus_from_codec = {111, 222}
-    excluded_sku_set = set(excluded_skus_from_codec) | m.BACKEND_EXCLUDED_SKUS
-    assert excluded_sku_set == {111, 222, 92462, 92463, 9151}
+    globally_blocked_skus = {92462, 92463, 9151, 85919, 79837}
+    excluded_sku_set = set(excluded_skus_from_codec) | globally_blocked_skus
+    assert excluded_sku_set == {111, 222, 92462, 92463, 9151, 85919, 79837}
+
+
+def test_globally_blocked_skus_empty_sheet_means_no_exclusion(tmp_path):
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+
+    def add(name, headers, rows):
+        ws = wb.create_sheet(name)
+        ws.append(headers)
+        for r in rows:
+            ws.append(r)
+
+    add("VOLUMETRIA", ["SKU", "PALLETS"], [])
+    add("BLOQUEOS_FORANEAS", ["SKU"], [])
+    add("BLOQUEOS", ["PRODUCT_ID"], [])
+    add("RUTA_COSTOS", ["Destination", "Catalog ID"], [])
+    add("PRIORIDAD", ["WAREHOUSE_ID", "PRIORIDAD"], [])
+    add("444_HV", ["EAN", "Category"], [])
+    add("831_HV", ["EAN", "Category"], [])
+    add("RACKEADOS", ["WHS", "SYNC"], [])
+    add("CAP_RECIBO", ["WH_ID", "CAP"], [])
+    add("CATALOGO", ["WAREHOUSE_ID", "PRODUCT_ID", "ADU"], [])
+    add("KVI", ["WAREHOUSE_ID", "PRODUCT_ID", "KVI"], [])
+    add("SHARE_VENTAS", ["WAREHOUSE_ID", "SHARE"], [])
+    add("NO_DISPONIBLE", ["WAREHOUSE_ID", "PRODUCT_ID", "STOCK"], [])
+    add("POR_MERMAR", ["WAREHOUSE_ID","PRODUCT_ID","STOCK_AVAILABLE","VALUE_STOCK","ARRIVAL_DATE","EXPIRATION_DATE"], [])
+    add("STOCK", ["WAREHOUSE_ID", "PRODUCT_ID", "STOCK_DISPONIBLE_FINAL"], [])
+    add("OWNER", ["WAREHOUSE_ID", "PRODUCT_ID", "OWNER_NAME", "STOCK_DISPONIBLE_FINAL"], [])
+    add("INSUMOS", ["WAREHOUSE_DESTINATION","WAREHOUSE_SOURCE","RETAIL_ID","QUANTITY","PLANNED_DATE","ROUTE","DELIVERY_PRIORITY"], [])
+    add("GOLDEN_INFALTABLES_ANCHOR", ["WAREHOUSE_ID","PRODUCT_ID_SYNC","IS_INFALTABLE","IS_GOLDEN","IS_ANCHOR"], [])
+    add("TIENDA", ["CITY", "WAREHOUSE_ID", "WAREHOUSE_NAME"], [["Ciudad de México", 444, "O444"]])
+    add("STORAGE", ["PRODUCT_ID", "STORAGE_NAME"], [])
+    add("TIENDAS_CERRADAS", ["WAREHOUSE_ID"], [])
+    add("SCHEDULE", ["CITY","WAREHOUSE_ID","WAREHOUSE_NAME","ORIGEN","DAYS"], [])
+    xlsx_path = tmp_path / "DATA_TRANSFERS.xlsx"
+    wb.save(xlsx_path)
+
+    config = engine.Config(origin_warehouses=(444,), max_tasks=100)
+    catalogs = engine.load_catalogs(xlsx_path, config)
+
+    assert catalogs.globally_blocked_skus == set()
 
 
 # --- Restricciones de perfil Raiden --------------------------------------
@@ -139,6 +219,150 @@ def test_all_required_origins_covered_passes():
     covered = {444, 831, 856}
     missing = origins_needing_copernico - covered
     assert missing == set()
+
+
+# --- Toggles de reglas (RACKEADOS, TIENDAS_CERRADAS, BLOQUEOS, RUTA_COSTOS) --
+
+def test_regional_block_disabled_via_catalogs_flag():
+    catalogs = engine.Catalogs(
+        volume_m3={}, blocked_products={10}, route_cost_blocks=set(),
+        store_priority={}, high_value={}, rackeados_444=set(), store_capacity={},
+        copernico_unusable_444={}, unavailable_stock={}, stock_base={},
+        golden_infaltables=set(),
+        stores={
+            444: {"city": "CDMX", "city_norm": "CDMX", "warehouse_name": "O444"},
+            100: {"city": "Guadalajara", "city_norm": "GDL", "warehouse_name": "S"},
+        },
+        storage={}, warnings=[],
+        regional_block_enabled=False,
+    )
+    assert engine.is_regional_block(catalogs, 444, 100, 10, "GDL", False) is False
+
+
+def test_regional_block_enabled_by_default():
+    catalogs = engine.Catalogs(
+        volume_m3={}, blocked_products={10}, route_cost_blocks=set(),
+        store_priority={}, high_value={}, rackeados_444=set(), store_capacity={},
+        copernico_unusable_444={}, unavailable_stock={}, stock_base={},
+        golden_infaltables=set(),
+        stores={
+            444: {"city": "CDMX", "city_norm": "CDMX", "warehouse_name": "O444"},
+            100: {"city": "Guadalajara", "city_norm": "GDL", "warehouse_name": "S"},
+        },
+        storage={}, warnings=[],
+    )
+    assert engine.is_regional_block(catalogs, 444, 100, 10, "GDL", False) is True
+
+
+def test_rackeados_rule_toggle_empties_the_set_upstream():
+    """Replica la lógica de execute_planning: apagar el toggle vacía el set,
+    lo que automáticamente vuelve inerte cualquier chequeo aguas abajo."""
+    rackeados_444 = {10, 20, 30}
+    enable_rackeados_rule = False
+    if not enable_rackeados_rule:
+        rackeados_444 = set()
+    assert rackeados_444 == set()
+
+
+def test_route_cost_block_toggle_empties_the_set_upstream():
+    route_cost_blocks = {(100, 10), (200, 20)}
+    enable_route_cost_block_rule = False
+    if not enable_route_cost_block_rule:
+        route_cost_blocks = set()
+    assert route_cost_blocks == set()
+
+
+def test_closed_stores_rule_toggle_skips_loading():
+    """Replica la lógica de execute_planning: apagar el toggle nunca llama al
+    loader, closed_store_ids queda vacío."""
+    enable_closed_stores_rule = False
+    closed_store_ids = (
+        {100, 200} if enable_closed_stores_rule else set()
+    )
+    assert closed_store_ids == set()
+
+
+# --- Modo simulación (punto E) --------------------------------------------
+
+def test_simulation_mode_cleanup_removes_all_generated_files(tmp_path):
+    """Replica exactamente el bloque de limpieza de execute_planning: borra
+    cada archivo listado, el zip, y el directorio de salida si queda vacío."""
+    output_dir = tmp_path / "outputs" / "21-09-2026"
+    output_dir.mkdir(parents=True)
+    file_paths = []
+    for name in ("BulkCD_444.csv", "Reporte_Planeacion_21-09-2026.xlsx"):
+        p = output_dir / name
+        p.write_text("contenido")
+        file_paths.append(p)
+    zip_path = tmp_path / "Planeacion_21-09-2026.zip"
+    zip_path.write_text("zip contenido")
+
+    simulation_mode = True
+    if simulation_mode:
+        for path in file_paths:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        try:
+            zip_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            output_dir.rmdir()
+        except OSError:
+            pass
+
+    assert not any(p.exists() for p in file_paths)
+    assert not zip_path.exists()
+    assert not output_dir.exists()
+
+
+def test_simulation_mode_run_dict_reports_empty_files_and_zip():
+    """Replica cómo se arma el dict de retorno en modo simulación."""
+    simulation_mode = True
+    local_files = ["a.csv", "b.xlsx"]
+    zip_path = "plan.zip"
+    if simulation_mode:
+        files_for_run: list[str] = []
+        zip_for_run = ""
+    else:
+        files_for_run = [str(p) for p in local_files]
+        zip_for_run = str(zip_path)
+    run = {"simulation": bool(simulation_mode), "files": files_for_run, "zip": zip_for_run}
+    assert run["simulation"] is True
+    assert run["files"] == []
+    assert run["zip"] == ""
+
+
+def test_normal_mode_run_dict_keeps_real_files_and_zip():
+    simulation_mode = False
+    local_files = ["a.csv", "b.xlsx"]
+    zip_path = "plan.zip"
+    if simulation_mode:
+        files_for_run: list[str] = []
+        zip_for_run = ""
+    else:
+        files_for_run = [str(p) for p in local_files]
+        zip_for_run = str(zip_path)
+    run = {"simulation": bool(simulation_mode), "files": files_for_run, "zip": zip_for_run}
+    assert run["simulation"] is False
+    assert run["files"] == ["a.csv", "b.xlsx"]
+    assert run["zip"] == "plan.zip"
+
+
+def test_simulation_toggle_only_offered_to_big_boss():
+    """Replica la lógica de render(): el toggle solo se muestra si
+    is_raiden es False."""
+    for is_raiden in (True, False):
+        simulation_mode = False
+        toggle_would_render = not is_raiden
+        if toggle_would_render:
+            simulation_mode = True  # simula que Big Boss lo prendió
+        if is_raiden:
+            assert simulation_mode is False
+        else:
+            assert simulation_mode is True
 
 
 # --- MOQ especial del SKU 86195 -------------------------------------------

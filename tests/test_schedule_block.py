@@ -186,7 +186,8 @@ def _build_data_transfers_workbook(path: Path) -> None:
             ws.append(r)
 
     add("VOLUMETRIA", ["SKU", "PALLETS"], [[10, 0.01]])
-    add("BLOQUEOS", ["SKU"], [])
+    add("BLOQUEOS_FORANEAS", ["SKU"], [])
+    add("BLOQUEOS", ["PRODUCT_ID"], [])
     add("RUTA_COSTOS", ["Destination", "Catalog ID"], [])
     add("PRIORIDAD", ["WAREHOUSE_ID", "PRIORIDAD"], [[100, 1]])
     add("444_HV", ["EAN", "Category"], [])

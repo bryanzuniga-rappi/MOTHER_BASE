@@ -299,11 +299,6 @@ INPUT_PLAN_COLUMNS = (
 
 PLANNING_REASON_COLUMN = "PLANNING_REASON"
 
-# SKUs excluidos siempre, a nivel backend, sin importar lo que el usuario
-# capture en el campo "Excluir SKUs" de CODEC. No aparecen en la UI: se unen
-# incondicionalmente al set de exclusión en cada corrida.
-BACKEND_EXCLUDED_SKUS: frozenset[int] = frozenset({92462, 92463, 9151})
-
 # REGLA_DEMANDA que solo generan los engines de cobertura (AVL, Preventivo,
 # Refuerzo Golden/Infaltable/Anchor, Shalashaska, Liquid, Venom) — nunca la
 # necesidad original de Fountain9. "Requerido" en Planeación Lista se calcula
@@ -1567,60 +1562,6 @@ def load_closed_store_ids(database_path: Path) -> set[int]:
     return closed_stores
 
 
-def load_avl_catalog_rows(
-    database_path: Path,
-) -> tuple[list[dict[str, Any]], list[str]]:
-    """Carga todo el catálogo y consolida una ADU por combinación tienda-SKU."""
-    consolidated: dict[tuple[int, int], float] = {}
-    warnings: list[str] = []
-    workbook = openpyxl.load_workbook(database_path, read_only=True, data_only=True)
-    try:
-        for record in engine.iter_sheet_records(
-            workbook,
-            "CATALOGO",
-            ["WAREHOUSE_ID", "PRODUCT_ID", "ADU"],
-            ["WAREHOUSE_ID", "PRODUCT_ID", "ADU"],
-        ):
-            destination = engine.to_id(
-                record["WAREHOUSE_ID"],
-                "CATALOGO.WAREHOUSE_ID",
-                allow_none=True,
-            )
-            sku = engine.to_id(
-                record["PRODUCT_ID"],
-                "CATALOGO.PRODUCT_ID",
-                allow_none=True,
-            )
-            adu = max(engine.to_float(record["ADU"], 0.0), 0.0)
-            if destination is None or sku is None or adu <= 0:
-                continue
-            key = (destination, sku)
-            if key in consolidated and not math.isclose(
-                consolidated[key], adu, abs_tol=1e-9
-            ):
-                previous = consolidated[key]
-                consolidated[key] = max(previous, adu)
-                if len(warnings) < 20:
-                    warnings.append(
-                        f"CATALOGO: {key} tiene ADU {previous} y {adu}; "
-                        f"se usó la mayor ({consolidated[key]})."
-                    )
-            else:
-                consolidated[key] = adu
-    finally:
-        workbook.close()
-
-    rows = [
-        {
-            "WAREHOUSE_DESTINATION": destination,
-            "RETAIL_ID": sku,
-            "ADU": adu,
-        }
-        for (destination, sku), adu in consolidated.items()
-    ]
-    return rows, warnings
-
-
 def load_venom_catalog_lookup(
     database_path: Path,
 ) -> tuple[dict[tuple[int, int], dict[str, Any]], list[str]]:
@@ -1695,7 +1636,13 @@ def load_venom_catalog_lookup(
 def load_avl_catalog_rows(
     database_path: Path,
 ) -> tuple[list[dict[str, Any]], list[str]]:
-    """Carga todo el catálogo y consolida una ADU por combinación tienda-SKU."""
+    """Carga todo el catálogo y consolida una ADU por combinación tienda-SKU.
+
+    Ya NO descarta filas con ADU <= 0: AVL, Preventivo y el Refuerzo
+    Golden/Infaltable/Anchor necesitan ver esas combinaciones para poder
+    aplicarles la cascada de respaldo (ADU propio -> promedio de la misma
+    ciudad -> sin dato), en vez de quedar invisibles desde el arranque.
+    """
     consolidated: dict[tuple[int, int], float] = {}
     warnings: list[str] = []
     workbook = openpyxl.load_workbook(database_path, read_only=True, data_only=True)
@@ -1717,7 +1664,7 @@ def load_avl_catalog_rows(
                 allow_none=True,
             )
             adu = max(engine.to_float(record["ADU"], 0.0), 0.0)
-            if destination is None or sku is None or adu <= 0:
+            if destination is None or sku is None:
                 continue
             key = (destination, sku)
             if key in consolidated and not math.isclose(
@@ -1744,6 +1691,145 @@ def load_avl_catalog_rows(
         for (destination, sku), adu in consolidated.items()
     ]
     return rows, warnings
+
+
+def resolve_adu_with_city_fallback(
+    catalog_rows: list[dict[str, Any]],
+    catalogs,
+    keys_to_resolve: set[tuple[int, int]] | None = None,
+) -> tuple[dict[tuple[int, int], float], dict[tuple[int, int], str]]:
+    """Cascada de ADU compartida por AVL, Preventivo y Refuerzo
+    Golden/Infaltable/Anchor:
+
+    1. ADU propio en CATALOGO para esa tienda-SKU -> se usa tal cual.
+    2. Sin ADU propio (ausente o <= 0) -> promedio de ADU del mismo SKU en
+       otras tiendas de la MISMA CIUDAD que sí tengan ADU > 0 en CATALOGO.
+    3. Ninguna tienda de la misma ciudad tiene ADU para ese SKU -> sin dato
+       (no aparece en el resultado).
+
+    ``keys_to_resolve`` son las combinaciones (destino, sku) que se quieren
+    resolver — típicamente el universo de candidatos de quien llama, que
+    para el Refuerzo Golden/Infaltable/Anchor NO es el mismo que las llaves
+    presentes en ``catalog_rows`` (viene de GOLDEN_INFALTABLES_ANCHOR, así
+    que muchas combinaciones ni siquiera tienen fila propia en CATALOGO).
+    Si se omite, se resuelven solo las llaves que sí aparecen en
+    ``catalog_rows`` (comportamiento histórico de AVL/Preventivo).
+
+    Devuelve ``(adu_by_key, source_by_key)`` — ``source_by_key`` vale
+    "PROPIO" o "PROMEDIO_CIUDAD", útil para trazabilidad/advertencias.
+    """
+    own_adu: dict[tuple[int, int], float] = {}
+    for row in catalog_rows:
+        key = (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"])
+        adu = float(row["ADU"])
+        if adu > 0:
+            own_adu[key] = adu
+
+    city_sku_adu_sum: dict[tuple[str, int], float] = defaultdict(float)
+    city_sku_adu_count: dict[tuple[str, int], int] = defaultdict(int)
+    for (destination, sku), adu in own_adu.items():
+        city_norm = catalogs.stores.get(destination, {}).get("city_norm", "")
+        if not city_norm:
+            continue
+        city_sku_adu_sum[(city_norm, sku)] += adu
+        city_sku_adu_count[(city_norm, sku)] += 1
+
+    resolved: dict[tuple[int, int], float] = {}
+    source: dict[tuple[int, int], str] = {}
+    all_keys = (
+        set(keys_to_resolve)
+        if keys_to_resolve is not None
+        else {
+            (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"])
+            for row in catalog_rows
+        }
+    )
+    for key in all_keys:
+        destination, sku = key
+        if key in own_adu:
+            resolved[key] = own_adu[key]
+            source[key] = "PROPIO"
+            continue
+        city_norm = catalogs.stores.get(destination, {}).get("city_norm", "")
+        city_key = (city_norm, sku)
+        count = city_sku_adu_count.get(city_key, 0)
+        if city_norm and count > 0:
+            resolved[key] = city_sku_adu_sum[city_key] / count
+            source[key] = "PROMEDIO_CIUDAD"
+        # Sin ADU propio ni de la ciudad: no se agrega, queda "sin dato".
+    return resolved, source
+
+
+def build_golden_infaltable_anchor_health_check(
+    result,
+    catalogs,
+    target_doh: float,
+    catalog_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Verificación de salud al final del pipeline (después de Shalashaska,
+    Liquid y Venom): compara el DOH final real de cada tienda-SKU
+    Golden/Infaltable/Anchor contra ``target_doh``, usando la posición final
+    real (stock inicial + todo lo asignado por cualquier engine en esta
+    corrida). Avisa si algo quedó por debajo del objetivo — por ejemplo
+    porque un engine que corrió DESPUÉS del Refuerzo consumió stock del
+    mismo origen y nadie volvió a revisarlo.
+
+    Es un chequeo informativo, no una re-planeación: no mueve nada, solo
+    reporta para que la corrida se pueda corregir ANTES de entregarse.
+    """
+    keys = (
+        catalogs.golden_products
+        | catalogs.infaltable_products
+        | catalogs.anchor_products
+    )
+    if not keys:
+        return {"enabled": False, "checked": 0, "below_target": [], "no_adu": 0}
+
+    adu_by_key, _source = resolve_adu_with_city_fallback(
+        catalog_rows, catalogs, keys_to_resolve=keys
+    )
+    assigned_by_key: Counter[tuple[int, int]] = Counter()
+    for allocation in result.allocation_rows:
+        assigned_by_key[
+            (allocation["WAREHOUSE_DESTINATION"], allocation["RETAIL_ID"])
+        ] += int(allocation.get("QUANTITY", 0) or 0)
+
+    below_target: list[dict[str, Any]] = []
+    no_adu = 0
+    for destination, sku in keys:
+        key = (destination, sku)
+        adu = adu_by_key.get(key, 0.0)
+        if adu <= 0:
+            no_adu += 1
+            continue  # sin ADU no hay forma de evaluar DOH para este caso
+        initial_stock = max(float(catalogs.stock_base.get(key, 0.0)), 0.0)
+        final_position = initial_stock + assigned_by_key.get(key, 0)
+        final_doh = final_position / adu
+        if final_doh < target_doh - 1e-6:
+            store = catalogs.stores.get(destination, {})
+            priority_profile = engine.product_priority_profile(
+                catalogs, destination, sku
+            )
+            below_target.append(
+                {
+                    "WAREHOUSE_DESTINATION": destination,
+                    "WAREHOUSE_NAME": store.get("warehouse_name", ""),
+                    "RETAIL_ID": sku,
+                    "TIPO": priority_profile["type"],
+                    "DOH_FINAL": round(final_doh, 3),
+                    "DOH_OBJETIVO": round(target_doh, 3),
+                    "UNIDADES_FALTANTES": int(
+                        math.ceil(max((target_doh - final_doh) * adu, 0.0))
+                    ),
+                }
+            )
+
+    return {
+        "enabled": True,
+        "checked": len(keys),
+        "no_adu": no_adu,
+        "below_target": sorted(below_target, key=lambda row: row["DOH_FINAL"]),
+    }
 
 
 def load_insumos_rows(
@@ -3507,6 +3593,7 @@ def empty_avl_summary(enabled: bool, doh: float) -> dict[str, Any]:
         "stockout_candidates": 0,
         "preventive_candidates": 0,
         "special_candidates": 0,
+        "special_candidates_no_adu": 0,
         "cases_sent": 0,
         "cases_full": 0,
         "cases_partial": 0,
@@ -3593,8 +3680,43 @@ def apply_avl_fill(
         row["WAREHOUSE_DESTINATION"]: row for row in result.capacity_rows
     }
 
+    # Posición ya asignada a cada tienda-SKU en esta corrida (por cualquier
+    # engine anterior, incluidos Naked/Solidus y AVL/Preventivo si ya
+    # corrieron). Solo se usa en modo special_doh, para hacer on-top sobre
+    # lo que ya dejaron otros engines de cobertura en vez de descartar el
+    # caso por completo.
+    assigned_units_by_key: Counter[tuple[int, int]] = Counter()
+    for allocation in result.allocation_rows:
+        assigned_units_by_key[
+            (allocation["WAREHOUSE_DESTINATION"], allocation["RETAIL_ID"])
+        ] += int(allocation.get("QUANTITY", 0) or 0)
+
+    if candidate_mode == "special_doh":
+        # El universo de candidatos es GOLDEN_INFALTABLES_ANCHOR completo —
+        # no CATALOGO. Un SKU marcado Golden/Infaltable/Anchor sin fila en
+        # CATALOGO para esa tienda igual debe evaluarse (con ADU de respaldo
+        # o, en último caso, el mínimo de 3 sin DOH).
+        iteration_keys = (
+            catalogs.golden_products
+            | catalogs.infaltable_products
+            | catalogs.anchor_products
+        )
+        iteration_rows = [
+            {"WAREHOUSE_DESTINATION": destination, "RETAIL_ID": sku}
+            for destination, sku in iteration_keys
+        ]
+        adu_by_key, adu_source_by_key = resolve_adu_with_city_fallback(
+            catalog_rows, catalogs, keys_to_resolve=iteration_keys
+        )
+    else:
+        iteration_rows = catalog_rows
+        # Cascada de ADU: propio -> promedio de la misma ciudad -> sin dato.
+        adu_by_key, adu_source_by_key = resolve_adu_with_city_fallback(
+            catalog_rows, catalogs
+        )
+
     candidates: list[dict[str, Any]] = []
-    for catalog_row in catalog_rows:
+    for catalog_row in iteration_rows:
         destination = catalog_row["WAREHOUSE_DESTINATION"]
         sku = catalog_row["RETAIL_ID"]
         key = (destination, sku)
@@ -3614,7 +3736,7 @@ def apply_avl_fill(
             summary["skipped_missing_stock"] += 1
             continue
         destination_stock = max(float(catalogs.stock_base[key]), 0.0)
-        adu = float(catalog_row["ADU"])
+        adu = adu_by_key.get(key, 0.0)
         current_doh = destination_stock / adu if adu > 0 else math.inf
         priority_profile = engine.product_priority_profile(
             catalogs,
@@ -3623,6 +3745,7 @@ def apply_avl_fill(
         )
         is_golden = priority_profile["is_golden"]
         is_kvi = priority_profile["is_kvi"]
+        no_adu_anywhere = False
         if candidate_mode == "stockout":
             if destination_stock > 0:
                 summary["skipped_not_stockout"] += 1
@@ -3641,22 +3764,39 @@ def apply_avl_fill(
             )
             summary["preventive_candidates"] += 1
         else:  # special_doh — refuerzo de Golden/Infaltable/Anchor
-            if not (
-                priority_profile["is_infaltable"]
-                or priority_profile["is_golden"]
-                or priority_profile["is_anchor"]
-            ):
-                summary["skipped_not_special"] += 1
+            if key in excluded_key_set:
+                # Fountain9 sí pidió algo para esta tienda-SKU: el refuerzo
+                # nunca hace on-top a Fountain9, sin importar si se cubrió.
+                summary["skipped_already_served"] += 1
                 continue
-            if adu <= 0 or current_doh >= doh:
-                summary["skipped_doh_sufficient"] += 1
-                continue
-            target = int(math.ceil(max((adu * doh) - destination_stock, 0.0)))
-            if target <= 0:
-                summary["skipped_doh_sufficient"] += 1
-                continue
+            already_assigned = assigned_units_by_key.get(key, 0)
+            current_position = destination_stock + already_assigned
+            if adu > 0:
+                current_doh = current_position / adu
+                if current_doh >= doh:
+                    summary["skipped_doh_sufficient"] += 1
+                    continue
+                target_position = int(math.ceil(adu * doh))
+                target = max(target_position - current_position, 0)
+                if target <= 0:
+                    summary["skipped_doh_sufficient"] += 1
+                    continue
+            else:
+                # Sin ADU propio ni de ninguna tienda de la misma ciudad:
+                # no hay forma de calcular un DOH objetivo. Mínimo operativo
+                # de 3 unidades, sin piso de DOH, marcado en advertencias.
+                no_adu_anywhere = True
+                target = max(3 - already_assigned, 0)
+                if target <= 0:
+                    summary["skipped_doh_sufficient"] += 1
+                    continue
+                summary["special_candidates_no_adu"] = (
+                    summary.get("special_candidates_no_adu", 0) + 1
+                )
             summary["special_candidates"] += 1
-        if key in assigned_keys or key in excluded_key_set:
+        if candidate_mode != "special_doh" and (
+            key in assigned_keys or key in excluded_key_set
+        ):
             summary["skipped_already_served"] += 1
             continue
         if key in catalogs.route_cost_blocks:
@@ -3668,6 +3808,8 @@ def apply_avl_fill(
                 "WAREHOUSE_DESTINATION": destination,
                 "RETAIL_ID": sku,
                 "ADU": adu,
+                "ADU_SOURCE": adu_source_by_key.get(key, "SIN_DATO"),
+                "NO_ADU_ANYWHERE": no_adu_anywhere,
                 "DESTINATION_STOCK": destination_stock,
                 "CURRENT_DOH": current_doh,
                 "TARGET": target,
@@ -3945,15 +4087,33 @@ def apply_avl_fill(
                         f"unidades y {candidate['CURRENT_DOH']:.3f} DOH antes del envío"
                         if candidate_mode == "preventive"
                         else (
-                            "Refuerzo Golden/Infaltable/Anchor: "
-                            f"{candidate['DESTINATION_STOCK']:g} unidades y "
-                            f"{candidate['CURRENT_DOH']:.3f} DOH antes del envío"
+                            (
+                                "Refuerzo Golden/Infaltable/Anchor SIN ADU "
+                                "(ni propio ni de la ciudad): mínimo operativo "
+                                "de 3 unidades, sin piso de DOH."
+                            )
+                            if candidate["NO_ADU_ANYWHERE"]
+                            else (
+                                "Refuerzo Golden/Infaltable/Anchor: "
+                                f"{candidate['DESTINATION_STOCK']:g} unidades en "
+                                "stock + lo ya asignado por otros engines de "
+                                "cobertura en esta corrida = "
+                                f"{candidate['CURRENT_DOH']:.3f} DOH antes de este "
+                                f"envío (ADU {candidate['ADU_SOURCE'].lower()})"
+                            )
                         )
                     )
                 )
-                + f"; objetivo de cobertura {doh:g} DOH con ADU "
-                f"{candidate['ADU']:.4f}. Asignadas {assigned} de "
-                f"{original_target} sin exceder capacidad."
+                + (
+                    f"; objetivo de cobertura {doh:g} DOH con ADU "
+                    f"{candidate['ADU']:.4f}. "
+                    if not (
+                        candidate_mode == "special_doh"
+                        and candidate["NO_ADU_ANYWHERE"]
+                    )
+                    else "; "
+                )
+                + f"Asignadas {assigned} de {original_target} sin exceder capacidad."
             ),
         }
         for source in config.origin_warehouses:
@@ -4649,10 +4809,16 @@ def execute_planning(
     avl_doh: float = 3.0,
     block_fruver_811: bool = False,
     block_off_schedule_shipments: bool = False,
+    enable_rackeados_rule: bool = True,
+    enable_closed_stores_rule: bool = True,
+    enable_regional_block_rule: bool = True,
+    enable_route_cost_block_rule: bool = True,
+    simulation_mode: bool = False,
     include_preventive_fill: bool = False,
     include_special_doh_fill: bool = False,
     special_doh_target: float = 21.0,
     include_naked_engine: bool = True,
+    cover_fountain9_hardcodes: bool = True,
     include_solidus_engine: bool = True,
     include_shalashaska_engine: bool = False,
     shalashaska_target_doh: float = 7.0,
@@ -4740,6 +4906,26 @@ def execute_planning(
             apply_origin_storage_override
         )
         catalogs.schedule_block_enabled = bool(block_off_schedule_shipments)
+        catalogs.regional_block_enabled = bool(enable_regional_block_rule)
+        if not catalogs.regional_block_enabled:
+            catalogs.warnings.append(
+                "Bloqueo regional (BLOQUEOS_FORANEAS) desactivado para esta "
+                "corrida desde CODEC."
+            )
+        if not enable_rackeados_rule:
+            catalogs.warnings.append(
+                f"Regla RACKEADOS desactivada para esta corrida desde CODEC: "
+                f"{len(catalogs.rackeados_444):,} SKUs dejaron de tratarse "
+                "como rackeados en 444."
+            )
+            catalogs.rackeados_444 = set()
+        if not enable_route_cost_block_rule:
+            catalogs.warnings.append(
+                "Regla RUTA_COSTOS desactivada para esta corrida desde "
+                f"CODEC: {len(catalogs.route_cost_blocks):,} combinaciones "
+                "tienda-SKU dejaron de bloquearse por ruta."
+            )
+            catalogs.route_cost_blocks = set()
         if catalogs.schedule_block_enabled:
             weekday_display = engine.WEEKDAY_DISPLAY_NAMES.get(
                 catalogs.run_weekday_norm, catalogs.run_weekday_norm
@@ -4750,17 +4936,18 @@ def execute_planning(
                 f"fuera de los días definidos en SCHEDULE "
                 f"({len(catalogs.schedule_days):,} combinaciones configuradas)."
             )
-        excluded_sku_set = set(excluded_skus or ()) | BACKEND_EXCLUDED_SKUS
+        excluded_sku_set = set(excluded_skus or ()) | catalogs.globally_blocked_skus
         manually_excluded_store_ids = set(excluded_store_ids or ())
         catalogs.excluded_products = excluded_sku_set
         if excluded_sku_set:
             user_excluded_count = len(set(excluded_skus or ()))
+            sheet_excluded_count = len(catalogs.globally_blocked_skus)
             catalogs.warnings.append(
                 "Exclusión general: se bloquearon completamente "
                 f"{len(excluded_sku_set):,} SKUs ("
                 f"{user_excluded_count:,} ingresados en CODEC + "
-                f"{len(BACKEND_EXCLUDED_SKUS):,} excluidos permanentemente "
-                "a nivel backend)."
+                f"{sheet_excluded_count:,} de la hoja BLOQUEOS de "
+                "DATA_TRANSFERS)."
             )
         fruver_811_summary = apply_fruver_811_block(
             catalogs,
@@ -4774,7 +4961,14 @@ def execute_planning(
                 f"({fruver_811_summary['units_blocked']:,.0f} unidades) antes de "
                 "la asignación. Los demás orígenes permanecieron disponibles."
             )
-        closed_store_ids = load_closed_store_ids(data_path)
+        closed_store_ids = (
+            load_closed_store_ids(data_path) if enable_closed_stores_rule else set()
+        )
+        if not enable_closed_stores_rule:
+            catalogs.warnings.append(
+                "Regla TIENDAS_CERRADAS desactivada para esta corrida desde "
+                "CODEC: ninguna tienda se excluye por este bloqueo permanente."
+            )
         insumos_rows: list[dict[str, Any]] = []
         if include_insumos and 444 in origins:
             insumos_rows, insumos_warnings = load_insumos_rows(
@@ -4883,7 +5077,7 @@ def execute_planning(
             daily_plan_rows,
             config,
             include_naked=include_naked_engine,
-            include_solidus=include_solidus_engine,
+            include_hardcodes=cover_fountain9_hardcodes,
         )
 
         result = engine.plan_transfers(engine_plan_rows, catalogs, config)
@@ -5179,6 +5373,26 @@ def execute_planning(
             catalogs,
             config,
         )
+        health_check_catalog_rows, _health_check_warnings = load_avl_catalog_rows(
+            data_path
+        )
+        golden_health_check = build_golden_infaltable_anchor_health_check(
+            result,
+            catalogs,
+            special_doh_target,
+            health_check_catalog_rows,
+        )
+        if golden_health_check["below_target"]:
+            affected = len(golden_health_check["below_target"])
+            result.warnings.append(
+                "Check de salud Golden/Infaltable/Anchor: "
+                f"{affected:,} tienda-SKU terminaron esta corrida por debajo "
+                f"de {special_doh_target:g} DOH (de {golden_health_check['checked']:,} "
+                "evaluadas). Es probable que un engine posterior al Refuerzo "
+                "(Shalashaska, Liquid o Venom) haya consumido stock del mismo "
+                "origen después de que se les aseguró su cobertura. Revisa el "
+                "detalle antes de entregar esta planeación."
+            )
         normalize_result_storage(result)
         analytics = build_planning_analytics(result, origins)
         apply_reporting_labels(result)
@@ -5404,10 +5618,34 @@ def execute_planning(
         local_files,
         workspace / f"Planeacion_{run_date:%d-%m-%Y}.zip",
     )
+    if simulation_mode:
+        # Modo simulación: se corrió todo el pipeline real (para que los
+        # números sean exactos), pero no debe quedar ningún archivo
+        # persistido como si fuera una entrega real. Se limpia todo lo que
+        # se acaba de escribir a disco antes de regresar.
+        for path in local_files:
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError:
+                pass
+        try:
+            Path(zip_path).unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            output_dir.rmdir()
+        except OSError:
+            pass
+        files_for_run: list[str] = []
+        zip_for_run = ""
+    else:
+        files_for_run = [str(path) for path in local_files]
+        zip_for_run = str(zip_path)
     return {
         "workspace": str(workspace),
-        "files": [str(path) for path in local_files],
-        "zip": str(zip_path),
+        "simulation": bool(simulation_mode),
+        "files": files_for_run,
+        "zip": zip_for_run,
         "tasks": result.tasks_used,
         "units": units,
         "requirements": requirements,
@@ -5431,6 +5669,7 @@ def execute_planning(
         "fruver_811": fruver_811_summary,
         "schedule_block": schedule_block,
         "naked": naked_summary,
+        "golden_health_check": golden_health_check,
         "copernico_cuts": copernico_cuts,
         "venom": venom_summary,
         "input_consolidation": consolidation_summary,
@@ -6357,8 +6596,7 @@ def render_results(run: dict[str, Any]) -> None:
                 "description": (
                     "Combinaciones tienda–SKU únicas obtenidas después de sumar todos "
                     "los CSV cargados. Incluye tiendas cerradas y ciudades "
-                    "bloqueadas, así como tiendas detectadas como outlier, antes "
-                    "de aplicar exclusiones."
+                    "bloqueadas, antes de aplicar exclusiones."
                 ),
                 "tone": "acid",
             },
@@ -6567,121 +6805,131 @@ def render_results(run: dict[str, Any]) -> None:
             f"{city_block['stores']:,} tiendas y "
             f"{city_block['products']:,} productos antes de asignar stock."
         )
-    st.markdown('<span class="section-label">DESCARGAR TODO</span>', unsafe_allow_html=True)
-    zip_path = Path(run["zip"])
-    st.download_button(
-        "Descargar planeación completa (.zip)",
-        data=zip_path.read_bytes(),
-        file_name=zip_path.name,
-        mime="application/zip",
-        use_container_width=True,
-    )
-
-    st.markdown('<span class="section-label">ARCHIVOS INDIVIDUALES</span>', unsafe_allow_html=True)
-
-    def _download_button(path: Path, label: str, key: str) -> None:
-        mime = (
-            "text/csv"
-            if path.suffix.lower() == ".csv"
-            else "application/pdf"
-            if path.suffix.lower() == ".pdf"
-            else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    if run.get("simulation"):
+        st.markdown(
+            '<span class="section-label">DESCARGAR TODO</span>', unsafe_allow_html=True
         )
-        st.markdown(f'<span class="file-pill">{path.name}</span>', unsafe_allow_html=True)
+        st.info(
+            "MODO SIMULACIÓN: esta corrida no generó archivos descargables. "
+            "Vuelve a correrla con el modo simulación apagado para obtener "
+            "los CSV, el Excel, el PDF y el ZIP reales."
+        )
+    else:
+        st.markdown('<span class="section-label">DESCARGAR TODO</span>', unsafe_allow_html=True)
+        zip_path = Path(run["zip"])
         st.download_button(
-            label,
-            data=path.read_bytes(),
-            file_name=path.name,
-            mime=mime,
-            key=key,
+            "Descargar planeación completa (.zip)",
+            data=zip_path.read_bytes(),
+            file_name=zip_path.name,
+            mime="application/zip",
             use_container_width=True,
         )
 
-    all_paths = [Path(raw_path) for raw_path in run["files"]]
-    bulk_pattern = re.compile(r"^BulkCD_(\d+)(?:_(.+))?\.csv$")
-    report_paths = [p for p in all_paths if p.name.startswith("Reporte_Planeacion_")]
-    bulk_paths = sorted(
-        (p for p in all_paths if bulk_pattern.match(p.name)),
-        key=lambda p: (
-            int(bulk_pattern.match(p.name).group(1)),
-            bulk_pattern.match(p.name).group(2) or "",
-        ),
-    )
-    fountain9_zero_paths = [
-        p for p in all_paths if p.name.startswith("Fountain9_Sin_Recomendacion_")
-    ]
-    outlier_paths = [
-        p for p in all_paths if p.name.startswith("Outliers_Fountain9_Excluidos_")
-    ]
-    pdf_paths = [
-        p for p in all_paths if p.name.startswith("Reporte_Ejecutivo_Planeacion_")
-    ]
-    categorized = (
-        set(report_paths)
-        | set(bulk_paths)
-        | set(fountain9_zero_paths)
-        | set(outlier_paths)
-        | set(pdf_paths)
-    )
-    other_paths = [p for p in all_paths if p not in categorized]
+        st.markdown('<span class="section-label">ARCHIVOS INDIVIDUALES</span>', unsafe_allow_html=True)
 
-    if report_paths:
-        st.caption("Reporte de planeación (Excel)")
-        for index, path in enumerate(report_paths):
-            _download_button(
-                path, "Descargar reporte de planeación", f"download_report_{index}"
+        def _download_button(path: Path, label: str, key: str) -> None:
+            mime = (
+                "text/csv"
+                if path.suffix.lower() == ".csv"
+                else "application/pdf"
+                if path.suffix.lower() == ".pdf"
+                else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+            st.markdown(f'<span class="file-pill">{path.name}</span>', unsafe_allow_html=True)
+            st.download_button(
+                label,
+                data=path.read_bytes(),
+                file_name=path.name,
+                mime=mime,
+                key=key,
+                use_container_width=True,
             )
 
-    if bulk_paths:
-        # No asumas una cantidad fija: hay tantos Bulk como orígenes
-        # seleccionados hayan generado al menos una línea (más owner splits
-        # de 425/856), así que esto siempre se acomoda al número real.
-        st.caption(f"Bulk por origen ({len(bulk_paths):,})")
-        bulk_columns = st.columns(min(max(len(bulk_paths), 1), 3))
-        for index, path in enumerate(bulk_paths):
-            match = bulk_pattern.match(path.name)
-            origin_label = match.group(1) if match else ""
-            owner_label = f" · {match.group(2)}" if match and match.group(2) else ""
-            with bulk_columns[index % len(bulk_columns)]:
+        all_paths = [Path(raw_path) for raw_path in run["files"]]
+        bulk_pattern = re.compile(r"^BulkCD_(\d+)(?:_(.+))?\.csv$")
+        report_paths = [p for p in all_paths if p.name.startswith("Reporte_Planeacion_")]
+        bulk_paths = sorted(
+            (p for p in all_paths if bulk_pattern.match(p.name)),
+            key=lambda p: (
+                int(bulk_pattern.match(p.name).group(1)),
+                bulk_pattern.match(p.name).group(2) or "",
+            ),
+        )
+        fountain9_zero_paths = [
+            p for p in all_paths if p.name.startswith("Fountain9_Sin_Recomendacion_")
+        ]
+        outlier_paths = [
+            p for p in all_paths if p.name.startswith("Outliers_Fountain9_Excluidos_")
+        ]
+        pdf_paths = [
+            p for p in all_paths if p.name.startswith("Reporte_Ejecutivo_Planeacion_")
+        ]
+        categorized = (
+            set(report_paths)
+            | set(bulk_paths)
+            | set(fountain9_zero_paths)
+            | set(outlier_paths)
+            | set(pdf_paths)
+        )
+        other_paths = [p for p in all_paths if p not in categorized]
+
+        if report_paths:
+            st.caption("Reporte de planeación (Excel)")
+            for index, path in enumerate(report_paths):
+                _download_button(
+                    path, "Descargar reporte de planeación", f"download_report_{index}"
+                )
+
+        if bulk_paths:
+            # No asumas una cantidad fija: hay tantos Bulk como orígenes
+            # seleccionados hayan generado al menos una línea (más owner splits
+            # de 425/856), así que esto siempre se acomoda al número real.
+            st.caption(f"Bulk por origen ({len(bulk_paths):,})")
+            bulk_columns = st.columns(min(max(len(bulk_paths), 1), 3))
+            for index, path in enumerate(bulk_paths):
+                match = bulk_pattern.match(path.name)
+                origin_label = match.group(1) if match else ""
+                owner_label = f" · {match.group(2)}" if match and match.group(2) else ""
+                with bulk_columns[index % len(bulk_columns)]:
+                    _download_button(
+                        path,
+                        f"Descargar Bulk {origin_label}{owner_label}",
+                        f"download_bulk_{index}",
+                    )
+
+        if fountain9_zero_paths:
+            st.caption("Sin recomendación Fountain9")
+            for index, path in enumerate(fountain9_zero_paths):
                 _download_button(
                     path,
-                    f"Descargar Bulk {origin_label}{owner_label}",
-                    f"download_bulk_{index}",
+                    "Descargar sin recomendación Fountain9",
+                    f"download_f9zero_{index}",
                 )
 
-    if fountain9_zero_paths:
-        st.caption("Sin recomendación Fountain9")
-        for index, path in enumerate(fountain9_zero_paths):
-            _download_button(
-                path,
-                "Descargar sin recomendación Fountain9",
-                f"download_f9zero_{index}",
-            )
-
-    if outlier_paths:
-        st.caption("Outliers Fountain9")
-        for index, path in enumerate(outlier_paths):
-            _download_button(
-                path, "Descargar outliers Fountain9", f"download_outliers_{index}"
-            )
-
-    if pdf_paths:
-        st.caption("Reporte ejecutivo de planeación (PDF)")
-        for index, path in enumerate(pdf_paths):
-            _download_button(
-                path,
-                "Descargar reporte ejecutivo de planeación",
-                f"download_pdf_{index}",
-            )
-
-    if other_paths:
-        st.caption("Otros archivos")
-        other_columns = st.columns(min(max(len(other_paths), 1), 3))
-        for index, path in enumerate(other_paths):
-            with other_columns[index % len(other_columns)]:
+        if outlier_paths:
+            st.caption("Outliers Fountain9")
+            for index, path in enumerate(outlier_paths):
                 _download_button(
-                    path, f"Descargar {path.name}", f"download_other_{index}"
+                    path, "Descargar outliers Fountain9", f"download_outliers_{index}"
                 )
+
+        if pdf_paths:
+            st.caption("Reporte ejecutivo de planeación (PDF)")
+            for index, path in enumerate(pdf_paths):
+                _download_button(
+                    path,
+                    "Descargar reporte ejecutivo de planeación",
+                    f"download_pdf_{index}",
+                )
+
+        if other_paths:
+            st.caption("Otros archivos")
+            other_columns = st.columns(min(max(len(other_paths), 1), 3))
+            for index, path in enumerate(other_paths):
+                with other_columns[index % len(other_columns)]:
+                    _download_button(
+                        path, f"Descargar {path.name}", f"download_other_{index}"
+                    )
 
     st.markdown('<span class="section-label">BREAKDOWN</span>', unsafe_allow_html=True)
     st.markdown(
@@ -6730,6 +6978,50 @@ def render_results(run: dict[str, Any]) -> None:
 
     if run.get("analytics"):
         render_planning_analytics(run["analytics"], run)
+
+    golden_health_check = run.get("golden_health_check", {})
+    if golden_health_check.get("enabled"):
+        st.markdown(
+            '<div class="report-title">CHECK DE SALUD GOLDEN/INFALTABLE/ANCHOR.</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            """
+            <div class="report-note">
+                Comparación final, después de TODOS los engines (incluidos
+                Shalashaska, Liquid y Venom), entre el DOH real de cada
+                tienda-SKU Golden/Infaltable/Anchor y el objetivo del
+                Refuerzo. No mueve nada — solo avisa si algo quedó por debajo
+                del objetivo, revisa antes de entregar.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        below_target = golden_health_check.get("below_target", [])
+        if below_target:
+            st.error(
+                f"{len(below_target):,} de {golden_health_check['checked']:,} "
+                "tienda-SKU Golden/Infaltable/Anchor terminaron por debajo del "
+                "DOH objetivo."
+            )
+            health_height = (max(6, len(below_target)) + 1) * 36 + 4
+            st.dataframe(
+                below_target,
+                use_container_width=True,
+                hide_index=True,
+                height=health_height,
+            )
+        else:
+            st.success(
+                f"Las {golden_health_check['checked']:,} combinaciones "
+                "Golden/Infaltable/Anchor evaluadas terminaron en o por "
+                "encima del DOH objetivo."
+            )
+        if golden_health_check.get("no_adu"):
+            st.caption(
+                f"{golden_health_check['no_adu']:,} combinaciones no se "
+                "evaluaron por falta de ADU (ni propio ni de la ciudad)."
+            )
 
     st.markdown(
         '<div class="report-title">REPORTE POR ENGINE.</div>',
@@ -7284,6 +7576,8 @@ RAIDEN_PROTECTED_CITIES: frozenset[str] = frozenset(
     {"CDMX", "GDL", "MTY", "PUEBLA", "QUERETARO", "SALTILLO"}
 )
 RAIDEN_DEFAULT_ORIGINS: tuple[int, ...] = (444, 831)
+# Orígenes por default al abrir el módulo, para ambos perfiles.
+DEFAULT_ORIGINS: tuple[int, ...] = (444, 831)
 
 
 @st.dialog("Confirmación antes de ejecutar")
@@ -7464,16 +7758,9 @@ def render() -> None:
 
     st.markdown('<span class="section-label">04 — VARIABLES</span>', unsafe_allow_html=True)
     run_date = datetime.now(ZoneInfo("America/Mexico_City")).date()
-    if is_raiden:
-        default_origins = [
-            origin for origin in RAIDEN_DEFAULT_ORIGINS if origin in ORIGIN_WAREHOUSES
-        ]
-    else:
-        default_origins = [
-            origin
-            for origin in engine.CONFIG.origin_warehouses
-            if origin in ORIGIN_WAREHOUSES
-        ] or [811, 834]
+    default_origins = [
+        origin for origin in DEFAULT_ORIGINS if origin in ORIGIN_WAREHOUSES
+    ]
 
     blockable_city_options = list(city_labels)
     if is_raiden:
@@ -7532,6 +7819,45 @@ def render() -> None:
             )
             st.warning(f"Se bloqueará completamente: {selected_names}")
 
+        st.markdown("###### Reglas activas por default — desactivar es la excepción")
+        rules_col1, rules_col2, rules_col3, rules_col4 = st.columns(4)
+        with rules_col1:
+            enable_rackeados_rule = st.toggle(
+                "RACKEADOS",
+                value=True,
+                help=(
+                    "Si se apaga, ningún SKU se trata como rackeado en 444: su "
+                    "stock deja de excluirse por esta regla."
+                ),
+            )
+        with rules_col2:
+            enable_closed_stores_rule = st.toggle(
+                "TIENDAS_CERRADAS",
+                value=True,
+                help=(
+                    "Si se apaga, ninguna tienda se excluye por el bloqueo "
+                    "permanente de TIENDAS_CERRADAS."
+                ),
+            )
+        with rules_col3:
+            enable_regional_block_rule = st.toggle(
+                "BLOQUEOS regional",
+                value=True,
+                help=(
+                    "Si se apaga, el bloqueo CDMX→GDL/MTY de la hoja "
+                    "BLOQUEOS_FORANEAS deja de aplicarse."
+                ),
+            )
+        with rules_col4:
+            enable_route_cost_block_rule = st.toggle(
+                "RUTA_COSTOS",
+                value=True,
+                help=(
+                    "Si se apaga, ninguna combinación tienda-SKU se bloquea "
+                    "por la hoja RUTA_COSTOS."
+                ),
+            )
+
         selected_excluded_stores = st.multiselect(
             "Excluir tiendas directamente — opcional",
             options=list(store_labels),
@@ -7554,17 +7880,10 @@ def render() -> None:
                 )
             )
 
-        exclude_fountain9_outlier_stores = st.toggle(
-            "Excluir tiendas con cobertura Fountain9 anormalmente baja",
-            value=True,
-            help=(
-                "Cuando está activo, excluye las tiendas con combinaciones SKU–tienda "
-                "iguales o inferiores al 50% de la mediana del archivo consolidado. "
-                "La regla solo se activa si hay al menos cinco tiendas y la mediana "
-                "es de 20 líneas o más. Al apagarlo, ninguna tienda se elimina por "
-                "este control."
-            ),
-        )
+        # Detección de outliers Fountain9 eliminada a pedido de negocio — ya
+        # no hay toggle ni UI para esto. Se deja la variable en False para no
+        # tener que tocar cada punto interno que todavía la recibe.
+        exclude_fountain9_outlier_stores = False
 
         excluded_skus_raw = st.text_area(
             "Exclusión global de SKUs — opcional",
@@ -7630,8 +7949,9 @@ def render() -> None:
             eyebrow="ENGINE / 01 · FOUNTAIN9",
             title="NAKED ENGINE",
             description=(
-                "Recomendación natural de Fountain9. Tiene la primera prioridad "
-                "sobre el presupuesto compartido de tareas."
+                "Recomendación natural de Fountain9, más los hardcodes de "
+                "cobertura cuando no dio un ROQ positivo. Tiene la primera "
+                "prioridad sobre el presupuesto compartido de tareas."
             ),
             active=include_naked_engine,
             tone="acid",
@@ -7641,8 +7961,22 @@ def render() -> None:
         ):
             st.session_state["mb_engine_naked_enabled"] = not include_naked_engine
             st.rerun()
+        cover_fountain9_hardcodes = False
         if include_naked_engine:
             st.caption("Procesa exclusivamente casos con ROQ natural positivo.")
+            cover_fountain9_hardcodes = st.toggle(
+                "Cubrir a Fountain9",
+                value=True,
+                help=(
+                    "Cuando Fountain9 no dio un ROQ positivo (MOV ≤ 0), el "
+                    "modelo igual puede armar un objetivo de 3 o 4 unidades "
+                    "según inventario/demanda en destino "
+                    "(HARDCODE_4_CERO_TOTAL / HARDCODE_3_INVENTARIO_MENOR_"
+                    "DEMANDA). Apagar esto deja esos casos completamente sin "
+                    "cubrir por Naked — Solidus (AVL/Preventivo/Refuerzo) "
+                    "sigue pudiendo cubrirlos por su cuenta si aplica."
+                ),
+            )
         else:
             st.caption(
                 "Naked Engine está apagado. Activa la tarjeta para incluir la "
@@ -7665,8 +7999,9 @@ def render() -> None:
             eyebrow="ENGINE / 02 · PROTECTION",
             title="SOLIDUS ENGINE",
             description=(
-                "Protecciones manuales, forecast 0, cobertura AVL, prevención "
-                "de posibles quiebres y refuerzo de Golden/Infaltable/Anchor."
+                "Cobertura AVL, prevención de posibles quiebres y refuerzo de "
+                "Golden/Infaltable/Anchor. Los hardcodes de Fountain9 ahora "
+                "viven en Naked."
                 if not is_raiden
                 else "Bloqueado para el perfil Raiden."
             ),
@@ -7984,8 +8319,8 @@ def render() -> None:
                     help=(
                         "Venom solo evalúa buffers DDMRP para las tiendas "
                         "seleccionadas aquí. Respeta TIENDAS_CERRADAS, "
-                        "exclusiones, ciudades bloqueadas y outliers Fountain9 "
-                        "igual que el resto de los engines."
+                        "exclusiones y ciudades bloqueadas igual que el resto "
+                        "de los engines."
                     ),
                 )
             with venom_right:
@@ -8046,6 +8381,25 @@ def render() -> None:
             st.caption(
                 "Venom Engine está apagado. No se ejecutará ningún llenado "
                 "DDMRP posterior a la planeación."
+            )
+
+    simulation_mode = False
+    if not is_raiden:
+        simulation_mode = st.toggle(
+            "Modo simulación — solo calcular, no generar archivos",
+            value=False,
+            help=(
+                "Corre la planeación completa con números exactos, pero no "
+                "escribe ni entrega ningún CSV, Excel, PDF o ZIP — todo se "
+                "borra al terminar. Útil para probar parámetros (por "
+                "ejemplo un DOH distinto) sin comprometer una entrega. "
+                "Exclusivo de Big Boss."
+            ),
+        )
+        if simulation_mode:
+            st.info(
+                "MODO SIMULACIÓN ACTIVO: esta corrida no va a generar "
+                "archivos descargables. Apaga el toggle para una entrega real."
             )
 
     submitted_click = st.button(
@@ -8145,14 +8499,6 @@ def render() -> None:
                         )
                         + "…"
                     )
-                if exclude_fountain9_outlier_stores:
-                    st.write(
-                        "Validando tiendas con cobertura Fountain9 anormalmente baja…"
-                    )
-                else:
-                    st.write(
-                        "Exclusión de tiendas outlier Fountain9 desactivada para esta corrida."
-                    )
                 if include_insumos and 444 in origins:
                     st.write("Preparando insumos para las rutas activas del 444…")
                 elif include_insumos:
@@ -8228,10 +8574,16 @@ def render() -> None:
                     avl_doh=float(avl_doh),
                     block_fruver_811=block_fruver_811,
                     block_off_schedule_shipments=block_off_schedule_shipments,
+                    enable_rackeados_rule=enable_rackeados_rule,
+                    enable_closed_stores_rule=enable_closed_stores_rule,
+                    enable_regional_block_rule=enable_regional_block_rule,
+                    enable_route_cost_block_rule=enable_route_cost_block_rule,
+                    simulation_mode=simulation_mode,
                     include_preventive_fill=include_preventive_fill,
                     include_special_doh_fill=include_special_doh_fill,
                     special_doh_target=float(special_doh_target),
                     include_naked_engine=include_naked_engine,
+                    cover_fountain9_hardcodes=cover_fountain9_hardcodes,
                     include_solidus_engine=include_solidus_engine,
                     include_shalashaska_engine=include_shalashaska_engine,
                     shalashaska_target_doh=float(shalashaska_target_doh),

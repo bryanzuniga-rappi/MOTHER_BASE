@@ -13,9 +13,17 @@ def select_engine_rows(
     config: engine.Config,
     *,
     include_naked: bool,
-    include_solidus: bool,
+    include_hardcodes: bool,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    """Prepara la cola secuencial que consumirá el ledger global."""
+    """Prepara la cola secuencial que consumirá el ledger global.
+
+    ``include_hardcodes`` controla los hardcodes HARDCODE_4_CERO_TOTAL /
+    HARDCODE_3_INVENTARIO_MENOR_DEMANDA (MOV<=0 pero el modelo igual arma un
+    objetivo). Conceptualmente viven bajo Naked (es la forma en que tomamos
+    la necesidad cuando Fountain9 no dio un ROQ positivo), con su propio
+    toggle "Cubrir a Fountain9" — independiente de Solidus Engine, que hoy
+    solo cubre AVL, Preventivo y Refuerzo Golden/Infaltable/Anchor.
+    """
     selected: list[dict[str, Any]] = []
     summary = {
         "naked_requirements": 0,
@@ -37,7 +45,7 @@ def select_engine_rows(
 
         accepted = (
             (naked and include_naked)
-            or (solidus and include_solidus)
+            or (solidus and include_hardcodes)
             or (no_recommendation and include_naked)
         )
         if accepted:
