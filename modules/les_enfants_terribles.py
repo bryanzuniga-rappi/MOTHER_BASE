@@ -5956,6 +5956,67 @@ def execute_planning(
     }
 
 
+MAX_DISPLAY_ROWS = 100
+
+
+def rows_to_csv_bytes(rows: list[dict[str, Any]]) -> bytes:
+    """Serializa una lista de dicts a CSV (con BOM, igual que el resto de la
+    app) para ofrecer descarga completa de tablas truncadas en pantalla."""
+    if not rows:
+        return b""
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=list(rows[0].keys()))
+    writer.writeheader()
+    writer.writerows(rows)
+    return buffer.getvalue().encode("utf-8-sig")
+
+
+def render_capped_dataframe(
+    rows: list[dict[str, Any]],
+    *,
+    key: str,
+    offer_download: bool = False,
+    file_label: str = "",
+    column_config: dict[str, Any] | None = None,
+    max_display: int = MAX_DISPLAY_ROWS,
+) -> None:
+    """Renderiza una tabla potencialmente grande sin arriesgar el navegador:
+    nunca manda más de ``max_display`` filas al frontend (antes solo se
+    limitaba la ALTURA del contenedor, no el volumen de datos real — con
+    tablas de miles de filas eso seguía mandando el dataset completo aunque
+    solo se vieran unas pocas). Si hay más filas de las mostradas, lo dice
+    explícitamente y, si ``offer_download`` está activo, ofrece el CSV
+    completo para no perder el detalle.
+    """
+    if not rows:
+        st.info("No existen registros para mostrar en esta sección.")
+        return
+    total = len(rows)
+    visible = min(total, max_display)
+    display_rows = rows[:max_display]
+    height = (visible + 1) * 36 + 4
+    st.dataframe(
+        display_rows,
+        use_container_width=True,
+        hide_index=True,
+        height=height,
+        column_config=column_config or {},
+    )
+    if total > max_display:
+        st.caption(
+            f"Mostrando {max_display:,} de {total:,} filas."
+            + (" Descarga el CSV para ver el detalle completo." if offer_download else "")
+        )
+    if offer_download:
+        st.download_button(
+            f"Descargar {file_label or 'detalle'} completo (.csv)",
+            data=rows_to_csv_bytes(rows),
+            file_name=f"{(file_label or 'detalle').replace(' ', '_')}.csv",
+            mime="text/csv",
+            key=f"download_{key}",
+        )
+
+
 def report_table(
     rows: list[dict[str, Any]],
     *,
@@ -5965,14 +6026,22 @@ def report_table(
     if not rows:
         st.info("No existen registros para mostrar en esta sección.")
         return
-    height = min(max(150, 36 * (len(rows) + 1)), max_height)
+    total = len(rows)
+    display_rows = rows[:MAX_DISPLAY_ROWS]
+    # Antes esto solo acotaba la ALTURA del contenedor; con tablas de miles
+    # de filas (posible en ciudad/tienda con redes grandes) el dataset
+    # completo igual viajaba al navegador. Ahora también se acota el
+    # volumen real de filas enviadas.
+    height = min(max(150, 36 * (len(display_rows) + 1)), max_height)
     st.dataframe(
-        rows,
+        display_rows,
         use_container_width=True,
         hide_index=True,
         height=height,
         column_config=column_config or {},
     )
+    if total > MAX_DISPLAY_ROWS:
+        st.caption(f"Mostrando {MAX_DISPLAY_ROWS:,} de {total:,} filas.")
 
 
 def render_source_analysis(analytics: dict[str, Any]) -> None:
@@ -6862,12 +6931,11 @@ def render_bucket_universe_report(bucket_label: str, report: dict[str, Any]) -> 
             )}
             for row in rows
         ]
-        detail_height = (max(6, min(len(display_rows), 30)) + 1) * 36 + 4
-        st.dataframe(
+        render_capped_dataframe(
             display_rows,
-            use_container_width=True,
-            hide_index=True,
-            height=detail_height,
+            key=f"{bucket_label.lower()}_universe_detail",
+            offer_download=True,
+            file_label=f"universo_{bucket_label.lower()}_detalle",
             column_config={
                 "MOTIVO_NO_CUBIERTO": st.column_config.TextColumn(
                     "MOTIVO NO CUBIERTO", width="large"
@@ -6878,8 +6946,7 @@ def render_bucket_universe_report(bucket_label: str, report: dict[str, Any]) -> 
     no_cubierto_rows = [row for row in rows if row["CATEGORIA"] == "NO_CUBIERTO"]
     if no_cubierto_rows:
         st.markdown(f"###### {bucket_label} — micro-detalle: por qué no se cubrió")
-        micro_height = (max(6, min(len(no_cubierto_rows), 30)) + 1) * 36 + 4
-        st.dataframe(
+        render_capped_dataframe(
             [
                 {
                     "WAREHOUSE_DESTINATION": row["WAREHOUSE_DESTINATION"],
@@ -6890,9 +6957,9 @@ def render_bucket_universe_report(bucket_label: str, report: dict[str, Any]) -> 
                 }
                 for row in no_cubierto_rows
             ],
-            use_container_width=True,
-            hide_index=True,
-            height=micro_height,
+            key=f"{bucket_label.lower()}_universe_no_cubierto",
+            offer_download=True,
+            file_label=f"universo_{bucket_label.lower()}_no_cubierto",
             column_config={
                 "MOTIVO_NO_CUBIERTO": st.column_config.TextColumn(
                     "MOTIVO NO CUBIERTO", width="large"
@@ -7344,33 +7411,29 @@ def render_results(run: dict[str, Any]) -> None:
 
     st.markdown("##### Efectivamente planeado — por engine y causal")
     planned_by_engine_rows = run.get("planned_by_engine_rows", [])
-    planned_height = (max(6, len(planned_by_engine_rows)) + 1) * 36 + 4
-    st.dataframe(
+    render_capped_dataframe(
         planned_by_engine_rows,
-        use_container_width=True,
-        hide_index=True,
-        height=planned_height,
+        key="planned_by_engine",
+        offer_download=True,
+        file_label="planeado_por_engine",
     )
 
     st.markdown("##### Cortes — todo lo que no se mandó, por motivo")
     cuts_detail_rows = run.get("cuts_detail_rows", [])
-    cuts_height = (max(6, len(cuts_detail_rows)) + 1) * 36 + 4
-    st.dataframe(
+    render_capped_dataframe(
         cuts_detail_rows,
-        use_container_width=True,
-        hide_index=True,
-        height=cuts_height,
+        key="cuts_detail",
+        offer_download=True,
+        file_label="cortes_por_motivo",
     )
 
     st.markdown("##### Overview general")
     breakdown = ordered_breakdown_rows(run["status_counts"])
-    visible_breakdown_rows = max(12, len(breakdown))
-    breakdown_height = (visible_breakdown_rows + 1) * 36 + 4
-    st.dataframe(
+    render_capped_dataframe(
         breakdown,
-        use_container_width=True,
-        hide_index=True,
-        height=breakdown_height,
+        key="breakdown_overview",
+        offer_download=True,
+        file_label="breakdown_overview",
     )
 
     if run.get("analytics"):
@@ -7401,12 +7464,11 @@ def render_results(run: dict[str, Any]) -> None:
                 "tienda-SKU Golden/Infaltable/Anchor terminaron por debajo del "
                 "DOH objetivo."
             )
-            health_height = (max(6, len(below_target)) + 1) * 36 + 4
-            st.dataframe(
+            render_capped_dataframe(
                 below_target,
-                use_container_width=True,
-                hide_index=True,
-                height=health_height,
+                key="golden_health_below_target",
+                offer_download=True,
+                file_label="check_salud_golden_infaltable_anchor",
             )
         else:
             st.success(
