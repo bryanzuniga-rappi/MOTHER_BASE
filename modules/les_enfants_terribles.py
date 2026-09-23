@@ -65,7 +65,22 @@ from mother_base_theme import (
 
 APP_NAME = "Les Enfants Terribles"
 MAX_UPLOAD_MB = 500
-DATA_TRANSFERS_SPREADSHEET_ID = "18kHevkMvf9l4s6ANg3h5KdNyj2yEPGAp5C_t8JwxFVw"
+
+
+def configured_data_transfers_spreadsheet_id() -> str:
+    """Lee el ID del Google Sheet DATA_TRANSFERS desde Streamlit Secrets.
+
+    Nunca hardcodees el ID real en el código fuente: este repo es
+    compartido, y un ID de spreadsheet expuesto puede filtrar la ubicación
+    (y, si el Sheet queda mal configurado, el contenido) del inventario real
+    de la empresa. Se configura igual que BIG_BOSS_PASSWORD, ver
+    .streamlit/secrets.toml.example.
+    """
+    try:
+        return str(st.secrets.get("DATA_TRANSFERS_SPREADSHEET_ID", ""))
+    except Exception:
+        return ""
+
 
 ORIGIN_WAREHOUSES = {
     444: "CITYPARK TURBO",
@@ -1487,9 +1502,16 @@ def omit_unexecuted_manual_task_rows(result) -> None:
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_public_database() -> bytes:
     """Exporta el Google Sheet público completo como XLSX y conserva 5 min de caché."""
+    spreadsheet_id = configured_data_transfers_spreadsheet_id()
+    if not spreadsheet_id:
+        raise RuntimeError(
+            "Falta configurar DATA_TRANSFERS_SPREADSHEET_ID en Secrets "
+            "(.streamlit/secrets.toml en local, o App settings → Secrets en "
+            "Streamlit Community Cloud)."
+        )
     export_url = (
         "https://docs.google.com/spreadsheets/d/"
-        f"{DATA_TRANSFERS_SPREADSHEET_ID}/export?format=xlsx"
+        f"{spreadsheet_id}/export?format=xlsx"
     )
     request = urllib.request.Request(
         export_url,
@@ -5115,8 +5137,6 @@ def execute_planning(
         default_m3_per_unit=engine.CONFIG.default_m3_per_unit,
         minimum_positive_quantity=engine.CONFIG.minimum_positive_quantity,
         local_work_dir=str(workspace / "engine"),
-        replace_same_day_outputs=True,
-        generate_empty_source_files=False,
     )
 
     captured = io.StringIO()

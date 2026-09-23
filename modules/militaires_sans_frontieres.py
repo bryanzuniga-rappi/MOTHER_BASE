@@ -17,8 +17,19 @@ import streamlit as st
 
 from mother_base_theme import render_system_stamp
 
-# --- ORIGEN DE DATOS (SHEET ORIGINAL) ---
-DATA_DASHBOARD_SPREADSHEET_ID = "174wMJVmpXdeWEOmn4pamlsDaNcIF0ltE1sJjbUpMKsQ"
+
+def configured_data_dashboard_spreadsheet_id() -> str:
+    """Lee el ID del Google Sheet DATA_DASHBOARD desde Streamlit Secrets.
+
+    Igual que DATA_TRANSFERS_SPREADSHEET_ID en les_enfants_terribles.py: no
+    hardcodear el ID real en el código fuente de un repo compartido. Ver
+    .streamlit/secrets.toml.example.
+    """
+    try:
+        return str(st.secrets.get("DATA_DASHBOARD_SPREADSHEET_ID", ""))
+    except Exception:
+        return ""
+
 
 # --- PALETA OBLIGATORIA (Brutalismo táctico de Mother Base) ---
 INK = "#111111"
@@ -45,9 +56,16 @@ def _header(value: object) -> str:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _fetch_dashboard() -> bytes:
+    spreadsheet_id = configured_data_dashboard_spreadsheet_id()
+    if not spreadsheet_id:
+        raise RuntimeError(
+            "Falta configurar DATA_DASHBOARD_SPREADSHEET_ID en Secrets "
+            "(.streamlit/secrets.toml en local, o App settings → Secrets en "
+            "Streamlit Community Cloud)."
+        )
     url = (
         "https://docs.google.com/spreadsheets/d/"
-        f"{DATA_DASHBOARD_SPREADSHEET_ID}/export?format=xlsx"
+        f"{spreadsheet_id}/export?format=xlsx"
     )
     request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 MotherBase/1.0"})
     try:

@@ -169,13 +169,15 @@ mother_base/
 
 ### Secreto local
 
-Cree `.streamlit/secrets.toml`:
+Cree `.streamlit/secrets.toml` (o copie `.streamlit/secrets.toml.example`):
 
 ```toml
 BIG_BOSS_PASSWORD = "reemplace-esto-por-un-secreto-seguro"
+DATA_TRANSFERS_SPREADSHEET_ID = "el-id-real-de-su-sheet"
+DATA_DASHBOARD_SPREADSHEET_ID = "el-id-real-de-su-sheet"
 ```
 
-Nunca suba ese archivo a Git. Verifique que esté cubierto por `.gitignore`.
+Nunca suba ese archivo a Git, y nunca pegue esos IDs reales en el código ni en este README — son datos de la empresa, no ejemplos. Verifique que `secrets.toml` esté cubierto por `.gitignore`.
 
 ---
 
@@ -206,11 +208,13 @@ Recomendaciones de producción:
 
 ### Conexión
 
-El ID se configura en `modules/les_enfants_terribles.py`:
+El ID **nunca vive en el código ni en este README** — se configura como Secret, igual que `BIG_BOSS_PASSWORD` (ver §6 y `.streamlit/secrets.toml.example`):
 
-```python
-DATA_TRANSFERS_SPREADSHEET_ID = "18kHevkMvf9l4s6ANg3h5KdNyj2yEPGAp5C_t8JwxFVw"
+```toml
+DATA_TRANSFERS_SPREADSHEET_ID = "el-id-real-de-su-sheet"
 ```
+
+`configured_data_transfers_spreadsheet_id()` en `modules/les_enfants_terribles.py` lo lee de `st.secrets`. Si falta, `fetch_public_database()` lanza un error claro en vez de fallar en silencio.
 
 Se descarga como XLSX mediante la exportación pública de Google Sheets. No requiere Google API ni cuenta de servicio mientras el archivo permanezca público para lectura.
 
@@ -218,10 +222,9 @@ Para cambiar la base:
 
 1. Publique el nuevo Google Sheet para lectura por enlace.
 2. Copie el ID entre `/d/` y `/edit`.
-3. Reemplace `DATA_TRANSFERS_SPREADSHEET_ID`.
-4. Despliegue el cambio.
-5. Presione **Volver a validar la base**.
-6. Confirme que todas las tarjetas estén verdes.
+3. Reemplace `DATA_TRANSFERS_SPREADSHEET_ID` en Secrets (local o Streamlit Community Cloud).
+4. Presione **Volver a validar la base**.
+5. Confirme que todas las tarjetas estén verdes.
 
 > Un Sheet público puede exponer información sensible de inventario. Antes de producción debe aceptarse formalmente ese riesgo o migrar a una fuente autenticada.
 
@@ -957,6 +960,8 @@ La raíz de la rama debe contener `app.py`, `requirements.txt`, `runtime.txt`, `
 
    ```toml
    BIG_BOSS_PASSWORD = "un-secreto-fuerte-y-unico"
+   DATA_TRANSFERS_SPREADSHEET_ID = "el-id-real-de-su-sheet"
+   DATA_DASHBOARD_SPREADSHEET_ID = "el-id-real-de-su-sheet"
    ```
 
 6. Despliegue y revise logs.
@@ -984,13 +989,14 @@ pytest -q
 - [ ] Memoria probada con los archivos máximos reales.
 - [ ] HTTPS activo y XSRF habilitado.
 - [ ] `BIG_BOSS_PASSWORD` distinta de `Admin`.
+- [ ] `DATA_TRANSFERS_SPREADSHEET_ID` y `DATA_DASHBOARD_SPREADSHEET_ID` configurados en Secrets — nunca hardcodeados en el código ni documentados en el README.
 - [ ] `secrets.toml` fuera de Git.
 - [ ] Riesgo del Sheet público aprobado.
 - [ ] Política de logs, reinicio y acceso definida.
 
 ### Datos
 
-- [ ] Las 21 hojas obligatorias existen con nombres exactos.
+- [ ] Las 22 hojas obligatorias existen con nombres exactos.
 - [ ] Encabezados cumplen contrato.
 - [ ] C7 de Aleph es válido.
 - [ ] Fuentes de 1.2 horas y 24 horas dentro del SLA.
