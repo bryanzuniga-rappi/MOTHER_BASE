@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-# Mother Base build 2026-09-06.1 — CODEC, exclusión de tiendas y reporte F9 cero.
-
 from collections import Counter, defaultdict
 from contextlib import redirect_stdout
 from datetime import date, datetime, timedelta, timezone

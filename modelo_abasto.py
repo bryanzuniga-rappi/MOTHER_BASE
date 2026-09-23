@@ -1,24 +1,18 @@
 """
-Modelo de abasto y transferencias para Google Colab.
+Motor de planeación de abasto y transferencias entre warehouses.
 
-Flujo:
-1. Autentica al usuario de Colab contra Google Drive.
-2. Exporta DATA_TRANSFERS (Google Sheet) como XLSX.
-3. Busca en TR_PLANS el CSV DD-MM-YYYY.csv de la fecha de ejecución.
-4. Calcula demanda, prioridades, stock ajustado, capacidad y tareas.
-5. Genera un reporte XLSX y un CSV independiente por WAREHOUSE_SOURCE.
-6. Guarda los resultados en TR_PLANS/SALIDAS/DD-MM-YYYY.
+Este módulo es el motor puro (sin UI): recibe DATA_TRANSFERS.xlsx y el plan
+diario de Fountain9 ya en disco, calcula demanda, prioridades, stock
+ajustado, capacidad y tareas, y genera las filas de asignación y los
+reportes. Lo importa y orquesta la app de Streamlit en
+``modules/les_enfants_terribles.py`` — no se ejecuta como script
+independiente.
 
 El motor es deliberadamente secuencial en la fase de asignación: el stock,
 la capacidad y el número de tareas cambian después de cada requerimiento.
 """
 
-# %% [markdown]
-# CONFIGURACIÓN: modifica únicamente este bloque en Google Colab.
-
 from __future__ import annotations
-
-# Mother Base model build 2026-09-05.1 — OWNER 425/856 y fuentes opcionales.
 
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -30,18 +24,15 @@ import csv
 import io
 import math
 import re
-import shutil
 import statistics
-import sys
 import unicodedata
+
+import openpyxl
+import xlsxwriter
 
 
 @dataclass
 class Config:
-    # Aceptan el ID o la URL completa.
-    data_transfers_spreadsheet: str = "18kHevkMvf9l4s6ANg3h5KdNyj2yEPGAp5C_t8JwxFVw"
-    tr_plans_folder: str = "1yDJTSClDR1ikSS6-sZNAbCWwtjTf384z"
-
     # El orden representa la prioridad de consumo del stock.
     origin_warehouses: tuple[int, ...] = (811, 834)
     max_tasks: int = 14_000
@@ -55,43 +46,13 @@ class Config:
     default_m3_per_unit: float = 0.002
     minimum_positive_quantity: int = 3
 
-    # Carpeta remota: TR_PLANS/SALIDAS/DD-MM-YYYY.
-    remote_output_root_name: str = "SALIDAS"
-    local_work_dir: str = "/content/modelo_abasto"
-
-    # En una segunda ejecución del mismo día actualiza los archivos del día.
-    replace_same_day_outputs: bool = True
-    generate_empty_source_files: bool = False
+    # Carpeta de trabajo local para outputs de una corrida (execute_planning
+    # siempre pasa una ruta de workspace temporal propia; este default solo
+    # aplica si alguien construye un Config() sin especificarlo).
+    local_work_dir: str = "/tmp/mother_base"
 
 
 CONFIG = Config()
-
-
-# %% Dependencias
-
-def ensure_dependencies() -> None:
-    """Instala únicamente las dependencias que falten en el runtime de Colab."""
-    missing: list[str] = []
-    try:
-        import openpyxl  # noqa: F401
-    except ImportError:
-        missing.append("openpyxl>=3.1")
-    try:
-        import xlsxwriter  # noqa: F401
-    except ImportError:
-        missing.append("xlsxwriter>=3.2")
-    if missing:
-        import subprocess
-
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "-q", *missing]
-        )
-
-
-ensure_dependencies()
-
-import openpyxl
-import xlsxwriter
 
 
 OUTPUT_COLUMNS = [
@@ -115,7 +76,7 @@ GDL = "GDL"
 MTY = "MTY"
 FOREIGN_DESTINATION_CITIES = {GDL, MTY}
 
-# %% SCHEDULE — frecuencia de envío por destino-origen
+# ---- SCHEDULE: frecuencia de envío por destino-origen ----------------
 
 # date.weekday(): 0 = lunes ... 6 = domingo.
 SPANISH_WEEKDAYS_BY_INDEX = {
@@ -138,7 +99,7 @@ WEEKDAY_DISPLAY_NAMES = {
 }
 
 
-# %% Utilidades generales
+# ---- Utilidades generales ---------------------------------------------
 
 def clean_text(value: Any) -> str:
     if value is None:
@@ -221,183 +182,11 @@ def parse_run_date(config: Config) -> date:
     )
 
 
-def extract_drive_id(value: str, label: str) -> str:
-    value = clean_text(value)
-    if not value or "PEGA_AQUI" in value:
-        raise ValueError(f"Falta configurar {label}")
-    patterns = (
-        r"/spreadsheets/d/([A-Za-z0-9_-]+)",
-        r"/folders/([A-Za-z0-9_-]+)",
-        r"^([A-Za-z0-9_-]{15,})$",
-    )
-    for pattern in patterns:
-        match = re.search(pattern, value)
-        if match:
-            return match.group(1)
-    raise ValueError(f"No pude extraer el ID de {label}: {value!r}")
-
-
 def safe_filename(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._")
 
 
-# %% Google Drive
-
-def authenticate_drive():
-    try:
-        from google.colab import auth
-    except ImportError as exc:
-        raise RuntimeError(
-            "La autenticación automática está diseñada para Google Colab. "
-            "Para pruebas locales usa run_pipeline(..., upload_to_drive=False)."
-        ) from exc
-
-    auth.authenticate_user()
-    try:
-        import googleapiclient  # noqa: F401
-    except ImportError:
-        import subprocess
-
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "-q", "google-api-python-client>=2.0"]
-        )
-    import google.auth
-    import httplib2
-    from google_auth_httplib2 import AuthorizedHttp
-    from googleapiclient.discovery import build
-
-    credentials, _ = google.auth.default(
-        scopes=["https://www.googleapis.com/auth/drive"]
-    )
-    authorized_http = AuthorizedHttp(credentials, http=httplib2.Http(timeout=180))
-    return build("drive", "v3", http=authorized_http, cache_discovery=False)
-
-
-def escape_drive_query(value: str) -> str:
-    return value.replace("\\", "\\\\").replace("'", "\\'")
-
-
-def list_exact_files(drive, folder_id: str, names: Iterable[str]) -> list[dict[str, Any]]:
-    escaped_names = [f"name = '{escape_drive_query(name)}'" for name in names]
-    query = (
-        f"'{escape_drive_query(folder_id)}' in parents and trashed = false and "
-        f"({' or '.join(escaped_names)})"
-    )
-    response = (
-        drive.files()
-        .list(
-            q=query,
-            fields="files(id,name,mimeType,modifiedTime,webViewLink,parents)",
-            orderBy="modifiedTime desc",
-            pageSize=100,
-        )
-        .execute()
-    )
-    return response.get("files", [])
-
-
-def download_drive_file(drive, file_id: str, destination: Path) -> None:
-    from googleapiclient.http import MediaIoBaseDownload
-
-    metadata = drive.files().get(fileId=file_id, fields="id,name,mimeType").execute()
-    if metadata["mimeType"] == "application/vnd.google-apps.spreadsheet":
-        request = drive.files().export_media(
-            fileId=file_id,
-            mimeType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-    else:
-        request = drive.files().get_media(fileId=file_id)
-
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    with destination.open("wb") as handle:
-        downloader = MediaIoBaseDownload(handle, request)
-        done = False
-        while not done:
-            _, done = downloader.next_chunk()
-
-
-def find_daily_plan_file(drive, folder_id: str, run_date: date) -> dict[str, Any]:
-    stem = run_date.strftime("%d-%m-%Y")
-    files = list_exact_files(drive, folder_id, [f"{stem}.csv", f"{stem}.CSV"])
-    if not files:
-        raise FileNotFoundError(
-            f"No existe {stem}.csv ni {stem}.CSV dentro de la carpeta TR_PLANS"
-        )
-    if len(files) > 1:
-        names = ", ".join(f"{f['name']} ({f['id']})" for f in files)
-        raise RuntimeError(
-            "Encontré más de un plan para la fecha. Elimina la ambigüedad: " + names
-        )
-    return files[0]
-
-
-def find_or_create_folder(drive, parent_id: str, name: str) -> dict[str, Any]:
-    files = list_exact_files(drive, parent_id, [name])
-    folders = [
-        item
-        for item in files
-        if item.get("mimeType") == "application/vnd.google-apps.folder"
-    ]
-    if len(folders) > 1:
-        raise RuntimeError(f"Existen varias carpetas llamadas {name!r} bajo el mismo padre")
-    if folders:
-        return folders[0]
-    return (
-        drive.files()
-        .create(
-            body={
-                "name": name,
-                "mimeType": "application/vnd.google-apps.folder",
-                "parents": [parent_id],
-            },
-            fields="id,name,mimeType,webViewLink",
-        )
-        .execute()
-    )
-
-
-def upload_or_replace_file(
-    drive,
-    local_path: Path,
-    folder_id: str,
-    mime_type: str,
-    replace: bool,
-) -> dict[str, Any]:
-    from googleapiclient.http import MediaFileUpload
-
-    existing = list_exact_files(drive, folder_id, [local_path.name])
-    media = MediaFileUpload(str(local_path), mimetype=mime_type, resumable=True)
-    if replace and len(existing) == 1:
-        return (
-            drive.files()
-            .update(
-                fileId=existing[0]["id"],
-                media_body=media,
-                fields="id,name,mimeType,webViewLink,modifiedTime",
-            )
-            .execute()
-        )
-    if len(existing) > 1:
-        raise RuntimeError(
-            f"Hay varios archivos llamados {local_path.name!r} en la carpeta de salida"
-        )
-    if existing and not replace:
-        timestamp = datetime.now().strftime("%H%M%S")
-        upload_name = f"{local_path.stem}_{timestamp}{local_path.suffix}"
-    else:
-        upload_name = local_path.name
-    return (
-        drive.files()
-        .create(
-            body={"name": upload_name, "parents": [folder_id]},
-            media_body=media,
-            fields="id,name,mimeType,webViewLink,modifiedTime",
-        )
-        .execute()
-    )
-
-
-# %% Lectura de DATA_TRANSFERS
+# ---- Lectura de DATA_TRANSFERS -----------------------------------------
 
 def find_header_row(ws, required_headers: Iterable[str], scan_rows: int = 40) -> tuple[int, dict[str, int]]:
     required = {normalize_header(header) for header in required_headers}
@@ -1383,7 +1172,7 @@ def detect_fountain9_store_outliers(
     }
 
 
-# %% Lectura y preparación del requerimiento diario
+# ---- Lectura y preparación del requerimiento diario --------------------
 
 PLAN_REQUIRED_COLUMNS = [
     "Warehouseid",
@@ -1562,7 +1351,7 @@ def calculate_target_quantity(row: dict[str, Any], config: Config) -> tuple[int,
     return 0, "SIN_DEMANDA"
 
 
-# %% Motor de asignación
+# ---- Motor de asignación ------------------------------------------------
 
 def source_stock_components(catalogs: Catalogs, source: int, sku: int) -> dict[str, Any]:
     base = max(catalogs.stock_base.get((source, sku), 0.0), 0.0)
@@ -2532,7 +2321,7 @@ def plan_transfers(
     )
 
 
-# %% Outputs
+# ---- Outputs --------------------------------------------------------------
 
 def write_csv(path: Path, rows: list[dict[str, Any]], columns: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -2794,143 +2583,3 @@ def create_output_files(
             paths.append(path)
     return paths
 
-
-# %% Orquestación
-
-def run_pipeline(
-    config: Config,
-    *,
-    local_data_transfers_path: str | Path | None = None,
-    local_plan_path: str | Path | None = None,
-    upload_to_drive: bool = True,
-) -> dict[str, Any]:
-    if not config.origin_warehouses:
-        raise ValueError("origin_warehouses no puede estar vacío")
-    if len(set(config.origin_warehouses)) != len(config.origin_warehouses):
-        raise ValueError("origin_warehouses contiene duplicados")
-    if config.max_tasks < 0:
-        raise ValueError("max_tasks no puede ser negativo")
-
-    run_date = parse_run_date(config)
-    date_text = run_date.strftime("%d-%m-%Y")
-    work_dir = Path(config.local_work_dir)
-    input_dir = work_dir / "inputs" / date_text
-    output_dir = work_dir / "outputs" / date_text
-    input_dir.mkdir(parents=True, exist_ok=True)
-    if output_dir.exists():
-        shutil.rmtree(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    drive = None
-    plan_drive_metadata: dict[str, Any] | None = None
-    if local_data_transfers_path and local_plan_path:
-        data_path = Path(local_data_transfers_path)
-        plan_path = Path(local_plan_path)
-        if not data_path.exists() or not plan_path.exists():
-            raise FileNotFoundError("No existen los archivos locales de prueba")
-    else:
-        if not upload_to_drive:
-            raise ValueError(
-                "Sin archivos locales, upload_to_drive debe ser True para descargar de Drive"
-            )
-        drive = authenticate_drive()
-        spreadsheet_id = extract_drive_id(
-            config.data_transfers_spreadsheet, "data_transfers_spreadsheet"
-        )
-        plans_folder_id = extract_drive_id(config.tr_plans_folder, "tr_plans_folder")
-        data_path = input_dir / "DATA_TRANSFERS.xlsx"
-        download_drive_file(drive, spreadsheet_id, data_path)
-        plan_drive_metadata = find_daily_plan_file(drive, plans_folder_id, run_date)
-        plan_path = input_dir / plan_drive_metadata["name"]
-        download_drive_file(drive, plan_drive_metadata["id"], plan_path)
-
-    print(f"Fecha de ejecución: {date_text}")
-    print(f"DATA_TRANSFERS: {data_path.name}")
-    print(f"Plan diario: {plan_path.name}")
-    print(f"Orígenes: {list(config.origin_warehouses)}")
-
-    catalogs = load_catalogs(data_path, config)
-    plan_read = read_plan_csv(plan_path, config)
-    result = plan_transfers(plan_read.rows, catalogs, config)
-    result.warnings.extend(plan_read.warnings)
-    apply_owner_inventory_partition(result, catalogs, config)
-    local_files = create_output_files(
-        result, config, run_date, plan_path.name, output_dir
-    )
-
-    uploaded: list[dict[str, Any]] = []
-    remote_folder: dict[str, Any] | None = None
-    if upload_to_drive:
-        if drive is None:
-            drive = authenticate_drive()
-        plans_folder_id = extract_drive_id(config.tr_plans_folder, "tr_plans_folder")
-        output_root = find_or_create_folder(
-            drive, plans_folder_id, config.remote_output_root_name
-        )
-        remote_folder = find_or_create_folder(drive, output_root["id"], date_text)
-        for path in local_files:
-            mime = (
-                "text/csv"
-                if path.suffix.lower() == ".csv"
-                else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-            uploaded.append(
-                upload_or_replace_file(
-                    drive,
-                    path,
-                    remote_folder["id"],
-                    mime,
-                    config.replace_same_day_outputs,
-                )
-            )
-
-    status_counts = Counter(row["TIPO_DE_CORTE"] for row in result.base_rows)
-    print("\nProceso finalizado")
-    print(f"Filas leídas del CSV: {plan_read.input_row_count:,}")
-    print(f"Requerimientos únicos: {len(result.base_rows):,}")
-    print(f"Filas duplicadas consolidadas: {plan_read.duplicate_row_count:,}")
-    print(f"Llaves duplicadas: {plan_read.duplicate_key_count:,}")
-    print(
-        "Llaves duplicadas con métricas diferentes: "
-        f"{plan_read.conflicting_duplicate_key_count:,}"
-    )
-    print(f"Asignaciones/tareas: {result.tasks_used:,} de {result.max_tasks:,}")
-    for source in config.origin_warehouses:
-        source_rows = sum(
-            row["WAREHOUSE_SOURCE"] == source for row in result.allocation_rows
-        )
-        source_units = sum(
-            row["QUANTITY"]
-            for row in result.allocation_rows
-            if row["WAREHOUSE_SOURCE"] == source
-        )
-        print(f"Source {source}: {source_rows:,} líneas / {source_units:,} unidades")
-    print("Tipos de corte:")
-    for status, count in sorted(status_counts.items()):
-        print(f"  {status}: {count:,}")
-    if result.warnings:
-        print(f"Advertencias de calidad: {len(result.warnings)} (ver RESUMEN)")
-    print("Archivos locales:")
-    for path in local_files:
-        print(f"  {path}")
-    if uploaded:
-        print("Archivos guardados en Drive:")
-        for item in uploaded:
-            print(f"  {item.get('name')}: {item.get('webViewLink', item.get('id'))}")
-
-    return {
-        "run_date": run_date,
-        "result": result,
-        "local_files": local_files,
-        "uploaded_files": uploaded,
-        "remote_folder": remote_folder,
-        "plan_drive_metadata": plan_drive_metadata,
-    }
-
-
-def main() -> None:
-    run_pipeline(CONFIG)
-
-
-if __name__ == "__main__":
-    main()

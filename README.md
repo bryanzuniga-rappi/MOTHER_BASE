@@ -120,7 +120,8 @@ mother_base/
 │   ├── naked_engine.py             # Clasificación de ROQ natural
 │   ├── solidus_engine.py           # Clasificación de protecciones manuales
 │   ├── shalashaska_engine.py       # Evacuación de inventario por mermar
-│   └── liquid_engine.py            # Liquidación de remanentes
+│   ├── liquid_engine.py            # Liquidación de remanentes
+│   └── venom_engine.py             # Cobertura DDMRP post-planeación
 ├── modules/
 │   ├── les_enfants_terribles.py    # UI, orquestación, analítica y outputs web
 │   └── militaires_sans_frontieres.py
@@ -133,8 +134,6 @@ mother_base/
 ├── requirements-dev.txt
 └── runtime.txt
 ```
-
-Los ZIP y archivos `*_BUILD_*` de la raíz son artefactos históricos. No son importados por la aplicación. En producción conviene moverlos a Releases o eliminarlos del branch operativo para evitar confusión.
 
 ---
 

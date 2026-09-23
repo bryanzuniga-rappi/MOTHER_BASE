@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-# Mother Base theme build 2026-09-02.15 — Engine alignment emitted with each card.
-
 import streamlit as st
 
 

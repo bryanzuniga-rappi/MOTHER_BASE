@@ -80,8 +80,8 @@ def render_gateway() -> None:
             eyebrow="PROFILE / 02 · OPERATIVE ACCESS",
             title="RAIDEN",
             description=(
-                "Acceso operativo sin contraseña. Por ahora tiene las mismas "
-                "funciones."
+                "Acceso operativo sin contraseña. Solidus y Liquid Engine "
+                "quedan bloqueados, y no puede bloquear ciudades protegidas."
             ),
             active=False,
             tone="white",
