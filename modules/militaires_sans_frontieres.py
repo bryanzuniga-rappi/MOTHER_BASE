@@ -134,30 +134,64 @@ def get_drive_service():
         raise RuntimeError(f"No pude iniciar el cliente de Drive: {exc}") from exc
 
 
+def _resolve_shared_drive_id(service, folder_id: str) -> str | None:
+    """Devuelve el ID del Drive compartido que contiene ``folder_id``, o
+    None si es una carpeta normal de Mi unidad.
+
+    Esto es lo oficialmente recomendado por Google para listar contenido
+    de un Drive compartido de forma confiable: ``corpora="drive"`` +
+    ``driveId=<id del Drive compartido>`` — NO el ID de la subcarpeta
+    (en este proyecto, la carpeta configurada es "SWA", que vive DENTRO
+    del Drive compartido "MOTHER-BASE"; son IDs distintos). El intento
+    anterior con ``corpora="allDrives"`` sin ``driveId`` no es tan
+    confiable — Google la documenta como más lenta/menos consistente que
+    apuntar directo al Drive compartido correcto.
+    """
+    folder = (
+        service.files()
+        .get(fileId=folder_id, fields="id, driveId", supportsAllDrives=True)
+        .execute()
+    )
+    return folder.get("driveId")
+
+
+def _drive_list_query(service, folder_id: str, q: str, **list_kwargs) -> dict:
+    """Ejecuta ``files().list()`` apuntando correctamente al Drive
+    compartido de ``folder_id`` (ver _resolve_shared_drive_id). Centraliza
+    esto en un solo lugar para no repetir la resolución de driveId en cada
+    función que necesita listar/buscar archivos."""
+    drive_id = _resolve_shared_drive_id(service, folder_id)
+    kwargs = {
+        "q": q,
+        "supportsAllDrives": True,
+        "includeItemsFromAllDrives": True,
+        **list_kwargs,
+    }
+    if drive_id:
+        kwargs["corpora"] = "drive"
+        kwargs["driveId"] = drive_id
+    else:
+        # Carpeta normal de Mi unidad — no hay Drive compartido que resolver.
+        kwargs["corpora"] = "user"
+    return service.files().list(**kwargs).execute()
+
+
 def _drive_find_file(service, folder_id: str, filename: str) -> dict | None:
     """Busca un archivo por nombre EXACTO dentro del folder. Devuelve
     {"id", "name", "modifiedTime"} o None. ``supportsAllDrives`` es
     obligatorio para que esto funcione con Drives compartidos, no solo Mi
     unidad — omitirlo es el error más común con este tipo de integración.
-    ``corpora="allDrives"`` es el segundo gotcha, menos conocido: sin él,
-    ``files.list`` puede no buscar de verdad dentro de un Drive compartido
-    aunque supportsAllDrives esté activo — el default de ``corpora`` es
-    "user" (Mi unidad + compartido conmigo), no Drives compartidos."""
+    """
     safe_name = filename.replace("'", "\\'")
     query = (
         f"'{folder_id}' in parents and name = '{safe_name}' and trashed = false"
     )
-    response = (
-        service.files()
-        .list(
-            q=query,
-            fields="files(id, name, modifiedTime, properties)",
-            corpora="allDrives",
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True,
-            pageSize=1,
-        )
-        .execute()
+    response = _drive_list_query(
+        service,
+        folder_id,
+        query,
+        fields="files(id, name, modifiedTime, properties)",
+        pageSize=1,
     )
     files = response.get("files", [])
     return files[0] if files else None
@@ -171,18 +205,13 @@ def _drive_list_files(service, folder_id: str, prefix: str = "") -> list[dict]:
     if prefix:
         safe_prefix = prefix.replace("'", "\\'")
         query += f" and name contains '{safe_prefix}'"
-    response = (
-        service.files()
-        .list(
-            q=query,
-            fields="files(id, name, modifiedTime, properties)",
-            orderBy="name desc",
-            corpora="allDrives",
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True,
-            pageSize=200,
-        )
-        .execute()
+    response = _drive_list_query(
+        service,
+        folder_id,
+        query,
+        fields="files(id, name, modifiedTime, properties)",
+        orderBy="name desc",
+        pageSize=200,
     )
     return response.get("files", [])
 
@@ -246,13 +275,19 @@ def test_drive_connection() -> str:
         folder_id = configured_data_dashboard_drive_folder_id()
         folder = (
             service.files()
-            .get(fileId=folder_id, fields="id, name", supportsAllDrives=True)
+            .get(fileId=folder_id, fields="id, name, driveId", supportsAllDrives=True)
             .execute()
         )
         existing_files = _drive_list_files(service, folder_id)
+        drive_note = (
+            f"Drive compartido detectado (driveId {folder['driveId']})."
+            if folder.get("driveId")
+            else "Esta carpeta NO está dentro de un Drive compartido (es de "
+            "Mi unidad) — confirma que sea la carpeta correcta."
+        )
         return (
             f"Conexión OK. Carpeta encontrada: '{folder.get('name', folder_id)}'. "
-            f"{len(existing_files)} archivo(s) existente(s) en ella."
+            f"{len(existing_files)} archivo(s) existente(s) en ella. {drive_note}"
         )
     except HttpError as exc:
         status = getattr(exc, "status_code", None) or getattr(
