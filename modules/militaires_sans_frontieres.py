@@ -22,6 +22,7 @@ from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 from mother_base_theme import render_system_stamp
+from modules.les_enfants_terribles import render_capped_dataframe, rows_to_csv_bytes
 
 
 def configured_data_dashboard_spreadsheet_id() -> str:
@@ -253,6 +254,99 @@ def test_drive_connection() -> str:
         return f"Error inesperado probando la conexión: {exc}"
 
 
+def upload_daily_snapshot(
+    file_bytes: bytes, filename: str, uploaded_by: str
+) -> tuple[str, dict[str, Any]]:
+    """Parsea, valida, y sube el snapshot del día a Drive (RAW_<fecha>.csv,
+    sobreescribe si ya se subió algo ese mismo día), y actualiza el rollup
+    histórico con el resumen de ese día. Devuelve (fecha, resumen_del_día).
+
+    No usa caché — cada subida debe golpear Drive de verdad.
+    """
+    df = parse_daily_snapshot(file_bytes, filename)
+    date_str = snapshot_date(df)
+    if not date_str:
+        raise SnapshotValidationError("No pude determinar la fecha (columna DATE vacía).")
+
+    service = get_drive_service()
+    folder_id = configured_data_dashboard_drive_folder_id()
+
+    raw_csv_bytes = df.write_csv().encode("utf-8")
+    uploaded_at = datetime.now(timezone.utc).isoformat()
+    _drive_upload_or_replace(
+        service,
+        folder_id,
+        f"{RAW_FILENAME_PREFIX}{date_str}.csv",
+        raw_csv_bytes,
+        mime_type="text/csv",
+        properties={"uploaded_by": uploaded_by, "uploaded_at": uploaded_at},
+    )
+
+    rollup_row = build_rollup_row(df, date_str)
+    _append_rollup_row(service, folder_id, rollup_row)
+
+    return date_str, rollup_row
+
+
+def _append_rollup_row(service, folder_id: str, new_row: dict[str, Any]) -> None:
+    """Agrega o actualiza la fila de un día en ROLLUP.csv. Si el archivo no
+    existe todavía, lo crea con esa sola fila. Si el día ya tenía una fila
+    (re-subida del mismo día), la reemplaza en vez de duplicarla."""
+    existing = _drive_find_file(service, folder_id, ROLLUP_FILENAME)
+    rows: list[dict[str, Any]] = []
+    if existing:
+        raw = _drive_download(service, existing["id"])
+        rows = pl.read_csv(io.BytesIO(raw)).to_dicts()
+    rows = [row for row in rows if row.get("FECHA") != new_row["FECHA"]]
+    rows.append(new_row)
+    rows.sort(key=lambda row: row["FECHA"])
+    updated_df = pl.DataFrame(rows)
+    _drive_upload_or_replace(
+        service, folder_id, ROLLUP_FILENAME, updated_df.write_csv().encode("utf-8")
+    )
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def list_available_snapshot_dates() -> list[str]:
+    """Fechas (YYYY-MM-DD) de los snapshots RAW disponibles en Drive, más
+    reciente primero."""
+    service = get_drive_service()
+    folder_id = configured_data_dashboard_drive_folder_id()
+    files = _drive_list_files(service, folder_id, prefix=RAW_FILENAME_PREFIX)
+    dates = []
+    for f in files:
+        name = f["name"]
+        if name.startswith(RAW_FILENAME_PREFIX) and name.endswith(".csv"):
+            dates.append(name[len(RAW_FILENAME_PREFIX):-4])
+    return sorted(dates, reverse=True)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def read_snapshot_for_date(date_str: str) -> pl.DataFrame:
+    """Descarga y parsea el snapshot RAW de una fecha específica."""
+    service = get_drive_service()
+    folder_id = configured_data_dashboard_drive_folder_id()
+    filename = f"{RAW_FILENAME_PREFIX}{date_str}.csv"
+    found = _drive_find_file(service, folder_id, filename)
+    if not found:
+        raise RuntimeError(f"No existe un snapshot subido para {date_str}.")
+    raw = _drive_download(service, found["id"])
+    return parse_daily_snapshot(raw, filename)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def read_rollup_history() -> list[dict]:
+    """Lee el rollup histórico completo (chico, un renglón por día) para
+    alimentar la tendencia. Lista vacía si todavía no existe."""
+    service = get_drive_service()
+    folder_id = configured_data_dashboard_drive_folder_id()
+    found = _drive_find_file(service, folder_id, ROLLUP_FILENAME)
+    if not found:
+        return []
+    raw = _drive_download(service, found["id"])
+    return pl.read_csv(io.BytesIO(raw)).sort("FECHA").to_dicts()
+
+
 # --- PALETA OBLIGATORIA (Brutalismo táctico de Mother Base) ---
 INK = "#111111"
 ACID = "#D4FF2A"
@@ -324,6 +418,215 @@ def _number(value: object) -> float:
         return float(value or 0)
     except (TypeError, ValueError):
         return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Snapshot diario de Snowflake (grano producto-tienda) — reemplaza el Sheet
+# viejo (CURRENT_DATE/28D) como fuente real. Diseñado para ~200K filas/día:
+# todo el procesamiento pesado usa polars, nunca listas de dicts de Python.
+# ---------------------------------------------------------------------------
+
+# Columnas que el dashboard necesita sí o sí. Si faltan, se rechaza el
+# archivo con un mensaje claro en vez de fallar más adelante con un
+# KeyError críptico en medio de una agregación.
+SNAPSHOT_REQUIRED_COLUMNS = {
+    "DATE", "CITY", "WAREHOUSE_ID", "WAREHOUSE_NAME", "PRODUCT_ID",
+    "PRODUCT_NAME", "MACRO_CATEGORY", "CATEGORY", "SUB_CATEGORY", "MAKER",
+    "FINAL_PROVEEDOR_NAME", "BLOCKING_REASON", "IS_INFALTABLE", "IS_GOLDEN",
+    "IS_ANCHOR", "STOCK_UNITS", "ADU", "AVL_COUNTRY", "SWA_COUNTRY",
+    "AVL_CITY", "SWA_CITY", "AVL_WH", "SWA_WH", "COMENTARIO",
+}
+
+# Columnas numéricas: se fuerzan a float al leer, cualquier valor no
+# parseable (vacío, texto) se vuelve null sin tronar la carga completa.
+SNAPSHOT_NUMERIC_COLUMNS = [
+    "STOCK_UNITS", "FULL_SALES_28", "FULL_SALES_56", "AVG_SALES", "ADU",
+    "AVL_LAST_DAY", "SWA_COUNTRY", "SWA_CITY", "SWA_WH", "SWA_MAKER_COUNTRY",
+    "SWA_MAKER_CITY", "SWA_MAKER_WH", "SWA_PROVEEDOR_COUNTRY",
+    "SWA_PROVEEDOR_CITY", "SWA_PROVEEDOR_WH", "AVL_COUNTRY", "AVL_CITY",
+    "AVL_WH", "AVL_MAKER_COUNTRY", "AVL_MAKER_CITY", "AVL_MAKER_WH",
+    "AVL_PROVEEDOR_COUNTRY", "AVL_PROVEEDOR_CITY", "AVL_PROVEEDOR_WH",
+    "AVL_28D", "INCOMING_TOTAL", "STOCK_CEDIS_444", "STOCK_CEDIS_831",
+    "STOCK_CEDIS_811", "STOCK_CEDIS_834", "INCOMING_CEDIS_TOTAL",
+]
+
+
+class SnapshotValidationError(ValueError):
+    """El archivo subido no tiene la forma que el dashboard espera."""
+
+
+def parse_daily_snapshot(file_bytes: bytes, filename: str) -> pl.DataFrame:
+    """Lee el export diario de Snowflake (CSV, el formato real confirmado
+    con la muestra) a un DataFrame de polars, valida columnas mínimas y
+    normaliza tipos. No agrega ni resume nada — eso lo hacen las funciones
+    build_* de abajo, cada una sobre este mismo DataFrame ya limpio."""
+    lower_name = filename.lower()
+    try:
+        if lower_name.endswith((".xlsx", ".xls")):
+            df = pl.read_excel(io.BytesIO(file_bytes))
+        else:
+            df = pl.read_csv(
+                io.BytesIO(file_bytes),
+                infer_schema_length=0,  # todo string primero; se tipa explícito abajo
+                encoding="utf8-lossy",
+            )
+    except Exception as exc:
+        raise SnapshotValidationError(
+            f"No pude leer el archivo como CSV/Excel: {exc}"
+        ) from exc
+
+    if df.is_empty():
+        raise SnapshotValidationError("El archivo no tiene filas.")
+
+    missing = SNAPSHOT_REQUIRED_COLUMNS - set(df.columns)
+    if missing:
+        raise SnapshotValidationError(
+            "Al archivo le faltan columnas que el dashboard necesita: "
+            f"{', '.join(sorted(missing))}."
+        )
+
+    numeric_present = [c for c in SNAPSHOT_NUMERIC_COLUMNS if c in df.columns]
+    df = df.with_columns(
+        [
+            pl.col(c).cast(pl.Float64, strict=False).fill_null(0.0)
+            for c in numeric_present
+        ]
+    )
+    for bool_col in ("IS_INFALTABLE", "IS_GOLDEN", "IS_ANCHOR", "IS_BLACKLIST"):
+        if bool_col in df.columns:
+            df = df.with_columns(
+                (pl.col(bool_col).str.to_uppercase() == "YES").alias(bool_col)
+            )
+    return df
+
+
+def snapshot_date(df: pl.DataFrame) -> str:
+    """La fecha del snapshot, tal como viene en la columna DATE (se asume
+    un solo día por archivo, que es el contrato acordado con negocio)."""
+    values = df.get_column("DATE").unique().to_list()
+    return str(values[0]) if values else ""
+
+
+def build_country_kpis(df: pl.DataFrame) -> dict[str, float]:
+    """AVL/SWA país: ya vienen calculados y repetidos en cada fila, así que
+    basta con tomar el primer valor no nulo, no hay que promediar nada."""
+    if df.is_empty():
+        return {"AVL_COUNTRY": 0.0, "SWA_COUNTRY": 0.0}
+    first = df.row(0, named=True)
+    return {
+        "AVL_COUNTRY": _number(first.get("AVL_COUNTRY")),
+        "SWA_COUNTRY": _number(first.get("SWA_COUNTRY")),
+    }
+
+
+def build_city_breakdown(df: pl.DataFrame) -> list[dict]:
+    """Una fila por CITY con su AVL/SWA ya calculado (mismo insumo que
+    antes alimentaba el waterfall) — compatible tal cual con
+    _build_waterfall, que espera CITY + SWA_CITY."""
+    if df.is_empty():
+        return []
+    grouped = (
+        df.group_by("CITY")
+        .agg(pl.col("AVL_CITY").first(), pl.col("SWA_CITY").first())
+        .sort("SWA_CITY")
+    )
+    return grouped.to_dicts()
+
+
+def build_blocking_reason_breakdown(df: pl.DataFrame) -> list[dict]:
+    """Cuántas líneas caen en cada BLOCKING_REASON, con un comentario de
+    ejemplo real para dar contexto sin tener que abrir el detalle."""
+    if df.is_empty():
+        return []
+    grouped = (
+        df.filter(pl.col("BLOCKING_REASON").is_not_null())
+        .group_by("BLOCKING_REASON")
+        .agg(
+            pl.len().alias("LINEAS"),
+            pl.col("COMENTARIO").drop_nulls().first().alias("EJEMPLO_COMENTARIO"),
+        )
+        .sort("LINEAS", descending=True)
+    )
+    return grouped.to_dicts()
+
+
+def build_stockout_rate_breakdown(df: pl.DataFrame, group_col: str) -> list[dict]:
+    """% de líneas con STOCK_UNITS = 0 por categoría/maker/proveedor.
+
+    Deliberadamente NO se llama SWA: SWA por país/ciudad/tienda ya viene
+    calculado por Snowflake con su propia fórmula de ponderación (por
+    venta, seguramente), pero esa fórmula no existe a nivel categoría/maker/
+    proveedor en los datos que llegan — inventarla aquí sería adivinar un
+    número que alguien podría tomar como oficial. Este es un proxy honesto
+    y 100% verificable: cuántas líneas están literalmente en cero.
+    """
+    if df.is_empty() or group_col not in df.columns:
+        return []
+    grouped = (
+        df.group_by(group_col)
+        .agg(
+            pl.len().alias("LINEAS_TOTALES"),
+            (pl.col("STOCK_UNITS") <= 0).sum().alias("LINEAS_EN_QUIEBRE"),
+        )
+        .with_columns(
+            (pl.col("LINEAS_EN_QUIEBRE") / pl.col("LINEAS_TOTALES") * 100)
+            .round(1)
+            .alias("PCT_EN_QUIEBRE")
+        )
+        .sort("PCT_EN_QUIEBRE", descending=True)
+    )
+    return grouped.to_dicts()
+
+
+def build_drilldown_rows(
+    df: pl.DataFrame,
+    *,
+    city: str | None = None,
+    macro_category: str | None = None,
+    maker: str | None = None,
+    proveedor: str | None = None,
+    only_blocked: bool = False,
+    only_golden_infaltable_anchor: bool = False,
+) -> list[dict]:
+    """Detalle producto-tienda filtrado — esto es lo que responde "¿dónde
+    exactamente está el problema?". Se filtra en polars (rápido incluso con
+    200K filas) y el resultado ya capado (render_capped_dataframe) es lo
+    único que se manda al navegador."""
+    result = df
+    if city:
+        result = result.filter(pl.col("CITY") == city)
+    if macro_category:
+        result = result.filter(pl.col("MACRO_CATEGORY") == macro_category)
+    if maker:
+        result = result.filter(pl.col("MAKER") == maker)
+    if proveedor:
+        result = result.filter(pl.col("FINAL_PROVEEDOR_NAME") == proveedor)
+    if only_blocked:
+        result = result.filter(pl.col("BLOCKING_REASON").is_not_null())
+    if only_golden_infaltable_anchor:
+        result = result.filter(
+            pl.col("IS_GOLDEN") | pl.col("IS_INFALTABLE") | pl.col("IS_ANCHOR")
+        )
+    columns = [
+        "CITY", "WAREHOUSE_NAME", "PRODUCT_ID", "PRODUCT_NAME",
+        "MACRO_CATEGORY", "MAKER", "FINAL_PROVEEDOR_NAME", "STOCK_UNITS",
+        "ADU", "SWA_WH", "AVL_WH", "BLOCKING_REASON", "COMENTARIO",
+    ]
+    columns = [c for c in columns if c in result.columns]
+    return result.select(columns).sort("SWA_WH").to_dicts()
+
+
+def build_rollup_row(df: pl.DataFrame, date_str: str) -> dict[str, Any]:
+    """Una sola fila resumen del día completo, para acumular en el rollup
+    histórico de Drive. Grano: un día = una fila (tendencia país)."""
+    kpis = build_country_kpis(df)
+    return {
+        "FECHA": date_str,
+        "AVL": round(kpis["AVL_COUNTRY"], 2),
+        "SWA": round(kpis["SWA_COUNTRY"], 2),
+        "FILAS": df.height,
+    }
+
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _load_metrics(payload: bytes) -> tuple[list[dict], list[dict]]:
@@ -678,15 +981,15 @@ def render() -> None:
         <section class="mb-hero" style="margin-bottom: 30px;">
             <span class="msf-badge bg-ok" style="margin-bottom:15px; display:inline-block;">MILITAIRES SANS FRONTIÈRES</span>
             <h1 style="font-size: 3.5rem; line-height: 0.9; margin: 0 0 15px 0;">NETWORK<br>PERFORMANCE.</h1>
-            <p style="font-size: 1rem; max-width: 650px; font-weight: 600;">Control táctico de disponibilidad (AVL), impacto de quiebres (SWA) y planes de acción para la red operativa.</p>
+            <p style="font-size: 1rem; max-width: 650px; font-weight: 600;">Control táctico de disponibilidad (AVL), impacto de quiebres (SWA) y detalle producto-tienda para saber exactamente qué accionar.</p>
         </section>
         """,
         unsafe_allow_html=True,
     )
 
-    # --- Diagnóstico de conexión a Drive (solo Big Boss, temporal mientras
-    # se construye la carga diaria completa encima de esta base). ---
-    if st.session_state.get("mb_profile") == "BIG BOSS":
+    is_big_boss = st.session_state.get("mb_profile") == "BIG BOSS"
+
+    if is_big_boss:
         with st.expander("🔧 Conexión a Drive (diagnóstico)", expanded=False):
             st.caption(
                 "Prueba que la cuenta de servicio pueda alcanzar el Drive "
@@ -700,153 +1003,226 @@ def render() -> None:
                 else:
                     st.error(result_message)
 
-    with st.spinner("SINCRONIZANDO INTELIGENCIA DE RED…"):
+        with st.expander("📤 Cargar snapshot diario", expanded=False):
+            st.caption(
+                "Sube el export de Snowflake del día (CSV). Se guarda "
+                "completo en Drive y se agrega un resumen a la tendencia "
+                "histórica. Si ya subiste algo hoy, esto lo reemplaza."
+            )
+            uploaded_file = st.file_uploader(
+                "Archivo CSV", type=["csv"], key="msf_snapshot_upload"
+            )
+            uploader_name = st.text_input(
+                "Tu nombre (queda registrado con la carga)",
+                key="msf_uploader_name",
+            )
+            if st.button("Subir a Drive", key="msf_upload_button"):
+                if uploaded_file is None:
+                    st.warning("Selecciona un archivo primero.")
+                elif not uploader_name.strip():
+                    st.warning("Escribe tu nombre antes de subir.")
+                else:
+                    with st.spinner("Subiendo y procesando…"):
+                        try:
+                            date_str, rollup_row = upload_daily_snapshot(
+                                uploaded_file.getvalue(),
+                                uploaded_file.name,
+                                uploader_name.strip(),
+                            )
+                        except SnapshotValidationError as exc:
+                            st.error(f"Archivo rechazado: {exc}")
+                        except Exception as exc:
+                            st.error(f"No pude subir el snapshot: {exc}")
+                        else:
+                            st.success(
+                                f"Snapshot del {date_str} subido y procesado "
+                                f"({rollup_row['FILAS']:,} filas, AVL "
+                                f"{rollup_row['AVL']:.2f}%, SWA "
+                                f"{rollup_row['SWA']:.2f}%)."
+                            )
+                            list_available_snapshot_dates.clear()
+                            read_snapshot_for_date.clear()
+                            read_rollup_history.clear()
+                            st.rerun()
+
+    try:
+        available_dates = list_available_snapshot_dates()
+    except Exception as exc:
+        st.markdown(
+            f'<div class="msf-error-card">⚠ No pude listar los snapshots '
+            f'disponibles en Drive: {html.escape(str(exc))}</div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    if not available_dates:
+        st.markdown(
+            '<div class="msf-error-card">⚠ Todavía no hay ningún snapshot '
+            "cargado. Un Big Boss debe subir el primero desde "
+            '"Cargar snapshot diario".</div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    col_date, col_refresh = st.columns([3, 1])
+    selected_date = col_date.selectbox(
+        "FECHA DEL SNAPSHOT", available_dates, index=0, key="msf_selected_date"
+    )
+    col_refresh.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True)
+    if col_refresh.button("ACTUALIZAR", key="msf_refresh"):
+        list_available_snapshot_dates.clear()
+        read_snapshot_for_date.clear()
+        read_rollup_history.clear()
+        st.rerun()
+
+    with st.spinner("CARGANDO SNAPSHOT…"):
         try:
-            current, history = _load_metrics(_fetch_dashboard())
+            df = read_snapshot_for_date(selected_date)
         except Exception as exc:
-            st.markdown(f'<div class="msf-error-card">⚠ ERROR CRÍTICO: {html.escape(str(exc))}</div>', unsafe_allow_html=True)
-            if st.button("REINTENTAR SINCRONIZACIÓN", key="msf_refresh_error"):
-                _fetch_dashboard.clear(); _load_metrics.clear(); st.rerun()
+            st.markdown(
+                f'<div class="msf-error-card">⚠ ERROR CRÍTICO: '
+                f'{html.escape(str(exc))}</div>',
+                unsafe_allow_html=True,
+            )
             return
 
-    if not current or not history:
-        st.markdown('<div class="msf-error-card">⚠ DATA_DASHBOARD sin datos suficientes para renderizar el módulo.</div>', unsafe_allow_html=True)
+    if df.is_empty():
+        st.markdown(
+            '<div class="msf-error-card">⚠ El snapshot no tiene filas.</div>',
+            unsafe_allow_html=True,
+        )
         return
 
     # --- FILTROS TÁCTICOS ---
     with st.container(border=True, key="msf_filters"):
-        col1, col2, col3, col4 = st.columns([1.5, 1.5, 1.2, 1])
-        cities = sorted({str(row["CITY"]).strip() for row in current if row.get("CITY")})
+        col1, col2, col3, col4 = st.columns(4)
+        cities = sorted(df.get_column("CITY").drop_nulls().unique().to_list())
         selected_city = col1.selectbox("ZONA OPERATIVA", ["TODAS"] + cities)
+        categories = sorted(
+            df.get_column("MACRO_CATEGORY").drop_nulls().unique().to_list()
+        )
+        selected_category = col2.selectbox("CATEGORÍA", ["TODAS"] + categories)
+        makers = sorted(df.get_column("MAKER").drop_nulls().unique().to_list())
+        selected_maker = col3.selectbox("MAKER", ["TODOS"] + makers)
+        proveedores = sorted(
+            df.get_column("FINAL_PROVEEDOR_NAME").drop_nulls().unique().to_list()
+        )
+        selected_proveedor = col4.selectbox("PROVEEDOR", ["TODOS"] + proveedores)
 
-        bucket_options = sorted({str(row["BUCKET_TYPE"]).strip() for row in history if row.get("BUCKET_TYPE")})
-        selected_bucket = col2.selectbox("CATÁLOGO / BUCKET", bucket_options, index=bucket_options.index("GENERAL") if "GENERAL" in bucket_options else 0)
-        window_label = col3.selectbox("VENTANA HISTÓRICA", list(HISTORY_WINDOWS.keys()), index=2)
+    scoped = df
+    if selected_city != "TODAS":
+        scoped = scoped.filter(pl.col("CITY") == selected_city)
+    if selected_category != "TODAS":
+        scoped = scoped.filter(pl.col("MACRO_CATEGORY") == selected_category)
+    if selected_maker != "TODOS":
+        scoped = scoped.filter(pl.col("MAKER") == selected_maker)
+    if selected_proveedor != "TODOS":
+        scoped = scoped.filter(pl.col("FINAL_PROVEEDOR_NAME") == selected_proveedor)
 
-        col4.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True)
-        if col4.button("ACTUALIZAR", key="msf_refresh_filters"):
-            _fetch_dashboard.clear(); _load_metrics.clear(); st.rerun()
-
-    # Data Scoping
-    scope = [row for row in current if selected_city == "TODAS" or str(row["CITY"]).strip() == selected_city]
-    if not scope:
-        st.markdown('<div class="msf-error-card">⚠ Sin datos para esta zona operativa.</div>', unsafe_allow_html=True)
-        return
-        
-    first = current[0]
-    if selected_city == "TODAS":
-        avl, swa = _number(first["AVL_COUNTRY"]), _number(first["SWA_COUNTRY"])
-    else:
-        city_row = next((row for row in scope if row.get("AVL_CITY") is not None), scope[0])
-        avl, swa = _number(city_row["AVL_CITY"]), _number(city_row["SWA_CITY"])
-    warehouses_medidos = len({row["WAREHOUSE_ID"] for row in scope})
-
-    # --- SITUACIÓN ACTUAL ---
+    # --- SITUACIÓN ACTUAL (siempre a nivel país completo, sin importar
+    # los filtros — los filtros solo acotan las secciones de abajo) ---
+    kpis = build_country_kpis(df)
+    warehouses_medidos = df.get_column("WAREHOUSE_ID").n_unique()
+    avl_country_label = f"{kpis['AVL_COUNTRY']:.2f}%"
+    swa_country_label = f"{kpis['SWA_COUNTRY']:.2f}%"
     st.markdown("### SITUACIÓN ACTUAL")
     st.markdown(
         f'<div class="msf-kpi-row">'
-        f'{_kpi_card("AVL ACTUAL", f"{avl:.2f}%", "Available: % de SKUs del catálogo con inventario.", "kpi-acid")}'
-        f'{_kpi_card("SWA ACTUAL", f"{swa:.2f}%", "Stockout-Weighted Availability: disponibilidad ponderada por relevancia.", "kpi-blue")}'
-        f'{_kpi_card("NODOS ACTIVOS", f"{warehouses_medidos:,}", "Número de almacenes reportando inventario.", "")}'
-        f'</div>',
+        f'{_kpi_card("AVL PAÍS", avl_country_label, "Available: pct de SKUs del catálogo con inventario.", "kpi-acid")}'
+        f'{_kpi_card("SWA PAÍS", swa_country_label, "Stockout-Weighted Availability: disponibilidad ponderada por relevancia.", "kpi-blue")}'
+        f'{_kpi_card("NODOS MEDIDOS", f"{warehouses_medidos:,}", "Número de tiendas/almacenes en este snapshot.", "")}'
+        f'{_kpi_card("LÍNEAS TOTALES", f"{df.height:,}", "Filas producto-tienda en el snapshot completo.", "")}'
+        f"</div>",
         unsafe_allow_html=True,
     )
 
     # --- ANÁLISIS 360 (CHARTS) ---
     col_chart1, col_chart2 = st.columns(2)
-    
+
     with col_chart1:
-        st.markdown("### ANÁLISIS DE BRECHA (SWA)")
-        if selected_city == "TODAS":
-            fig_waterfall = _build_waterfall(current, swa)
-            if fig_waterfall:
-                st.plotly_chart(fig_waterfall, use_container_width=True, config={'displayModeBar': False})
-            else:
-                st.markdown('<div class="mb-card-solid">Red SWA al 100% o sin datos suficientes.</div>', unsafe_allow_html=True)
+        st.markdown("### ANÁLISIS DE BRECHA (SWA POR CIUDAD)")
+        city_data = build_city_breakdown(df)
+        fig_waterfall = _build_waterfall(city_data, kpis["SWA_COUNTRY"])
+        if fig_waterfall:
+            st.plotly_chart(fig_waterfall, use_container_width=True, config={"displayModeBar": False})
         else:
-            st.markdown('<div class="mb-card-solid"><p class="msf-note">El análisis de cascada (Bridge) opera a nivel país. Selecciona "TODAS" en Zona Operativa.</p></div>', unsafe_allow_html=True)
+            st.markdown('<div class="mb-card-solid">Red SWA al 100% o sin datos suficientes.</div>', unsafe_allow_html=True)
 
     with col_chart2:
-        st.markdown("### TENDENCIA HISTÓRICA")
-        rows = [r for r in history if str(r["BUCKET_TYPE"]).strip() == selected_bucket and (selected_city == "TODAS" or str(r["CITY"]).strip() == selected_city)]
-        by_day = defaultdict(list)
-        for r in rows: by_day[r["MAIN_DATE"]].append(r)
-        
-        trend = []
-        for day, items in sorted(by_day.items(), key=lambda item: item[0]):
-            trend.append({
-                "FECHA": day,
-                "AVL": round(sum(_number(x["AVL"]) for x in items) / len(items), 2),
-                "SWA": round(sum(_number(x["SWA"]) for x in items) / len(items), 2)
-            })
-        trend_window = trend[-HISTORY_WINDOWS[window_label]:]
-        
-        if trend_window:
-            st.plotly_chart(_build_trend(trend_window), use_container_width=True, config={'displayModeBar': False})
+        st.markdown("### TENDENCIA (acumulada por cada subida)")
+        rollup = read_rollup_history()
+        if len(rollup) >= 2:
+            st.plotly_chart(_build_trend(rollup[-28:]), use_container_width=True, config={"displayModeBar": False})
         else:
-            st.markdown('<div class="mb-card-solid">Sin datos históricos.</div>', unsafe_allow_html=True)
-
-    # --- LECTURA OPERATIVA ---
-    latest_day = max(by_day) if by_day else None
-    detail = []
-    if latest_day is not None:
-        for row in by_day[latest_day]:
-            detail.append({
-                "CIUDAD": str(row["CITY"] or "—"),
-                "WAREHOUSE": str(row["WAREHOUSE_NAME"] or "—"),
-                "AVL": _number(row["AVL"]),
-                "SWA": _number(row["SWA"]),
-                "SKUS": int(_number(row.get("SKUS_IN_BL")))
-            })
-        detail.sort(key=lambda r: (r["SWA"], r["AVL"]))
-
-    st.markdown("### PUNTOS CRÍTICOS (TOP 10)")
-    if detail:
-        rows_html = []
-        for r in detail[:10]:
-            avl_label, avl_class = _status(r["AVL"], AVL_HEALTHY, AVL_WARNING)
-            swa_label, swa_class = _status(r["SWA"], SWA_HEALTHY, SWA_WARNING)
-            rows_html.append(
-                f"<tr>"
-                f"<td>{html.escape(r['CIUDAD'])}</td>"
-                f"<td>{html.escape(r['WAREHOUSE'])}</td>"
-                f"<td>{r['AVL']:.1f}% <span class='msf-badge {avl_class}'>{avl_label}</span></td>"
-                f"<td>{r['SWA']:.1f}% <span class='msf-badge {swa_class}'>{swa_label}</span></td>"
-                f"<td>{r['SKUS']:,}</td>"
-                f"</tr>"
+            st.markdown(
+                '<div class="mb-card-solid">Necesitas al menos 2 días subidos '
+                "para que se vea la tendencia — sube el snapshot de mañana "
+                "para empezar a verla.</div>",
+                unsafe_allow_html=True,
             )
-        table_html = (
-            f'<div class="mb-card-solid" style="padding:0;">'
-            f"<table class='msf-table'>"
-            f"<thead><tr><th>Ciudad</th><th>Warehouse</th><th>AVL</th><th>SWA</th><th>SKUs Backlog</th></tr></thead>"
-            f"<tbody>{''.join(rows_html)}</tbody></table>"
-            f"</div>"
+
+    # --- MOTIVOS DE BLOQUEO ---
+    st.markdown("### MOTIVOS DE BLOQUEO")
+    reason_rows = build_blocking_reason_breakdown(scoped)
+    if reason_rows:
+        render_capped_dataframe(
+            reason_rows,
+            key="msf_blocking_reasons",
+            offer_download=True,
+            file_label=f"motivos_bloqueo_{selected_date}",
         )
-        st.markdown(table_html, unsafe_allow_html=True)
+    else:
+        st.markdown('<div class="mb-card-solid">Sin líneas bloqueadas en este filtro.</div>', unsafe_allow_html=True)
 
-    # --- INSIGHTS Y PLANES DE ACCIÓN AUTOMATIZADOS ---
-    st.markdown("### INTELIGENCIA Y PLANES DE ACCIÓN")
-    plans = []
-    
-    if len(trend) >= 2:
-        delta_swa = trend[-1]["SWA"] - trend[0]["SWA"]
-        if delta_swa < -1.5:
-            plans.append(f"🔴 <span class='msf-badge bg-crit'>ALERTA DE TENDENCIA</span><br>El SWA ha caído <b>{abs(delta_swa):.1f} pts</b> en la ventana actual. <b>ACCIÓN:</b> Revisar inbounds pendientes y mermas en centros de distribución clave.")
-        elif delta_swa > 1.5:
-            plans.append(f"🟢 <span class='msf-badge bg-ok'>RECUPERACIÓN</span><br>El SWA subió <b>{delta_swa:.1f} pts</b>. Consolidar el fill-rate actual.")
+    # --- % EN QUIEBRE POR CATEGORÍA / MAKER / PROVEEDOR ---
+    st.markdown("### % EN QUIEBRE (proxy directo, no es SWA)")
+    st.caption(
+        "SWA por país/ciudad/tienda ya viene calculado por Snowflake con su "
+        "propia fórmula de ponderación por venta. Esa fórmula no existe a "
+        "nivel categoría/maker/proveedor en los datos que llegan, así que "
+        "esto NO es SWA — es el % de líneas con 0 unidades de stock, un "
+        "número 100% verificable a partir de STOCK_UNITS."
+    )
+    tab_cat, tab_maker, tab_prov = st.tabs(["CATEGORÍA", "MAKER", "PROVEEDOR"])
+    with tab_cat:
+        render_capped_dataframe(
+            build_stockout_rate_breakdown(scoped, "MACRO_CATEGORY"),
+            key="msf_stockout_category",
+            offer_download=True,
+            file_label=f"quiebre_por_categoria_{selected_date}",
+        )
+    with tab_maker:
+        render_capped_dataframe(
+            build_stockout_rate_breakdown(scoped, "MAKER"),
+            key="msf_stockout_maker",
+            offer_download=True,
+            file_label=f"quiebre_por_maker_{selected_date}",
+        )
+    with tab_prov:
+        render_capped_dataframe(
+            build_stockout_rate_breakdown(scoped, "FINAL_PROVEEDOR_NAME"),
+            key="msf_stockout_proveedor",
+            offer_download=True,
+            file_label=f"quiebre_por_proveedor_{selected_date}",
+        )
 
-    if detail:
-        worst = detail[0]
-        if worst["SWA"] < SWA_WARNING:
-            plans.append(f"⚡ <span class='msf-badge bg-crit'>FOCO ROJO</span><br><b>{worst['WAREHOUSE']} ({worst['CIUDAD']})</b> tiene un SWA crítico de <b>{worst['SWA']:.1f}%</b>. <b>ACCIÓN:</b> Ejecutar cross-docking urgente para el top 20% de SKUs generadores de venta.")
-
-    for r in detail[:5]:
-        if r["AVL"] >= AVL_HEALTHY and r["SWA"] < SWA_WARNING:
-            plans.append(f"🔍 <span class='msf-badge bg-warn'>DESALINEACIÓN DE INVENTARIO</span><br>En <b>{r['WAREHOUSE']}</b>, el AVL es sano ({r['AVL']:.1f}%) pero el SWA es pobre ({r['SWA']:.1f}%). <b>ACCIÓN:</b> Depurar el catálogo local; hay exceso de inventario inmovilizado, mientras que los top sellers están en quiebre.")
-            break
-
-    if not plans:
-        plans.append("🛡️ <span class='msf-badge bg-blue'>RED ESTABLE</span><br>Los KPIs se mantienen en rangos operativos. Mantener monitoreo de desviaciones.")
-
-    cards = "".join(f'<div class="mb-card-solid" style="margin-bottom:15px; font-size: 0.9rem; line-height: 1.5;">{p}</div>' for p in plans)
-    st.markdown(cards, unsafe_allow_html=True)
+    # --- DETALLE PRODUCTO-TIENDA: "¿dónde exactamente está el problema?" ---
+    st.markdown("### DETALLE PRODUCTO-TIENDA")
+    col_flag1, col_flag2 = st.columns(2)
+    only_blocked = col_flag1.checkbox("Solo líneas con motivo de bloqueo", key="msf_only_blocked")
+    only_gia = col_flag2.checkbox("Solo Golden/Infaltable/Anchor", key="msf_only_gia")
+    drilldown_rows = build_drilldown_rows(
+        df,
+        city=None if selected_city == "TODAS" else selected_city,
+        macro_category=None if selected_category == "TODAS" else selected_category,
+        maker=None if selected_maker == "TODOS" else selected_maker,
+        proveedor=None if selected_proveedor == "TODOS" else selected_proveedor,
+        only_blocked=only_blocked,
+        only_golden_infaltable_anchor=only_gia,
+    )
+    render_capped_dataframe(
+        drilldown_rows,
+        key="msf_drilldown",
+        offer_download=True,
+        file_label=f"detalle_producto_tienda_{selected_date}",
+    )
