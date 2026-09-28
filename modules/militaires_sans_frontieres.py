@@ -7,8 +7,10 @@ from datetime import datetime, timezone
 from typing import Any
 import html
 import io
+import json
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 
@@ -17,6 +19,7 @@ import polars as pl
 import plotly.graph_objects as go
 import streamlit as st
 from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials as OAuthUserCredentials
 from googleapiclient.discovery import build as build_drive_service
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
@@ -99,23 +102,182 @@ def _drive_service_account_info() -> dict | None:
         ) from exc
 
 
+def configured_impersonate_email() -> str:
+    """Correo de Workspace que la cuenta de servicio suplanta vía Domain-
+    Wide Delegation. Vacío = sin suplantación, la cuenta de servicio actúa
+    con su propia identidad (el comportamiento original, que topa con
+    políticas de DLP atadas a etiquetas de clasificación como
+    "Confidential" — ver README)."""
+    try:
+        return str(st.secrets.get("DATA_DASHBOARD_IMPERSONATE_EMAIL", ""))
+    except Exception:
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# OAuth de usuario (alternativa cuando no hay admin de Workspace disponible
+# para autorizar Domain-Wide Delegation). El usuario autoriza la app UNA
+# VEZ con su propia cuenta de Google; el refresh token resultante se guarda
+# en Secrets y desde entonces la app actúa exactamente con los permisos de
+# ese usuario — incluye archivos que una cuenta de servicio no puede ver
+# por políticas de DLP/clasificación, porque ya no es una cuenta de
+# servicio, es literalmente el usuario.
+# ---------------------------------------------------------------------------
+
+OAUTH_SCOPE = "https://www.googleapis.com/auth/drive"
+OAUTH_AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
+OAUTH_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
+
+
+def configured_oauth_client_id() -> str:
+    try:
+        return str(st.secrets.get("DATA_DASHBOARD_OAUTH_CLIENT_ID", ""))
+    except Exception:
+        return ""
+
+
+def configured_oauth_client_secret() -> str:
+    try:
+        return str(st.secrets.get("DATA_DASHBOARD_OAUTH_CLIENT_SECRET", ""))
+    except Exception:
+        return ""
+
+
+def configured_oauth_redirect_uri() -> str:
+    try:
+        return str(st.secrets.get("DATA_DASHBOARD_OAUTH_REDIRECT_URI", ""))
+    except Exception:
+        return ""
+
+
+def configured_oauth_refresh_token() -> str:
+    """El token de larga duración obtenido tras la autorización única. Su
+    presencia es lo que activa el modo "actuar como el usuario" en
+    get_drive_service — mientras no esté, la app sigue usando la cuenta de
+    servicio (con o sin suplantación) como hoy."""
+    try:
+        return str(st.secrets.get("DATA_DASHBOARD_OAUTH_REFRESH_TOKEN", ""))
+    except Exception:
+        return ""
+
+
+def oauth_is_configured() -> bool:
+    return bool(
+        configured_oauth_client_id()
+        and configured_oauth_client_secret()
+        and configured_oauth_redirect_uri()
+    )
+
+
+def build_oauth_authorization_url() -> str:
+    """URL de Google donde el usuario inicia sesión y autoriza la app.
+    ``access_type=offline`` es lo que hace que Google entregue un refresh
+    token (no solo un access token de una hora); ``prompt=consent`` fuerza
+    a que SIEMPRE lo entregue, incluso si el usuario ya había autorizado
+    la app antes (si no se fuerza, Google a veces omite el refresh token
+    en autorizaciones repetidas)."""
+    params = {
+        "client_id": configured_oauth_client_id(),
+        "redirect_uri": configured_oauth_redirect_uri(),
+        "response_type": "code",
+        "scope": OAUTH_SCOPE,
+        "access_type": "offline",
+        "prompt": "consent",
+    }
+    return f"{OAUTH_AUTH_ENDPOINT}?{urllib.parse.urlencode(params)}"
+
+
+def exchange_oauth_code_for_tokens(code: str) -> dict[str, Any]:
+    """Intercambia el código de autorización (que Google regresó en la URL
+    de redirección) por tokens — el paso final del flujo, ejecutado una
+    sola vez. Devuelve el JSON completo de Google; lo que a nosotros nos
+    importa es la llave "refresh_token"."""
+    payload = urllib.parse.urlencode(
+        {
+            "code": code,
+            "client_id": configured_oauth_client_id(),
+            "client_secret": configured_oauth_client_secret(),
+            "redirect_uri": configured_oauth_redirect_uri(),
+            "grant_type": "authorization_code",
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        OAUTH_TOKEN_ENDPOINT,
+        data=payload,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"Google rechazó el intercambio de código (HTTP {exc.code}): "
+            f"{error_body}"
+        ) from exc
+
+
 def get_drive_service():
-    """Construye el cliente de la API de Drive v3 con la cuenta de servicio.
+    """Construye el cliente de la API de Drive v3.
+
+    Prioridad de autenticación:
+    1. Si hay un refresh token de OAuth de usuario configurado (obtenido
+       una vez vía el flujo de "Conectar mi cuenta personal de Google"),
+       se usa ese — la app actúa exactamente como ese usuario, con sus
+       mismos permisos. No requiere ninguna acción de un admin de
+       Workspace.
+    2. Si no, cae a la cuenta de servicio [gcp_service_account]. Si además
+       DATA_DASHBOARD_IMPERSONATE_EMAIL está configurado, la cuenta de
+       servicio suplanta a ese usuario (Domain-Wide Delegation) — esto SÍ
+       requiere que un admin de Workspace haya autorizado el Client ID de
+       la cuenta de servicio en Admin Console → Seguridad → Controles de
+       API → Delegación en todo el dominio, con el scope de Drive.
 
     Lanza RuntimeError con un mensaje claro (no una excepción críptica de
     Google) si falta cualquier pieza de configuración, para que el error se
     entienda sin tener que leer el traceback.
     """
-    info = _drive_service_account_info()
-    if not info:
-        raise RuntimeError(
-            "Falta configurar [gcp_service_account] en Secrets. Ver "
-            ".streamlit/secrets.toml.example."
-        )
     folder_id = configured_data_dashboard_drive_folder_id()
     if not folder_id:
         raise RuntimeError(
             "Falta configurar DATA_DASHBOARD_DRIVE_FOLDER_ID en Secrets."
+        )
+
+    refresh_token = configured_oauth_refresh_token()
+    if refresh_token:
+        if not (configured_oauth_client_id() and configured_oauth_client_secret()):
+            raise RuntimeError(
+                "Hay un DATA_DASHBOARD_OAUTH_REFRESH_TOKEN en Secrets, pero "
+                "faltan DATA_DASHBOARD_OAUTH_CLIENT_ID/CLIENT_SECRET — los "
+                "tres van juntos."
+            )
+        try:
+            credentials = OAuthUserCredentials(
+                None,
+                refresh_token=refresh_token,
+                client_id=configured_oauth_client_id(),
+                client_secret=configured_oauth_client_secret(),
+                token_uri=OAUTH_TOKEN_ENDPOINT,
+                scopes=[OAUTH_SCOPE],
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"El refresh token de OAuth configurado no es válido: {exc}"
+            ) from exc
+        try:
+            return build_drive_service(
+                "drive", "v3", credentials=credentials, cache_discovery=False
+            )
+        except Exception as exc:
+            raise RuntimeError(f"No pude iniciar el cliente de Drive: {exc}") from exc
+
+    info = _drive_service_account_info()
+    if not info:
+        raise RuntimeError(
+            "Falta configurar [gcp_service_account] en Secrets (o, en su "
+            "lugar, DATA_DASHBOARD_OAUTH_REFRESH_TOKEN). Ver "
+            ".streamlit/secrets.toml.example."
         )
     try:
         credentials = service_account.Credentials.from_service_account_info(
@@ -126,6 +288,15 @@ def get_drive_service():
             "Las credenciales de [gcp_service_account] no son válidas: "
             f"{exc}"
         ) from exc
+    impersonate_email = configured_impersonate_email()
+    if impersonate_email:
+        try:
+            credentials = credentials.with_subject(impersonate_email)
+        except Exception as exc:
+            raise RuntimeError(
+                f"No pude configurar la suplantación de {impersonate_email}: "
+                f"{exc}"
+            ) from exc
     try:
         return build_drive_service(
             "drive", "v3", credentials=credentials, cache_discovery=False
@@ -319,6 +490,18 @@ def test_drive_connection() -> str:
     lanza una excepción cruda a la UI."""
     try:
         service = get_drive_service()
+        impersonate_email = configured_impersonate_email()
+        identity_note = (
+            "Actuando vía OAuth de usuario (conectado con una cuenta "
+            "personal, no con la cuenta de servicio)."
+            if configured_oauth_refresh_token()
+            else (
+                f"Actuando como {impersonate_email} (suplantación activa)."
+                if impersonate_email
+                else "Actuando con la identidad propia de la cuenta de "
+                "servicio (sin suplantación configurada)."
+            )
+        )
         folder_id = configured_data_dashboard_drive_folder_id()
         folder = (
             service.files()
@@ -333,8 +516,9 @@ def test_drive_connection() -> str:
             "Mi unidad) — confirma que sea la carpeta correcta."
         )
         return (
-            f"Conexión OK. Carpeta encontrada: '{folder.get('name', folder_id)}'. "
-            f"{len(existing_files)} archivo(s) existente(s) en ella. {drive_note}"
+            f"Conexión OK. {identity_note} Carpeta encontrada: "
+            f"'{folder.get('name', folder_id)}'. {len(existing_files)} "
+            f"archivo(s) existente(s) en ella. {drive_note}"
         )
     except HttpError as exc:
         status = getattr(exc, "status_code", None) or getattr(
@@ -1149,6 +1333,67 @@ def render() -> None:
                         st.success(direct_result)
                     else:
                         st.error(direct_result)
+
+        with st.expander("🔑 Conectar mi cuenta personal de Google (OAuth)", expanded=False):
+            st.caption(
+                "Alternativa a la cuenta de servicio, para cuando políticas "
+                "de DLP/clasificación bloquean su acceso y no hay un admin "
+                "de Workspace disponible para autorizar Domain-Wide "
+                "Delegation. Autorizas una sola vez con tu propia cuenta; "
+                "la app queda actuando con tus permisos exactos desde "
+                "entonces, guardando un token en Secrets."
+            )
+            if not oauth_is_configured():
+                st.warning(
+                    "Falta configurar DATA_DASHBOARD_OAUTH_CLIENT_ID, "
+                    "DATA_DASHBOARD_OAUTH_CLIENT_SECRET y "
+                    "DATA_DASHBOARD_OAUTH_REDIRECT_URI en Secrets antes de "
+                    "poder usar este flujo."
+                )
+            else:
+                oauth_code = st.query_params.get("code")
+                if oauth_code:
+                    st.info(
+                        "Google te regresó con un código de autorización. "
+                        "Dale clic abajo para intercambiarlo por el token "
+                        "final — esto solo funciona una vez por código."
+                    )
+                    if st.button("Completar conexión", key="msf_oauth_exchange"):
+                        with st.spinner("Intercambiando código por tokens…"):
+                            try:
+                                tokens = exchange_oauth_code_for_tokens(oauth_code)
+                            except RuntimeError as exc:
+                                st.error(str(exc))
+                            else:
+                                refresh_token = tokens.get("refresh_token")
+                                if not refresh_token:
+                                    st.error(
+                                        "Google no regresó un refresh_token. "
+                                        "Esto pasa si ya habías autorizado "
+                                        "esta app antes sin 'prompt=consent' "
+                                        "— ve a myaccount.google.com/"
+                                        "permissions, quita el acceso de "
+                                        "esta app, y vuelve a intentar desde "
+                                        "el botón de conectar."
+                                    )
+                                else:
+                                    st.success(
+                                        "¡Listo! Copia este refresh token "
+                                        "completo y pégalo en Secrets como "
+                                        "DATA_DASHBOARD_OAUTH_REFRESH_TOKEN, "
+                                        "luego reinicia la app:"
+                                    )
+                                    st.code(refresh_token, language=None)
+                                    st.caption(
+                                        "Este token no se vuelve a mostrar — "
+                                        "cópialo ahora."
+                                    )
+                        st.query_params.clear()
+                else:
+                    auth_url = build_oauth_authorization_url()
+                    st.link_button(
+                        "Conectar mi cuenta personal de Google", auth_url
+                    )
 
         with st.expander("📤 Cargar snapshot diario", expanded=False):
             st.caption(
