@@ -71,14 +71,32 @@ def configured_data_dashboard_drive_folder_id() -> str:
 
 
 def _drive_service_account_info() -> dict | None:
-    """Lee el bloque [gcp_service_account] de Secrets como dict plano."""
+    """Lee el bloque [gcp_service_account] de Secrets como dict plano.
+
+    A propósito NO atrapa cualquier excepción en silencio: si la tabla
+    existe pero algo en ella truena (una llave TOML mal formada, por
+    ejemplo), eso debe verse en el mensaje de error real en vez de
+    disfrazarse siempre como "falta configurar" — ese mensaje genérico solo
+    debe aparecer cuando la tabla de verdad no está.
+    """
     try:
-        raw = st.secrets.get("gcp_service_account")
-    except Exception:
+        available_keys = list(st.secrets.keys())
+    except Exception as exc:
+        raise RuntimeError(
+            f"No pude leer Secrets en absoluto (TOML inválido a nivel "
+            f"archivo, revisa que todo el secrets.toml tenga sintaxis "
+            f"correcta): {exc}"
+        ) from exc
+    if "gcp_service_account" not in available_keys:
         return None
-    if not raw:
-        return None
-    return dict(raw)
+    try:
+        raw = st.secrets["gcp_service_account"]
+        return dict(raw)
+    except Exception as exc:
+        raise RuntimeError(
+            "La tabla [gcp_service_account] existe en Secrets, pero no se "
+            f"pudo leer correctamente — revisa su formato TOML: {exc}"
+        ) from exc
 
 
 def get_drive_service():
@@ -501,10 +519,30 @@ def parse_daily_snapshot(file_bytes: bytes, filename: str) -> pl.DataFrame:
 
 
 def snapshot_date(df: pl.DataFrame) -> str:
-    """La fecha del snapshot, tal como viene en la columna DATE (se asume
-    un solo día por archivo, que es el contrato acordado con negocio)."""
+    """La fecha del snapshot, normalizada a YYYY-MM-DD sin importar el
+    formato en que Snowflake la exportó (se asume un solo día por archivo,
+    que es el contrato acordado con negocio).
+
+    El export real trae DATE como texto "28/09/2026" (DD/MM/YYYY) — nunca
+    se debe usar tal cual en el nombre del archivo ni para ordenar: como
+    texto libre, "28/09/2026" no ordena cronológicamente contra otras
+    fechas (compara caracter por caracter, no como fecha), y las diagonales
+    además rompen la convención de nombre de archivo del resto del código.
+    """
     values = df.get_column("DATE").unique().to_list()
-    return str(values[0]) if values else ""
+    if not values:
+        return ""
+    raw = str(values[0]).strip()
+    candidate_formats = ("%d/%m/%Y", "%Y-%m-%d", "%m/%d/%Y", "%d-%m-%Y")
+    for fmt in candidate_formats:
+        try:
+            return datetime.strptime(raw, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    raise SnapshotValidationError(
+        f"No reconozco el formato de la columna DATE: {raw!r}. Formatos "
+        "soportados: DD/MM/AAAA, AAAA-MM-DD, MM/DD/AAAA, DD-MM-AAAA."
+    )
 
 
 def build_country_kpis(df: pl.DataFrame) -> dict[str, float]:
