@@ -4,4 +4,5 @@ xlsxwriter>=3.2,<4
 reportlab>=4.2,<5
 plotly>=5.14.0
 polars>=0.19.0
-openpyxl
+google-api-python-client>=2.100,<3
+google-auth>=2.23,<3

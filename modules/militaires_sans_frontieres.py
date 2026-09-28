@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from datetime import datetime, timezone
+from typing import Any
 import html
 import io
 import re
@@ -14,6 +16,10 @@ import openpyxl
 import polars as pl
 import plotly.graph_objects as go
 import streamlit as st
+from google.oauth2 import service_account
+from googleapiclient.discovery import build as build_drive_service
+from googleapiclient.errors import HttpError
+from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 from mother_base_theme import render_system_stamp
 
@@ -29,6 +35,222 @@ def configured_data_dashboard_spreadsheet_id() -> str:
         return str(st.secrets.get("DATA_DASHBOARD_SPREADSHEET_ID", ""))
     except Exception:
         return ""
+
+
+# ---------------------------------------------------------------------------
+# Google Drive — snapshots diarios crudos + rollup histórico acumulado
+# ---------------------------------------------------------------------------
+#
+# Un solo folder de Drive compartido guarda dos tipos de archivo, ambos
+# planos (sin subcarpetas, para no depender de lógica extra de find-or-create
+# de carpetas):
+#   - "RAW_YYYY-MM-DD.csv": la subida cruda de ese día, tal cual. Si se sube
+#     dos veces el mismo día, la segunda SOBREESCRIBE la primera (gana la
+#     última subida del día).
+#   - "ROLLUP.csv": un solo archivo que acumula un resumen por día, usado
+#     para la tendencia histórica. Cada subida le agrega/actualiza la fila
+#     de ese día, nunca borra días anteriores.
+#
+# Nada de esto se ha podido probar contra la API real de Google desde este
+# entorno (sin acceso a red) — el patrón sigue la documentación oficial de
+# google-api-python-client al pie de la letra, pero la primera conexión real
+# debe validarla quien lo despliegue (por eso el botón "Probar conexión").
+
+DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
+RAW_FILENAME_PREFIX = "RAW_"
+ROLLUP_FILENAME = "ROLLUP.csv"
+
+
+def configured_data_dashboard_drive_folder_id() -> str:
+    """Lee el ID del folder de Drive compartido desde Streamlit Secrets."""
+    try:
+        return str(st.secrets.get("DATA_DASHBOARD_DRIVE_FOLDER_ID", ""))
+    except Exception:
+        return ""
+
+
+def _drive_service_account_info() -> dict | None:
+    """Lee el bloque [gcp_service_account] de Secrets como dict plano."""
+    try:
+        raw = st.secrets.get("gcp_service_account")
+    except Exception:
+        return None
+    if not raw:
+        return None
+    return dict(raw)
+
+
+def get_drive_service():
+    """Construye el cliente de la API de Drive v3 con la cuenta de servicio.
+
+    Lanza RuntimeError con un mensaje claro (no una excepción críptica de
+    Google) si falta cualquier pieza de configuración, para que el error se
+    entienda sin tener que leer el traceback.
+    """
+    info = _drive_service_account_info()
+    if not info:
+        raise RuntimeError(
+            "Falta configurar [gcp_service_account] en Secrets. Ver "
+            ".streamlit/secrets.toml.example."
+        )
+    folder_id = configured_data_dashboard_drive_folder_id()
+    if not folder_id:
+        raise RuntimeError(
+            "Falta configurar DATA_DASHBOARD_DRIVE_FOLDER_ID en Secrets."
+        )
+    try:
+        credentials = service_account.Credentials.from_service_account_info(
+            info, scopes=DRIVE_SCOPES
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "Las credenciales de [gcp_service_account] no son válidas: "
+            f"{exc}"
+        ) from exc
+    try:
+        return build_drive_service(
+            "drive", "v3", credentials=credentials, cache_discovery=False
+        )
+    except Exception as exc:
+        raise RuntimeError(f"No pude iniciar el cliente de Drive: {exc}") from exc
+
+
+def _drive_find_file(service, folder_id: str, filename: str) -> dict | None:
+    """Busca un archivo por nombre EXACTO dentro del folder. Devuelve
+    {"id", "name", "modifiedTime"} o None. ``supportsAllDrives`` es
+    obligatorio para que esto funcione con Drives compartidos, no solo Mi
+    unidad — omitirlo es el error más común con este tipo de integración."""
+    safe_name = filename.replace("'", "\\'")
+    query = (
+        f"'{folder_id}' in parents and name = '{safe_name}' and trashed = false"
+    )
+    response = (
+        service.files()
+        .list(
+            q=query,
+            fields="files(id, name, modifiedTime, properties)",
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+            pageSize=1,
+        )
+        .execute()
+    )
+    files = response.get("files", [])
+    return files[0] if files else None
+
+
+def _drive_list_files(service, folder_id: str, prefix: str = "") -> list[dict]:
+    """Lista archivos del folder (opcionalmente filtrados por prefijo de
+    nombre), ordenados por nombre descendente — con nombres tipo
+    RAW_YYYY-MM-DD.csv, eso equivale a orden cronológico descendente."""
+    query = f"'{folder_id}' in parents and trashed = false"
+    if prefix:
+        safe_prefix = prefix.replace("'", "\\'")
+        query += f" and name contains '{safe_prefix}'"
+    response = (
+        service.files()
+        .list(
+            q=query,
+            fields="files(id, name, modifiedTime, properties)",
+            orderBy="name desc",
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+            pageSize=200,
+        )
+        .execute()
+    )
+    return response.get("files", [])
+
+
+def _drive_upload_or_replace(
+    service,
+    folder_id: str,
+    filename: str,
+    content_bytes: bytes,
+    mime_type: str = "text/csv",
+    properties: dict[str, str] | None = None,
+) -> str:
+    """Crea el archivo si no existe, o sobreescribe su contenido si ya
+    existe con ese nombre exacto. Devuelve el file id."""
+    existing = _drive_find_file(service, folder_id, filename)
+    media = MediaIoBaseUpload(
+        io.BytesIO(content_bytes), mimetype=mime_type, resumable=False
+    )
+    if existing:
+        update_kwargs: dict[str, Any] = {
+            "fileId": existing["id"],
+            "media_body": media,
+            "supportsAllDrives": True,
+        }
+        if properties:
+            # No pasar body=None explícito: algunas versiones del cliente
+            # intentan serializarlo como metadata real y la API lo rechaza.
+            # Si no hay properties nuevas, simplemente se omite el kwarg.
+            update_kwargs["body"] = {"properties": properties}
+        updated = service.files().update(**update_kwargs).execute()
+        return updated["id"]
+    metadata: dict[str, Any] = {"name": filename, "parents": [folder_id]}
+    if properties:
+        metadata["properties"] = properties
+    created = (
+        service.files()
+        .create(body=metadata, media_body=media, supportsAllDrives=True, fields="id")
+        .execute()
+    )
+    return created["id"]
+
+
+def _drive_download(service, file_id: str) -> bytes:
+    """Descarga el contenido completo de un archivo de Drive."""
+    request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
+    buffer = io.BytesIO()
+    downloader = MediaIoBaseDownload(buffer, request)
+    done = False
+    while not done:
+        _status, done = downloader.next_chunk()
+    return buffer.getvalue()
+
+
+def test_drive_connection() -> str:
+    """Prueba end-to-end mínima: conecta, y confirma que el folder
+    configurado existe y es alcanzable. No sube ni descarga nada. Pensada
+    para el botón "Probar conexión" — devuelve un mensaje humano, nunca
+    lanza una excepción cruda a la UI."""
+    try:
+        service = get_drive_service()
+        folder_id = configured_data_dashboard_drive_folder_id()
+        folder = (
+            service.files()
+            .get(fileId=folder_id, fields="id, name", supportsAllDrives=True)
+            .execute()
+        )
+        existing_files = _drive_list_files(service, folder_id)
+        return (
+            f"Conexión OK. Carpeta encontrada: '{folder.get('name', folder_id)}'. "
+            f"{len(existing_files)} archivo(s) existente(s) en ella."
+        )
+    except HttpError as exc:
+        status = getattr(exc, "status_code", None) or getattr(
+            getattr(exc, "resp", None), "status", None
+        )
+        if status == 404:
+            return (
+                "Conectó con Google, pero no encontró la carpeta — revisa "
+                "que DATA_DASHBOARD_DRIVE_FOLDER_ID sea el ID correcto (el "
+                "de la URL de la carpeta, no un nombre) y que la cuenta de "
+                "servicio esté agregada como miembro del Drive compartido."
+            )
+        if status == 403:
+            return (
+                "Conectó con Google, pero el acceso fue rechazado (403) — "
+                "confirma que la cuenta de servicio esté agregada al Drive "
+                "compartido como Content Manager o superior."
+            )
+        return f"Error de la API de Drive: {exc}"
+    except RuntimeError as exc:
+        return str(exc)
+    except Exception as exc:
+        return f"Error inesperado probando la conexión: {exc}"
 
 
 # --- PALETA OBLIGATORIA (Brutalismo táctico de Mother Base) ---
@@ -461,6 +683,22 @@ def render() -> None:
         """,
         unsafe_allow_html=True,
     )
+
+    # --- Diagnóstico de conexión a Drive (solo Big Boss, temporal mientras
+    # se construye la carga diaria completa encima de esta base). ---
+    if st.session_state.get("mb_profile") == "BIG BOSS":
+        with st.expander("🔧 Conexión a Drive (diagnóstico)", expanded=False):
+            st.caption(
+                "Prueba que la cuenta de servicio pueda alcanzar el Drive "
+                "compartido configurado, sin subir ni descargar nada todavía."
+            )
+            if st.button("Probar conexión", key="msf_test_drive_connection"):
+                with st.spinner("Probando conexión con Drive…"):
+                    result_message = test_drive_connection()
+                if result_message.startswith("Conexión OK"):
+                    st.success(result_message)
+                else:
+                    st.error(result_message)
 
     with st.spinner("SINCRONIZANDO INTELIGENCIA DE RED…"):
         try:
