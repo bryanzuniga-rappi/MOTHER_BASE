@@ -265,6 +265,53 @@ def _drive_download(service, file_id: str) -> bytes:
     return buffer.getvalue()
 
 
+def test_direct_file_access(file_id: str) -> str:
+    """Diagnóstico: intenta leer un archivo por ID directo (.get + descarga
+    de contenido), sin pasar por búsqueda/list en absoluto. Si esto
+    funciona mientras "Probar conexión" sigue viendo 0 archivos, confirma
+    que el problema es específico de list()/búsqueda (por ejemplo, DLP
+    ligado a una etiqueta de clasificación que oculta contenido de
+    búsquedas por API pero no bloquea el acceso directo por ID) y no un
+    problema de permisos generales de la cuenta de servicio."""
+    try:
+        service = get_drive_service()
+    except RuntimeError as exc:
+        return str(exc)
+    try:
+        metadata = (
+            service.files()
+            .get(
+                fileId=file_id,
+                fields="id, name, size, driveId, trashed",
+                supportsAllDrives=True,
+            )
+            .execute()
+        )
+    except HttpError as exc:
+        status = getattr(exc, "status_code", None) or getattr(
+            getattr(exc, "resp", None), "status", None
+        )
+        return (
+            f"NO pude acceder al archivo por ID directo (HTTP {status}). "
+            "Esto apunta a un bloqueo de permisos/DLP real, no solo de "
+            f"búsqueda: {exc}"
+        )
+    except Exception as exc:
+        return f"Error inesperado: {exc}"
+    try:
+        content = _drive_download(service, file_id)
+        content_note = f"Contenido descargado: {len(content):,} bytes."
+    except Exception as exc:
+        content_note = f"Metadata OK pero la descarga del contenido falló: {exc}"
+    return (
+        f"Metadata OK por ID directo: '{metadata.get('name')}' "
+        f"({metadata.get('size', '?')} bytes reportados, trashed="
+        f"{metadata.get('trashed')}). {content_note} — si esto funcionó y "
+        '"Probar conexión" sigue en 0, el problema es específico de '
+        "list()/búsqueda, no de acceso al archivo en sí."
+    )
+
+
 def test_drive_connection() -> str:
     """Prueba end-to-end mínima: conecta, y confirma que el folder
     configurado existe y es alcanzable. No sube ni descarga nada. Pensada
@@ -1081,6 +1128,27 @@ def render() -> None:
                     st.success(result_message)
                 else:
                     st.error(result_message)
+
+            st.divider()
+            st.caption(
+                "Diagnóstico extra: prueba leer UN archivo por su ID directo "
+                "(clic derecho en el archivo en Drive → 'Obtener enlace' → "
+                "el ID es la parte entre /d/ y /view o /edit del enlace). "
+                "Esto no es sensible, solo identifica el archivo."
+            )
+            direct_file_id = st.text_input(
+                "ID del archivo a probar", key="msf_direct_file_id"
+            )
+            if st.button("Probar acceso directo por ID", key="msf_test_direct_access"):
+                if not direct_file_id.strip():
+                    st.warning("Pega un ID de archivo primero.")
+                else:
+                    with st.spinner("Probando acceso directo…"):
+                        direct_result = test_direct_file_access(direct_file_id.strip())
+                    if direct_result.startswith("Metadata OK"):
+                        st.success(direct_result)
+                    else:
+                        st.error(direct_result)
 
         with st.expander("📤 Cargar snapshot diario", expanded=False):
             st.caption(
