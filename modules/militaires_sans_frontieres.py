@@ -138,7 +138,11 @@ def _drive_find_file(service, folder_id: str, filename: str) -> dict | None:
     """Busca un archivo por nombre EXACTO dentro del folder. Devuelve
     {"id", "name", "modifiedTime"} o None. ``supportsAllDrives`` es
     obligatorio para que esto funcione con Drives compartidos, no solo Mi
-    unidad — omitirlo es el error más común con este tipo de integración."""
+    unidad — omitirlo es el error más común con este tipo de integración.
+    ``corpora="allDrives"`` es el segundo gotcha, menos conocido: sin él,
+    ``files.list`` puede no buscar de verdad dentro de un Drive compartido
+    aunque supportsAllDrives esté activo — el default de ``corpora`` es
+    "user" (Mi unidad + compartido conmigo), no Drives compartidos."""
     safe_name = filename.replace("'", "\\'")
     query = (
         f"'{folder_id}' in parents and name = '{safe_name}' and trashed = false"
@@ -148,6 +152,7 @@ def _drive_find_file(service, folder_id: str, filename: str) -> dict | None:
         .list(
             q=query,
             fields="files(id, name, modifiedTime, properties)",
+            corpora="allDrives",
             supportsAllDrives=True,
             includeItemsFromAllDrives=True,
             pageSize=1,
@@ -172,6 +177,7 @@ def _drive_list_files(service, folder_id: str, prefix: str = "") -> list[dict]:
             q=query,
             fields="files(id, name, modifiedTime, properties)",
             orderBy="name desc",
+            corpora="allDrives",
             supportsAllDrives=True,
             includeItemsFromAllDrives=True,
             pageSize=200,
