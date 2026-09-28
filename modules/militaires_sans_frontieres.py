@@ -1445,15 +1445,24 @@ def render() -> None:
             f'disponibles en Drive: {html.escape(str(exc))}</div>',
             unsafe_allow_html=True,
         )
+        if st.button("Reintentar", key="msf_retry_list_error"):
+            list_available_snapshot_dates.clear()
+            st.rerun()
         return
 
     if not available_dates:
         st.markdown(
             '<div class="msf-error-card">⚠ Todavía no hay ningún snapshot '
-            "cargado. Un Big Boss debe subir el primero desde "
-            '"Cargar snapshot diario".</div>',
+            "cargado (o la lista está en caché de una prueba anterior — "
+            "dale a Reintentar si ya subiste uno). Un Big Boss debe subir "
+            'el primero desde "Cargar snapshot diario".</div>',
             unsafe_allow_html=True,
         )
+        if st.button("Reintentar", key="msf_retry_empty_dates"):
+            list_available_snapshot_dates.clear()
+            read_snapshot_for_date.clear()
+            read_rollup_history.clear()
+            st.rerun()
         return
 
     col_date, col_refresh = st.columns([3, 1])
