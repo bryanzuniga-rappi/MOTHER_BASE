@@ -2620,7 +2620,7 @@ def create_output_files(
 
     for source in config.origin_warehouses:
         rows = rows_by_source.get(source, [])
-        if not rows and not config.generate_empty_source_files:
+        if not rows:
             continue
         if source in OWNER_SPLIT_SOURCES:
             rows_by_owner: dict[str, list[dict[str, Any]]] = defaultdict(list)
