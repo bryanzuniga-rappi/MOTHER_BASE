@@ -839,7 +839,11 @@ Toggle exclusivo de **Big Boss** ("Modo simulación — solo calcular, no genera
 | `CITY` | Ciudad destino. |
 | `STORAGE` | Ambiente aplicable. |
 | `VALUE` | HV por origen o REGULAR. |
+| `PRODUCT_NAME` | Nombre del producto (hoja DATA, por SYNC_ID). Vacío si DATA no está cargada o el SKU no aparece ahí — nunca bloquea el CSV. |
+| `CATEGORY_NAME` | Categoría del producto (misma fuente). |
 | `PLANNING_REASON` | Fountain9, Solidus, AVL, prevención, Shalashaska, Liquid o Insumos. |
+
+`enrich_rows_with_product_info()` (`modelo_abasto.py`) le pega `PRODUCT_NAME`/`CATEGORY_NAME` a `result.base_rows` y `result.allocation_rows` una sola vez, justo antes de escribir cualquier archivo — de ahí salen automáticamente los CSV operativos, `BASE_TRANSFERS` y `DETALLE_ASIGNACION`. También se aplica al reporte de universo Golden/Infaltable/Anchor (§17) y al check de salud. **No** aplica a las tablas de breakdown (`planned_by_engine_rows`/`cuts_detail_rows`/overview): son agregados por engine/causal, sin fila por SKU. Tampoco al PDF ejecutivo, que no tiene tablas a nivel SKU.
 
 ### CSV de tres ceros
 

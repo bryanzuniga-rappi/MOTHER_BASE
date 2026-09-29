@@ -1848,11 +1848,14 @@ def build_golden_infaltable_anchor_health_check(
             priority_profile = engine.product_priority_profile(
                 catalogs, destination, sku
             )
+            product_info = catalogs.product_catalog.get(sku, {})
             below_target.append(
                 {
                     "WAREHOUSE_DESTINATION": destination,
                     "WAREHOUSE_NAME": store.get("warehouse_name", ""),
                     "RETAIL_ID": sku,
+                    "PRODUCT_NAME": product_info.get("PRODUCT_NAME", ""),
+                    "CATEGORY_NAME": product_info.get("CATEGORY_NAME", ""),
                     "TIPO": priority_profile["type"],
                     "DOH_FINAL": round(final_doh, 3),
                     "DOH_OBJETIVO": round(target_doh, 3),
@@ -2033,11 +2036,14 @@ def build_bucket_universe_report(
                     capacity_by_store,
                 )
 
+        product_info = catalogs.product_catalog.get(sku, {})
         rows.append(
             {
                 "WAREHOUSE_DESTINATION": destination,
                 "WAREHOUSE_NAME": store.get("warehouse_name", ""),
                 "RETAIL_ID": sku,
+                "PRODUCT_NAME": product_info.get("PRODUCT_NAME", ""),
+                "CATEGORY_NAME": product_info.get("CATEGORY_NAME", ""),
                 "ADU": round(adu, 4),
                 "ADU_ORIGEN": adu_source_by_key.get(key, "SIN_DATO"),
                 "STOCK_INICIAL": int(stock_initial),
@@ -2377,6 +2383,7 @@ def append_insumos_to_bulk_444(
             "Se encontraron insumos elegibles, pero no se generó BulkCD_444.csv."
         )
 
+    engine.enrich_rows_with_product_info(selected, catalogs)
     engine.write_csv(
         bulk_path,
         regular_444_rows + selected,
@@ -5748,6 +5755,12 @@ def execute_planning(
             / "outputs"
             / run_date.strftime("%d-%m-%Y")
         )
+        # Nombre + categoría del producto en todos los entregables (hoja
+        # DATA, por SYNC_ID). Se hace UNA sola vez, sobre las dos listas
+        # que alimentan todo lo demás (CSVs, Excel), antes de escribir
+        # nada — así no hay que repetir el lookup en cada punto de salida.
+        engine.enrich_rows_with_product_info(result.base_rows, catalogs)
+        engine.enrich_rows_with_product_info(result.allocation_rows, catalogs)
         local_files = engine.create_output_files(
             result,
             config,
@@ -6987,6 +7000,8 @@ def render_bucket_universe_report(bucket_label: str, report: dict[str, Any]) -> 
                     "WAREHOUSE_DESTINATION": row["WAREHOUSE_DESTINATION"],
                     "WAREHOUSE_NAME": row["WAREHOUSE_NAME"],
                     "RETAIL_ID": row["RETAIL_ID"],
+                    "PRODUCT_NAME": row["PRODUCT_NAME"],
+                    "CATEGORY_NAME": row["CATEGORY_NAME"],
                     "DOH_FINAL": row["DOH_FINAL"],
                     "MOTIVO_NO_CUBIERTO": row["MOTIVO_NO_CUBIERTO"],
                 }

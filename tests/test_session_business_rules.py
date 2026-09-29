@@ -595,3 +595,99 @@ def test_append_insumos_blocks_90532_outside_cdmx(tmp_path):
     assert (100, 82126) in dest_by_sku  # 82126 sin restricción: ambas tiendas
     assert (200, 82126) in dest_by_sku
     assert summary["lines_blocked_city_restriction"] == 1
+
+
+# --- Nombre + categoría de producto en entregables (hoja DATA) -----------
+
+def test_output_columns_include_product_name_and_category():
+    assert "PRODUCT_NAME" in engine.OUTPUT_COLUMNS
+    assert "CATEGORY_NAME" in engine.OUTPUT_COLUMNS
+
+
+def test_bulk_output_columns_inherit_product_fields():
+    assert "PRODUCT_NAME" in m.BULK_OUTPUT_COLUMNS
+    assert "CATEGORY_NAME" in m.BULK_OUTPUT_COLUMNS
+
+
+def test_enrich_rows_with_product_info_fills_known_sku():
+    catalogs = engine.Catalogs(
+        volume_m3={}, blocked_products=set(), route_cost_blocks=set(),
+        store_priority={}, high_value={}, rackeados_444=set(),
+        store_capacity={}, copernico_unusable_444={}, unavailable_stock={},
+        stock_base={}, golden_infaltables=set(), stores={}, storage={},
+        warnings=[],
+        product_catalog={
+            10: {
+                "PRODUCT_NAME": "Huevo Blanco 12pz",
+                "MACROCATEGORY_NAME": "Perecederos",
+                "CATEGORY_NAME": "Huevo",
+                "SUBCATEGORY_NAME": "Huevo Blanco",
+            }
+        },
+    )
+    rows = [{"RETAIL_ID": 10, "QUANTITY": 5}]
+    engine.enrich_rows_with_product_info(rows, catalogs)
+    assert rows[0]["PRODUCT_NAME"] == "Huevo Blanco 12pz"
+    assert rows[0]["CATEGORY_NAME"] == "Huevo"
+
+
+def test_enrich_rows_with_product_info_blank_for_unknown_sku():
+    """Sin dato en DATA (hoja ausente o SKU no encontrado): cadena vacía,
+    nunca truena ni inventa un nombre."""
+    catalogs = engine.Catalogs(
+        volume_m3={}, blocked_products=set(), route_cost_blocks=set(),
+        store_priority={}, high_value={}, rackeados_444=set(),
+        store_capacity={}, copernico_unusable_444={}, unavailable_stock={},
+        stock_base={}, golden_infaltables=set(), stores={}, storage={},
+        warnings=[],
+    )  # product_catalog vacío por default
+    rows = [{"RETAIL_ID": 999, "QUANTITY": 1}]
+    engine.enrich_rows_with_product_info(rows, catalogs)
+    assert rows[0]["PRODUCT_NAME"] == ""
+    assert rows[0]["CATEGORY_NAME"] == ""
+
+
+def test_enrich_rows_with_product_info_custom_sku_field():
+    catalogs = engine.Catalogs(
+        volume_m3={}, blocked_products=set(), route_cost_blocks=set(),
+        store_priority={}, high_value={}, rackeados_444=set(),
+        store_capacity={}, copernico_unusable_444={}, unavailable_stock={},
+        stock_base={}, golden_infaltables=set(), stores={}, storage={},
+        warnings=[],
+        product_catalog={20: {"PRODUCT_NAME": "Producto X", "CATEGORY_NAME": "Cat X"}},
+    )
+    rows = [{"PRODUCT_ID": 20}]
+    engine.enrich_rows_with_product_info(rows, catalogs, sku_field="PRODUCT_ID")
+    assert rows[0]["PRODUCT_NAME"] == "Producto X"
+
+
+def test_universe_report_rows_include_product_name_and_category(tmp_path):
+    """El reporte de universo Golden/Infaltable/Anchor debe traer nombre y
+    categoría por fila, no solo el CSV operativo."""
+    catalogs = engine.Catalogs(
+        volume_m3={10: 1.0}, blocked_products=set(), route_cost_blocks=set(),
+        store_priority={100: 1}, high_value={}, rackeados_444=set(),
+        store_capacity={100: 100.0}, copernico_unusable_444={},
+        unavailable_stock={},
+        stock_base={(444, 10): 100.0, (100, 10): 50.0},
+        golden_infaltables=set(),
+        stores={
+            444: {"city": "CDMX", "city_norm": "CDMX", "warehouse_name": "O444"},
+            100: {"city": "CDMX", "city_norm": "CDMX", "warehouse_name": "STORE"},
+        },
+        storage={}, warnings=[],
+        product_catalog={10: {"PRODUCT_NAME": "Huevo Blanco 12pz", "CATEGORY_NAME": "Huevo"}},
+    )
+    from types import SimpleNamespace
+    result = SimpleNamespace(
+        base_rows=[], allocation_rows=[], capacity_rows=[], tasks_used=0,
+        max_tasks=100, warnings=[],
+    )
+    config = engine.Config(origin_warehouses=(444,), max_tasks=100)
+    catalog_rows = [{"WAREHOUSE_DESTINATION": 100, "RETAIL_ID": 10, "ADU": 1.0}]
+    report = m.build_bucket_universe_report(
+        {(100, 10)}, result, catalogs, config, set(), (), catalog_rows
+    )
+    row = report["rows"][0]
+    assert row["PRODUCT_NAME"] == "Huevo Blanco 12pz"
+    assert row["CATEGORY_NAME"] == "Huevo"

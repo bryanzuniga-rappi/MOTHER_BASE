@@ -66,6 +66,8 @@ OUTPUT_COLUMNS = [
     "CITY",
     "STORAGE",
     "VALUE",
+    "PRODUCT_NAME",
+    "CATEGORY_NAME",
 ]
 
 OWNER_SPLIT_SOURCES = {425, 856}
@@ -2386,6 +2388,29 @@ def write_csv(path: Path, rows: list[dict[str, Any]], columns: list[str]) -> Non
         writer = csv.DictWriter(handle, fieldnames=columns, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
+
+
+def enrich_rows_with_product_info(
+    rows: list[dict[str, Any]],
+    catalogs: Catalogs,
+    sku_field: str = "RETAIL_ID",
+) -> None:
+    """Le pega PRODUCT_NAME y CATEGORY_NAME a cada fila, buscando por SKU en
+    catalogs.product_catalog (hoja DATA, indexado por SYNC_ID). Muta las
+    filas en el lugar — se llama UNA vez sobre cada lista de filas
+    (base_rows, allocation_rows, o cualquier lista de Insumos/Refuerzo)
+    antes de que esa lista se escriba a cualquier CSV/Excel, para que todo
+    lo que lea de ahí después ya lo tenga sin tener que repetir el lookup.
+
+    Si catalogs.product_catalog está vacío (hoja DATA ausente) o el SKU no
+    aparece ahí, deja las columnas en cadena vacía — nunca truena, nunca
+    inventa un nombre.
+    """
+    for row in rows:
+        sku = row.get(sku_field)
+        info = catalogs.product_catalog.get(sku, {}) if sku is not None else {}
+        row["PRODUCT_NAME"] = info.get("PRODUCT_NAME", "")
+        row["CATEGORY_NAME"] = info.get("CATEGORY_NAME", "")
 
 
 def excel_safe(value: Any) -> Any:
