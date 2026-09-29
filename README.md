@@ -407,6 +407,22 @@ Cuando el saldo excluido por COPÉRNICO en un origen (que de otra forma sería e
 
 `Net Inter Store Transfers` sin guion también se reconoce. Aunque el encabezado conserve `(MOV)`, el producto lo presenta como **ROQ**.
 
+**MOV efectivo — máximo entre 12 columnas, no solo (MOV):** el ROQ con el que realmente se planea es el máximo entre la columna `(MOV)` de arriba y hasta 11 columnas más, todas opcionales (si el archivo no las trae, simplemente no participan):
+
+- `Replenishment Quantity for Plan Duration (Batch Size Rounded)`
+- `Replenishment Quantity for Plan Duration (MOQ)`
+- `Replenishment Quantity for Plan Duration (Initial Allocation)`
+- `Replenishment Quantity for Plan Duration (Max Cap. Adj.)`
+- `Replenishment Quantity for Plan Duration (Max Cap. Adj.) (Batch Size Rounded)`
+- `Replenishment Quantity for Plan Duration (Max Cap. Adj.) (MOQ)`
+- `Replenishment Quantity for Plan Duration Diff.`
+- `Allocation Quantity for Plan Duration`
+- `Replenishment(Allocation) Quantity for Plan Duration Editable`
+- `Allocation (Store Based)`
+- `Allocation (DOI Based)`
+
+Cuando la misma tienda-SKU aparece en más de una fila o más de un archivo cargado el mismo día, el ROQ resultante es el **máximo** entre todas esas apariciones — no la suma (a diferencia de Forecast, Opening y Net Inter-Store Transfers, que sí siguen sumándose entre duplicados, sin cambio). `MOV_MAX_OPTIONAL_COLUMNS` en `modules/les_enfants_terribles.py` define la lista de las 11 columnas opcionales.
+
 Si `Warehouseid` y `Node_Store` vienen poblados, deben coincidir. Las demás dimensiones se obtienen de DATA_TRANSFERS.
 
 ### Consolidación
@@ -417,7 +433,7 @@ Llave:
 WAREHOUSE_DESTINATION + RETAIL_ID
 ```
 
-Para una misma llave se suman demanda, opening, ROQ y Net Inter-Store Transfers. Se conserva la trazabilidad de archivos y filas. No cargue dos veces el mismo archivo salvo que quiera duplicar intencionalmente sus cantidades.
+Para una misma llave se suman demanda, opening y Net Inter-Store Transfers. El ROQ es la excepción: se toma el **máximo** (ver arriba, "MOV efectivo"), no la suma. Se conserva la trazabilidad de archivos y filas. No cargue dos veces el mismo archivo salvo que quiera duplicar intencionalmente demanda/opening/transfers (el ROQ no se duplica, por diseño).
 
 `Current Inventory` se deriva de STOCK usando destino–SKU, no del CSV.
 

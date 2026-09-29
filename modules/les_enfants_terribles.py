@@ -328,6 +328,26 @@ INPUT_PLAN_COLUMNS = (
     "Net Inter-Store Transfers",
 )
 
+# El "MOV efectivo" con el que se planea ya no es solo la columna (MOV) —
+# se toma el MÁXIMO entre esta y estas otras 11 columnas relacionadas, si
+# están presentes en el archivo. Solo (MOV) es obligatoria (parte de
+# INPUT_PLAN_COLUMNS arriba); estas 11 son opcionales: si el archivo de
+# Fountain9 no las trae, simplemente no participan en el máximo — nunca
+# tumban la carga.
+MOV_MAX_OPTIONAL_COLUMNS = (
+    "Replenishment Quantity for Plan Duration (Batch Size Rounded)",
+    "Replenishment Quantity for Plan Duration (MOQ)",
+    "Replenishment Quantity for Plan Duration (Initial Allocation)",
+    "Replenishment Quantity for Plan Duration (Max Cap. Adj.)",
+    "Replenishment Quantity for Plan Duration (Max Cap. Adj.) (Batch Size Rounded)",
+    "Replenishment Quantity for Plan Duration (Max Cap. Adj.) (MOQ)",
+    "Replenishment Quantity for Plan Duration Diff.",
+    "Allocation Quantity for Plan Duration",
+    "Replenishment(Allocation) Quantity for Plan Duration Editable",
+    "Allocation (Store Based)",
+    "Allocation (DOI Based)",
+)
+
 PLANNING_REASON_COLUMN = "PLANNING_REASON"
 
 # REGLA_DEMANDA que solo generan los engines de cobertura (AVL, Preventivo,
@@ -1290,6 +1310,16 @@ def consolidate_plan_files(
                     f"{path.name}: faltan columnas obligatorias: {missing}."
                 )
 
+            # Columnas opcionales para el máximo del MOV efectivo: se
+            # resuelven las que sí estén presentes en ESTE archivo, sin
+            # exigir ninguna. Cada archivo puede traer un subconjunto
+            # distinto.
+            optional_mov_lookup: dict[str, str] = {}
+            for column in MOV_MAX_OPTIONAL_COLUMNS:
+                match = field_lookup.get(engine.normalize_header(column))
+                if match is not None:
+                    optional_mov_lookup[column] = match
+
             for csv_row, raw in enumerate(reader, start=2):
                 if not any(engine.clean_text(value) for value in raw.values()):
                     continue
@@ -1337,14 +1367,29 @@ def consolidate_plan_files(
                 record["PREDICTED_OPENING_INVENTORY"] += engine.to_float(
                     raw.get(required_lookup["Predicted Opening Inventory"], "")
                 )
-                record["ROQ_INPUT"] += engine.to_float(
-                    raw.get(
-                        required_lookup[
-                            "Replenishment Quantity for Plan Duration (MOV)"
-                        ],
-                        "",
+                # MOV efectivo de ESTA fila: el máximo entre la columna
+                # (MOV) obligatoria y cualquiera de las 11 opcionales que
+                # sí estén presentes en este archivo.
+                row_mov_candidates = [
+                    engine.to_float(
+                        raw.get(
+                            required_lookup[
+                                "Replenishment Quantity for Plan Duration (MOV)"
+                            ],
+                            "",
+                        )
                     )
-                )
+                ]
+                for column, field_name in optional_mov_lookup.items():
+                    row_mov_candidates.append(
+                        engine.to_float(raw.get(field_name, ""))
+                    )
+                row_mov_max = max(row_mov_candidates)
+                # Entre filas/archivos duplicados de la misma tienda-SKU se
+                # toma el MÁXIMO, no la suma — a propósito de esta sesión:
+                # evita sumar o duplicar cuando la misma combinación
+                # aparece más de una vez.
+                record["ROQ_INPUT"] = max(record["ROQ_INPUT"], row_mov_max)
                 record["NET_INTER_STORE_TRANSFERS"] += engine.to_float(
                     raw.get(required_lookup["Net Inter-Store Transfers"], "")
                 )
