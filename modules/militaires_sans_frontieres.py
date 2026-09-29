@@ -718,27 +718,51 @@ def _number(value: object) -> float:
 
 # Columnas que el dashboard necesita sí o sí. Si faltan, se rechaza el
 # archivo con un mensaje claro en vez de fallar más adelante con un
-# KeyError críptico en medio de una agregación.
+# KeyError críptico en medio de una agregación. BLOCKING_REASON y
+# COMENTARIO deliberadamente NO están aquí — negocio confirmó que el
+# indicador de bloqueo es solo interno de Snowflake, sin valor accionable
+# en este dashboard, así que ni se exige ni se muestra en ningún lado.
 SNAPSHOT_REQUIRED_COLUMNS = {
     "DATE", "CITY", "WAREHOUSE_ID", "WAREHOUSE_NAME", "PRODUCT_ID",
     "PRODUCT_NAME", "MACRO_CATEGORY", "CATEGORY", "SUB_CATEGORY", "MAKER",
-    "FINAL_PROVEEDOR_NAME", "BLOCKING_REASON", "IS_INFALTABLE", "IS_GOLDEN",
-    "IS_ANCHOR", "STOCK_UNITS", "ADU", "AVL_COUNTRY", "SWA_COUNTRY",
-    "AVL_CITY", "SWA_CITY", "AVL_WH", "SWA_WH", "COMENTARIO",
+    "FINAL_PROVEEDOR_NAME", "IS_INFALTABLE", "IS_GOLDEN", "IS_ANCHOR",
+    "STOCK_UNITS", "ADU", "AVL_COUNTRY", "SWA_COUNTRY", "AVL_CITY",
+    "SWA_CITY", "AVL_WH", "SWA_WH",
 }
 
 # Columnas numéricas: se fuerzan a float al leer, cualquier valor no
 # parseable (vacío, texto) se vuelve null sin tronar la carga completa.
+# Lista alineada 1:1 con las columnas reales de la query de Snowflake
+# (confirmadas por negocio), no solo con lo que traía la muestra chica.
 SNAPSHOT_NUMERIC_COLUMNS = [
     "STOCK_UNITS", "FULL_SALES_28", "FULL_SALES_56", "AVG_SALES", "ADU",
-    "AVL_LAST_DAY", "SWA_COUNTRY", "SWA_CITY", "SWA_WH", "SWA_MAKER_COUNTRY",
+    "AVL_LAST_DAY",
+    "SHARE_OF_SALES_COUNTRY", "SHARE_OF_SALES_CITY", "SHARE_OF_SALES_WH",
+    "SHARE_OF_SALES_MAKER_COUNTRY", "SHARE_OF_SALES_MAKER_CITY",
+    "SHARE_OF_SALES_MAKER_WH", "SHARE_OF_SALES_PROVEEDOR_COUNTRY",
+    "SHARE_OF_SALES_PROVEEDOR_CITY", "SHARE_OF_SALES_PROVEEDOR_WH",
+    "SWA_COUNTRY", "SWA_CITY", "SWA_WH", "SWA_MAKER_COUNTRY",
     "SWA_MAKER_CITY", "SWA_MAKER_WH", "SWA_PROVEEDOR_COUNTRY",
-    "SWA_PROVEEDOR_CITY", "SWA_PROVEEDOR_WH", "AVL_COUNTRY", "AVL_CITY",
-    "AVL_WH", "AVL_MAKER_COUNTRY", "AVL_MAKER_CITY", "AVL_MAKER_WH",
-    "AVL_PROVEEDOR_COUNTRY", "AVL_PROVEEDOR_CITY", "AVL_PROVEEDOR_WH",
-    "AVL_28D", "INCOMING_TOTAL", "STOCK_CEDIS_444", "STOCK_CEDIS_831",
-    "STOCK_CEDIS_811", "STOCK_CEDIS_834", "INCOMING_CEDIS_TOTAL",
+    "SWA_PROVEEDOR_CITY", "SWA_PROVEEDOR_WH",
+    "SWA_POTENTIAL_GAIN_COUNTRY", "SWA_POTENTIAL_GAIN_CITY",
+    "SWA_POTENTIAL_GAIN_WH", "SWA_POTENTIAL_GAIN_MAKER_COUNTRY",
+    "SWA_POTENTIAL_GAIN_MAKER_CITY", "SWA_POTENTIAL_GAIN_MAKER_WH",
+    "SWA_POTENTIAL_GAIN_PROVEEDOR_COUNTRY",
+    "SWA_POTENTIAL_GAIN_PROVEEDOR_CITY", "SWA_POTENTIAL_GAIN_PROVEEDOR_WH",
+    "AVL_COUNTRY", "AVL_CITY", "AVL_WH", "AVL_MAKER_COUNTRY",
+    "AVL_MAKER_CITY", "AVL_MAKER_WH", "AVL_PROVEEDOR_COUNTRY",
+    "AVL_PROVEEDOR_CITY", "AVL_PROVEEDOR_WH",
+    "AVL_POTENTIAL_GAIN_COUNTRY", "AVL_POTENTIAL_GAIN_CITY",
+    "AVL_POTENTIAL_GAIN_WH", "AVL_POTENTIAL_GAIN_MAKER_COUNTRY",
+    "AVL_POTENTIAL_GAIN_MAKER_CITY", "AVL_POTENTIAL_GAIN_MAKER_WH",
+    "AVL_POTENTIAL_GAIN_PROVEEDOR_COUNTRY",
+    "AVL_POTENTIAL_GAIN_PROVEEDOR_CITY", "AVL_POTENTIAL_GAIN_PROVEEDOR_WH",
+    "AVL_28D", "INCOMING_TOTAL",
+    "STOCK_CEDIS_444", "STOCK_CEDIS_831", "STOCK_CEDIS_811",
+    "STOCK_CEDIS_834", "STOCK_CEDIS_425", "STOCK_CEDIS_856",
+    "STOCK_NODO_49", "INCOMING_CEDIS_TOTAL",
 ]
+
 
 
 class SnapshotValidationError(ValueError):
@@ -844,20 +868,12 @@ def build_city_breakdown(df: pl.DataFrame) -> list[dict]:
 
 
 def build_blocking_reason_breakdown(df: pl.DataFrame) -> list[dict]:
-    """Cuántas líneas caen en cada BLOCKING_REASON, con un comentario de
-    ejemplo real para dar contexto sin tener que abrir el detalle."""
-    if df.is_empty():
-        return []
-    grouped = (
-        df.filter(pl.col("BLOCKING_REASON").is_not_null())
-        .group_by("BLOCKING_REASON")
-        .agg(
-            pl.len().alias("LINEAS"),
-            pl.col("COMENTARIO").drop_nulls().first().alias("EJEMPLO_COMENTARIO"),
-        )
-        .sort("LINEAS", descending=True)
-    )
-    return grouped.to_dicts()
+    """Deprecado: negocio confirmó que BLOCKING_REASON/COMENTARIO son solo
+    un indicador interno de Snowflake sin valor accionable en este
+    dashboard. Se deja como stub inerte (nunca se llama desde render())
+    por si algún día vuelve a hacer falta, en vez de borrar la función y
+    tener que reescribirla desde cero."""
+    return []
 
 
 def build_stockout_rate_breakdown(df: pl.DataFrame, group_col: str) -> list[dict]:
@@ -895,13 +911,17 @@ def build_drilldown_rows(
     macro_category: str | None = None,
     maker: str | None = None,
     proveedor: str | None = None,
-    only_blocked: bool = False,
     only_golden_infaltable_anchor: bool = False,
 ) -> list[dict]:
     """Detalle producto-tienda filtrado — esto es lo que responde "¿dónde
     exactamente está el problema?". Se filtra en polars (rápido incluso con
     200K filas) y el resultado ya capado (render_capped_dataframe) es lo
-    único que se manda al navegador."""
+    único que se manda al navegador.
+
+    BLOCKING_REASON/COMENTARIO deliberadamente excluidos — negocio
+    confirmó que es solo un indicador interno de Snowflake, sin valor
+    accionable aquí.
+    """
     result = df
     if city:
         result = result.filter(pl.col("CITY") == city)
@@ -911,8 +931,6 @@ def build_drilldown_rows(
         result = result.filter(pl.col("MAKER") == maker)
     if proveedor:
         result = result.filter(pl.col("FINAL_PROVEEDOR_NAME") == proveedor)
-    if only_blocked:
-        result = result.filter(pl.col("BLOCKING_REASON").is_not_null())
     if only_golden_infaltable_anchor:
         result = result.filter(
             pl.col("IS_GOLDEN") | pl.col("IS_INFALTABLE") | pl.col("IS_ANCHOR")
@@ -920,7 +938,7 @@ def build_drilldown_rows(
     columns = [
         "CITY", "WAREHOUSE_NAME", "PRODUCT_ID", "PRODUCT_NAME",
         "MACRO_CATEGORY", "MAKER", "FINAL_PROVEEDOR_NAME", "STOCK_UNITS",
-        "ADU", "SWA_WH", "AVL_WH", "BLOCKING_REASON", "COMENTARIO",
+        "ADU", "SWA_WH", "AVL_WH",
     ]
     columns = [c for c in columns if c in result.columns]
     return result.select(columns).sort("SWA_WH").to_dicts()
@@ -1562,19 +1580,6 @@ def render() -> None:
                 unsafe_allow_html=True,
             )
 
-    # --- MOTIVOS DE BLOQUEO ---
-    st.markdown("### MOTIVOS DE BLOQUEO")
-    reason_rows = build_blocking_reason_breakdown(scoped)
-    if reason_rows:
-        render_capped_dataframe(
-            reason_rows,
-            key="msf_blocking_reasons",
-            offer_download=True,
-            file_label=f"motivos_bloqueo_{selected_date}",
-        )
-    else:
-        st.markdown('<div class="mb-card-solid">Sin líneas bloqueadas en este filtro.</div>', unsafe_allow_html=True)
-
     # --- % EN QUIEBRE POR CATEGORÍA / MAKER / PROVEEDOR ---
     st.markdown("### % EN QUIEBRE (proxy directo, no es SWA)")
     st.caption(
@@ -1609,16 +1614,13 @@ def render() -> None:
 
     # --- DETALLE PRODUCTO-TIENDA: "¿dónde exactamente está el problema?" ---
     st.markdown("### DETALLE PRODUCTO-TIENDA")
-    col_flag1, col_flag2 = st.columns(2)
-    only_blocked = col_flag1.checkbox("Solo líneas con motivo de bloqueo", key="msf_only_blocked")
-    only_gia = col_flag2.checkbox("Solo Golden/Infaltable/Anchor", key="msf_only_gia")
+    only_gia = st.checkbox("Solo Golden/Infaltable/Anchor", key="msf_only_gia")
     drilldown_rows = build_drilldown_rows(
         df,
         city=None if selected_city == "TODAS" else selected_city,
         macro_category=None if selected_category == "TODAS" else selected_category,
         maker=None if selected_maker == "TODOS" else selected_maker,
         proveedor=None if selected_proveedor == "TODOS" else selected_proveedor,
-        only_blocked=only_blocked,
         only_golden_infaltable_anchor=only_gia,
     )
     render_capped_dataframe(
