@@ -449,3 +449,123 @@ def test_health_check_disabled_when_no_golden_infaltable_anchor_universe():
     )
     assert check["enabled"] is False
     assert check["checked"] == 0
+
+
+# --- Mínimo de unidades a enviar, ahora configurable (punto de esta sesión) -
+
+def test_avl_stockout_respects_custom_minimum_quantity():
+    """Con minimum_positive_quantity=6 (más alto que el ADU*DOH natural),
+    AVL debe mandar 6, no el 3 que antes estaba fijo en el código."""
+    catalogs = make_catalogs(stock_base={(444, 10): 100.0, (100, 10): 0.0})
+    config = engine.Config(
+        origin_warehouses=(444,), max_tasks=100, minimum_positive_quantity=6
+    )
+    result = make_result()
+    m.apply_avl_fill(
+        result, catalog_rows(adu_10=1.0), catalogs, config, set(), (), 2.0,
+        candidate_mode="stockout",
+    )
+    avl_rows = [r for r in result.allocation_rows if r["RETAIL_ID"] == 10]
+    # ceil(1.0*2.0)=2, pero el piso configurado es 6 -> debe mandar 6.
+    assert sum(r["QUANTITY"] for r in avl_rows) == 6
+
+
+def test_preventive_respects_custom_minimum_quantity():
+    catalogs = make_catalogs(stock_base={(444, 10): 100.0, (100, 10): 1.0})
+    config = engine.Config(
+        origin_warehouses=(444,), max_tasks=100, minimum_positive_quantity=5
+    )
+    result = make_result()
+    m.apply_avl_fill(
+        result, catalog_rows(adu_10=1.0), catalogs, config, set(), (), 2.0,
+        candidate_mode="preventive",
+    )
+    prev_rows = [r for r in result.allocation_rows if r["RETAIL_ID"] == 10]
+    # objetivo natural = ceil(2.0-1.0)=1, piso configurado 5 -> manda 5.
+    assert sum(r["QUANTITY"] for r in prev_rows) == 5
+
+
+def test_special_doh_no_adu_respects_custom_minimum_quantity():
+    catalogs = make_catalogs(
+        stock_base={(444, 50): 100.0, (100, 50): 0.0},
+        golden_products={(100, 50)},
+    )
+    config = engine.Config(
+        origin_warehouses=(444,), max_tasks=100, minimum_positive_quantity=7
+    )
+    result = make_result()
+    m.apply_avl_fill(
+        result, catalog_rows(), catalogs, config, set(), (), 10.0,
+        candidate_mode="special_doh",
+    )
+    refuerzo_rows = [r for r in result.allocation_rows if r["RETAIL_ID"] == 50]
+    assert sum(r["QUANTITY"] for r in refuerzo_rows) == 7
+
+
+def test_calculate_target_quantity_hardcodes_use_configured_minimum():
+    """Los dos hardcodes de Naked (antes fijos en 4 y 3) ahora deben
+    reflejar exactamente minimum_positive_quantity, sin importar su valor."""
+    config = engine.Config(
+        origin_warehouses=(444,), max_tasks=100, minimum_positive_quantity=5
+    )
+    # HARDCODE_4_CERO_TOTAL: demanda=0, inventario=0.
+    row_cero_total = {
+        "MOV_ORIGINAL": 0.0, "PREDICTED_DEMAND": 0.0,
+        "PREDICTED_OPENING_INVENTORY": 0.0,
+    }
+    target, regla = engine.calculate_target_quantity(row_cero_total, config)
+    assert target == 5
+    assert regla == "HARDCODE_4_CERO_TOTAL"  # la etiqueta no cambia, solo el valor
+
+    # HARDCODE_3_INVENTARIO_MENOR_DEMANDA: inventario < demanda, MOV=0.
+    row_inv_menor = {
+        "MOV_ORIGINAL": 0.0, "PREDICTED_DEMAND": 10.0,
+        "PREDICTED_OPENING_INVENTORY": 2.0,
+    }
+    target, regla = engine.calculate_target_quantity(row_inv_menor, config)
+    assert target == 5
+    assert regla == "HARDCODE_3_INVENTARIO_MENOR_DEMANDA"
+
+
+def test_calculate_target_quantity_mov_minimo_uses_configured_minimum():
+    config = engine.Config(
+        origin_warehouses=(444,), max_tasks=100, minimum_positive_quantity=8
+    )
+    row = {
+        "MOV_ORIGINAL": 2.0, "PREDICTED_DEMAND": 0.0,
+        "PREDICTED_OPENING_INVENTORY": 0.0,
+    }
+    target, regla = engine.calculate_target_quantity(row, config)
+    # MOV=2 pedido, pero el piso configurado es 8 -> gana el piso.
+    assert target == 8
+    assert regla == "MOV_MINIMO_3"
+
+
+def test_calculate_target_quantity_default_minimum_is_still_3():
+    """Regresión: sin especificar minimum_positive_quantity, el default de
+    Config sigue siendo 3 — no debe cambiar el comportamiento existente."""
+    config = engine.Config(origin_warehouses=(444,), max_tasks=100)
+    row = {
+        "MOV_ORIGINAL": 0.0, "PREDICTED_DEMAND": 0.0,
+        "PREDICTED_OPENING_INVENTORY": 0.0,
+    }
+    target, _ = engine.calculate_target_quantity(row, config)
+    assert target == 3
+
+
+def test_preventive_eligibility_threshold_stays_fixed_at_3():
+    """Confirmado explícitamente: destination_stock < 3 (elegibilidad de
+    Preventivo) NO debe volverse variable, aunque minimum_positive_quantity
+    cambie — son conceptos distintos."""
+    catalogs = make_catalogs(stock_base={(444, 10): 100.0, (100, 10): 4.0})
+    config = engine.Config(
+        origin_warehouses=(444,), max_tasks=100, minimum_positive_quantity=10
+    )
+    result = make_result()
+    # destination_stock=4 (>= 3) y current_doh alto -> NO debe calificar
+    # como preventivo, sin importar que minimum_positive_quantity sea 10.
+    m.apply_avl_fill(
+        result, catalog_rows(adu_10=1.0), catalogs, config, set(), (), 2.0,
+        candidate_mode="preventive",
+    )
+    assert result.allocation_rows == []

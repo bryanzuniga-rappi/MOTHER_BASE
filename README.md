@@ -759,6 +759,7 @@ Toggle exclusivo de **Big Boss** ("Modo simulación — solo calcular, no genera
 | BLOQUEOS regional | Todos | Activo por default; toggle vacía `catalogs.blocked_products` si se apaga. |
 | RUTA_COSTOS | Todos | Activo por default; toggle vacía `catalogs.route_cost_blocks` si se apaga. |
 | Cubrir a Fountain9 | Naked | Activo por default; controla los hardcodes HARDCODE_4/HARDCODE_3 (ver §17). |
+| Mínimo de unidades a enviar | Todos | `Config.minimum_positive_quantity`. Default **4 para Big Boss, 3 para Raiden**. Piso de MOV_MINIMO_3, HARDCODE_4_CERO_TOTAL, HARDCODE_3_INVENTARIO_MENOR_DEMANDA (Naked), AVL, Preventivo, y el Refuerzo Golden/Infaltable/Anchor sin ADU. **No** afecta el umbral de elegibilidad de Preventivo (`destination_stock < 3`), que sigue fijo — son conceptos distintos. |
 | Modo simulación | Solo Big Boss | Apagado por default; ver §19.1. |
 | Warehouses origen | Todos | Orden = prioridad de consumo. |
 | Máximo de tareas | Todos | Presupuesto global; normalmente 14,000. |

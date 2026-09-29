@@ -3996,7 +3996,9 @@ def apply_avl_fill(
             if destination_stock > 0:
                 summary["skipped_not_stockout"] += 1
                 continue
-            target = max(int(math.ceil(adu * doh)), 3)
+            target = max(
+                int(math.ceil(adu * doh)), config.minimum_positive_quantity
+            )
             summary["stockout_candidates"] += 1
         elif candidate_mode == "preventive":
             if destination_stock <= 0 or not (
@@ -4006,7 +4008,7 @@ def apply_avl_fill(
                 continue
             target = max(
                 int(math.ceil(max((adu * doh) - destination_stock, 0.0))),
-                3,
+                config.minimum_positive_quantity,
             )
             summary["preventive_candidates"] += 1
         else:  # special_doh — refuerzo de Golden/Infaltable/Anchor
@@ -4030,9 +4032,11 @@ def apply_avl_fill(
             else:
                 # Sin ADU propio ni de ninguna tienda de la misma ciudad:
                 # no hay forma de calcular un DOH objetivo. Mínimo operativo
-                # de 3 unidades, sin piso de DOH, marcado en advertencias.
+                # configurable, sin piso de DOH, marcado en advertencias.
                 no_adu_anywhere = True
-                target = max(3 - already_assigned, 0)
+                target = max(
+                    config.minimum_positive_quantity - already_assigned, 0
+                )
                 if target <= 0:
                     summary["skipped_doh_sufficient"] += 1
                     continue
@@ -5060,6 +5064,7 @@ def execute_planning(
     enable_regional_block_rule: bool = True,
     enable_route_cost_block_rule: bool = True,
     simulation_mode: bool = False,
+    minimum_positive_quantity: int = 3,
     include_preventive_fill: bool = False,
     include_special_doh_fill: bool = False,
     special_doh_target: float = 21.0,
@@ -5135,7 +5140,7 @@ def execute_planning(
         run_date_override=run_date.strftime("%d-%m-%Y"),
         default_store_capacity_m3=engine.CONFIG.default_store_capacity_m3,
         default_m3_per_unit=engine.CONFIG.default_m3_per_unit,
-        minimum_positive_quantity=engine.CONFIG.minimum_positive_quantity,
+        minimum_positive_quantity=minimum_positive_quantity,
         local_work_dir=str(workspace / "engine"),
     )
 
@@ -8308,6 +8313,20 @@ def render() -> None:
             )
             st.warning(f"Se bloqueará completamente: {selected_names}")
 
+        minimum_positive_quantity = st.number_input(
+            "Mínimo de unidades a enviar (cuando sí se manda algo)",
+            min_value=1,
+            value=3 if is_raiden else 4,
+            step=1,
+            help=(
+                "Piso general de unidades cuando el modelo decide enviar "
+                "algo: MOV_MINIMO_3, los hardcodes de Naked (Cubrir a "
+                "Fountain9), AVL, Preventivo, y el Refuerzo Golden/"
+                "Infaltable/Anchor sin ADU disponible. Default 4 para Big "
+                "Boss, 3 para Raiden — se puede ajustar cada corrida."
+            ),
+        )
+
         st.markdown("###### Reglas activas por default — desactivar es la excepción")
         rules_col1, rules_col2, rules_col3, rules_col4 = st.columns(4)
         with rules_col1:
@@ -9068,6 +9087,7 @@ def render() -> None:
                     enable_regional_block_rule=enable_regional_block_rule,
                     enable_route_cost_block_rule=enable_route_cost_block_rule,
                     simulation_mode=simulation_mode,
+                    minimum_positive_quantity=minimum_positive_quantity,
                     include_preventive_fill=include_preventive_fill,
                     include_special_doh_fill=include_special_doh_fill,
                     special_doh_target=float(special_doh_target),

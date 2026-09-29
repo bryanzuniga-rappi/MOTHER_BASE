@@ -1345,9 +1345,9 @@ def calculate_target_quantity(row: dict[str, Any], config: Config) -> tuple[int,
     if math.isclose(demand, 0.0, abs_tol=1e-9) and math.isclose(
         opening, 0.0, abs_tol=1e-9
     ):
-        return 4, "HARDCODE_4_CERO_TOTAL"
+        return config.minimum_positive_quantity, "HARDCODE_4_CERO_TOTAL"
     if opening < demand:
-        return 3, "HARDCODE_3_INVENTARIO_MENOR_DEMANDA"
+        return config.minimum_positive_quantity, "HARDCODE_3_INVENTARIO_MENOR_DEMANDA"
     return 0, "SIN_DEMANDA"
 
 
