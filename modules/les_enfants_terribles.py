@@ -104,6 +104,7 @@ ALEPH_SHEETS = {
     "TIENDA",
     "STORAGE",
     "OWNER",
+    "DATA",
 }
 
 MANUAL_BACKEND_SHEETS = {"TIENDAS_CERRADAS"}
@@ -131,6 +132,7 @@ REQUIRED_DATABASE_SHEETS = (
     "STORAGE",
     "OWNER",
     "SCHEDULE",
+    "DATA",
 )
 
 SHEET_DESCRIPTIONS = {
@@ -234,6 +236,13 @@ SHEET_DESCRIPTIONS = {
         "programado. Un par destino-origen ausente de SCHEDULE no tiene "
         "restricción de frecuencia."
     ),
+    "DATA": (
+        "Catálogo maestro de producto (nombre, categoría, marca, maker, EAN, "
+        "etc.). SYNC_ID es la llave que empata con el SKU que usa todo el "
+        "resto del sistema (RETAIL_ID de Fountain9, PRODUCT_ID de CATALOGO). "
+        "Se usa para darle nombre y categoría legibles a reportes y "
+        "entregables, no para ninguna regla de negocio."
+    ),
 }
 
 ALEPH_MAX_AGE_HOURS = {
@@ -248,6 +257,7 @@ ALEPH_MAX_AGE_HOURS = {
     "STORAGE": 24.0,
     "SHARE_VENTAS": 24.0,
     "OWNER": 1.2,
+    "DATA": 24.0,
 }
 
 DEMAND_RULE_LABELS = {

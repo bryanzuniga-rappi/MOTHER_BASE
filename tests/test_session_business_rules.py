@@ -74,6 +74,128 @@ def test_globally_blocked_skus_union_with_codec_field():
     assert excluded_sku_set == {111, 222, 92462, 92463, 9151, 85919, 79837}
 
 
+# --- Hoja DATA: catálogo maestro de producto (nombre + categoría) --------
+
+def _minimal_workbook_with_extra_sheet(tmp_path, sheet_name=None, headers=None, rows=None):
+    """Arma el mismo workbook mínimo del test de arriba, y opcionalmente le
+    agrega/reemplaza UNA hoja extra (para no repetir las otras 19 hojas en
+    cada test de DATA)."""
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+
+    def add(name, hdrs, rws):
+        ws = wb.create_sheet(name)
+        ws.append(hdrs)
+        for r in rws:
+            ws.append(r)
+
+    add("VOLUMETRIA", ["SKU", "PALLETS"], [])
+    add("BLOQUEOS_FORANEAS", ["SKU"], [])
+    add("BLOQUEOS", ["PRODUCT_ID"], [])
+    add("RUTA_COSTOS", ["Destination", "Catalog ID"], [])
+    add("PRIORIDAD", ["WAREHOUSE_ID", "PRIORIDAD"], [])
+    add("444_HV", ["EAN", "Category"], [])
+    add("831_HV", ["EAN", "Category"], [])
+    add("RACKEADOS", ["WHS", "SYNC"], [])
+    add("CAP_RECIBO", ["WH_ID", "CAP"], [])
+    add("CATALOGO", ["WAREHOUSE_ID", "PRODUCT_ID", "ADU"], [])
+    add("KVI", ["WAREHOUSE_ID", "PRODUCT_ID", "KVI"], [])
+    add("SHARE_VENTAS", ["WAREHOUSE_ID", "SHARE"], [])
+    add("NO_DISPONIBLE", ["WAREHOUSE_ID", "PRODUCT_ID", "STOCK"], [])
+    add("POR_MERMAR", ["WAREHOUSE_ID","PRODUCT_ID","STOCK_AVAILABLE","VALUE_STOCK","ARRIVAL_DATE","EXPIRATION_DATE"], [])
+    add("STOCK", ["WAREHOUSE_ID", "PRODUCT_ID", "STOCK_DISPONIBLE_FINAL"], [])
+    add("OWNER", ["WAREHOUSE_ID", "PRODUCT_ID", "OWNER_NAME", "STOCK_DISPONIBLE_FINAL"], [])
+    add("INSUMOS", ["WAREHOUSE_DESTINATION","WAREHOUSE_SOURCE","RETAIL_ID","QUANTITY","PLANNED_DATE","ROUTE","DELIVERY_PRIORITY"], [])
+    add("GOLDEN_INFALTABLES_ANCHOR", ["WAREHOUSE_ID","PRODUCT_ID_SYNC","IS_INFALTABLE","IS_GOLDEN","IS_ANCHOR"], [])
+    add("TIENDA", ["CITY", "WAREHOUSE_ID", "WAREHOUSE_NAME"], [["Ciudad de México", 444, "O444"]])
+    add("STORAGE", ["PRODUCT_ID", "STORAGE_NAME"], [])
+    add("TIENDAS_CERRADAS", ["WAREHOUSE_ID"], [])
+    add("SCHEDULE", ["CITY","WAREHOUSE_ID","WAREHOUSE_NAME","ORIGEN","DAYS"], [])
+    if sheet_name:
+        add(sheet_name, headers, rows or [])
+    xlsx_path = tmp_path / "DATA_TRANSFERS.xlsx"
+    wb.save(xlsx_path)
+    return xlsx_path
+
+
+def test_product_catalog_loads_name_and_category_from_data_sheet(tmp_path):
+    xlsx_path = _minimal_workbook_with_extra_sheet(
+        tmp_path,
+        "DATA",
+        [
+            "COUNTRY", "CATALOG_ID", "SYNC_ID", "PRODUCT_NAME",
+            "MACROCATEGORY_NAME", "CATEGORY_NAME", "SUBCATEGORY_NAME",
+        ],
+        [
+            ["MX", 99999, 10, "Huevo Blanco 12pz", "Perecederos", "Huevo", "Huevo Blanco"],
+        ],
+    )
+    config = engine.Config(origin_warehouses=(444,), max_tasks=100)
+    catalogs = engine.load_catalogs(xlsx_path, config)
+
+    assert catalogs.product_catalog[10] == {
+        "PRODUCT_NAME": "Huevo Blanco 12pz",
+        "MACROCATEGORY_NAME": "Perecederos",
+        "CATEGORY_NAME": "Huevo",
+        "SUBCATEGORY_NAME": "Huevo Blanco",
+    }
+
+
+def test_product_catalog_uses_sync_id_not_catalog_id(tmp_path):
+    """El punto central de esta sesión: SYNC_ID es la llave de match, NO
+    CATALOG_ID — aunque ambos existan en la fila con valores distintos."""
+    xlsx_path = _minimal_workbook_with_extra_sheet(
+        tmp_path,
+        "DATA",
+        [
+            "CATALOG_ID", "SYNC_ID", "PRODUCT_NAME", "MACROCATEGORY_NAME",
+            "CATEGORY_NAME", "SUBCATEGORY_NAME",
+        ],
+        [[99999, 10, "Huevo Blanco 12pz", "Perecederos", "Huevo", "Huevo Blanco"]],
+    )
+    config = engine.Config(origin_warehouses=(444,), max_tasks=100)
+    catalogs = engine.load_catalogs(xlsx_path, config)
+    assert 10 in catalogs.product_catalog
+    assert 99999 not in catalogs.product_catalog
+
+
+def test_product_catalog_empty_when_data_sheet_missing(tmp_path):
+    """DATA es opcional en tiempo de carga: su ausencia no debe romper
+    load_catalogs ni afectar ninguna otra hoja."""
+    xlsx_path = _minimal_workbook_with_extra_sheet(tmp_path)
+    config = engine.Config(origin_warehouses=(444,), max_tasks=100)
+    catalogs = engine.load_catalogs(xlsx_path, config)
+    assert catalogs.product_catalog == {}
+
+
+def test_product_catalog_keeps_first_row_on_duplicate_sync_id(tmp_path):
+    xlsx_path = _minimal_workbook_with_extra_sheet(
+        tmp_path,
+        "DATA",
+        [
+            "SYNC_ID", "PRODUCT_NAME", "MACROCATEGORY_NAME", "CATEGORY_NAME",
+            "SUBCATEGORY_NAME",
+        ],
+        [
+            [10, "Nombre Original", "Macro A", "Categoria A", "Sub A"],
+            [10, "Nombre Duplicado", "Macro B", "Categoria B", "Sub B"],
+        ],
+    )
+    config = engine.Config(origin_warehouses=(444,), max_tasks=100)
+    catalogs = engine.load_catalogs(xlsx_path, config)
+    assert catalogs.product_catalog[10]["PRODUCT_NAME"] == "Nombre Original"
+
+
+def test_data_sheet_in_required_and_aleph_lists():
+    assert "DATA" in m.REQUIRED_DATABASE_SHEETS
+    assert "DATA" in m.ALEPH_SHEETS
+    assert "DATA" in m.SHEET_DESCRIPTIONS
+    assert "DATA" in m.ALEPH_MAX_AGE_HOURS
+    assert m.ALEPH_MAX_AGE_HOURS["DATA"] == 24.0
+
+
 def test_globally_blocked_skus_empty_sheet_means_no_exclusion(tmp_path):
     import openpyxl
 

@@ -291,6 +291,34 @@ def iter_schedule_records(workbook) -> Iterator[dict[str, Any]]:
             yield record
 
 
+def iter_product_catalog_records(workbook) -> Iterator[dict[str, Any]]:
+    """Lee la hoja DATA (catálogo maestro de producto): nombre, categoría y
+    jerarquía por SYNC_ID — la misma llave de SKU que usa todo el resto del
+    sistema (RETAIL_ID de Fountain9, PRODUCT_ID de CATALOGO).
+
+    DATA es parte del contrato obligatorio (se valida en el panel de
+    salud), pero este loader es defensivo igual que SCHEDULE: si la hoja no
+    está presente, no interrumpe la carga — simplemente no hay nombre ni
+    categoría disponibles para enriquecer reportes, sin afectar ninguna
+    regla de negocio (esta hoja nunca participa en la asignación).
+    """
+    if "DATA" not in workbook.sheetnames:
+        return
+    yield from iter_sheet_records(
+        workbook,
+        "DATA",
+        ["SYNC_ID", "PRODUCT_NAME"],
+        [
+            "SYNC_ID",
+            "PRODUCT_NAME",
+            "MACROCATEGORY_NAME",
+            "CATEGORY_NAME",
+            "SUBCATEGORY_NAME",
+        ],
+    )
+
+
+
 def put_unique(
     target: dict[Any, Any],
     key: Any,
@@ -633,6 +661,10 @@ class Catalogs:
     # SKUs de la hoja BLOQUEOS (columna PRODUCT_ID) que nunca se envían a
     # ningún lugar, mantenidos directamente por negocio en DATA_TRANSFERS.
     globally_blocked_skus: set[int] = field(default_factory=set)
+    # Catálogo maestro de producto (hoja DATA), por SYNC_ID -> nombre y
+    # categoría. Solo para enriquecer reportes/entregables con texto
+    # legible; nunca participa en ninguna regla de asignación.
+    product_catalog: dict[int, dict[str, str]] = field(default_factory=dict)
 
 
 def load_catalogs(
@@ -1014,6 +1046,30 @@ def load_catalogs(
                 schedule_days[key] = schedule_days[key] | days_set
             else:
                 schedule_days[key] = days_set
+
+        # Catálogo maestro de producto (hoja DATA): nombre y categoría por
+        # SYNC_ID, solo para reportes — nunca participa en asignación. La
+        # hoja es opcional en tiempo de carga (ver iter_product_catalog_records);
+        # si un SYNC_ID se repite, se conserva la primera fila y se avisa.
+        product_catalog: dict[int, dict[str, str]] = {}
+        for row in iter_product_catalog_records(workbook):
+            sku = to_id(row["SYNC_ID"], "DATA.SYNC_ID", True)
+            if sku is None:
+                continue
+            info = {
+                "PRODUCT_NAME": clean_text(row.get("PRODUCT_NAME")),
+                "MACROCATEGORY_NAME": clean_text(row.get("MACROCATEGORY_NAME")),
+                "CATEGORY_NAME": clean_text(row.get("CATEGORY_NAME")),
+                "SUBCATEGORY_NAME": clean_text(row.get("SUBCATEGORY_NAME")),
+            }
+            if sku in product_catalog:
+                if product_catalog[sku] != info and len(warnings) < 200:
+                    warnings.append(
+                        f"DATA: SYNC_ID {sku} aparece más de una vez con "
+                        "datos distintos; se conservó la primera fila."
+                    )
+                continue
+            product_catalog[sku] = info
     finally:
         workbook.close()
 
@@ -1058,6 +1114,7 @@ def load_catalogs(
         run_weekday_norm=run_weekday_norm,
         copernico_unusable_by_reason=copernico_unusable_by_reason,
         globally_blocked_skus=globally_blocked_skus,
+        product_catalog=product_catalog,
     )
 
 

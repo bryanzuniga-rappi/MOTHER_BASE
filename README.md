@@ -265,6 +265,7 @@ Los encabezados se buscan dinámicamente en las primeras 40 filas. Esto permite 
 | `TIENDA` | `CITY`, `WAREHOUSE_ID`, `WAREHOUSE_NAME` | Maestro de nodos, nombres y ciudades. |
 | `STORAGE` | `PRODUCT_ID`, `STORAGE_NAME` | Ambiente estándar. |
 | `SCHEDULE` | `WAREHOUSE_ID` (o `WAREHOUSE ID`), `ORIGEN`, `DAYS` | Frecuencia de envío permitida por destino–origen. Opcional: su ausencia no bloquea la planeación. |
+| `DATA` | `SYNC_ID`, `PRODUCT_NAME`, `MACROCATEGORY_NAME`, `CATEGORY_NAME`, `SUBCATEGORY_NAME` | Catálogo maestro de producto (ALEPH, actualiza cada 24h). `SYNC_ID` es la llave que empata con el SKU de todo el resto del sistema — **no** `CATALOG_ID`, que es un ID distinto de la misma fila. Solo para darle nombre/categoría legibles a reportes y entregables; nunca participa en ninguna regla de asignación. Opcional: su ausencia no bloquea la planeación, solo deja `catalogs.product_catalog` vacío. |
 
 ### Hoja legado no obligatoria
 
@@ -997,7 +998,7 @@ pytest -q
 
 ### Datos
 
-- [ ] Las 22 hojas obligatorias existen con nombres exactos.
+- [ ] Las 23 hojas obligatorias existen con nombres exactos.
 - [ ] Encabezados cumplen contrato.
 - [ ] C7 de Aleph es válido.
 - [ ] Fuentes de 1.2 horas y 24 horas dentro del SLA.
