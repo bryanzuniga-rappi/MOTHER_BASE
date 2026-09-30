@@ -6883,7 +6883,7 @@ def render_planning_analytics(analytics: dict[str, Any], run: dict[str, Any]) ->
                     "Casos Infaltable, Golden o Anchor que reciben al menos una unidad, sin "
                     "importar cuántas tareas se generaron."
                 ),
-                "tone": "blue",
+                "tone": "acid",
             },
         ]
     )
@@ -6944,6 +6944,18 @@ CATEGORIA_DISPLAY_LABELS = {
 }
 
 
+# Identidad visual de cada bucket en el reporte de universo — un color
+# fijo por bucket para reconocerlos de un vistazo, independiente del
+# significado semántico (verde/rojo/azul) que ya usan las tarjetas de
+# resultado de abajo. "purple" queda fuera a propósito: ya es la identidad
+# de la tarjeta de Venom en CODEC, no se reutiliza aquí.
+UNIVERSE_BUCKET_BADGE_COLORS = {
+    "GOLDEN": "#FFF000",
+    "INFALTABLE": "#BD00FF",
+    "ANCHOR": "#FF007F",
+}
+
+
 def render_bucket_universe_report(bucket_label: str, report: dict[str, Any]) -> None:
     """Renderiza los 3 niveles del reporte de universo completo de un
     bucket (Golden, Infaltable o Anchor): general, general con detalle, y
@@ -6951,8 +6963,15 @@ def render_bucket_universe_report(bucket_label: str, report: dict[str, Any]) -> 
     if not report or not report.get("enabled"):
         return
 
+    badge_color = UNIVERSE_BUCKET_BADGE_COLORS.get(bucket_label.upper(), "#5e7cff")
     st.markdown(
-        f'<div class="report-title">UNIVERSO {bucket_label}.</div>',
+        f'<div class="report-title">'
+        f'<span style="display:inline-block; width:22px; height:22px; '
+        f'background:{badge_color}; border:2px solid #111111; '
+        f'border-radius:4px; margin-right:10px; vertical-align:middle;">'
+        f"</span>"
+        f"UNIVERSO {bucket_label}."
+        f"</div>",
         unsafe_allow_html=True,
     )
     st.markdown(
@@ -7179,7 +7198,7 @@ def render_results(run: dict[str, Any]) -> None:
                     "separada para no mezclarla con unidades de producto y ya refleja "
                     "cualquier recorte por stock del 444."
                 ),
-                "tone": "coral",
+                "tone": "acid",
             },
         ],
         columns_count=3,
@@ -7267,90 +7286,10 @@ def render_results(run: dict[str, Any]) -> None:
                         "Filas adicionales absorbidas al coincidir en Warehouse–SKU. "
                         "No se duplican como requerimientos separados."
                     ),
-                    "tone": "coral",
-                },
-            ],
-            columns_count=4,
-        )
-
-    outliers = run.get("outliers_f9", {})
-    if outliers.get("enabled"):
-        st.markdown(
-            '<span class="section-label">CONTROL DE OUTLIERS · FOUNTAIN9</span>',
-            unsafe_allow_html=True,
-        )
-        render_kpi_cards(
-            [
-                {
-                    "category": "TIENDAS · INPUT",
-                    "label": "TIENDAS EVALUADAS",
-                    "value": f"{outliers.get('stores_evaluated', 0):,}",
-                    "description": (
-                        "Tiendas distintas encontradas en el conjunto consolidado "
-                        "de archivos Fountain9."
-                    ),
                     "tone": "blue",
                 },
-                {
-                    "category": "LÍNEAS · REFERENCIA",
-                    "label": "MEDIANA POR TIENDA",
-                    "value": f"{outliers.get('median_lines', 0):,.1f}",
-                    "description": (
-                        "Mediana de combinaciones SKU–tienda únicas. Es más "
-                        "estable que el promedio frente a archivos anómalos."
-                    ),
-                },
-                {
-                    "category": "LÍNEAS · CONTROL",
-                    "label": "UMBRAL DE EXCLUSIÓN",
-                    "value": f"{outliers.get('threshold', 0):,}",
-                    "description": (
-                        "Una tienda se excluye cuando contiene 50% o menos de la "
-                        "mediana de líneas. La regla solo se activa con al menos "
-                        "cinco tiendas y una mediana mínima de 20."
-                    ),
-                    "tone": "acid",
-                },
-                {
-                    "category": "TIENDAS · EXCLUIDAS",
-                    "label": "OUTLIERS DETECTADOS",
-                    "value": f"{outliers.get('stores_excluded', 0):,}",
-                    "description": (
-                        "Tiendas eliminadas antes de ejecutar cualquier engine. "
-                        "No consumieron stock, capacidad ni tareas."
-                    ),
-                    "tone": "coral",
-                },
             ],
             columns_count=4,
-        )
-        if outliers.get("stores"):
-            report_table(
-                outliers["stores"],
-                column_config={
-                    "WAREHOUSE_DESTINATION": st.column_config.NumberColumn(
-                        "WAREHOUSE", format="%d"
-                    ),
-                    "PORCENTAJE_DE_LA_MEDIANA": st.column_config.NumberColumn(
-                        "% DE LA MEDIANA", format="%.1f%%"
-                    ),
-                },
-                max_height=420,
-            )
-        if outliers.get("requirements_excluded", 0):
-            st.warning(
-                f"Se excluyeron {outliers['requirements_excluded']:,} combinaciones "
-                f"de {outliers['stores_excluded']:,} tiendas anómalas. El detalle "
-                "completo está en el CSV Outliers_Fountain9_Excluidos."
-            )
-
-    closed_stores = run.get("closed_stores", {})
-    if closed_stores.get("requirements", 0) > 0:
-        store_ids = ", ".join(map(str, closed_stores.get("store_ids", [])))
-        st.warning(
-            "Bloqueo backend TIENDAS_CERRADAS aplicado: se excluyeron "
-            f"{closed_stores['requirements']:,} requerimientos de "
-            f"{closed_stores['stores']:,} tiendas ({store_ids}) antes de asignar stock."
         )
 
     city_block = run.get("city_block", {})
@@ -7683,7 +7622,7 @@ def render_results(run: dict[str, Any]) -> None:
                         "según ADU. El objetivo mínimo es 3, salvo que el stock "
                         "permitido disponible sea menor."
                     ),
-                    "tone": "coral",
+                    "tone": "acid",
                 },
             ],
             columns_count=3,
@@ -7734,7 +7673,7 @@ def render_results(run: dict[str, Any]) -> None:
                         f"{preventive.get('doh', 0):g} DOH. El envío mínimo es 3 "
                         "unidades, salvo que el stock permitido disponible sea menor."
                     ),
-                    "tone": "coral",
+                    "tone": "acid",
                 },
                 {
                     "category": "CASOS · CANDIDATOS",
@@ -7797,7 +7736,7 @@ def render_results(run: dict[str, Any]) -> None:
                         f"hasta {special_doh.get('doh', 0):g} DOH, sin mínimo "
                         "forzado de 3 unidades (a diferencia de AVL/preventivo)."
                     ),
-                    "tone": "coral",
+                    "tone": "acid",
                 },
                 {
                     "category": "CASOS · CANDIDATOS",
@@ -7906,7 +7845,7 @@ def render_results(run: dict[str, Any]) -> None:
                         "Unidades adicionales distribuidas primero para nivelar DOH "
                         "hasta 14 y después mediante el share general de las tiendas."
                     ),
-                    "tone": "coral",
+                    "tone": "acid",
                 },
                 {
                     "category": "SALDOS · ORIGEN-SKU",
@@ -8030,6 +7969,74 @@ def render_results(run: dict[str, Any]) -> None:
                 f"pero {skipped_total:,} quedaron sin línea por stock "
                 "insuficiente, capacidad, tareas, bloqueos o falta de ADU "
                 "(ver advertencias para el detalle)."
+            )
+
+    insumos = run.get("insumos", {})
+    if insumos.get("enabled"):
+        st.markdown(
+            '<span class="section-label">INSUMOS · ANEXO SIN TAREAS</span>',
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            "Corre aparte de los demás engines: se anexa directo al "
+            "BulkCD_444.csv ya escrito, sin consumir el presupuesto "
+            "compartido de tareas."
+        )
+        render_kpi_cards(
+            [
+                {
+                    "category": "LÍNEAS · INSUMOS",
+                    "label": "LÍNEAS AGREGADAS",
+                    "value": f"{insumos.get('lines_added', 0):,}",
+                    "description": (
+                        "Filas de INSUMOS anexadas al Bulk del 444 para "
+                        "tiendas que ya recibían producto normal desde ahí."
+                    ),
+                    "tone": "blue",
+                },
+                {
+                    "category": "UNIDADES · RECORTADAS",
+                    "label": "UNIDADES CORTADAS POR STOCK/MOQ",
+                    "value": (
+                        f"{insumos.get('units_cut_stock', 0) + insumos.get('units_cut_moq', 0):,}"
+                    ),
+                    "description": (
+                        "Unidades que se pidieron pero no se pudieron mandar "
+                        "completas por límite de stock ajustado del 444 o por "
+                        "no alcanzar el múltiplo de MOQ del insumo."
+                    ),
+                    "tone": "coral",
+                },
+                {
+                    "category": "UNIDADES · INSUMOS",
+                    "label": "UNIDADES AGREGADAS",
+                    "value": f"{insumos.get('units_added', 0):,}",
+                    "description": "Unidades de insumos efectivamente anexadas.",
+                    "tone": "acid",
+                },
+                {
+                    "category": "TIENDAS · INSUMOS",
+                    "label": "TIENDAS CUBIERTAS",
+                    "value": f"{insumos.get('stores_added', 0):,}",
+                    "description": (
+                        "Tiendas distintas que recibieron al menos una línea "
+                        "de insumos en esta corrida."
+                    ),
+                    "tone": "blue",
+                },
+            ],
+            columns_count=4,
+        )
+        blocked_total = (
+            insumos.get("lines_blocked_regional", 0)
+            + insumos.get("lines_blocked_schedule", 0)
+            + insumos.get("lines_blocked_city_restriction", 0)
+        )
+        if blocked_total > 0:
+            st.warning(
+                f"{blocked_total:,} líneas de insumos se descartaron por "
+                "bloqueo regional, frecuencia (SCHEDULE) o restricción de "
+                "ciudad específica del SKU."
             )
 
     fruver_811 = run.get("fruver_811", {})
