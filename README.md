@@ -552,7 +552,7 @@ Ejecuta casos con ROQ original positivo. Consume stock, capacidad y tareas. Sus 
 
 ### Solidus Engine
 
-Desde esta sesión, Solidus **ya no incluye los hardcodes de Fountain9** (ver arriba) — son tres coberturas opcionales, todas apoyadas en CATALOGO:
+Desde esta sesión, Solidus **ya no incluye los hardcodes de Fountain9** (ver arriba) — son cuatro coberturas opcionales, todas apoyadas en CATALOGO (AVL, Prevención, Refuerzo Golden/Infaltable/Anchor y Cobertura sin Fountain9; esta última se documenta más abajo, después de Refuerzo):
 
 **AVL:** busca catálogo con stock final cero y sin servicio positivo previo. Objetivo:
 
@@ -564,9 +564,9 @@ max(ceil(ADU × DOH objetivo), 3)
 
 Ambas ya **no descartan** combinaciones tienda-SKU con ADU ≤ 0 en CATALOGO desde el arranque — usan la cascada de ADU compartida (ver abajo) antes de decidir si hay o no dato suficiente.
 
-### Cascada de ADU compartida (AVL, Preventivo, Refuerzo)
+### Cascada de ADU compartida (AVL, Preventivo, Refuerzo, Cobertura sin Fountain9)
 
-Las tres coberturas de Solidus resuelven el ADU de cada tienda-SKU con la misma lógica de respaldo, implementada en `resolve_adu_with_city_fallback`:
+Las cuatro coberturas de Solidus resuelven el ADU de cada tienda-SKU con la misma lógica de respaldo, implementada en `resolve_adu_with_city_fallback`. Cobertura sin Fountain9 tiene un piso adicional propio (0.14/día) cuando ni esta cascada encuentra dato — ver su sección más abajo.
 
 1. **ADU propio** en CATALOGO para esa tienda-SKU → se usa tal cual.
 2. **Sin ADU propio** (ausente o ≤ 0) → promedio de ADU del mismo SKU en otras tiendas de la **misma ciudad** que sí tengan ADU > 0 en CATALOGO.
@@ -590,7 +590,25 @@ Rediseñado por completo en esta sesión. Diferencias clave frente a AVL/Prevent
 
 `PLANNING_REASON = "REFUERZO GOLDEN/INFALTABLE/ANCHOR · SOLIDUS ENGINE"`, `TIPO_DE_CORTE = "ENVIADOS PARA REFORZAR GOLDEN/INFALTABLE/ANCHOR"`.
 
-Las tres coberturas de Solidus usan únicamente stock, capacidad y tareas remanentes, en el orden: AVL → Prevención → Refuerzo Golden/Infaltable/Anchor — cada una solo ve las tareas que dejaron libres las anteriores.
+### Cobertura sin Fountain9
+
+Cuarta cobertura de Solidus, opcional y desactivada por default (toggle "Cubrir quiebres sin fila de Fountain9"). Corre **al final de Solidus**, después de AVL, Preventivo y Refuerzo, usando exclusivamente lo que sobró de tareas y stock.
+
+- **Universo de candidatos**: CATALOGO completo, igual que AVL/Preventivo. Un candidato califica si (a) el stock en destino es 0 (quebrado) y (b) la combinación tienda-SKU **no tiene ninguna fila en el archivo de Fountain9 de esta corrida** — ni siquiera una con `CANTIDAD_OBJETIVO = 0`. Esto es más estricto que la exclusión que usa el Refuerzo (`CANTIDAD_OBJETIVO > 0`): aquí basta con que la fila exista, sin importar su valor, para que este mecanismo la ignore por completo.
+- **Objetivo, sin DOH fijo de CODEC**:
+
+  ```text
+  ADU_efectivo = ADU propio (o de ciudad) > 0 ? ese valor : 0.14 (ADU ficticio)
+  objetivo = ADU_efectivo × (Duration_moda_tienda + Lead_Time_moda_tienda) − stock_destino − STOCK.INCOMING
+  a_enviar = max(ceil(objetivo), mínimo de unidades a enviar de CODEC)
+  ```
+
+  `Duration` y `Primary Source Lead Time (Days)` son columnas opcionales del Bulk de Fountain9 (si el archivo no las trae, este mecanismo simplemente no encuentra candidatos — no bloquea la carga). Se toma la **moda** de cada una, calculada **por tienda** sobre todas las filas de esa tienda en el Bulk consolidado (no por SKU, no un promedio). Si una tienda no tiene ninguna fila con esos datos válidos en el Bulk, sus quiebres sin Fountain9 se saltan sin piso de cálculo (contados en `skipped_no_duration_data`).
+- **`STOCK.INCOMING`**: columna que estaba reservada en el contrato de la hoja STOCK desde hace tiempo, sin usarse. Este mecanismo es el primero en activarla — opcional, se detecta si está presente antes de exigirla. Representa unidades ya en tránsito hacia esa tienda-SKU por cualquier motivo previo a la corrida; se resta del objetivo para no sobre-enviar.
+
+`PLANNING_REASON = "COBERTURA SIN FOUNTAIN9 · SOLIDUS ENGINE"`, `REGLA_DEMANDA = "COBERTURA_SIN_FOUNTAIN9"`, `TIPO_DE_CORTE = "ENVIADOS PARA CUBRIR QUIEBRE SIN FOUNTAIN9"`.
+
+Las cuatro coberturas de Solidus usan únicamente stock, capacidad y tareas remanentes, en el orden: AVL → Prevención → Refuerzo Golden/Infaltable/Anchor → Cobertura sin Fountain9 — cada una solo ve las tareas que dejaron libres las anteriores.
 
 ### Check de salud Golden/Infaltable/Anchor (post-corrida)
 
@@ -778,6 +796,7 @@ Toggle exclusivo de **Big Boss** ("Modo simulación — solo calcular, no genera
 | BLOQUEOS regional | Todos | Activo por default; toggle vacía `catalogs.blocked_products` si se apaga. |
 | RUTA_COSTOS | Todos | Activo por default; toggle vacía `catalogs.route_cost_blocks` si se apaga. |
 | Cubrir a Fountain9 | Naked | Activo por default; controla los hardcodes HARDCODE_4/HARDCODE_3 (ver §17). |
+| Cubrir quiebres sin fila de Fountain9 | Solidus | Apagado por default. Corre al final de Solidus, usa Duration/Lead Time moda por tienda del Bulk de Fountain9 en vez del DOH fijo (ver §17). |
 | Mínimo de unidades a enviar | Todos | `Config.minimum_positive_quantity`. Default **4 para Big Boss, 3 para Raiden**. Piso de MOV_MINIMO_3, HARDCODE_4_CERO_TOTAL, HARDCODE_3_INVENTARIO_MENOR_DEMANDA (Naked), AVL, Preventivo, y el Refuerzo Golden/Infaltable/Anchor sin ADU. **No** afecta el umbral de elegibilidad de Preventivo (`destination_stock < 3`), que sigue fijo — son conceptos distintos. |
 | Modo simulación | Solo Big Boss | Apagado por default; ver §19.1. |
 | Warehouses origen | Todos | Orden = prioridad de consumo. |

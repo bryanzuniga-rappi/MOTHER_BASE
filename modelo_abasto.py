@@ -676,6 +676,11 @@ class Catalogs:
     # categoría. Solo para enriquecer reportes/entregables con texto
     # legible; nunca participa en ninguna regla de asignación.
     product_catalog: dict[int, dict[str, str]] = field(default_factory=dict)
+    # STOCK.INCOMING (opcional, antes reservado sin usar): unidades ya en
+    # tránsito hacia (warehouse, sku), por cualquier motivo previo a esta
+    # corrida. Se resta al calcular cuánto falta cubrir en el mecanismo de
+    # cobertura sin Fountain9, para no sobre-enviar.
+    incoming_stock: dict[tuple[int, int], float] = field(default_factory=dict)
 
 
 def load_catalogs(
@@ -904,11 +909,21 @@ def load_catalogs(
             if warehouse is not None and sku is not None:
                 unavailable_stock[(warehouse, sku)] += max(to_float(row["STOCK"]), 0.0)
 
+        # INCOMING es opcional (reservado desde hace tiempo, nunca exigido):
+        # se detecta si está presente en el encabezado real ANTES de
+        # pedirlo, para no romper cargas de negocio que todavía no lo
+        # traen en su STOCK.
+        stock_required = ["WAREHOUSE_ID", "PRODUCT_ID", "STOCK_DISPONIBLE_FINAL"]
+        _, stock_header_positions = find_header_row(workbook["STOCK"], stock_required)
+        has_incoming_column = normalize_header("INCOMING") in stock_header_positions
+        stock_selected = list(stock_required)
+        if has_incoming_column:
+            stock_selected.append("INCOMING")
+
         stock_base: dict[tuple[int, int], float] = {}
+        incoming_stock: dict[tuple[int, int], float] = defaultdict(float)
         for row in iter_sheet_records(
-            workbook,
-            "STOCK",
-            ["WAREHOUSE_ID", "PRODUCT_ID", "STOCK_DISPONIBLE_FINAL"],
+            workbook, "STOCK", stock_required, stock_selected
         ):
             warehouse = to_id(row["WAREHOUSE_ID"], "STOCK.WAREHOUSE_ID", True)
             sku = to_id(row["PRODUCT_ID"], "STOCK.PRODUCT_ID", True)
@@ -916,6 +931,10 @@ def load_catalogs(
                 continue
             stock = max(to_float(row["STOCK_DISPONIBLE_FINAL"]), 0.0)
             put_unique(stock_base, (warehouse, sku), stock, warnings, "STOCK", "min")
+            if has_incoming_column:
+                incoming_stock[(warehouse, sku)] += max(
+                    to_float(row.get("INCOMING")), 0.0
+                )
 
         owner_stock: dict[tuple[int, int, str], int] = defaultdict(int)
         for row in iter_sheet_records(
@@ -1126,6 +1145,7 @@ def load_catalogs(
         copernico_unusable_by_reason=copernico_unusable_by_reason,
         globally_blocked_skus=globally_blocked_skus,
         product_catalog=product_catalog,
+        incoming_stock=dict(incoming_stock),
     )
 
 

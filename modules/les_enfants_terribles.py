@@ -11,6 +11,7 @@ import io
 import math
 import csv
 import re
+import statistics
 import shutil
 import tempfile
 import time
@@ -335,6 +336,9 @@ INPUT_PLAN_COLUMNS = (
 # INPUT_PLAN_COLUMNS arriba); estas 11 son opcionales: si el archivo de
 # Fountain9 no las trae, simplemente no participan en el máximo — nunca
 # tumban la carga.
+DURATION_COLUMN = "Duration"
+LEAD_TIME_COLUMN = "Primary Source Lead Time (Days)"
+
 MOV_MAX_OPTIONAL_COLUMNS = (
     "Replenishment Quantity for Plan Duration (Batch Size Rounded)",
     "Replenishment Quantity for Plan Duration (MOQ)",
@@ -376,6 +380,12 @@ PLANNING_REASON_AVL = "CUBRIR AVL · SOLIDUS ENGINE"
 PLANNING_REASON_PREVENTIVE = "EVITAR QUIEBRES · SOLIDUS ENGINE"
 PLANNING_REASON_SPECIAL_DOH = "REFUERZO GOLDEN/INFALTABLE/ANCHOR · SOLIDUS ENGINE"
 SPECIAL_DOH_CUT = "ENVIADOS PARA REFORZAR GOLDEN/INFALTABLE/ANCHOR"
+PLANNING_REASON_NO_FOUNTAIN9 = "COBERTURA SIN FOUNTAIN9 · SOLIDUS ENGINE"
+NO_FOUNTAIN9_CUT = "ENVIADOS PARA CUBRIR QUIEBRE SIN FOUNTAIN9"
+# ADU de respaldo cuando el SKU no tiene ADU propio ni de ciudad (cascada
+# de resolve_adu_with_city_fallback) Y además Fountain9 nunca lo evaluó —
+# a falta de cualquier señal de venta, 0.14/día es el piso de negocio.
+FICTITIOUS_ADU_NO_FOUNTAIN9 = 0.14
 PLANNING_REASON_INSUMOS = "INSUMOS"
 BULK_OUTPUT_COLUMNS = [*engine.OUTPUT_COLUMNS, PLANNING_REASON_COLUMN]
 
@@ -1252,6 +1262,9 @@ def consolidate_plan_files(
     consolidated: dict[tuple[int, int], dict[str, Any]] = {}
     source_row_count = 0
     source_counts: Counter[str] = Counter()
+    # Para la moda de Duration/Lead Time por tienda (ver más abajo).
+    duration_values_by_store: dict[int, list[float]] = defaultdict(list)
+    lead_time_values_by_store: dict[int, list[float]] = defaultdict(list)
 
     for path in plan_paths:
         with path.open(
@@ -1321,6 +1334,14 @@ def consolidate_plan_files(
                 if match is not None:
                     optional_mov_lookup[column] = match
 
+            # Duration/Lead Time: opcionales, para la moda por tienda que
+            # alimenta la cobertura de SKUs sin fila de Fountain9 (ver
+            # build_no_fountain9_coverage_candidates). No es un promedio
+            # por SKU — es una sola moda por tienda, sobre TODAS las filas
+            # de esa tienda en el archivo, sin importar el SKU.
+            duration_field = field_lookup.get(engine.normalize_header(DURATION_COLUMN))
+            lead_time_field = field_lookup.get(engine.normalize_header(LEAD_TIME_COLUMN))
+
             for csv_row, raw in enumerate(reader, start=2):
                 if not any(engine.clean_text(value) for value in raw.values()):
                     continue
@@ -1344,6 +1365,14 @@ def consolidate_plan_files(
                         f"no coinciden ({destination_values})."
                     )
                 destination = destination_values[0]
+                if duration_field is not None:
+                    duration_value = engine.to_float(raw.get(duration_field, ""))
+                    if duration_value > 0:
+                        duration_values_by_store[destination].append(duration_value)
+                if lead_time_field is not None:
+                    lead_time_value = engine.to_float(raw.get(lead_time_field, ""))
+                    if lead_time_value > 0:
+                        lead_time_values_by_store[destination].append(lead_time_value)
                 sku_field = required_lookup["SKU ID"]
                 sku = engine.to_id(
                     raw.get(sku_field, ""),
@@ -1457,6 +1486,20 @@ def consolidate_plan_files(
     duplicated_keys = sum(
         int(record["SOURCE_ROWS"] > 1) for record in consolidated.values()
     )
+    # Moda de Duration/Lead Time por tienda — una sola vez, sobre TODAS las
+    # filas de esa tienda en TODOS los archivos cargados (no por archivo).
+    # statistics.mode() toma el primer valor más frecuente en caso de
+    # empate (determinístico, sin lanzar excepción).
+    duration_mode_by_store: dict[int, float] = {
+        store: statistics.mode(values)
+        for store, values in duration_values_by_store.items()
+        if values
+    }
+    lead_time_mode_by_store: dict[int, float] = {
+        store: statistics.mode(values)
+        for store, values in lead_time_values_by_store.items()
+        if values
+    }
     summary = {
         "files": len(plan_paths),
         "file_names": [path.name for path in plan_paths],
@@ -1466,6 +1509,8 @@ def consolidate_plan_files(
         "duplicated_keys": duplicated_keys,
         "net_transfer_hardcodes": net_transfer_hardcodes,
         "rows_by_file": dict(source_counts),
+        "duration_mode_by_store": duration_mode_by_store,
+        "lead_time_mode_by_store": lead_time_mode_by_store,
     }
     return output_path, consolidated, summary
 
@@ -3937,11 +3982,23 @@ def apply_avl_fill(
     *,
     candidate_mode: str = "stockout",
     excluded_keys: set[tuple[int, int]] | None = None,
+    duration_mode_by_store: dict[int, float] | None = None,
+    lead_time_mode_by_store: dict[int, float] | None = None,
 ) -> dict[str, Any]:
-    """Usa tareas remanentes para stockouts, inventario preventivo o refuerzo
-    de Golden/Infaltable/Anchor del catálogo."""
-    if candidate_mode not in {"stockout", "preventive", "special_doh"}:
+    """Usa tareas remanentes para stockouts, inventario preventivo, refuerzo
+    de Golden/Infaltable/Anchor del catálogo, o cobertura de quiebres sin
+    fila de Fountain9 (candidate_mode="no_fountain9_coverage").
+
+    ``duration_mode_by_store``/``lead_time_mode_by_store`` solo aplican al
+    modo "no_fountain9_coverage" — la moda de Duration/Lead Time del Bulk
+    de Fountain9, una por tienda (ver consolidate_plan_files).
+    """
+    if candidate_mode not in {
+        "stockout", "preventive", "special_doh", "no_fountain9_coverage",
+    }:
         raise ValueError(f"Modo de cobertura de catálogo inválido: {candidate_mode}")
+    duration_mode_by_store = duration_mode_by_store or {}
+    lead_time_mode_by_store = lead_time_mode_by_store or {}
     summary = empty_avl_summary(True, doh)
     summary["mode"] = candidate_mode
     summary["catalog_rows"] = len(catalog_rows)
@@ -4074,6 +4131,41 @@ def apply_avl_fill(
                 config.minimum_positive_quantity,
             )
             summary["preventive_candidates"] += 1
+        elif candidate_mode == "no_fountain9_coverage":
+            # Quebrado (stock=0) Y Fountain9 nunca evaluó esta tienda-SKU
+            # (el filtro de "ya excluido por excluded_keys", más abajo,
+            # es lo que descarta lo que Fountain9 sí trae). Duration/Lead
+            # Time moda por TIENDA sustituyen el DOH fijo de CODEC; sin
+            # esos dos datos para esta tienda, no hay base para calcular.
+            if destination_stock > 0:
+                summary["skipped_not_stockout"] += 1
+                continue
+            duration_mode = duration_mode_by_store.get(destination)
+            lead_time_mode = lead_time_mode_by_store.get(destination)
+            if duration_mode is None or lead_time_mode is None:
+                summary["skipped_no_duration_data"] = (
+                    summary.get("skipped_no_duration_data", 0) + 1
+                )
+                continue
+            effective_adu = adu if adu > 0 else FICTITIOUS_ADU_NO_FOUNTAIN9
+            incoming = max(catalogs.incoming_stock.get(key, 0.0), 0.0)
+            raw_target = (
+                effective_adu * (duration_mode + lead_time_mode)
+                - destination_stock
+                - incoming
+            )
+            raw_target = max(raw_target, 0.0)
+            if raw_target <= 0:
+                summary["skipped_covered_by_incoming"] = (
+                    summary.get("skipped_covered_by_incoming", 0) + 1
+                )
+                continue
+            target = max(
+                int(math.ceil(raw_target)), config.minimum_positive_quantity
+            )
+            summary["no_fountain9_candidates"] = (
+                summary.get("no_fountain9_candidates", 0) + 1
+            )
         else:  # special_doh — refuerzo de Golden/Infaltable/Anchor
             if key in excluded_key_set:
                 # Fountain9 sí pidió algo para esta tienda-SKU: el refuerzo
@@ -4134,6 +4226,24 @@ def apply_avl_fill(
                 "PRODUCT_PRIORITY_TYPE": priority_profile["type"],
                 "PRODUCT_PRIORITY_RANK": priority_profile["rank"],
                 "PRIORITY": catalogs.store_priority.get(destination, 100),
+                "DURATION_MODE": (
+                    duration_mode_by_store.get(destination)
+                    if candidate_mode == "no_fountain9_coverage"
+                    else None
+                ),
+                "LEAD_TIME_MODE": (
+                    lead_time_mode_by_store.get(destination)
+                    if candidate_mode == "no_fountain9_coverage"
+                    else None
+                ),
+                "INCOMING": (
+                    max(catalogs.incoming_stock.get(key, 0.0), 0.0)
+                    if candidate_mode == "no_fountain9_coverage"
+                    else 0.0
+                ),
+                "USED_FICTITIOUS_ADU": (
+                    candidate_mode == "no_fountain9_coverage" and adu <= 0
+                ),
             }
         )
 
@@ -4284,7 +4394,11 @@ def apply_avl_fill(
                         else (
                             PLANNING_REASON_PREVENTIVE
                             if candidate_mode == "preventive"
-                            else PLANNING_REASON_SPECIAL_DOH
+                            else (
+                                PLANNING_REASON_NO_FOUNTAIN9
+                                if candidate_mode == "no_fountain9_coverage"
+                                else PLANNING_REASON_SPECIAL_DOH
+                            )
                         )
                     ),
                 }
@@ -4336,11 +4450,23 @@ def apply_avl_fill(
                 else (
                     "PREVENTIVO_DOH"
                     if candidate_mode == "preventive"
-                    else "REFUERZO_ESPECIALES_DOH"
+                    else (
+                        "COBERTURA_SIN_FOUNTAIN9"
+                        if candidate_mode == "no_fountain9_coverage"
+                        else "REFUERZO_ESPECIALES_DOH"
+                    )
                 )
             ),
-            "ADU_CATALOGO": candidate["ADU"],
-            "DOH_AVL": doh,
+            "ADU_CATALOGO": (
+                FICTITIOUS_ADU_NO_FOUNTAIN9
+                if candidate.get("USED_FICTITIOUS_ADU")
+                else candidate["ADU"]
+            ),
+            "DOH_AVL": (
+                (candidate["DURATION_MODE"] or 0) + (candidate["LEAD_TIME_MODE"] or 0)
+                if candidate_mode == "no_fountain9_coverage"
+                else doh
+            ),
             "DOH_DESTINO_ANTES": (
                 round(candidate["CURRENT_DOH"], 3)
                 if math.isfinite(candidate["CURRENT_DOH"])
@@ -4388,7 +4514,11 @@ def apply_avl_fill(
                 else (
                     "ENVIADOS PARA PREVENIR QUIEBRE"
                     if candidate_mode == "preventive"
-                    else SPECIAL_DOH_CUT
+                    else (
+                        NO_FOUNTAIN9_CUT
+                        if candidate_mode == "no_fountain9_coverage"
+                        else SPECIAL_DOH_CUT
+                    )
                 )
             ),
             "DETALLE_MOTIVO": (
@@ -4401,30 +4531,45 @@ def apply_avl_fill(
                         if candidate_mode == "preventive"
                         else (
                             (
-                                "Refuerzo Golden/Infaltable/Anchor SIN ADU "
-                                "(ni propio ni de la ciudad): mínimo operativo "
-                                "de 3 unidades, sin piso de DOH."
+                                f"Quebrado sin fila de Fountain9: ADU "
+                                f"{'ficticio ' if candidate['USED_FICTITIOUS_ADU'] else ''}"
+                                f"{(FICTITIOUS_ADU_NO_FOUNTAIN9 if candidate['USED_FICTITIOUS_ADU'] else candidate['ADU']):.4f} "
+                                f"× (Duration {candidate['DURATION_MODE']:g} + Lead "
+                                f"Time {candidate['LEAD_TIME_MODE']:g} moda de la "
+                                f"tienda) − {candidate['INCOMING']:g} incoming"
                             )
-                            if candidate["NO_ADU_ANYWHERE"]
+                            if candidate_mode == "no_fountain9_coverage"
                             else (
-                                "Refuerzo Golden/Infaltable/Anchor: "
-                                f"{candidate['DESTINATION_STOCK']:g} unidades en "
-                                "stock + lo ya asignado por otros engines de "
-                                "cobertura en esta corrida = "
-                                f"{candidate['CURRENT_DOH']:.3f} DOH antes de este "
-                                f"envío (ADU {candidate['ADU_SOURCE'].lower()})"
+                                (
+                                    "Refuerzo Golden/Infaltable/Anchor SIN ADU "
+                                    "(ni propio ni de la ciudad): mínimo operativo "
+                                    "de 3 unidades, sin piso de DOH."
+                                )
+                                if candidate["NO_ADU_ANYWHERE"]
+                                else (
+                                    "Refuerzo Golden/Infaltable/Anchor: "
+                                    f"{candidate['DESTINATION_STOCK']:g} unidades en "
+                                    "stock + lo ya asignado por otros engines de "
+                                    "cobertura en esta corrida = "
+                                    f"{candidate['CURRENT_DOH']:.3f} DOH antes de este "
+                                    f"envío (ADU {candidate['ADU_SOURCE'].lower()})"
+                                )
                             )
                         )
                     )
                 )
                 + (
-                    f"; objetivo de cobertura {doh:g} DOH con ADU "
-                    f"{candidate['ADU']:.4f}. "
-                    if not (
-                        candidate_mode == "special_doh"
-                        and candidate["NO_ADU_ANYWHERE"]
+                    "; "
+                    if candidate_mode == "no_fountain9_coverage"
+                    else (
+                        f"; objetivo de cobertura {doh:g} DOH con ADU "
+                        f"{candidate['ADU']:.4f}. "
+                        if not (
+                            candidate_mode == "special_doh"
+                            and candidate["NO_ADU_ANYWHERE"]
+                        )
+                        else "; "
                     )
-                    else "; "
                 )
                 + f"Asignadas {assigned} de {original_target} sin exceder capacidad."
             ),
@@ -5130,6 +5275,7 @@ def execute_planning(
     minimum_positive_quantity: int = 3,
     include_preventive_fill: bool = False,
     include_special_doh_fill: bool = False,
+    include_no_fountain9_coverage: bool = False,
     special_doh_target: float = 21.0,
     include_naked_engine: bool = True,
     cover_fountain9_hardcodes: bool = True,
@@ -5401,6 +5547,16 @@ def execute_planning(
             for row in result.base_rows
             if int(row.get("CANTIDAD_OBJETIVO", 0) or 0) > 0
         }
+        # TODA tienda-SKU que tuvo fila en Fountain9, sin importar el
+        # target (a diferencia de fountain_recommended_keys, que solo
+        # cuenta target>0). Se captura AQUÍ, antes de que AVL/Preventivo/
+        # Refuerzo agreguen sus propias filas a base_rows por candidatos
+        # de CATALOGO que Fountain9 nunca tuvo — si se calculara después,
+        # incluiría por error esas filas ajenas a Fountain9.
+        fountain9_seen_keys = {
+            (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"])
+            for row in result.base_rows
+        }
         closed_summary = closed_store_summary(
             closed_plan_rows,
             closed_store_ids,
@@ -5487,7 +5643,15 @@ def execute_planning(
         include_special_doh_fill = (
             include_solidus_engine and include_special_doh_fill
         )
-        if include_avl_fill or include_preventive_fill or include_special_doh_fill:
+        include_no_fountain9_coverage = (
+            include_solidus_engine and include_no_fountain9_coverage
+        )
+        if (
+            include_avl_fill
+            or include_preventive_fill
+            or include_special_doh_fill
+            or include_no_fountain9_coverage
+        ):
             if catalog_fill_rows_cache is None:
                 avl_catalog_rows, avl_warnings = load_avl_catalog_rows(data_path)
                 result.warnings.extend(avl_warnings)
@@ -5568,6 +5732,35 @@ def execute_planning(
                 f"{special_doh_summary['units_added']:,} unidades para subir "
                 "productos Golden, Infaltable o Anchor por debajo del DOH "
                 "objetivo, sin recomendación positiva de Fountain9."
+            )
+
+        no_fountain9_summary = empty_avl_summary(include_no_fountain9_coverage, 1.0)
+        no_fountain9_summary["mode"] = "no_fountain9_coverage"
+        if include_no_fountain9_coverage:
+            no_fountain9_summary = apply_avl_fill(
+                result,
+                catalog_fill_rows,
+                catalogs,
+                config,
+                engine_blocked_store_ids,
+                blocked_cities,
+                1.0,  # dummy: este modo no usa un DOH fijo de CODEC
+                candidate_mode="no_fountain9_coverage",
+                excluded_keys=fountain9_seen_keys,
+                duration_mode_by_store=consolidation_summary.get(
+                    "duration_mode_by_store", {}
+                ),
+                lead_time_mode_by_store=consolidation_summary.get(
+                    "lead_time_mode_by_store", {}
+                ),
+            )
+            result.warnings.append(
+                "Cobertura sin Fountain9: se agregaron "
+                f"{no_fountain9_summary['cases_sent']:,} casos, "
+                f"{no_fountain9_summary['tasks_added']:,} tareas y "
+                f"{no_fountain9_summary['units_added']:,} unidades para SKUs "
+                "de catálogo quebrados que Fountain9 nunca evaluó, usando la "
+                "moda de Duration/Lead Time por tienda de su propio Bulk."
             )
 
         attach_consolidated_input_to_result(result, consolidated_input)
@@ -6025,6 +6218,7 @@ def execute_planning(
         "avl": avl_summary,
         "preventive": preventive_summary,
         "special_doh": special_doh_summary,
+        "no_fountain9_coverage": no_fountain9_summary,
         "liquid": liquid_summary,
         "shalashaska": shalashaska_summary,
         "fruver_811": fruver_811_summary,
@@ -7759,6 +7953,76 @@ def render_results(run: dict[str, Any]) -> None:
             f"{special_doh.get('units_added', 0):,} unidades adicionales."
         )
 
+    no_fountain9 = run.get("no_fountain9_coverage", {})
+    if no_fountain9.get("enabled"):
+        st.markdown(
+            '<span class="section-label">COBERTURA SIN FOUNTAIN9 · '
+            "ÚLTIMA PASADA DE SOLIDUS</span>",
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            "SKUs de catálogo con stock en cero que Fountain9 nunca evaluó — "
+            "ni una fila en su Bulk, ni siquiera con MOV=0. Usa la moda de "
+            "Duration y Lead Time por tienda del propio Bulk en vez del DOH "
+            "fijo de CODEC, y resta STOCK.INCOMING si está disponible."
+        )
+        render_kpi_cards(
+            [
+                {
+                    "category": "CASOS · SIN FOUNTAIN9",
+                    "label": "TIENDA-SKU CUBIERTOS",
+                    "value": f"{no_fountain9.get('cases_sent', 0):,}",
+                    "description": (
+                        "Combinaciones tienda-SKU quebradas (stock=0) sin fila "
+                        "de Fountain9 que recibieron envío en esta corrida."
+                    ),
+                    "tone": "acid",
+                },
+                {
+                    "category": "TAREAS · SIN FOUNTAIN9",
+                    "label": "TAREAS SOBRANTES UTILIZADAS",
+                    "value": f"{no_fountain9.get('tasks_added', 0):,}",
+                    "description": (
+                        "Líneas operativas adicionales. Solo usa tareas que "
+                        "quedaron disponibles después de todo lo demás en "
+                        "Solidus (AVL, preventivo y refuerzo)."
+                    ),
+                    "tone": "blue",
+                },
+                {
+                    "category": "UNIDADES · SIN FOUNTAIN9",
+                    "label": "UNIDADES AGREGADAS",
+                    "value": f"{no_fountain9.get('units_added', 0):,}",
+                    "description": (
+                        "Unidades: ADU (propio, de ciudad, o ficticio de "
+                        f"{FICTITIOUS_ADU_NO_FOUNTAIN9:g}/día) × (Duration + "
+                        "Lead Time moda de la tienda), menos stock e incoming, "
+                        "con el mínimo de unidades a enviar aplicado."
+                    ),
+                    "tone": "acid",
+                },
+                {
+                    "category": "CASOS · SIN DATO",
+                    "label": "SIN MODA DE DURATION/LEAD TIME",
+                    "value": f"{no_fountain9.get('skipped_no_duration_data', 0):,}",
+                    "description": (
+                        "Tiendas quebradas sin fila de Fountain9, pero cuya "
+                        "tienda no tiene ninguna fila con Duration/Lead Time "
+                        "válidos en el Bulk — no hay base para calcular, no se "
+                        "intentó cubrir."
+                    ),
+                    "tone": "coral",
+                },
+            ],
+            columns_count=4,
+        )
+        st.success(
+            "Cobertura sin Fountain9: "
+            f"{no_fountain9.get('cases_sent', 0):,} casos, "
+            f"{no_fountain9.get('tasks_added', 0):,} tareas y "
+            f"{no_fountain9.get('units_added', 0):,} unidades adicionales."
+        )
+
     shalashaska = run.get("shalashaska", {})
     if shalashaska.get("enabled"):
         st.markdown(
@@ -8572,6 +8836,7 @@ def render() -> None:
     include_avl_fill = False
     include_preventive_fill = False
     include_special_doh_fill = False
+    include_no_fountain9_coverage = False
     avl_doh = 3.0
     special_doh_target = 21.0
     with st.container(border=True, key="engine_solidus_module"):
@@ -8614,7 +8879,7 @@ def render() -> None:
                 "sesión como Big Boss para usarlo."
             )
         elif include_solidus_engine:
-            avl_left, preventive_mid, special_right = st.columns(3)
+            avl_left, preventive_mid, special_right, no_f9_right = st.columns(4)
             with avl_left:
                 include_avl_fill = st.toggle(
                     "Cubrir stockouts del catálogo (AVL)",
@@ -8642,6 +8907,21 @@ def render() -> None:
                         "estén por debajo del objetivo, sin recomendación positiva "
                         "de Fountain9. Usa su propio DOH objetivo, independiente "
                         "del de AVL/preventivo."
+                    ),
+                )
+            with no_f9_right:
+                include_no_fountain9_coverage = st.toggle(
+                    "Cubrir quiebres sin fila de Fountain9",
+                    value=False,
+                    help=(
+                        "Corre al final de Solidus, con lo que sobró después de "
+                        "AVL/Preventivo/Refuerzo. Cubre SKUs de catálogo con stock "
+                        "en cero que Fountain9 nunca evaluó (ni siquiera con MOV=0 "
+                        "— la fila no existe en su Bulk). Usa la moda de Duration "
+                        "y Lead Time por tienda del propio Bulk de Fountain9 en "
+                        "vez del DOH fijo, y resta STOCK.INCOMING si está "
+                        "disponible. Sin ADU (propio ni de ciudad), usa un ADU "
+                        f"ficticio de {FICTITIOUS_ADU_NO_FOUNTAIN9:g}/día."
                     ),
                 )
             doh_left, doh_right = st.columns(2)
@@ -9168,6 +9448,7 @@ def render() -> None:
                     minimum_positive_quantity=minimum_positive_quantity,
                     include_preventive_fill=include_preventive_fill,
                     include_special_doh_fill=include_special_doh_fill,
+                    include_no_fountain9_coverage=include_no_fountain9_coverage,
                     special_doh_target=float(special_doh_target),
                     include_naked_engine=include_naked_engine,
                     cover_fountain9_hardcodes=cover_fountain9_hardcodes,
