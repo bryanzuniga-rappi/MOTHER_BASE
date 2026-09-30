@@ -348,16 +348,27 @@ def put_unique(
 def copernico_is_usable(location: Any, warehouse: int | None = None) -> bool:
     """Replica las fórmulas históricas de ubicación y USABLE?.
 
-    ``RECIBO_444`` ya NO se excluye para ninguna bodega (a pedido de
-    negocio): ese saldo se considera usable sin importar el destino. El
-    parámetro ``warehouse`` se conserva en la firma por compatibilidad con
-    los llamadores existentes, aunque ya no cambia el resultado.
+    Cualquier ubicación de recibo — ``RECIBO_444``, ``RECIBO_831``,
+    ``RECIBO_852``, ``RECIBO_856`` o la que sea, para cualquier bodega — ya
+    NO se excluye (a pedido de negocio): ese saldo se considera usable sin
+    importar el destino. El chequeo es explícito por prefijo
+    (``RECIBO_<lo que sea>``), no por longitud de texto — antes solo se
+    comparaba contra el string literal ``"RECIBO_444"``, así que
+    ``RECIBO_831``/``852``/``856`` nunca coincidían con esa condición y
+    terminaban clasificándose como usables por pura coincidencia (caían al
+    chequeo genérico de longitud, que también las dejaba pasar). Ahora es
+    una regla a propósito, no un efecto colateral.
+
+    El parámetro ``warehouse`` se conserva en la firma por compatibilidad
+    con los llamadores existentes, aunque ya no cambia el resultado.
     """
     value = clean_text(location).upper()
     if value.startswith("Z"):
         return True
     if value == "CANCELADOS":
         return False
+    if value.startswith("RECIBO_"):
+        return True
     # REGEXEXTRACT("(.)(.)(.)(..)(.)(..)") requiere al menos 8 caracteres.
     return len(value) >= 8
 
@@ -406,7 +417,8 @@ def load_copernico_unusable_csv(
     unusable_by_reason: dict[str, dict[tuple[int, int], float]] = {
         "LOST": defaultdict(float),
         "CANCELADOS": defaultdict(float),
-        "RECIBO_444": defaultdict(float),
+        # RECIBO_* ya no es un motivo de exclusión (ver copernico_is_usable)
+        # — se quitó esta llave porque nunca vuelve a poblarse.
         "ZONA_856": defaultdict(float),  # BIN/DIF/RC/zona vacía o desconocida
     }
     storage_balances_856: dict[tuple[int, int], dict[str, float]] = defaultdict(
@@ -492,8 +504,8 @@ def load_copernico_unusable_csv(
                 )
 
                 # ZonaPiso = LOST excluye el saldo sin importar la bodega, igual
-                # que CANCELADOS/RECIBO_444 en Ubicacion. Se evalúa antes que
-                # cualquier otra regla para que nunca se cuente como usable.
+                # que CANCELADOS en Ubicacion. Se evalúa antes que cualquier
+                # otra regla para que nunca se cuente como usable.
                 if floor_zone == "LOST":
                     lost_zone_rows += 1
                     lost_zone_units += balance
@@ -651,8 +663,9 @@ class Catalogs:
     # igual que los tokens de SCHEDULE.DAYS, p. ej. "MIERCOLES".
     run_weekday_norm: str = ""
     # Saldo no usable de COPÉRNICO por motivo específico: "LOST",
-    # "CANCELADOS", "RECIBO_444", "ZONA_856", "OTRO_NO_USABLE" ->
-    # {(warehouse, sku): unidades}. Para el breakdown detallado de cortes.
+    # "CANCELADOS", "ZONA_856", "OTRO_NO_USABLE" -> {(warehouse, sku):
+    # unidades}. Para el breakdown detallado de cortes. RECIBO_* ya no es
+    # motivo de exclusión, así que no aparece aquí.
     copernico_unusable_by_reason: dict[str, dict[tuple[int, int], float]] = field(
         default_factory=dict
     )
@@ -1668,7 +1681,6 @@ def is_schedule_blocked(catalogs: Catalogs, source: int, destination: int) -> bo
 COPERNICO_REASON_LABELS: dict[str, str] = {
     "LOST": "LOST",
     "CANCELADOS": "CANCELADOS",
-    "RECIBO_444": "RECIBO",
     "ZONA_856": "ZONA 856",
     "OTRO_NO_USABLE": "OTRO",
 }
@@ -1681,8 +1693,8 @@ def dominant_copernico_reason(
     ``sku`` sumando los orígenes dados (ignora los que ya están bloqueados
     por otra regla, para no atribuir el corte a COPÉRNICO si el verdadero
     motivo es otro). Devuelve la etiqueta corta ("LOST", "CANCELADOS",
-    "RECIBO", "ZONA 856", "OTRO") o ``None`` si no hay saldo excluido por
-    COPÉRNICO en esos orígenes.
+    "ZONA 856", "OTRO") o ``None`` si no hay saldo excluido por COPÉRNICO
+    en esos orígenes.
 
     ``sources`` se materializa a una tupla de entrada: el cálculo itera sobre
     ella una vez por cada motivo posible, así que un generador de un solo

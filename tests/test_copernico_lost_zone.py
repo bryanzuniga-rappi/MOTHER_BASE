@@ -76,6 +76,30 @@ def test_recibo_444_is_usable_everywhere(tmp_path):
     assert summary["lost_zone_rows"] == 0
 
 
+def test_copernico_is_usable_recibo_is_a_concept_not_just_444():
+    """RECIBO_444, RECIBO_831, RECIBO_852 y RECIBO_856 son todas variantes
+    del mismo concepto (ubicación de recibo), no solo la de la bodega 444
+    — copernico_is_usable debe reconocerlas todas por igual, de forma
+    explícita (no por casualidad de que el string mida 8+ caracteres)."""
+    for variant in ("RECIBO_444", "RECIBO_831", "RECIBO_852", "RECIBO_856"):
+        assert engine.copernico_is_usable(variant) is True, variant
+        assert engine.copernico_is_usable(variant.lower()) is True, variant
+        # Con espacios/minúsculas alrededor, tal como podría venir del Excel.
+        assert engine.copernico_is_usable(f"  {variant}  ") is True, variant
+
+
+def test_recibo_variants_not_dependent_on_string_length_coincidence():
+    """Antes de este fix, RECIBO_831/852/856 pasaban como usables por
+    casualidad (el chequeo genérico de longitud >= 8 los dejaba pasar sin
+    que nadie lo haya decidido a propósito). Esta prueba fija que ahora es
+    una regla explícita: incluso si alguna variante futura de la bodega
+    fuera de un solo dígito (por ejemplo "RECIBO_9", 8 caracteres exactos,
+    o algo aún más corto si cambiara el formato), debe seguir siendo
+    usable porque el chequeo es por PREFIJO, no por longitud total."""
+    assert engine.copernico_is_usable("RECIBO_9") is True
+    assert engine.copernico_is_usable("RECIBO_") is True  # prefijo solo, caso límite
+
+
 def test_lost_in_warehouse_856_bypasses_zone_classification(tmp_path):
     """En 856, LOST no debe clasificarse como E/RCC/RR/MRM ni como zona desconocida."""
     path = tmp_path / "copernico.csv"

@@ -353,7 +353,7 @@ COPÉRNICO no define stock. Solo:
 
 - Ubicación que inicia con `Z`: utilizable.
 - `CANCELADOS`: no utilizable, en cualquier bodega.
-- `RECIBO_444`: **utilizable en cualquier bodega** (cambio de negocio; antes se excluía siempre, luego solo se permitió en 444/831 — ahora ya no se excluye en ninguna).
+- `RECIBO_*` (cualquier variante: `RECIBO_444`, `RECIBO_831`, `RECIBO_852`, `RECIBO_856`, etc.): **utilizable en cualquier bodega**. Es un concepto general — cualquier ubicación que empiece con `RECIBO_` cuenta, sin importar qué bodega tenga de sufijo (cambio de negocio; antes se excluía siempre, luego solo se permitió `RECIBO_444` en 444/831 — ahora el concepto completo deja de excluirse en cualquier bodega). El chequeo es explícito por prefijo, no por longitud de texto.
 - Otras ubicaciones: utilizables si cumplen la estructura histórica de al menos ocho caracteres.
 
 ### ZonaPiso = LOST (todas las bodegas)

@@ -309,8 +309,9 @@ BREAKDOWN_ORDER = (
     "OK PARCIAL - CORTE POR COPÉRNICO LOST",
     "CORTE POR COPÉRNICO CANCELADOS",
     "OK PARCIAL - CORTE POR COPÉRNICO CANCELADOS",
-    "CORTE POR COPÉRNICO RECIBO",
-    "OK PARCIAL - CORTE POR COPÉRNICO RECIBO",
+    # "CORTE POR COPÉRNICO RECIBO" ya no existe: RECIBO_* dejó de ser
+    # motivo de exclusión (copernico_is_usable), así que esa etiqueta
+    # nunca vuelve a generarse.
     "CORTE POR COPÉRNICO ZONA 856",
     "OK PARCIAL - CORTE POR COPÉRNICO ZONA 856",
     "CORTE POR COPÉRNICO OTRO",
@@ -2635,7 +2636,7 @@ def build_cuts_detail_rows(
 ) -> list[dict[str, Any]]:
     """Tabla 2: todo lo que NO se mandó (CANTIDAD_ASIGNADA == 0), con el
     motivo específico (incluye los sub-motivos de COPÉRNICO: LOST,
-    CANCELADOS, RECIBO, etc., no solo el bucket genérico). TIENDAS_CERRADAS
+    CANCELADOS, ZONA 856, etc., no solo el bucket genérico). TIENDAS_CERRADAS
     y ciudades bloqueadas se excluyen ANTES de llegar a base_rows, así que
     se agregan aparte con lo que ya reportan sus propios resúmenes."""
     counts: Counter[str] = Counter()
@@ -3360,7 +3361,7 @@ SCHEDULE_CUT_LABELS = {
 
 def is_copernico_cut_label(tipo_de_corte: str) -> bool:
     """True si el TIPO_DE_CORTE es cualquier variante de corte por COPÉRNICO,
-    con o sin el motivo específico como sufijo (LOST, CANCELADOS, RECIBO,
+    con o sin el motivo específico como sufijo (LOST, CANCELADOS,
     ZONA 856, OTRO)."""
     return tipo_de_corte.startswith("CORTE POR COPÉRNICO") or tipo_de_corte.startswith(
         "OK PARCIAL - CORTE POR COPÉRNICO"
@@ -7436,7 +7437,7 @@ def render_results(run: dict[str, Any]) -> None:
             EFECTIVAMENTE PLANEADO = casos que sí recibieron al menos una unidad,
             agrupados por engine y su causal · CORTES = todo lo que se quedó sin
             enviar, con el motivo específico (incluye COPÉRNICO desglosado por
-            LOST/CANCELADOS/RECIBO/etc.) · OVERVIEW = las dos tablas anteriores
+            LOST/CANCELADOS/ZONA 856/etc.) · OVERVIEW = las dos tablas anteriores
             combinadas en una sola, para una vista general.
         </div>
         """,
