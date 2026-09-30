@@ -48,35 +48,32 @@ def test_lost_takes_priority_over_usable_ubicacion():
     assert engine.copernico_is_usable("ZABCDEFG") is True  # referencia: sería usable
 
 
-def test_recibo_444_is_usable_for_warehouses_444_and_831(tmp_path):
-    """A pedido de negocio: RECIBO_444 ya NO se excluye en 444 ni 831."""
+def test_recibo_444_is_usable_everywhere(tmp_path):
+    """A pedido de negocio: RECIBO_444 ya no se excluye en ninguna bodega
+    que use la clasificación general por Ubicacion — ni siquiera
+    parcialmente (antes solo 444/831 eran la excepción). La bodega 856
+    queda fuera de este test a propósito: usa ZonaPiso en vez de Ubicacion,
+    es una clasificación estructuralmente distinta y RECIBO_444 no aplica
+    ahí en absoluto."""
     path = tmp_path / "copernico.csv"
     _write_copernico_csv(
         path,
         [
             [444, 12, "RECIBO_444", 3, ""],
             [831, 15, "RECIBO_444", 4, ""],
+            [425, 20, "RECIBO_444", 6, ""],  # antes seguía excluido aquí
             [444, 13, "CANCELADOS", 2, ""],
             [444, 14, "ZABCDEFG", 9, ""],
         ],
     )
     unusable, _storage_overrides, summary = engine.load_copernico_unusable_csv(path)
 
-    assert (444, 12) not in unusable  # RECIBO_444 en 444: ahora usable
-    assert (831, 15) not in unusable  # RECIBO_444 en 831: ahora usable
+    assert (444, 12) not in unusable
+    assert (831, 15) not in unusable
+    assert (425, 20) not in unusable  # ya no es la excepción de otras épocas
     assert unusable[(444, 13)] == 2.0  # CANCELADOS se sigue excluyendo
     assert (444, 14) not in unusable
     assert summary["lost_zone_rows"] == 0
-
-
-def test_recibo_444_still_excluded_for_other_warehouses(tmp_path):
-    """La excepción es solo para 444 y 831; cualquier otra bodega conserva
-    la regla histórica (RECIBO_444 sigue excluido ahí)."""
-    path = tmp_path / "copernico.csv"
-    _write_copernico_csv(path, [[425, 20, "RECIBO_444", 6, ""]])
-    unusable, _storage_overrides, _summary = engine.load_copernico_unusable_csv(path)
-
-    assert unusable[(425, 20)] == 6.0
 
 
 def test_lost_in_warehouse_856_bypasses_zone_classification(tmp_path):
@@ -381,3 +378,41 @@ def test_load_catalogs_accepts_multiple_copernico_files(tmp_path):
     assert any(
         "2 archivo(s)" in warning for warning in catalogs.warnings
     ), "la advertencia debe mencionar que fueron varios archivos"
+
+
+def test_sku_absent_from_copernico_has_no_restriction():
+    """Si un SKU tiene stock en DATA_TRANSFERS pero nunca aparece en
+    COPÉRNICO para ese origen (ni como usable ni como no-usable), debe
+    tratarse como sin ninguna restricción — no como bloqueado por
+    precaución."""
+    catalogs = engine.Catalogs(
+        volume_m3={}, blocked_products=set(), route_cost_blocks=set(),
+        store_priority={}, high_value={}, rackeados_444=set(),
+        store_capacity={}, copernico_unusable_444={}, unavailable_stock={},
+        stock_base={(444, 999): 50.0},
+        golden_infaltables=set(), stores={}, storage={}, warnings=[],
+        copernico_unusable_by_warehouse={},  # SKU 999 nunca aparece aquí
+    )
+    info = engine.source_stock_components(catalogs, 444, 999)
+    assert info["copernico_unusable"] == 0.0
+    assert info["adjusted"] == 50
+
+
+def test_sku_absent_from_copernico_no_restriction_for_any_warehouse():
+    """Mismo caso, pero confirmando que no depende de que el origen sea
+    444 — cualquier bodega debe comportarse igual. 425/856 quedan fuera:
+    tienen su propia partición por OWNER (ajena a COPÉRNICO) que también
+    acota 'adjusted', así que probarlas aquí mezclaría dos mecanismos
+    distintos sin poblar owner_stock."""
+    for warehouse in (444, 831, 9999):
+        catalogs = engine.Catalogs(
+            volume_m3={}, blocked_products=set(), route_cost_blocks=set(),
+            store_priority={}, high_value={}, rackeados_444=set(),
+            store_capacity={}, copernico_unusable_444={}, unavailable_stock={},
+            stock_base={(warehouse, 999): 30.0},
+            golden_infaltables=set(), stores={}, storage={}, warnings=[],
+            copernico_unusable_by_warehouse={},
+        )
+        info = engine.source_stock_components(catalogs, warehouse, 999)
+        assert info["copernico_unusable"] == 0.0, f"falló en bodega {warehouse}"
+        assert info["adjusted"] == 30

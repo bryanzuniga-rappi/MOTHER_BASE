@@ -348,17 +348,15 @@ def put_unique(
 def copernico_is_usable(location: Any, warehouse: int | None = None) -> bool:
     """Replica las fórmulas históricas de ubicación y USABLE?.
 
-    ``RECIBO_444`` dejó de excluirse para las bodegas 444 y 831 (a pedido de
-    negocio): ese saldo ahora se considera usable en esas dos bodegas. Para
-    cualquier otra bodega que use esta regla general (todo lo que no sea
-    856), ``RECIBO_444`` se sigue excluyendo como antes.
+    ``RECIBO_444`` ya NO se excluye para ninguna bodega (a pedido de
+    negocio): ese saldo se considera usable sin importar el destino. El
+    parámetro ``warehouse`` se conserva en la firma por compatibilidad con
+    los llamadores existentes, aunque ya no cambia el resultado.
     """
     value = clean_text(location).upper()
     if value.startswith("Z"):
         return True
     if value == "CANCELADOS":
-        return False
-    if value == "RECIBO_444" and warehouse not in {444, 831}:
         return False
     # REGEXEXTRACT("(.)(.)(.)(..)(.)(..)") requiere al menos 8 caracteres.
     return len(value) >= 8
@@ -548,8 +546,6 @@ def load_copernico_unusable_csv(
                 ).upper()
                 if ubicacion_value == "CANCELADOS":
                     unusable_by_reason["CANCELADOS"][(warehouse, sku)] += balance
-                elif ubicacion_value == "RECIBO_444":
-                    unusable_by_reason["RECIBO_444"][(warehouse, sku)] += balance
                 else:
                     unusable_by_reason.setdefault(
                         "OTRO_NO_USABLE", defaultdict(float)
@@ -1415,13 +1411,11 @@ def calculate_target_quantity(row: dict[str, Any], config: Config) -> tuple[int,
 def source_stock_components(catalogs: Catalogs, source: int, sku: int) -> dict[str, Any]:
     base = max(catalogs.stock_base.get((source, sku), 0.0), 0.0)
     unavailable = max(catalogs.unavailable_stock.get((source, sku), 0.0), 0.0)
+    # Si el SKU no aparece en absoluto en COPÉRNICO para este origen (ni
+    # como usable ni como no-usable), se considera sin ninguna restricción:
+    # el .get(..., 0.0) por default ya cubre exactamente ese caso.
     copernico_unusable = max(
-        catalogs.copernico_unusable_by_warehouse.get(
-            (source, sku),
-            catalogs.copernico_unusable_444.get(sku, 0.0)
-            if source == 444
-            else 0.0,
-        ),
+        catalogs.copernico_unusable_by_warehouse.get((source, sku), 0.0),
         0.0,
     )
     rackeado = source == 444 and sku in catalogs.rackeados_444
