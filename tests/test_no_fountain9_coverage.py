@@ -186,6 +186,21 @@ def test_minimum_quantity_floor_applied():
     assert summary["units_added"] == 5
 
 
+def test_no_fountain9_cut_registered_in_breakdown_order():
+    """Regresión: NO_FOUNTAIN9_CUT debe aparecer en BREAKDOWN_ORDER (si no,
+    el overview no lo muestra con orden correcto) — y, más grave, moverlo
+    a esa tupla por NOMBRE en vez de string literal rompía el import
+    completo del módulo por orden de definición. Esto fija ambas cosas."""
+    assert m.NO_FOUNTAIN9_CUT in m.BREAKDOWN_ORDER
+
+
+def test_no_fountain9_cut_attributed_to_its_own_engine():
+    """Regresión: sin esto, los casos de este engine se atribuían a
+    'Naked/Solidus' en la tabla de planeado-por-engine en vez de a su
+    propio engine."""
+    assert m.attribute_engine(m.NO_FOUNTAIN9_CUT) == "Cobertura sin Fountain9"
+
+
 def test_regla_demanda_and_tipo_de_corte_labels():
     catalogs = make_catalogs()
     result = make_result()
