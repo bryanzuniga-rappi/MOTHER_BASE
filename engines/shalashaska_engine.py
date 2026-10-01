@@ -415,10 +415,11 @@ def apply_shalashaska_engine(
             if capacity_units <= 0:
                 continue
 
+            # La ausencia de CATALOGO/ADU no invalida una ruta que ya sale del
+            # origen. Estas tiendas no participan en el nivelado por DOH, pero
+            # sí pueden recibir inventario por mermar en la segunda pasada,
+            # distribuida mediante SHARE_VENTAS.
             adu = max(float(catalog_adu.get((destination, sku), 0.0)), 0.0)
-            if adu <= 0:
-                summary["skipped_no_adu"] += 1
-                continue
             current_inventory = max(
                 float(catalogs.stock_base.get((destination, sku), 0.0)), 0.0
             ) + planned_incoming[(destination, sku)]
@@ -457,7 +458,6 @@ def apply_shalashaska_engine(
             summary["skipped_task_limit"] += 1
             continue
 
-        option_count = len(selected_options)
         capacity_left = {
             option["destination"]: int(option["capacity_units"])
             for option in selected_options
@@ -469,13 +469,11 @@ def apply_shalashaska_engine(
         )
         assigned_by_demand = sum(demand_allocations.values())
 
-        # No se descarga todo en una sola tienda sin soporte de forecast.
-        if option_count >= 2:
-            share_allocations = _share_distribution(
-                available - assigned_by_demand, selected_options, capacity_left
-            )
-        else:
-            share_allocations = Counter()
+        # El remanente se evacúa por SHARE_VENTAS incluso si sólo existe una
+        # ruta elegible. En ese caso la tienda representa el 100% del share.
+        share_allocations = _share_distribution(
+            available - assigned_by_demand, selected_options, capacity_left
+        )
         planned = Counter(demand_allocations)
         planned.update(share_allocations)
         planned = Counter(
