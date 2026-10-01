@@ -1,489 +1,232 @@
 # MOTHER BASE
 
-Centro de comando de Supply para planear transferencias entre centros de distribución y tiendas.
+**Centro de comando para planear transferencias de abasto entre CEDIS y tiendas.**
 
-Mother Base es una aplicación web construida con Streamlit. Su módulo operativo, **Les Enfants Terribles**, consolida recomendaciones de Fountain9, valida los catálogos de negocio, descuenta inventario no utilizable, asigna mercancía desde uno o varios warehouses origen y genera entregables operativos y ejecutivos.
+Mother Base toma la recomendación diaria de Fountain9, la contrasta con el inventario y las restricciones operativas vigentes, y produce una propuesta de transferencias lista para revisar y ejecutar. Su objetivo no es reemplazar al criterio operativo: es volverlo consistente, trazable y repetible.
 
-- Repositorio: [bryanzuniga-rappi/MOTHER_BASE](https://github.com/bryanzuniga-rappi/MOTHER_BASE)
-- Aplicación: [mother-base.streamlit.app](https://mother-base.streamlit.app/)
+La aplicación está construida en Streamlit y utiliza un motor de planeación propio. Los resultados se descargan como Excel, CSV operativos, PDF ejecutivo y ZIP consolidado.
 
-> **Fuente mandante de inventario:** la cantidad máxima que puede salir de cualquier origen siempre parte de `STOCK.STOCK_DISPONIBLE_FINAL`. Ningún engine, archivo de Fountain9, registro de POR_MERMAR, COPÉRNICO u OWNER puede aumentar ese techo.
-
----
-
-## 1. Estado y alcance
-
-### Disponible actualmente
-
-- Puerta de acceso Mother Base con perfiles **Big Boss** y **Raiden**.
-- Módulo de planeación **Les Enfants Terribles**.
-- Interfaz de planeación **Outer Heaven**.
-- Panel de variables compartidas **CODEC**.
-- Cuatro engines activables: Naked, Solidus, Shalashaska y Liquid.
-- **Venom Engine**: quinto engine opcional, llenado DDMRP posterior a toda la planeación.
-- Lectura automática del Google Sheet público `DATA_TRANSFERS`.
-- Panel visual de salud de todas las fuentes.
-- Carga opcional de un CSV de COPÉRNICO.
-- Carga y consolidación de uno o varios CSV de Fountain9.
-- Restricciones de stock, capacidad, tareas, rutas, ciudades, tiendas y productos.
-- Bloqueo opcional de envíos fuera de frecuencia según la hoja `SCHEDULE`.
-- Separación de entregables por owner para los orígenes 425 y 856.
-- Diferenciación funcional entre Big Boss y Raiden (ver §5): Raiden no puede activar Solidus ni Liquid, no puede bloquear seis ciudades protegidas, y tiene otros orígenes default.
-- Exclusión permanente de tres SKUs a nivel backend, sin importar el campo de exclusión de CODEC.
-- Validación obligatoria de COPÉRNICO por warehouse (444/831/856) antes de poder ejecutar.
-- Diálogo de confirmación obligatorio antes de ejecutar la planeación.
-- Reporte Excel, PDF ejecutivo, archivos CSV por origen/owner y ZIP consolidado.
-
-### En construcción o reservado
-
-- **Militaires Sans Frontières**: módulo de reporting histórico. Su tarjeta existe, pero continúa como `WORK IN PROGRESS`.
-- Uso futuro de `STOCK.INCOMING`.
-- `OVER_ORIGEN_STORAGE`: su compatibilidad permanece en backend, pero no es obligatorio y la interfaz lo mantiene desactivado.
-- `OOWL` en Venom Engine: lógica presente en el código pero bloqueada a nivel motor; no se ofrece en la UI.
+> **Audiencia de este documento**
+>
+> - **Supply / Operaciones:** qué resuelve el sistema, qué debe cargar y cómo interpretar el resultado.
+> - **Analítica / Planeación:** prioridad, restricciones, capacidad y lógica de los engines.
+> - **Desarrollo:** arquitectura, contratos de datos, puntos de extensión y validación antes de liberar.
 
 ---
 
-## 2. Principios mandantes
+## Contenido
 
-Estas reglas forman parte del contrato del sistema y deben preservarse en cualquier despliegue o refactorización:
-
-1. **STOCK es mandante.** Nunca se asignan más unidades que el stock final ajustado del origen.
-2. **Los bloqueos explícitos no se saltan.** Ningún engine puede ignorar tiendas cerradas, ciudades bloqueadas, rutas de costos, exclusiones manuales, productos excluidos ni bloqueos regionales aplicables.
-3. **La capacidad es estricta.** Ninguna asignación puede provocar que una tienda exceda su capacidad en m³.
-4. **El límite de tareas es compartido.** Naked, Solidus, Shalashaska y Liquid consumen un solo presupuesto global.
-5. **Una tarea es una línea origen–destino–SKU.** Agregar unidades a una combinación existente no genera otra tarea.
-6. **Prioridad absoluta de producto:** Infaltable, Golden, Anchor, KVI y Regular.
-7. **Prioridad de tienda ascendente.** La prioridad `1` se atiende antes que la `100`.
-8. **Golden no bloquea rutas.** Ser Golden o Infaltable aumenta prioridad, pero no crea una restricción geográfica.
-9. **COPÉRNICO no sustituye STOCK.** Solo descuenta ubicaciones no pickeables y puede determinar el ambiente del 856.
-10. **POR_MERMAR no sustituye STOCK.** Solo propone inventario en riesgo que se intentará evacuar.
-11. **OWNER no sustituye STOCK.** Separa inventario y archivos de 425/856; el menor entre STOCK ajustado y OWNER es el límite.
-12. **INSUMOS no consume tareas**, pero sí respeta stock de 444, MOQ y elegibilidad.
+1. [Qué problema resuelve](#qué-problema-resuelve)
+2. [Qué hace una corrida](#qué-hace-una-corrida)
+3. [Conceptos clave](#conceptos-clave)
+4. [Arquitectura técnica](#arquitectura-técnica)
+5. [Flujo de planeación](#flujo-de-planeación)
+6. [Fuentes de datos](#fuentes-de-datos)
+7. [Reglas mandantes](#reglas-mandantes)
+8. [Engines de planeación](#engines-de-planeación)
+9. [Restricciones y bloqueos](#restricciones-y-bloqueos)
+10. [Perfiles de acceso](#perfiles-de-acceso)
+11. [Resultados y cómo leerlos](#resultados-y-cómo-leerlos)
+12. [Operación diaria](#operación-diaria)
+13. [Instalación y despliegue](#instalación-y-despliegue)
+14. [Guía de desarrollo](#guía-de-desarrollo)
+15. [Pruebas y liberaciones](#pruebas-y-liberaciones)
+16. [Limitaciones conocidas](#limitaciones-conocidas)
 
 ---
 
-## 3. Arquitectura y flujo
+## Qué problema resuelve
+
+En una operación de abasto, una recomendación de demanda por sí sola no basta para crear una transferencia ejecutable. Antes de decidir qué enviar hay que considerar, al mismo tiempo:
+
+- Stock realmente utilizable en cada origen.
+- Capacidad de recibo de cada tienda.
+- Prioridad comercial de producto y tienda.
+- Máximo de tareas que la operación puede ejecutar.
+- Tiendas cerradas, rutas no permitidas, bloqueos regionales y frecuencia de envío.
+- Inventario no pickeable detectado por COPÉRNICO.
+- Inventario con owner específico en los orígenes 425 y 856.
+
+Mother Base reúne estas condiciones en una sola corrida. Primero atiende la necesidad natural de Fountain9 y, si se activan, ejecuta mecanismos de cobertura, evacuación o liquidación usando únicamente el stock, capacidad y tareas que sigan disponibles.
+
+### Resultado esperado
+
+| Pregunta | Dónde se responde |
+|---|---|
+| ¿Qué transferencias se deben crear? | CSV por origen / owner y Excel consolidado |
+| ¿Qué se cubrió totalmente o parcialmente? | `DETALLE_ASIGNACION`, breakdown y KPIs |
+| ¿Por qué no se envió un caso? | `BASE_TRANSFERS` y tabla de cortes |
+| ¿Qué inventario del origen se utilizó? | Detalle de asignación y análisis por origen |
+| ¿Qué cambió frente a Fountain9? | Reporte comparativo Fountain9 vs Mother Base |
+| ¿Hay productos prioritarios todavía en riesgo? | Check de salud Golden / Infaltable / Anchor |
+
+---
+
+## Qué hace una corrida
 
 ```mermaid
 flowchart TD
-    UI["Streamlit · Mother Base"] --> DB["DATA_TRANSFERS público"]
-    UI --> COP["CSV COPÉRNICO opcional"]
-    UI --> F9["Uno o varios CSV Fountain9"]
-    DB --> CORE["Catálogos y reglas"]
-    COP --> CORE
-    F9 --> CONS["Consolidación destino–SKU"]
-    CORE --> PLAN["Ledger global: stock · m³ · tareas"]
-    CONS --> PLAN
-    PLAN --> ENG["Naked · Solidus · Shalashaska · Liquid"]
-    ENG --> OUT["XLSX · CSV · PDF · ZIP"]
+    A["1. Validar DATA_TRANSFERS"] --> B["2. Cargar Fountain9 y COPÉRNICO"]
+    B --> C["3. Configurar CODEC"]
+    C --> D["4. Planear y aplicar engines"]
+    D --> E["5. Revisar cortes y alertas"]
+    E --> F["6. Descargar entregables"]
 ```
 
-La aplicación trabaja por sesión de Streamlit:
+1. El usuario entra a **Les Enfants Terribles** y el sistema obtiene `DATA_TRANSFERS`.
+2. Se valida que las fuentes y hojas requeridas estén disponibles y con una frescura aceptable.
+3. Se cargan uno o varios CSV de Fountain9. Opcionalmente se agregan los archivos de COPÉRNICO.
+4. Supply define orígenes, máximo de tareas, bloqueos temporales y engines activos en el panel **CODEC**.
+5. El motor consolida las necesidades por tienda–SKU y asigna respetando todas las restricciones.
+6. Se generan diagnósticos, KPIs y archivos de salida.
 
-- Descarga `DATA_TRANSFERS` y valida sus fuentes.
-- Conserva la base validada en caché durante la sesión.
-- Solo vuelve a validarla cuando inicia una sesión nueva, vence la caché o el usuario presiona **Volver a validar la base**.
-- Guarda uploads y resultados en un directorio temporal del servidor.
-- Expone los resultados como descargas; no los persiste automáticamente en Google Drive.
-
-### Secuencia real de una corrida
-
-1. Autenticación y selección de módulo.
-2. Descarga y validación de `DATA_TRANSFERS`.
-3. Carga opcional de COPÉRNICO.
-4. Carga de uno o varios CSV de Fountain9.
-5. Captura de CODEC y activación de engines.
-6. Consolidación de Fountain9 por destino–SKU.
-7. Exclusión de tiendas, ciudades y SKUs.
-8. Planeación base Naked y protecciones manuales Solidus.
-9. Ejecución opcional de Shalashaska.
-10. Cobertura opcional AVL y prevención de quiebres de Solidus.
-11. Ejecución opcional de Liquid.
-12. Partición OWNER para 425/856.
-13. Normalización de STORAGE y etiquetas de reporting.
-14. Incorporación opcional de INSUMOS al `BulkCD_444.csv`.
-15. Generación de Excel, CSV, PDF y ZIP.
-
-> La jerarquía de producto es más fuerte que la separación Naked/Solidus. Dentro de una misma categoría se atiende primero el ROQ natural, pero un Infaltable protegido puede adelantarse a un producto Regular con ROQ natural.
+La aplicación pide una confirmación explícita antes de ejecutar. Esa confirmación es parte del control operativo: confirma que se validó la capacidad de recibo y que se consideraron tiendas en resguardo.
 
 ---
 
-## 4. Estructura del repositorio
+## Conceptos clave
 
-```text
-mother_base/
-├── .streamlit/
-│   ├── config.toml                 # Tema, seguridad y límites de upload
-│   └── secrets.toml.example        # Ejemplo de secreto local
-├── engines/
-│   ├── mission_control.py          # Selección Naked/Solidus de la cola base
-│   ├── naked_engine.py             # Clasificación de ROQ natural
-│   ├── solidus_engine.py           # Clasificación de protecciones manuales
-│   ├── shalashaska_engine.py       # Evacuación de inventario por mermar
-│   ├── liquid_engine.py            # Liquidación de remanentes
-│   └── venom_engine.py             # Cobertura DDMRP post-planeación
-├── modules/
-│   ├── les_enfants_terribles.py    # UI, orquestación, analítica y outputs web
-│   └── militaires_sans_frontieres.py
-├── tests/                          # Pruebas del comportamiento crítico
-├── app.py                          # Entrada de Streamlit y navegación
-├── auth.py                         # Perfiles y validación Big Boss
-├── modelo_abasto.py                # Catálogos, stock, asignador y Excel/CSV
-├── mother_base_theme.py            # Sistema visual brutalista
-├── requirements.txt
-├── requirements-dev.txt
-└── runtime.txt
-```
-
----
-
-## 5. Acceso y perfiles
-
-### Raiden
-
-- No requiere contraseña.
-- Antes de ejecutar se aplica una espera operativa adicional de 10 segundos.
-- **Restricciones exclusivas de este perfil** (Big Boss no las tiene):
-  - No puede activar **Solidus Engine** ni **Liquid Engine**; sus tarjetas aparecen bloqueadas ("BLOQUEADO · SOLO BIG BOSS") y el clic no hace nada.
-  - No puede bloquear las ciudades Ciudad de México, Guadalajara, Monterrey, Puebla, Querétaro ni Saltillo — desaparecen de las opciones del multiselect "Bloquear ciudades".
-  - No ve el toggle de **Modo simulación** (exclusivo de Big Boss).
-
-### Big Boss
-
-- Requiere contraseña.
-- Se lee de `st.secrets["BIG_BOSS_PASSWORD"]`.
-- Existe un fallback de compatibilidad con valor `Admin`.
-- En producción **no debe usarse el fallback**; configure un secreto largo y único.
-- Sin restricciones de engines o ciudades; es el único perfil que ve el toggle de **Modo simulación** (ver §17 y §20).
-
-### Ambos perfiles
-
-- Los warehouses origen que aparecen seleccionados por default al abrir el módulo son **444 y 831**, sin importar el perfil.
-
-### Sesión
-
-- La autenticación vive en `st.session_state`.
-- No hay barra lateral ni botón de regreso a la portada.
-- La forma prevista de volver al acceso es recargar la página.
-- Aún no existe SSO, identidad individual, roles persistentes ni bitácora de usuario.
-
-### Secreto local
-
-Cree `.streamlit/secrets.toml` (o copie `.streamlit/secrets.toml.example`):
-
-```toml
-BIG_BOSS_PASSWORD = "reemplace-esto-por-un-secreto-seguro"
-DATA_TRANSFERS_SPREADSHEET_ID = "el-id-real-de-su-sheet"
-DATA_DASHBOARD_SPREADSHEET_ID = "el-id-real-de-su-sheet"
-```
-
-Nunca suba ese archivo a Git, y nunca pegue esos IDs reales en el código ni en este README — son datos de la empresa, no ejemplos. Verifique que `secrets.toml` esté cubierto por `.gitignore`.
-
----
-
-## 6. Requisitos técnicos
-
-- Python 3.12, declarado en `runtime.txt`.
-- `streamlit==1.62.0`.
-- `openpyxl>=3.1,<4` para leer el XLSX.
-- `xlsxwriter>=3.2,<4` para generar el reporte Excel.
-- `reportlab>=4.2,<5` para el PDF.
-- `pytest>=8,<9` para desarrollo.
-
-### Archivos grandes
-
-Streamlit está configurado para aceptar hasta 500 MB por archivo. Ese es un límite de interfaz, no una garantía de memoria. Un CSV de más de 100 MB puede ocupar varias veces su tamaño en RAM al convertirse en objetos Python.
-
-Recomendaciones de producción:
-
-- 4 GB de RAM como mínimo para pruebas controladas.
-- 8 GB o más si habrá varios CSV grandes simultáneamente.
-- Limitar concurrencia según memoria disponible.
-- Probar con el mayor conjunto real antes de liberar.
-- Vigilar espacio temporal y reiniciar workers con sesiones abandonadas.
-
----
-
-## 7. DATA_TRANSFERS
-
-### Conexión
-
-El ID **nunca vive en el código ni en este README** — se configura como Secret, igual que `BIG_BOSS_PASSWORD` (ver §6 y `.streamlit/secrets.toml.example`):
-
-```toml
-DATA_TRANSFERS_SPREADSHEET_ID = "el-id-real-de-su-sheet"
-```
-
-`configured_data_transfers_spreadsheet_id()` en `modules/les_enfants_terribles.py` lo lee de `st.secrets`. Si falta, `fetch_public_database()` lanza un error claro en vez de fallar en silencio.
-
-Se descarga como XLSX mediante la exportación pública de Google Sheets. No requiere Google API ni cuenta de servicio mientras el archivo permanezca público para lectura.
-
-Para cambiar la base:
-
-1. Publique el nuevo Google Sheet para lectura por enlace.
-2. Copie el ID entre `/d/` y `/edit`.
-3. Reemplace `DATA_TRANSFERS_SPREADSHEET_ID` en Secrets (local o Streamlit Community Cloud).
-4. Presione **Volver a validar la base**.
-5. Confirme que todas las tarjetas estén verdes.
-
-> Un Sheet público puede exponer información sensible de inventario. Antes de producción debe aceptarse formalmente ese riesgo o migrar a una fuente autenticada.
-
-### Caché
-
-- La descarga usa caché con TTL aproximado de 5 minutos.
-- La base validada se conserva como recurso de sesión.
-- Encender o apagar engines no debe descargar ni revalidar la fuente.
-- **Volver a validar la base** fuerza el control de salud.
-
----
-
-## 8. Contrato de hojas de DATA_TRANSFERS
-
-Los encabezados se buscan dinámicamente en las primeras 40 filas. Esto permite que una consulta Aleph comience en B14.
-
-| Hoja | Columnas mínimas / estructura | Función |
-|---|---|---|
-| `TIENDAS_CERRADAS` | A1=`WAREHOUSE_ID`; IDs debajo | Bloqueo permanente de destinos. |
-| `VOLUMETRIA` | `SKU`, `PALLETS` | M³ por unidad. |
-| `BLOQUEOS_FORANEAS` | `SKU` | Productos con bloqueo explícito CDMX → GDL/MTY (hasta esta sesión se llamaba `BLOQUEOS`; el nombre cambió, el comportamiento no). |
-| `BLOQUEOS` | `PRODUCT_ID` | **Nueva**: lista de exclusión global de SKUs, mantenida directamente por negocio. Un SKU por fila; se une al campo "Excluir SKUs" de CODEC en cada corrida. No confundir con `BLOQUEOS_FORANEAS` — mismo nombre viejo, contenido y propósito distintos. |
-| `RUTA_COSTOS` | `Destination`, `Catalog ID` | Pares destino–SKU sin ruta. |
-| `PRIORIDAD` | `WAREHOUSE_ID`, `PRIORIDAD` | Orden de tiendas; 1 es prioridad máxima. |
-| `444_HV` | `EAN`, `Category` | VALUE por SKU al salir de 444. EAN representa PRODUCT_ID. |
-| `831_HV` | `EAN`, `Category` | VALUE por SKU al salir de 831. |
-| `RACKEADOS` | `WHS`, `SYNC` | Excluye completamente stock rackeado de 444. |
-| `CAP_RECIBO` | `WH_ID`, `CAP` | Capacidad en m³ por tienda. |
-| `CATALOGO` | `WAREHOUSE_ID`, `PRODUCT_ID`, `ADU` | Surtido y venta diaria para Solidus/Shalashaska. |
-| `KVI` | `WAREHOUSE_ID`, `PRODUCT_ID`, `KVI` | Clasificación KVI destino–producto. |
-| `SHARE_VENTAS` | `WAREHOUSE_ID`, `SHARE` | Peso general de ventas por tienda. |
-| `NO_DISPONIBLE` | `WAREHOUSE_ID`, `PRODUCT_ID`, `STOCK` | Inventario que se resta al origen indicado. |
-| `POR_MERMAR` | `WAREHOUSE_ID`, `PRODUCT_ID`, `STOCK_AVAILABLE`, `VALUE_STOCK`, `ARRIVAL_DATE`, `EXPIRATION_DATE` | Inventario en riesgo para Shalashaska. |
-| `STOCK` | `WAREHOUSE_ID`, `PRODUCT_ID`, `STOCK_DISPONIBLE_FINAL` | Fuente mandante. `INCOMING` está reservado. |
-| `OWNER` | `WAREHOUSE_ID`, `PRODUCT_ID`, `OWNER_NAME`, `STOCK_DISPONIBLE_FINAL` | Separa stock de 425/856 por owner. |
-| `INSUMOS` | `WAREHOUSE_DESTINATION`, `WAREHOUSE_SOURCE`, `RETAIL_ID`, `QUANTITY`, `PLANNED_DATE`, `ROUTE`, `DELIVERY_PRIORITY` | Recomendación Aleph; solo desde 444. |
-| `GOLDEN_INFALTABLES_ANCHOR` | `WAREHOUSE_ID`, `PRODUCT_ID_SYNC`, `IS_INFALTABLE`, `IS_GOLDEN`, `IS_ANCHOR` | Prioridad exacta destino–SKU. |
-| `TIENDA` | `CITY`, `WAREHOUSE_ID`, `WAREHOUSE_NAME` | Maestro de nodos, nombres y ciudades. |
-| `STORAGE` | `PRODUCT_ID`, `STORAGE_NAME` | Ambiente estándar. |
-| `SCHEDULE` | `WAREHOUSE_ID` (o `WAREHOUSE ID`), `ORIGEN`, `DAYS` | Frecuencia de envío permitida por destino–origen. Opcional: su ausencia no bloquea la planeación. |
-| `DATA` | `SYNC_ID`, `PRODUCT_NAME`, `MACROCATEGORY_NAME`, `CATEGORY_NAME`, `SUBCATEGORY_NAME` | Catálogo maestro de producto (ALEPH, actualiza cada 24h). `SYNC_ID` es la llave que empata con el SKU de todo el resto del sistema — **no** `CATALOG_ID`, que es un ID distinto de la misma fila. Solo para darle nombre/categoría legibles a reportes y entregables; nunca participa en ninguna regla de asignación. Opcional: su ausencia no bloquea la planeación, solo deja `catalogs.product_catalog` vacío. |
-
-### Hoja legado no obligatoria
-
-`OVER_ORIGEN_STORAGE` puede seguir siendo leída si existe y se habilita internamente. Su `WAREHOUSE_ID` representa el **origen**. La interfaz actual no la activa y la hoja puede no existir.
-
-### SCHEDULE — frecuencia de envío
-
-- Una fila define los días permitidos para un par **WAREHOUSE_ID destino + ORIGEN**. `DAYS` acepta los nombres de día en español separados por coma (`Lunes, Miércoles, Viernes`), tolera acentos, mayúsculas/minúsculas y puntos sueltos (`.Miércoles`).
-- El encabezado del destino acepta tanto `WAREHOUSE_ID` como `WAREHOUSE ID` (con espacio); el resto de las columnas usa los nombres exactos `ORIGEN` y `DAYS`.
-- La hoja es parte del contrato obligatorio (aparece en el panel de salud igual que `RUTA_COSTOS` o `BLOQUEOS_FORANEAS`), pero el motor la trata de forma defensiva: si por algún motivo no está presente al momento de cargar, no bloquea la ejecución, simplemente no aplica ninguna restricción de frecuencia.
-- Dentro de la hoja, cada **par destino–origen es independiente y opcional**: un par que **no aparece** en SCHEDULE **no tiene restricción de frecuencia**, incluso con el toggle activo.
-- Filas duplicadas para el mismo par se combinan (unión de días) y generan una advertencia; no producen error.
-- El bloqueo lo activa el toggle de CODEC **"Bloquear envíos fuera de frecuencia"**, apagado por default. Se evalúa contra la **fecha real del sistema** al momento de la corrida (zona horaria `America/Mexico_City`), no contra una fecha capturada manualmente.
-
-### Defaults
-
-- Tienda ausente de CAP_RECIBO: **10 m³**.
-- SKU sin volumetría válida: **0.002 m³/unidad**.
-- STORAGE ausente, `UNKNOWN`, `UNKNOW`, `N/A`, `NA`, `NONE` o `NULL`: **Room Temperature**.
-- Warehouse sin prioridad: **100**.
-- SKU sin HV para su origen: `REGULAR`.
-- Los IDs deben ser enteros, aunque Excel los represente como `123.0`.
-
----
-
-## 9. Salud y frescura de fuentes
-
-### Hojas Aleph y C7
-
-Validan la última actualización en `C7`:
-
-`CATALOGO`, `KVI`, `SHARE_VENTAS`, `NO_DISPONIBLE`, `POR_MERMAR`, `STOCK`, `OWNER`, `INSUMOS`, `GOLDEN_INFALTABLES_ANCHOR`, `TIENDA` y `STORAGE`.
-
-| Máxima antigüedad | Hojas |
-|---:|---|
-| 1.2 horas | STOCK, INSUMOS, NO_DISPONIBLE, OWNER |
-| 24 horas | POR_MERMAR, KVI, CATALOGO, GOLDEN_INFALTABLES_ANCHOR, TIENDA, STORAGE, SHARE_VENTAS |
-
-Si una fuente rebasa el SLA, la tarjeta se muestra roja y la planeación queda bloqueada.
-
-### Fechas aceptadas
-
-El parser soporta fechas Excel, formatos ISO y comunes, meses en inglés, zonas `UTC`, `GMT`, `EDT`, `EST`, `CDT`, `CST`, `MDT`, `MST`, `PDT`, `PST`, y offsets como `GMT-5` o `GMT-05:00`. Una fecha más de cinco minutos en el futuro se considera inválida.
-
-### IMPORTRANGE y manuales
-
-- Las demás hojas importadas se marcan rotas si `A1` contiene `#REF!`.
-- `TIENDAS_CERRADAS` es backend manual; A1 debe contener `WAREHOUSE_ID`.
-
-### Recuperación de una tarjeta roja
-
-1. Abra la hoja indicada.
-2. Si es Aleph, confirme C7 y el SLA.
-3. Si es IMPORTRANGE, repare permisos o `#REF!`.
-4. Si es TIENDAS_CERRADAS, restaure el encabezado.
-5. Espere a que termine la consulta.
-6. Presione **Volver a validar la base**.
-
----
-
-## 10. COPÉRNICO opcional
-
-Se carga antes de Fountain9 y puede omitirse si los orígenes del día no requieren corrección por ubicación.
-
-### Columnas
-
-| Concepto | Encabezado esperado |
+| Término | Significado operativo |
 |---|---|
-| Warehouse origen | `Bodega` o `WAREHOUSE_ID` |
-| Producto | `EAN` o `PRODUCT_ID` |
-| Ubicación | `Ubicacion` o `LOCATION` |
-| Cantidad | `Saldo`, `STOCK` o `QUANTITY` |
-| Zona | `ZonaPiso`; obligatoria si existe Bodega 856; se usa en **todas** las bodegas para excluir `LOST` |
-
-El archivo puede contener varios warehouses. Cada fila se aplica a su propia `Bodega`; no está hardcodeado al 444.
-
-### Función
-
-COPÉRNICO no define stock. Solo:
-
-- descuenta ubicaciones no utilizables;
-- resuelve STORAGE para inventario utilizable del 856.
-
-### Regla general histórica
-
-- Ubicación que inicia con `Z`: utilizable.
-- `CANCELADOS`: no utilizable, en cualquier bodega.
-- `RECIBO_*` (cualquier variante: `RECIBO_444`, `RECIBO_831`, `RECIBO_852`, `RECIBO_856`, etc.): **utilizable en cualquier bodega**. Es un concepto general — cualquier ubicación que empiece con `RECIBO_` cuenta, sin importar qué bodega tenga de sufijo (cambio de negocio; antes se excluía siempre, luego solo se permitió `RECIBO_444` en 444/831 — ahora el concepto completo deja de excluirse en cualquier bodega). El chequeo es explícito por prefijo, no por longitud de texto.
-- Otras ubicaciones: utilizables si cumplen la estructura histórica de al menos ocho caracteres.
-
-### ZonaPiso = LOST (todas las bodegas)
-
-Sin importar la bodega, una fila con `ZonaPiso = LOST` **siempre se excluye**, igual que `CANCELADOS` en Ubicacion. Esta regla se evalúa **antes** que cualquier otra (incluida la clasificación E/RCC/RR/MRM de la bodega 856) y tiene prioridad sobre una Ubicación que por sí sola sería utilizable. `ZonaPiso` sigue siendo opcional para bodegas distintas de 856: si la columna no existe en el archivo, simplemente no hay filas LOST que excluir.
-
-**Un SKU ausente de COPÉRNICO por completo** (ni usable ni no-usable en ningún archivo cargado, para ese origen) se trata como **sin ninguna restricción** — el stock de DATA_TRANSFERS se usa completo. No es una exclusión por precaución; la ausencia de dato nunca bloquea.
-
-### Bodega 856
-
-| ZonaPiso | Tratamiento | STORAGE |
-|---|---|---|
-| `LOST` | Se descuenta (sin importar la bodega, ver arriba) | Sin override |
-| `E` | Utilizable | Room Temperature |
-| `RCC` | Utilizable | Freezer |
-| `RR` | Utilizable | Refrigerated |
-| `BIN` | Se descuenta | Sin override |
-| `DIF` | Se descuenta | Sin override |
-| `RC` | Se descuenta | Sin override |
-| `MRM` | Se ignora; ya viene descontado en STOCK | Sin override |
-| Vacío/desconocido | Se descuenta conservadoramente | Sin override |
-
-Si un SKU tiene saldo utilizable en varios ambientes, se usa el ambiente con mayor saldo.
-
-Sin archivo COPÉRNICO no hay descuento por ubicaciones ni override 856; STOCK y NO_DISPONIBLE siguen operando.
-
-### Validación obligatoria por warehouse
-
-Los warehouses **444, 831 y 856** son los únicos con COPÉRNICO propio hoy. Si alguno de ellos está seleccionado como origen, la corrida **no avanza** sin que exista un archivo COPÉRNICO cargado que cubra específicamente ese warehouse (se detecta leyendo la columna `Bodega`/`WAREHOUSE_ID` de cada archivo, sin guardar nada a disco, antes de ejecutar). Otros orígenes (por ejemplo 425) no requieren COPÉRNICO para avanzar.
-
-### Visibilidad como motivo de corte
-
-Cuando el saldo excluido por COPÉRNICO en un origen (que de otra forma sería elegible) explica por qué un requerimiento no se cubrió, la línea recibe su propio `TIPO_DE_CORTE`: `CORTE POR COPÉRNICO` (nada asignado) u `OK PARCIAL - CORTE POR COPÉRNICO` (cobertura parcial) — en vez de caer en el bucket genérico `CORTE POR STOCK`. Esto permite cuantificar, en el breakdown y en una advertencia dedicada (`COPÉRNICO como motivo de corte`), cuántos requerimientos y unidades se dejaron de planificar específicamente por exclusiones de COPÉRNICO, separado de un stockout genuino. Un `BLOQUEO REGIONAL` o `BLOQUEO POR FRECUENCIA` en el mismo origen sigue teniendo prioridad sobre este bucket.
+| **Origen** | CEDIS o bodega desde la cual se envía inventario. |
+| **Destino** | Tienda que recibirá producto. |
+| **SKU** | Producto identificado por `RETAIL_ID` / `PRODUCT_ID`. |
+| **Tarea** | Una combinación única `origen + destino + SKU`. Una misma línea puede contener muchas unidades. |
+| **ROQ / MOV** | Recomendación natural conservada desde Fountain9. |
+| **ADU** | Venta diaria promedio (`Average Daily Units`). |
+| **DOH** | Días de inventario: inventario disponible entre ADU. |
+| **AVL** | Cobertura para productos que están en stockout de catálogo. |
+| **MOQ** | Múltiplo mínimo de envío. |
+| **OWNER** | Separación de inventario y archivos para 425 y 856. |
+| **COPÉRNICO** | Fuente que identifica inventario no utilizable o condiciones de ubicación. |
+| **CODEC** | Panel de parámetros de una corrida. |
 
 ---
 
-## 11. Archivos Fountain9
+## Arquitectura técnica
 
-### Archivos y columnas
-
-- Se admite uno o varios CSV.
-- Delimitadores: coma, punto y coma o tabulador.
-- Lectura UTF-8-SIG con reemplazo de caracteres inválidos.
-
-| Campo | Encabezado permitido | Obligatorio |
-|---|---|---:|
-| Destino | `Warehouseid` o `Node_Store` | Sí |
-| Producto | `SKU ID` | Sí |
-| Forecast | `Predicted Demand for selected duration` | Sí |
-| Opening | `Predicted Opening Inventory` | Sí |
-| ROQ | `Replenishment Quantity for Plan Duration (MOV)` | Sí |
-| Entrante | `Net Inter-Store Transfers` | Sí |
-
-`Net Inter Store Transfers` sin guion también se reconoce. Aunque el encabezado conserve `(MOV)`, el producto lo presenta como **ROQ**.
-
-**MOV efectivo — máximo entre 12 columnas, no solo (MOV):** el ROQ con el que realmente se planea es el máximo entre la columna `(MOV)` de arriba y hasta 11 columnas más, todas opcionales (si el archivo no las trae, simplemente no participan):
-
-- `Replenishment Quantity for Plan Duration (Batch Size Rounded)`
-- `Replenishment Quantity for Plan Duration (MOQ)`
-- `Replenishment Quantity for Plan Duration (Initial Allocation)`
-- `Replenishment Quantity for Plan Duration (Max Cap. Adj.)`
-- `Replenishment Quantity for Plan Duration (Max Cap. Adj.) (Batch Size Rounded)`
-- `Replenishment Quantity for Plan Duration (Max Cap. Adj.) (MOQ)`
-- `Replenishment Quantity for Plan Duration Diff.`
-- `Allocation Quantity for Plan Duration`
-- `Replenishment(Allocation) Quantity for Plan Duration Editable`
-- `Allocation (Store Based)`
-- `Allocation (DOI Based)`
-
-Cuando la misma tienda-SKU aparece en más de una fila o más de un archivo cargado el mismo día, el ROQ resultante es el **máximo** entre todas esas apariciones — no la suma (a diferencia de Forecast, Opening y Net Inter-Store Transfers, que sí siguen sumándose entre duplicados, sin cambio). `MOV_MAX_OPTIONAL_COLUMNS` en `modules/les_enfants_terribles.py` define la lista de las 11 columnas opcionales.
-
-Si `Warehouseid` y `Node_Store` vienen poblados, deben coincidir. Las demás dimensiones se obtienen de DATA_TRANSFERS.
-
-### Consolidación
-
-Llave:
-
-```text
-WAREHOUSE_DESTINATION + RETAIL_ID
+```mermaid
+flowchart TD
+    UI["Streamlit · app.py"] --> ORQ["Les Enfants Terribles\nUI y orquestación"]
+    ORQ --> CORE["modelo_abasto.py\ncatálogos y asignación"]
+    ORQ --> EXT["Engines opcionales"]
+    CORE --> OUT["Excel · CSV · PDF · ZIP"]
+    EXT --> OUT
 ```
 
-Para una misma llave se suman demanda, opening y Net Inter-Store Transfers. El ROQ es la excepción: se toma el **máximo** (ver arriba, "MOV efectivo"), no la suma. Se conserva la trazabilidad de archivos y filas. No cargue dos veces el mismo archivo salvo que quiera duplicar intencionalmente demanda/opening/transfers (el ROQ no se duplica, por diseño).
+### Componentes principales
 
-`Current Inventory` se deriva de STOCK usando destino–SKU, no del CSV.
+| Ruta | Responsabilidad |
+|---|---|
+| `app.py` | Entrada Streamlit, navegación y selección de módulo. |
+| `auth.py` | Estado de sesión y perfiles Big Boss / Raiden. |
+| `modules/les_enfants_terribles.py` | Pantallas de planeación, validación de inputs, orquestación, análisis y descargas. |
+| `modelo_abasto.py` | Motor puro: carga catálogos, consolida Fountain9, calcula objetivos, asigna stock y escribe entregables. |
+| `engines/mission_control.py` | Selecciona la cola base Naked / hardcodes. |
+| `engines/naked_engine.py` | Clasifica la recomendación natural y los casos sin recomendación. |
+| `engines/solidus_engine.py` | Clasifica protecciones manuales de la cola base. |
+| `engines/shalashaska_engine.py` | Evacuación de producto por mermar. |
+| `engines/liquid_engine.py` | Liquidación de remanente. |
+| `engines/venom_engine.py` | Cobertura DDMRP posterior a la planeación. |
+| `modules/militaires_sans_frontieres.py` | Reporting histórico y ejecutivo; módulo en evolución. |
+| `mother_base_theme.py` | Sistema visual de la aplicación. |
+| `tests/` | Pruebas de reglas de negocio y contratos críticos. |
 
----
+### Principio de diseño del motor
 
-## 12. Cantidad objetivo
+El motor es secuencial a propósito. Cada asignación modifica tres recursos compartidos:
 
-| Condición | Objetivo | Etiqueta |
-|---|---:|---|
-| ROQ original > 0 | `max(ceil(ROQ), 3)` | ROQ POSITIVO |
-| ROQ ≤ 0, demanda=0 y opening=0 | 4 | FORECAST 0 · FORZADO A 4 |
-| ROQ ≤ 0 y opening < demanda | 3 | ROQ 0 · INVENTARIO MENOR A DEMANDA |
-| ROQ ≤ 0, Net Transfer ≤ 3 e inventario destino < 3 | 3 | NET TRANSFER BAJO · FORZADO A 3 |
-| Ninguna | 0 | SIN RECOMENDACIÓN |
+```mermaid
+flowchart LR
+    A["Stock por origen-SKU"] --> D["Ledger global"]
+    B["Capacidad m³ por tienda"] --> D
+    C["Presupuesto de tareas"] --> D
+    D --> E["Siguiente necesidad / engine"]
+```
 
-El mínimo de 3 no bloquea el envío si el origen solo tiene 1 o 2 unidades. Los hardcodes se atribuyen a Solidus, no a Fountain9.
-
-Los manuales no ejecutados por falta de tareas se omiten del breakdown; no representan demanda natural incumplida.
-
----
-
-## 13. Prioridad y asignación
-
-### Jerarquía
-
-1. INFALTABLE.
-2. GOLDEN.
-3. ANCHOR.
-4. KVI.
-5. REGULAR.
-
-Después se consideran ROQ natural antes que manual dentro del mismo rango, prioridad de tienda, stockout, destino, SKU y fila de entrada.
-
-El orden de selección de warehouses origen define la prioridad de consumo. Una necesidad puede dividirse entre varios orígenes, por ejemplo 2 unidades del primero y 8 del segundo.
-
-### Solicitud grande frente a solicitudes pequeñas
-
-La asignación base usa dos pasadas:
-
-1. Intenta cubrir requerimientos completos y difiere el que no cabe completo.
-2. Continúa cubriendo solicitudes posteriores más pequeñas.
-3. Usa al final el stock sobrante para atender parcialmente las solicitudes diferidas.
-
-Ejemplo: quedan 4, una tienda pide 10 y dos posteriores piden 1. Primero cubre 1+1 y luego entrega las 2 restantes a la solicitud de 10.
+Por esta razón no se debe paralelizar la fase de asignación sin rediseñar el ledger. El orden de prioridades no es decorativo: cambia el resultado.
 
 ---
 
-## 14. Stock utilizable
+## Flujo de planeación
+
+### 1. Consolidación de la demanda
+
+Los CSV de Fountain9 se consolidan por destino–SKU. Para valores de recomendación repetidos se conserva el máximo cuando corresponde, evitando inflar la demanda por archivos o filas duplicadas.
+
+### 2. Construcción de candidatos
+
+Cada fila se enriquece con ciudad, prioridad de tienda, categoría comercial, volumen, stock actual, capacidad, restricciones y objetivo de envío. La jerarquía comercial es:
+
+1. Infaltable
+2. Golden
+3. Anchor
+4. KVI
+5. Regular
+
+Dentro de la misma categoría se atiende primero la recomendación natural, luego protecciones manuales, prioridad de tienda, stockout, destino, SKU y orden de entrada.
+
+### 3. Asignación base
+
+Para cada necesidad, el sistema intenta cubrir la cantidad objetivo con los orígenes seleccionados en CODEC. El orden de esos orígenes define la prioridad de consumo de stock.
+
+Cuando hay stock limitado, el motor protege el aprovechamiento del inventario con dos pasadas:
+
+1. Intenta cubrir solicitudes completas y difiere las que no caben.
+2. Atiende solicitudes posteriores más pequeñas y después usa el remanente para cubrir parcialmente lo diferido.
+
+Ejemplo: si quedan 4 unidades y las solicitudes son 10, 1 y 1, primero se cubren las dos solicitudes de 1 y las 2 unidades restantes se asignan al caso de 10.
+
+### 4. Engines posteriores
+
+Los engines opcionales se ejecutan sobre lo que quedó del ledger. Nunca deben inventar capacidad, tareas o stock.
+
+### 5. Salida y diagnóstico
+
+Las líneas planeadas, los cortes y las causas se escriben en los archivos de salida. Las tablas web limitan la visualización para proteger rendimiento, pero permiten descargar el detalle completo.
+
+---
+
+## Fuentes de datos
+
+### DATA_TRANSFERS
+
+`DATA_TRANSFERS` es la fuente de configuración y catálogo. Se descarga desde Google Sheets y se valida al iniciar o al presionar **Volver a validar la base**. La sesión conserva la versión validada en caché.
+
+Entre otras, la base contiene contratos para tiendas, stock, capacidad, productos, bloqueos, owners, horarios y prioridades. Las hojas obligatorias deben existir con sus encabezados acordados.
+
+### Fountain9
+
+Se carga como uno o varios CSV. Aporta la necesidad natural, variables de demanda e inventario y, cuando existe, la decisión final de asignación de Fountain9 mediante `Allocation (Store Based)`.
+
+La columna `Allocation (Store Based)` permite construir el reporte comparativo. Si no está presente, el reporte se omite; la planeación no se bloquea.
+
+### COPÉRNICO
+
+COPÉRNICO es opcional para la aplicación en general, pero es obligatorio cuando se planea desde los orígenes 444, 831 o 856. No sustituye a STOCK: descuenta inventario no pickeable y ayuda a determinar condiciones del 856.
+
+### SCHEDULE
+
+La hoja `SCHEDULE` define días permitidos para una pareja origen–destino. Su bloqueo está apagado por defecto. Si se activa, la validación se hace contra la fecha real de la corrida en la zona horaria de Ciudad de México.
+
+---
+
+## Reglas mandantes
+
+Estas reglas no deben cambiarse sin una revisión conjunta de Supply y Desarrollo.
+
+| Regla | Aplicación |
+|---|---|
+| **Stock es mandante** | Nunca se asignan más unidades que el stock final ajustado del origen. |
+| **Capacidad es mandante** | Ninguna tienda puede superar su `CAP_RECIBO` acumulado en m³. |
+| **Tareas compartidas** | Naked, Solidus, Shalashaska y Liquid comparten `MAX_TASKS`. |
+| **Bloqueos explícitos** | Tiendas, ciudades, rutas, productos, restricciones regionales y frecuencia no pueden saltarse. |
+| **Prioridad comercial** | Infaltable > Golden > Anchor > KVI > Regular. |
+| **OWNER no crea stock** | En 425/856 se usa el menor entre stock ajustado y stock del owner. |
+| **COPÉRNICO no crea stock** | Solo descuenta inventario no utilizable y aporta condición logística. |
+| **INSUMOS no consume tareas** | Sí consume stock de 444 y respeta MOQ, elegibilidad y calendario. |
+
+### Stock utilizable
 
 ```text
 stock ajustado = floor(max(STOCK_DISPONIBLE_FINAL
@@ -492,787 +235,382 @@ stock ajustado = floor(max(STOCK_DISPONIBLE_FINAL
                            0))
 ```
 
-Luego:
-
-- Rackeado 444 → 0.
-- SKU excluido → 0.
-- Para 425/856 → mínimo entre cálculo anterior y OWNER total.
-- `STOCK.INCOMING` no participa todavía.
-- `ZonaPiso=MRM` del 856 no se descuenta otra vez.
-- `ZonaPiso=LOST` de COPÉRNICO ya está incluido en `COPERNICO_NO_USABLE`, sin importar la bodega (ver §10).
-
----
-
-## 15. Capacidad y tareas
+Después se aplican exclusiones específicas: rackeado de 444, SKUs excluidos y, para 425/856, el límite por OWNER. `STOCK.INCOMING` no participa en la planeación base; únicamente puede utilizarse en la cobertura de quiebres sin Fountain9.
 
 ### Capacidad
 
 ```text
-m3 línea = unidades × m3 por unidad
-unidades que caben = floor(m3 restantes / m3 por unidad)
+m³ de línea = unidades × m³ por unidad
+unidades máximas = floor(m³ restante de tienda / m³ por unidad)
 ```
 
-La suma es global por destino a través de todos los engines. Ninguna categoría puede exceder CAP_RECIBO.
-
-### Tareas
-
-```text
-Naked + Solidus + Shalashaska + Liquid ≤ MAX_TASKS
-```
-
-Una tarea nueva es una combinación nueva de `source + destination + SKU`. Si un engine posterior agrega unidades a una combinación existente, no crea tarea.
-
-Separar OWNER puede requerir otra línea; si no hay cupo, se recorta la cantidad que no puede separarse. INSUMOS no cuenta en el límite.
+La capacidad se acumula por destino durante toda la corrida.
 
 ---
 
-## 16. Restricciones
+## Engines de planeación
 
-- **TIENDAS_CERRADAS:** bloqueo permanente de backend. Toggle en CODEC (activo por default); apagarlo hace que ninguna tienda se excluya por esta regla.
-- **Tiendas excluidas en CODEC:** bloqueo temporal para todos los engines; formato `247 - Carso`.
-- **Ciudades bloqueadas:** bloqueo temporal. Solo se contabiliza el corte si había necesidad positiva; el resto sigue como SIN RECOMENDACIÓN.
-- **SKUs excluidos:** el campo de CODEC (por coma/salto) se une con la hoja `BLOQUEOS` de DATA_TRANSFERS (columna `PRODUCT_ID`, mantenida por negocio); afecta engines e Insumos. Ver §8.
-- **RUTA_COSTOS:** bloquea el par destino–SKU. Toggle en CODEC (activo por default); apagarlo hace que ninguna combinación se bloquee por ruta.
-- **BLOQUEOS regionales:** solo si el SKU está en `BLOQUEOS_FORANEAS`, el origen es CDMX y el destino GDL/MTY. Golden/Infaltable/Anchor/KVI no crean este bloqueo. Toggle en CODEC (activo por default); apagarlo desactiva el bloqueo CDMX→GDL/MTY por completo.
-- **RACKEADOS:** excluye stock rackeado de 444 (hoja `RACKEADOS`). Toggle en CODEC (activo por default); apagarlo deja de tratar cualquier SKU como rackeado.
-- **SCHEDULE (toggle "Bloquear envíos fuera de frecuencia"):** bloquea el par origen–destino si el día real de la corrida no está en `SCHEDULE.DAYS` para ese `WAREHOUSE_ID` + `ORIGEN`. Un par ausente de SCHEDULE no tiene restricción. Apagado por default; aplica a Naked, Solidus (incluye AVL y prevención de quiebres), Shalashaska, Liquid e Insumos. Si todos los orígenes elegibles quedan bloqueados por frecuencia, la línea corta completa; si solo algunos, se asigna con los orígenes disponibles y queda como parcial.
-- **FRUVER 811:** toggle que retira ese stock del 811 sin afectar otros orígenes.
+Los engines se aplican en una secuencia explícita. Activar uno no le otorga recursos adicionales: consume el mismo ledger cuando corresponde.
 
-Las cuatro reglas con toggle (RACKEADOS, TIENDAS_CERRADAS, BLOQUEOS regional, RUTA_COSTOS) se implementan vaciando el set/estructura correspondiente en `Catalogs` cuando el toggle está apagado, no verificando el toggle en cada punto de uso — así que cualquier código que ya consulte esos sets respeta el toggle automáticamente.
-
----
-
-## 17. Engines
+```mermaid
+flowchart TD
+    A["Naked · demanda Fountain9"] --> B["Solidus · coberturas"]
+    B --> C["Shalashaska · mermar"]
+    C --> D["Liquid · remanentes"]
+    D --> E["Venom · DDMRP"]
+    E --> F["Chequeos y entregables"]
+```
 
 ### Naked Engine
 
-Ejecuta casos con ROQ original positivo. Consume stock, capacidad y tareas. Sus resultados incluyen `OK COMPLETO POR FOUNTAIN9` y cortes parciales o totales.
+Atiende la recomendación natural con ROQ positivo. Incluye un toggle independiente, **Cubrir a Fountain9**, para hardcodes en los que Fountain9 no produce ROQ positivo pero el negocio determina que debe haber una cobertura mínima:
 
-**Toggle "Cubrir a Fountain9"** (en la propia tarjeta de Naked, activo por default): controla los hardcodes `HARDCODE_4_CERO_TOTAL` y `HARDCODE_3_INVENTARIO_MENOR_DEMANDA` — casos donde Fountain9 no dio un ROQ positivo (MOV ≤ 0) pero el modelo igual arma un objetivo de 3 o 4 unidades según inventario/demanda en destino. Conceptualmente esto es Naked tomando la necesidad cuando Fountain9 no opinó, **no** Solidus — antes de esta sesión ambos vivían bajo el mismo toggle "Solidus Engine", lo cual mezclaba dos responsabilidades distintas. Si se apaga, esos casos quedan completamente sin cubrir por Naked (Solidus puede seguir cubriéndolos por su cuenta si aplica AVL/Preventivo/Refuerzo).
+- Inventario y demanda en cero: objetivo mínimo configurado.
+- Inventario menor a demanda con ROQ no positivo: objetivo mínimo.
+- Net transfer bajo y poco inventario en destino: mínimo de 3 unidades.
+
+Estos casos pertenecen a Naked porque cubren una necesidad que Fountain9 no formuló como ROQ positivo; no deben confundirse con Solidus.
 
 ### Solidus Engine
 
-Desde esta sesión, Solidus **ya no incluye los hardcodes de Fountain9** (ver arriba) — son cuatro coberturas opcionales, todas apoyadas en CATALOGO (AVL, Prevención, Refuerzo Golden/Infaltable/Anchor y Cobertura sin Fountain9; esta última se documenta más abajo, después de Refuerzo):
+Solidus utiliza stock, capacidad y tareas restantes en este orden:
 
-**AVL:** busca catálogo con stock final cero y sin servicio positivo previo. Objetivo:
+1. **AVL:** cobertura de catálogo con stock final cero y sin servicio positivo previo.
+2. **Prevención:** producto con poco inventario o menos de un DOH, sin recomendación positiva de Fountain9.
+3. **Refuerzo Golden / Infaltable / Anchor:** lleva el inventario hacia un DOH objetivo específico cuando Fountain9 no solicitó el caso.
+4. **Cobertura sin Fountain9:** opcional y apagada por defecto; cubre stockouts que ni siquiera tienen fila en el bulk de Fountain9.
 
-```text
-max(ceil(ADU × DOH objetivo), 3)
-```
+Para resolver ADU, las coberturas usan esta cascada:
 
-**Prevención:** busca inventario positivo con menos de 1 DOH o menos de 3 unidades, sin recomendación positiva Fountain9, e intenta llevarlo al DOH configurado.
+1. ADU de la tienda–SKU.
+2. Promedio del mismo SKU en otras tiendas de la misma ciudad.
+3. Sin ADU disponible: se aplica el tratamiento propio de cada cobertura.
 
-Ambas ya **no descartan** combinaciones tienda-SKU con ADU ≤ 0 en CATALOGO desde el arranque — usan la cascada de ADU compartida (ver abajo) antes de decidir si hay o no dato suficiente.
-
-### Cascada de ADU compartida (AVL, Preventivo, Refuerzo, Cobertura sin Fountain9)
-
-Las cuatro coberturas de Solidus resuelven el ADU de cada tienda-SKU con la misma lógica de respaldo, implementada en `resolve_adu_with_city_fallback`. Cobertura sin Fountain9 tiene un piso adicional propio (0.14/día) cuando ni esta cascada encuentra dato — ver su sección más abajo.
-
-1. **ADU propio** en CATALOGO para esa tienda-SKU → se usa tal cual.
-2. **Sin ADU propio** (ausente o ≤ 0) → promedio de ADU del mismo SKU en otras tiendas de la **misma ciudad** que sí tengan ADU > 0 en CATALOGO.
-3. **Ninguna tienda de la misma ciudad tiene ADU** para ese SKU → sin dato. AVL y Preventivo caen naturalmente al mínimo de 3 por su propia fórmula (`max(..., 3)`); el Refuerzo Golden/Infaltable/Anchor lo maneja de forma explícita (ver abajo), porque su fórmula no tiene ese piso por diseño.
-
-### Refuerzo Golden/Infaltable/Anchor
-
-Rediseñado por completo en esta sesión. Diferencias clave frente a AVL/Preventivo:
-
-- **Universo de candidatos**: sale de la hoja `GOLDEN_INFALTABLES_ANCHOR` (`catalogs.golden_products | infaltable_products | anchor_products`), **no** de CATALOGO. Un SKU marcado Golden/Infaltable/Anchor sin fila propia en CATALOGO para esa tienda igual se evalúa (con ADU de respaldo o, en último caso, el mínimo de 3).
-- **Fountain9 nunca se toca**: si Fountain9 pidió algo para esa tienda-SKU (`CANTIDAD_OBJETIVO > 0` en la pasada base), el Refuerzo no genera ninguna línea para ella, sin importar si esa recomendación se cubrió o se cortó por stock. El objetivo es no restarle confiabilidad a lo que Fountain9 decidió — el trabajo de cubrir esos casos lo mejor posible con el inventario de los orígenes es responsabilidad de Naked/Solidus (la cascada de asignación multi-origen normal), no del Refuerzo.
-- **On-top sobre otros engines de cobertura, no sobre Fountain9**: si Fountain9 no pidió nada para esa tienda-SKU, pero AVL o Preventivo ya le asignaron algo antes en la misma corrida, el Refuerzo calcula la **posición acumulada** (stock inicial + lo ya asignado por cualquier engine en esta corrida) y manda solo la diferencia hasta el DOH objetivo — ya no descarta el caso por "ya recibió algo".
-- **Objetivo independiente** (variable propia en CODEC, default 21 DOH — no comparte el número con AVL/Preventivo):
-
-  ```text
-  target = ceil(ADU × DOH objetivo Golden/Infaltable/Anchor)
-  a_enviar = max(target − posición_acumulada, 0)
-  ```
-
-- **Sin ADU en ninguna tienda de la ciudad**: mínimo operativo de 3 unidades (descontando lo ya asignado), sin piso de DOH, marcado en `DETALLE_MOTIVO` y contado en `special_candidates_no_adu`. A diferencia de AVL/Preventivo, esta rama es explícita porque la fórmula del Refuerzo no tiene un `max(..., 3)` incorporado — no queremos forzar 3 unidades a cada Golden/Infaltable/Anchor sin ADU salvo cuando de verdad haga falta.
-
-`PLANNING_REASON = "REFUERZO GOLDEN/INFALTABLE/ANCHOR · SOLIDUS ENGINE"`, `TIPO_DE_CORTE = "ENVIADOS PARA REFORZAR GOLDEN/INFALTABLE/ANCHOR"`.
-
-### Cobertura sin Fountain9
-
-Cuarta cobertura de Solidus, opcional y desactivada por default (toggle "Cubrir quiebres sin fila de Fountain9"). Corre **al final de Solidus**, después de AVL, Preventivo y Refuerzo, usando exclusivamente lo que sobró de tareas y stock.
-
-- **Universo de candidatos**: CATALOGO completo, igual que AVL/Preventivo. Un candidato califica si (a) el stock en destino es 0 (quebrado) y (b) la combinación tienda-SKU **no tiene ninguna fila en el archivo de Fountain9 de esta corrida** — ni siquiera una con `CANTIDAD_OBJETIVO = 0`. Esto es más estricto que la exclusión que usa el Refuerzo (`CANTIDAD_OBJETIVO > 0`): aquí basta con que la fila exista, sin importar su valor, para que este mecanismo la ignore por completo.
-- **Objetivo, sin DOH fijo de CODEC**:
-
-  ```text
-  ADU_efectivo = ADU propio (o de ciudad) > 0 ? ese valor : 0.14 (ADU ficticio)
-  objetivo = ADU_efectivo × (Duration_moda_tienda + Lead_Time_moda_tienda) − stock_destino − STOCK.INCOMING
-  a_enviar = max(ceil(objetivo), mínimo de unidades a enviar de CODEC)
-  ```
-
-  `Duration` y `Primary Source Lead Time (Days)` son columnas opcionales del Bulk de Fountain9 (si el archivo no las trae, este mecanismo simplemente no encuentra candidatos — no bloquea la carga). Se toma la **moda** de cada una, calculada **por tienda** sobre todas las filas de esa tienda en el Bulk consolidado (no por SKU, no un promedio). Si una tienda no tiene ninguna fila con esos datos válidos en el Bulk, sus quiebres sin Fountain9 se saltan sin piso de cálculo (contados en `skipped_no_duration_data`).
-- **`STOCK.INCOMING`**: columna que estaba reservada en el contrato de la hoja STOCK desde hace tiempo, sin usarse. Este mecanismo es el primero en activarla — opcional, se detecta si está presente antes de exigirla. Representa unidades ya en tránsito hacia esa tienda-SKU por cualquier motivo previo a la corrida; se resta del objetivo para no sobre-enviar.
-
-`PLANNING_REASON = "COBERTURA SIN FOUNTAIN9 · SOLIDUS ENGINE"`, `REGLA_DEMANDA = "COBERTURA_SIN_FOUNTAIN9"`, `TIPO_DE_CORTE = "ENVIADOS PARA CUBRIR QUIEBRE SIN FOUNTAIN9"`.
-
-Las cuatro coberturas de Solidus usan únicamente stock, capacidad y tareas remanentes, en el orden: AVL → Prevención → Refuerzo Golden/Infaltable/Anchor → Cobertura sin Fountain9 — cada una solo ve las tareas que dejaron libres las anteriores.
-
-### Check de salud Golden/Infaltable/Anchor (post-corrida)
-
-Nuevo en esta sesión (`build_golden_infaltable_anchor_health_check`). Corre al final del pipeline, **después** de Shalashaska, Liquid y Venom — no solo después del Refuerzo. Para cada tienda-SKU del universo Golden/Infaltable/Anchor con ADU resoluble (misma cascada de arriba), compara el **DOH final real** (stock inicial + todo lo asignado por cualquier engine en la corrida) contra el objetivo del Refuerzo, y reporta cualquier caso que haya quedado por debajo — típicamente porque un engine que corre después del Refuerzo (Shalashaska, Liquid, Venom) consumió stock del mismo origen y nadie volvió a revisarlo. Es puramente informativo: no mueve nada ni vuelve a planear, solo avisa antes de que la corrida se entregue. Se muestra en la web como tabla dedicada, justo antes de "Reporte por engine".
-
-### Reporte de universo Golden / Infaltable / Anchor
-
-Nuevo en esta sesión (`build_bucket_universe_report`). A diferencia del check de salud (que solo mira lo que quedó por debajo del objetivo entre lo evaluable), este reporte cubre el **universo completo** de cada bucket — toda tienda-SKU marcada en `GOLDEN_INFALTABLES_ANCHOR`, sin importar si algún engine la tocó hoy o si ni siquiera apareció en el Fountain9 del día. Son **3 reportes independientes** (Golden, Infaltable, Anchor); una misma tienda-SKU marcada en más de un bucket aparece en cada reporte por separado.
-
-El umbral de riesgo es fijo en **3 DOH** (`GOLDEN_INFALTABLE_ANCHOR_RISK_DOH`), independiente del DOH objetivo del Refuerzo (21 por default) — aquí la pregunta es "¿está en riesgo real de quiebre?", no "¿llegó al nivel de cobertura que queremos mantener?".
-
-**3 niveles:**
-
-1. **General**: conteo por categoría, usando DOH inicial (antes de cualquier engine) vs DOH final (con todo lo asignado hoy):
-   - `SIN_PROBLEMA`: nunca bajó de 3 DOH.
-   - `IBA_A_QUEBRAR_Y_SE_SALVO`: arrancó con stock > 0 pero < 3 DOH, terminó en ≥ 3.
-   - `QUEBRADO_Y_SE_SALVO`: arrancó en 0 unidades, terminó en ≥ 3 DOH.
-   - `NO_CUBIERTO`: seguía por debajo de 3 DOH al final.
-2. **General con detalle**: la tabla completa, una fila por tienda-SKU del universo, con ADU (y su origen: propio o promedio de ciudad), stock/DOH inicial y final, unidades asignadas hoy, y categoría.
-3. **Micro-detalle**: solo para `NO_CUBIERTO`, el motivo exacto (`_diagnose_uncovered_bucket_reason`). Revisa primero motivos a nivel tienda (SKU excluido globalmente, tienda cerrada, ciudad bloqueada, capacidad **real restante** llena, sin ADU en ningún lado); si ninguno aplica, revisa origen por origen (rackeado, COPÉRNICO con motivo específico, bloqueo regional, SCHEDULE, RUTA_COSTOS, sin stock ajustado). Si de verdad no encuentra ningún bloqueo pero el caso sigue sin cubrirse, el motivo es literalmente `"SIN MOTIVO DE BLOQUEO IDENTIFICADO"` — no se inventa una explicación; queda visible para revisión manual caso por caso.
-
-Un SKU sin ADU resoluble (ni propio ni de la ciudad) **siempre** cae en `NO_CUBIERTO`: un DOH "infinito" por falta de dato no es lo mismo que "sin riesgo", así que nunca se le da esa confianza.
+El Refuerzo Golden / Infaltable / Anchor usa el universo definido en la hoja correspondiente, no solamente las filas existentes de catálogo. Nunca modifica una recomendación que Fountain9 ya solicitó.
 
 ### Shalashaska Engine
 
-Evacúa inventario próximo a caducar de POR_MERMAR.
-
-Tiendas elegibles:
-
-- ya tienen una transferencia desde el mismo origen en la corrida;
-- no están cerradas/excluidas ni en ciudad bloqueada;
-- tienen ruta válida y superan el bloqueo regional;
-- tienen capacidad;
-- tienen ADU positivo en CATALOGO.
-
-Orden de candidatos: prioridad de producto, caducidad más cercana, mayor valor en riesgo, llegada más antigua, orden de origen y SKU.
-
-Objetivo seguro:
-
-```text
-DOH seguro = min(DOH configurado, max(días a caducidad - 1, 1))
-```
-
-Primero nivela las tiendas hacia el mismo DOH. Si queda inventario y hay al menos dos tiendas, distribuye por SHARE_VENTAS; si todos los shares son cero, usa pesos iguales. POR_MERMAR queda siempre topado por STOCK ajustado.
+Propone evacuar inventario marcado como **por mermar**, respetando los bloqueos, la capacidad de las tiendas y el presupuesto compartido de tareas.
 
 ### Liquid Engine
 
-Corre al final para agotar inventario remanente:
-
-- automático: saldo >0 y menor al **umbral configurable** (`tail_threshold`, default 10 unidades) en orígenes habilitados;
-- manual: SKUs capturados independientemente por origen;
-- solo considera destinos que **ya recibieron unidades reales** de otro engine en la misma corrida (Naked, Solidus, AVL, Preventivo o Shalashaska) — no cualquier tienda con un renglón de Fountain9, y nunca una tienda nueva fuera de lo que la planeación ya generó ese día;
-- no exige que el SKU esté en CATALOGO.
-
-Convierte el forecast a ADU:
-
-```text
-ADU estimado = Predicted Demand / días del horizonte
-```
-
-Primero nivela hasta un máximo fijo de 14 DOH. Después distribuye el resto por SHARE_VENTAS, en enteros, usando piso y residuos mayores. Respeta stock, capacidad, tareas y restricciones.
-
-### Por qué un candidato de Liquid puede no enviarse
-
-Un origen-SKU dentro del umbral (`0 < remanente < tail_threshold`) es un **candidato**, no una garantía de envío. Puede quedar sin línea por tres motivos, contados por separado en el resumen de advertencias:
-
-- **Sin destino elegible** (`skipped_no_destination_eligible`): todo destino del día quedó descartado por BLOQUEOS regional, RUTA_COSTOS, el toggle de frecuencia SCHEDULE, ciudad bloqueada o tienda cerrada, antes de siquiera revisar capacidad.
-- **Sin capacidad** (`skipped_capacity_full`): había al menos un destino elegible, pero ninguno tenía m³ libres para ni una sola unidad de ese SKU.
-- **Sin tareas** (`skipped_task_limit`): se agotó el presupuesto compartido de `MAX_TASKS` antes de llegar a este candidato.
-
-Antes de esta versión, estos tres motivos se colapsaban en un solo contador interno sin visibilidad en el reporte; ahora aparecen desglosados en la advertencia de Liquid y en las tarjetas KPI de la web. Nota importante: un saldo que ya fue excluido por COPÉRNICO (`LOST` o `CANCELADOS`) o marcado `RACKEADO_444` **nunca llega a ser candidato** — no es una falla de Liquid, es stock que el sistema correctamente nunca consideró disponible.
-
-El reparto por SHARE_VENTAS (`_weighted_integer_allocation`) ya redistribuye automáticamente entre las tiendas candidatas con espacio disponible: cuando una se llena, sale del cálculo de pesos y su parte se reparte entre las que quedan, iterando hasta agotar el remanente o quedarse sin tiendas con capacidad. `skipped_capacity_full` solo se dispara cuando **todas** las tiendas candidatas están llenas para ese SKU específico, no cuando algunas lo están.
+Distribuye remanentes de inventario desde los orígenes seleccionados. Puede correr con SKUs indicados manualmente o detectar colas pequeñas según el umbral configurado. Si no encuentra destino elegible, reporta el motivo: restricción, capacidad, falta de tarea o ausencia de demanda apta.
 
 ### Venom Engine
 
-Quinto engine, **opcional y desactivado por default**. Corre al final de absolutamente todo (después de Naked, Solidus, AVL, Preventivo, Shalashaska, Liquid e Insumos, y antes de la partición por OWNER), sobre los remanentes de stock post-allocation y lo ya asignado ("incoming") en esa misma corrida. Aplica un modelo **DDMRP (Demand Driven MRP)** simplificado para decidir si hace falta un envío adicional de llenado de buffer.
+Ejecuta al final como cobertura DDMRP. Calcula zonas de buffer y propone llenado hacia el `Top of Green` cuando corresponde. Sus líneas se conservan separadas de otras asignaciones aun cuando compartan origen, destino y SKU.
 
-**Variables de Venom en CODEC:**
+Venom no consume el ledger de capacidad usado por los engines anteriores ni se consolida con sus líneas. Esto debe mantenerse para que su impacto sea auditable.
 
-| Variable | Formato | Nota |
-|---|---|---|
-| Warehouses origen — Venom | Multiselección, mismo estilo que CODEC | Restringido a un subconjunto de los orígenes ya elegidos arriba. |
-| Tiendas destino — Venom | Multiselección | Respeta TIENDAS_CERRADAS, exclusiones y ciudades bloqueadas. |
-| Tipo de sección | Multiselección: Infaltable, Golden, Anchor, BL | Un par tienda-SKU entra si cumple **al menos uno** de los tipos marcados. `OOWL` está **bloqueado**: no aparece como opción y el motor lo descarta aunque llegara en `section_types`, en tres capas (UI, llamador, y dentro del propio `apply_venom_engine`). |
-| Lead time (días) | Numérico libre | Alimenta las zonas roja/amarilla/verde. |
-| Considerar planeación actual | Toggle, activo por default | Ver "On-Order" abajo. |
+### Checks posteriores
 
-**Modelo DDMRP simplificado**, con factores medios estándar (`LTF = 0.5`, `VF = 0.5`):
-
-```text
-ADU           = CATALOGO.ADU de esa tienda-SKU
-Red Base      = ADU x Lead Time x LTF
-Red Safety    = Red Base x VF
-Red Zone      = Red Base + Red Safety
-Yellow Zone   = ADU x Lead Time
-Green Zone    = max(ADU x Lead Time x LTF, mínimo operativo de 3)
-Top of Red    = Red Zone
-Top of Yellow = Red Zone + Yellow Zone
-Top of Green  = Top of Yellow + Green Zone
-
-On-Hand       = STOCK_DISPONIBLE_FINAL remanente en la tienda destino
-On-Order      = unidades ya asignadas a esa tienda-SKU en esta misma corrida
-                (Naked+Solidus+AVL+Preventivo+Shalashaska+Liquid+Insumos),
-                solo si "Considerar planeación actual" está activo; si no, 0.
-Demanda Calif.= ADU x Lead Time
-NFP           = On-Hand + On-Order - Demanda Calificada
-```
-
-Si `NFP >= Top of Yellow` el buffer está sano y no se genera envío. Si no, Venom ordena hasta el techo de la zona verde: `Cantidad = ceil(Top of Green - NFP)`.
-
-**Tipos de sección:**
-
-- `IS_INFALTABLE`, `IS_GOLDEN`, `IS_ANCHOR`: mismos flags que ya usa el resto del proyecto (`GOLDEN_INFALTABLES_ANCHOR`).
-- `BL`: tienda-SKU con `CATALOGO.LIST_TYPE = "BL"`. `LIST_TYPE` es una columna opcional en `CATALOGO`; si no existe, ningún producto califica como BL y Venom avisa con una advertencia (el resto de tipos de sección no se ve afectado).
-- `OOWL`: **bloqueado en esta versión** a pedido de negocio (ver nota arriba). Antes de bloquearse, no era una clasificación estática sino una condición evaluada en tiempo de corrida — combinaciones tienda-SKU con stock disponible en alguno de los orígenes de Venom, cero stock/incoming en la tienda destino, sin importar si tenían ADU o no; en ese caso Venom no calculaba ningún buffer, mandaba directamente el mínimo operativo. La lógica sigue en el código (inactiva) por si se reactiva más adelante.
-
-**No consolidación (regla mandante de Venom):** a diferencia de Liquid/Shalashaska/AVL, Venom **nunca** revisa si el trío origen-destino-SKU ya tiene una línea de otro engine para sumarle cantidad. Siempre agrega una fila **nueva y separada** a `DETALLE_ASIGNACION` y a los CSV, marcada con `PLANNING_REASON = "ENVIADO POR VENOM ENGINE"` y `TIPO_DE_CORTE = "ENVIADOS POR VENOM ENGINE"`. Si Naked ya mandó 10 unidades del SKU X a la tienda Y y Venom decide mandar 18 más, el reporte muestra **dos líneas** (10 y 18), nunca una consolidada de 28.
-
-**Presupuesto de tareas:** cada línea de Venom consume una tarea del mismo `MAX_TASKS` compartido con Naked/Solidus/Shalashaska/Liquid, incluso cuando duplica un trío origen-destino-SKU ya usado por otro engine.
-
-**Restricciones heredadas:** TIENDAS_CERRADAS, exclusiones manuales, ciudades bloqueadas, RUTA_COSTOS, BLOQUEOS regionales, CAP_RECIBO y el toggle de frecuencia SCHEDULE — igual que el resto de los engines.
+Al terminar la corrida, Mother Base revisa el universo Golden / Infaltable / Anchor. El check de salud es informativo: identifica tienda–SKU que quedaron debajo del objetivo de DOH después de todos los engines; no replantea automáticamente.
 
 ---
 
-## 18. INSUMOS
+## Restricciones y bloqueos
 
-El toggle **Agregar insumos al BulkCD_444** controla la fase.
-
-- Solo procesa `WAREHOUSE_SOURCE=444`.
-- Solo envía a tiendas con al menos una línea normal desde 444.
-- Respeta exclusiones, bloqueos y stock ajustado remanente.
-- No consume tareas.
-- Se anexa al mismo `BulkCD_444.csv`.
-
-| PRODUCT_ID | Insumo | Target informativo | MOQ |
-|---:|---|---:|---:|
-| 85097 | Bolsa 1 | 7,000 | 1,000 |
-| 86195 | Bolsa 2 | 2,100 | 200 |
-| 76491 | Sticker | 10,000 | 1,000 |
-
-Si falta stock, recorta por prioridad de tienda en múltiplos del MOQ. Una solicitud que no sea múltiplo también se reduce. Para SKU no configurado usa MOQ 1 y genera advertencia.
-
----
-
-## 19. OWNER para 425 y 856
-
-OWNER impide mezclar razones sociales:
-
-1. Calcula stock ajustado normal.
-2. Suma OWNER por origen–SKU.
-3. Usa el menor de ambos límites.
-4. Intenta surtir una línea desde un solo owner.
-5. Si necesita dividir, crea otra línea solo si queda tarea.
-6. Si no puede separar, recorta y advierte.
-7. Crea CSV independiente por owner.
-
-Ejemplos:
-
-```text
-BulkCD_425_TURBO.csv
-BulkCD_425_CHEDRAUI.csv
-BulkCD_856_TURBO.csv
-BulkCD_856_CHEDRAUI.csv
-```
-
-`OWNER_NAME` aparece en `DETALLE_ASIGNACION`, no en el CSV operativo: el owner está en el nombre del archivo.
-
----
-
-## 19.1 Modo simulación
-
-Toggle exclusivo de **Big Boss** ("Modo simulación — solo calcular, no generar archivos"), apagado por default. Corre el pipeline completo con números reales y exactos (incluida la escritura temporal de todos los CSV/Excel/PDF, necesaria porque INSUMOS escribe directamente sobre el Bulk físico del 444), pero al terminar **borra todo lo que se acaba de escribir a disco** antes de devolver el resultado — ningún archivo queda disponible para descarga. La sección "Descargar todo" se reemplaza por un aviso de que la corrida fue una simulación. Pensado para probar parámetros (por ejemplo, un DOH distinto del Refuerzo) sin comprometer una entrega real. Raiden no ve este toggle.
-
----
-
-## 20. Variables de CODEC
-
-### Compartidas
-
-| Variable | Alcance | Default / comportamiento |
-|---|---|---|
-| RACKEADOS | Todos | Activo por default; toggle vacía `catalogs.rackeados_444` si se apaga. |
-| TIENDAS_CERRADAS | Todos | Activo por default; toggle evita cargar `closed_store_ids` si se apaga. |
-| BLOQUEOS regional | Todos | Activo por default; toggle vacía `catalogs.blocked_products` si se apaga. |
-| RUTA_COSTOS | Todos | Activo por default; toggle vacía `catalogs.route_cost_blocks` si se apaga. |
-| Cubrir a Fountain9 | Naked | Activo por default; controla los hardcodes HARDCODE_4/HARDCODE_3 (ver §17). |
-| Cubrir quiebres sin fila de Fountain9 | Solidus | Apagado por default. Corre al final de Solidus, usa Duration/Lead Time moda por tienda del Bulk de Fountain9 en vez del DOH fijo (ver §17). |
-| Mínimo de unidades a enviar | Todos | `Config.minimum_positive_quantity`. Default **4 para Big Boss, 3 para Raiden**. Piso de MOV_MINIMO_3, HARDCODE_4_CERO_TOTAL, HARDCODE_3_INVENTARIO_MENOR_DEMANDA (Naked), AVL, Preventivo, y el Refuerzo Golden/Infaltable/Anchor sin ADU. **No** afecta el umbral de elegibilidad de Preventivo (`destination_stock < 3`), que sigue fijo — son conceptos distintos. |
-| Modo simulación | Solo Big Boss | Apagado por default; ver §19.1. |
-| Warehouses origen | Todos | Orden = prioridad de consumo. |
-| Máximo de tareas | Todos | Presupuesto global; normalmente 14,000. |
-| Bloquear ciudades | Todos | Temporal. |
-| Excluir tiendas | Todos | Temporal; `ID - Nombre`. |
-| Excluir SKUs | Todos e Insumos | Comas o saltos. Se une a `BACKEND_EXCLUDED_SKUS` (92462, 92463, 9151), fijos y no visibles en la UI. |
-| Agregar insumos | Postproceso 444 | Activo por default. |
-| Bloquear FRUVER 811 | Stock origen | Apagado por default. |
-| Bloquear envíos fuera de frecuencia | Todos (Naked, Solidus, Shalashaska, Liquid, Insumos) | Apagado por default; usa SCHEDULE y la fecha real del sistema. |
-
-### Por engine
-
-| Engine | Variable | Default |
-|---|---|---:|
-| Naked | Activar | Activo |
-| Naked | Cubrir a Fountain9 | Activo (visible solo con Naked activo) |
-| Solidus | Activar | Activo |
-| Solidus | Cubrir AVL | Inactivo |
-| Solidus | Prevenir quiebres | Inactivo |
-| Solidus | DOH objetivo (AVL y prevención) | 3 |
-| Solidus | Reforzar Golden/Infaltable/Anchor | Inactivo |
-| Solidus | DOH objetivo (Golden/Infaltable/Anchor) | 21 |
-| Shalashaska | Activar | Inactivo |
-| Shalashaska | DOH primera pasada | 7 |
-| Liquid | Activar | Inactivo |
-| Liquid | Remanentes bajo el umbral | Activo al abrir engine |
-| Liquid | Umbral de remanente (unidades) | 10 |
-| Liquid | Orígenes automáticos | Todos seleccionados |
-| Liquid | Horizonte forecast | 7 días |
-| Liquid | SKUs manuales | Lista por origen |
-| Venom | Activar | Inactivo |
-| Venom | Warehouses origen | Subconjunto de los orígenes de CODEC |
-| Venom | Tiendas destino | Ninguna (hay que seleccionar) |
-| Venom | Tipo de sección | Ninguno (hay que seleccionar al menos uno) |
-| Venom | Lead time (días) | 7 |
-| Venom | Considerar planeación actual | Activo |
-
-### Orígenes disponibles
-
-| ID | Nombre |
-|---:|---|
-| 444 | CITYPARK TURBO |
-| 831 | CITYPARK CHEDRAUI |
-| 811 | CEDA TURBO |
-| 834 | CEDA CHEDRAUI |
-| 425 | CEDIS LOCAL GDL |
-| 856 | CEDIS - LOCAL MTY |
-| 49 | NODO ALTAVISTA |
-
----
-
-## 21. Entregables
-
-### Excel
-
-`Reporte_Planeacion_DD-MM-YYYY.xlsx`
-
-- `RESUMEN`: métricas, breakdown, advertencias y capacidad.
-- `BASE_TRANSFERS`: requerimientos, reglas, stock, capacidad, tareas y corte.
-- `DETALLE_ASIGNACION`: líneas asignadas, incluido OWNER_NAME.
-
-### CSV operativos
-
-- Normal: `BulkCD_<SOURCE>.csv`.
-- 425/856: `BulkCD_<SOURCE>_<OWNER>.csv`.
-
-| Columna | Contenido |
+| Restricción | Efecto |
 |---|---|
-| `WAREHOUSE_DESTINATION` | Tienda receptora. |
-| `WAREHOUSE_SOURCE` | Origen. |
-| `RETAIL_ID` | PRODUCT_ID/SKU. |
-| `QUANTITY` | Unidades enteras. |
-| `PLANNED_DATE` | Vacío. |
-| `ROUTE` | Siempre 1. |
-| `DELIVERY_PRIORITY` | Siempre 1. |
-| `CITY` | Ciudad destino. |
-| `STORAGE` | Ambiente aplicable. |
-| `VALUE` | HV por origen o REGULAR. |
-| `PRODUCT_NAME` | Nombre del producto (hoja DATA, por SYNC_ID). Vacío si DATA no está cargada o el SKU no aparece ahí — nunca bloquea el CSV. |
-| `CATEGORY_NAME` | Categoría del producto (misma fuente). |
-| `PLANNING_REASON` | Fountain9, Solidus, AVL, prevención, Shalashaska, Liquid o Insumos. |
+| `TIENDAS_CERRADAS` | No permite envíos a destinos cerrados. Tiene toggle, activo por defecto. |
+| Tiendas excluidas en CODEC | Bloqueo temporal de destinos para la corrida. |
+| Ciudades bloqueadas | Bloqueo temporal de ciudades. Raiden no puede bloquear las ciudades protegidas. |
+| `BLOQUEOS` + SKUs de CODEC | Excluyen producto de engines e INSUMOS. |
+| `RUTA_COSTOS` | Bloquea una pareja destino–SKU. Tiene toggle activo por defecto. |
+| `BLOQUEOS_FORANEAS` | Bloquea productos señalados desde CDMX hacia GDL/MTY. Tiene toggle activo por defecto. |
+| `RACKEADOS` | El stock rackeado no puede salir desde 444. Tiene toggle activo por defecto. |
+| `SCHEDULE` | Si está activado, bloquea origen–destino fuera de frecuencia. |
+| FRUVER 811 | Toggle que retira el stock 811 sin alterar otros orígenes. |
 
-`enrich_rows_with_product_info()` (`modelo_abasto.py`) le pega `PRODUCT_NAME`/`CATEGORY_NAME` a `result.base_rows` y `result.allocation_rows` una sola vez, justo antes de escribir cualquier archivo — de ahí salen automáticamente los CSV operativos, `BASE_TRANSFERS` y `DETALLE_ASIGNACION`. También se aplica al reporte de universo Golden/Infaltable/Anchor (§17) y al check de salud. **No** aplica a las tablas de breakdown (`planned_by_engine_rows`/`cuts_detail_rows`/overview): son agregados por engine/causal, sin fila por SKU. Tampoco al PDF ejecutivo, que no tiene tablas a nivel SKU.
+La implementación de los toggles de reglas maestras limpia las estructuras afectadas al cargar los catálogos. Esto evita que cada engine tenga que implementar el mismo `if` y garantiza una aplicación uniforme.
 
-### CSV de tres ceros
+### Regla regional
 
-`Fountain9_Sin_Recomendacion_DD-MM-YYYY.csv`
-
-Incluye combinaciones originales con demanda, opening y ROQ/MOV exactamente en cero. Conserva inventario actual, objetivo manual 4, enviado real, resultado, exclusión manual, archivos fuente y filas consolidadas. Se genera incluso vacío.
-
-### PDF y ZIP
-
-- `Reporte_Ejecutivo_Planeacion_DD-MM-YYYY.pdf`: resumen para dirección.
-- `Planeacion_DD-MM-YYYY.zip`: todos los entregables.
-
-Los resultados son temporales: deben descargarse antes de que expire la sesión.
+El bloqueo regional solo aplica si el SKU figura en `BLOQUEOS_FORANEAS`, el origen está en CDMX y el destino está en GDL o MTY. Una clasificación Golden, Infaltable, Anchor o KVI no crea ni elimina por sí misma un bloqueo regional.
 
 ---
 
-## 22. BREAKDOWN
+## Perfiles de acceso
 
-La sección de resultados muestra 4 tablas independientes:
-
-1. **Efectivamente planeado** — por engine y causal, solo `CANTIDAD_ASIGNADA > 0`.
-2. **Cortes** — todo lo que no se mandó (`CANTIDAD_ASIGNADA == 0`), por motivo específico. **Ya no incluye `SIN RECOMENDACIÓN`** — ver la tabla 3.
-3. **Sin recomendación** — por qué Fountain9 no pidió nada para esa tienda-SKU, usando únicamente columnas propias del Bulk de Fountain9 (`PREDICTED_DEMAND`, `PREDICTED_OPENING_INVENTORY`, `NET_INTER_STORE_TRANSFERS`) — nunca CATALOGO/STOCK ni otros engines. Exclusivo de Naked por construcción (ningún otro engine genera `TIPO_DE_CORTE = "SIN RECOMENDACIÓN"`). `build_no_recommendation_breakdown` / `classify_no_recommendation_reason` en `modules/les_enfants_terribles.py`.
-
-   Todo SKU que llega aquí ya tiene, por construcción de `calculate_target_quantity`, `opening ≥ demand` (si no, cae en el hardcode de déficit en vez de `SIN_DEMANDA`) — así que "inventario cubre la demanda" no distingue nada por sí solo. Los 5 motivos, evaluados en este orden:
-
-   | Motivo | Condición |
-   |---|---|
-   | SIN DEMANDA PROYECTADA | `demand ≤ 0` |
-   | TRANSFERENCIA ENTRE TIENDAS CUBRE LA NECESIDAD | `net_transfer ≥ demand` |
-   | INVENTARIO CON AMPLIO MARGEN | `opening ≥ 2 × demand` |
-   | INVENTARIO SUFICIENTE CON MARGEN AJUSTADO | `demand ≤ opening < 2 × demand` |
-   | SIN MOTIVO IDENTIFICADO | comodín defensivo; no debería ocurrir salvo datos inconsistentes |
-
-4. **Overview general** — tablas 1 y 2 combinadas (`status_counts`, independiente de las anteriores) — **sí sigue incluyendo** `SIN RECOMENDACIÓN`, solo se quitó de la tabla 2.
-
-| BREAKDOWN | Significado |
+| Perfil | Alcance |
 |---|---|
-| CORTE POR CIUDAD BLOQUEADA | Había necesidad positiva y la ciudad se bloqueó temporalmente. |
-| CORTE POR PRODUCTO RACKEADO 444 | El SKU no puede usar el stock 444. |
-| CORTE POR STOCK | No existe stock utilizable. |
-| OK MANUAL POR FORECAST Y STOCK EN CERO | Hardcode de Naked: demanda=0 y opening=0, forzado al mínimo configurado. |
-| OK MANUAL POR INVENTARIO MENOR A DEMANDA | Hardcode de Naked: ROQ≤0 pero opening < demanda, forzado al mínimo. |
-| OK MANUAL POR NET TRANSFER BAJO | Hardcode de Naked: ROQ≤0, net transfer≤3 y stock destino<3, forzado a 3. |
-| OK MANUAL PARCIAL POR CUPO DE TAREAS | Parte manual ejecutada antes del máximo. |
-| OK COMPLETO POR FOUNTAIN9 | ROQ natural cubierto. |
-| OK PARCIAL - CORTE POR PRODUCTO RACKEADO 444 | Otro origen cubrió parte; 444 quedó bloqueado. |
-| OK PARCIAL - CORTE POR STOCK | Unidades menores al objetivo por stock. |
-| ENVIADOS PARA CUBRIR AVL | Cobertura de stockout de CATALOGO. |
-| ENVIADOS PARA PREVENIR QUIEBRE | Refuerzo preventivo Solidus. |
-| ENVIADOS PARA REFORZAR GOLDEN/INFALTABLE/ANCHOR | Refuerzo de DOH para productos especiales Solidus. |
-| ENVIADOS PARA CUBRIR QUIEBRE SIN FOUNTAIN9 | Cobertura sin Fountain9: última pasada de Solidus (ver §17). |
-| ENVIADOS POR SHALASHASKA ENGINE | Evacuación próxima a caducar. |
-| ENVIADOS POR LIQUID ENGINE | Liquidación de remanente. |
-| SIN RECOMENDACIÓN | No hubo necesidad positiva; no equivale necesariamente a forecast cero. |
-| CORTE POR RUTA DE COSTOS | Par destino–SKU bloqueado. |
-| CORTE POR TIENDA CERRADA | Destino bloqueado en backend. |
-| INSUMOS | Línea añadida al BulkCD_444. |
-| CORTE POR CAPACIDAD DE TIENDA | Sin m³ disponibles. |
-| CORTE POR CAPACIDAD DE TAREAS | Recomendación natural sin tarea disponible. |
-| OK PARCIAL - CORTE POR CAPACIDAD DE TAREAS | Cobertura parcial antes del máximo. |
-| CORTE POR BLOQUEO REGIONAL | Producto explícito BLOQUEOS, CDMX → GDL/MTY. |
-| OK PARCIAL - CORTE POR BLOQUEO REGIONAL | Otro origen cubrió parte. |
-| CORTE POR FRECUENCIA DE ENVÍO | Todos los orígenes elegibles no tienen envío programado hoy según SCHEDULE. |
-| OK PARCIAL - CORTE POR FRECUENCIA DE ENVÍO | Otro origen sí tenía envío programado hoy y cubrió parte o el total. |
-| CORTE POR COPÉRNICO | Toda la demanda quedó sin cubrir porque las unidades excluidas por COPÉRNICO (ubicación no usable, LOST, etc.) habrían sido suficientes para tener stock elegible. |
-| OK PARCIAL - CORTE POR COPÉRNICO | Se cubrió parte de la demanda; el resto quedó en unidades excluidas por COPÉRNICO en orígenes que de otra forma eran elegibles. |
-| ENVIADOS POR VENOM ENGINE | Línea de llenado DDMRP post-planeación. Nunca se consolida con otra línea del mismo trío origen-destino-SKU; siempre es una fila adicional y separada. |
-| ERROR DE DATOS | Falta información obligatoria. |
+| **Big Boss** | Acceso completo. Puede configurar todos los engines y usar modo simulación. |
+| **Raiden** | Perfil operativo. No activa Solidus ni Liquid, tiene otros orígenes predeterminados y no puede bloquear las seis ciudades protegidas. |
 
-La tabla web muestra al menos 12 filas sin scroll vertical.
+La autenticación de Big Boss se configura mediante `BIG_BOSS_PASSWORD` en Streamlit Secrets. No use valores de ejemplo en producción y nunca suba `secrets.toml` al repositorio.
 
 ---
 
-## 22.1 Fountain9 vs Mother Base (reporte comparativo)
+## Resultados y cómo leerlos
 
-Reporte aparte, no una tabla más de BREAKDOWN. **No es una comparación en igualdad de condiciones a propósito** — el objetivo es demostrar cuánto más desbloquea Mother Base de lo que Fountain9 siquiera alcanza a evaluar, no medir a los dos de forma "justa" sobre el mismo terreno achicado.
+### Entregables
 
-**La columna clave: `Allocation (Store Based)`.** Confirmado por análisis directo de archivos reales de Fountain9 (no por documentación de su producto, que es confusa): esta es la columna que refleja la decisión **final** de asignación de Fountain9 — no es el ROQ/MOV que recomienda mandar, es a quién le dio el stock cuando el origen no alcanzaba para todas las tiendas que lo pedían. Se verificó que:
+| Archivo | Uso |
+|---|---|
+| Excel de planeación | Revisión completa, detalle de base, asignación, cortes y análisis. |
+| CSV operativos | Carga o ejecución por origen; 425/856 se separan por owner cuando corresponde. |
+| `Fountain9_Sin_Recomendacion_DD-MM-YYYY.csv` | Casos en que Fountain9 no recomendó y su explicación operativa. |
+| PDF ejecutivo | Resumen para dirección. |
+| ZIP | Paquete consolidado de toda la corrida. |
 
-- Coincide con `Allocation Quantity for Plan Duration` (el campo que de verdad se resta del origen) en 99%+ de los casos, incluso cuando el mecanismo de "Multi Source" de Fountain9 reasigna a un origen distinto del original.
-- `Allocation (DOI Based)` es un método alternativo que Fountain9 calcula pero **no usa** como decisión final — casi nunca coincide con el resultado real.
-- `Source Current Inventory` / `Source Inventory After Allocation` son **compartidos entre todas las tiendas** que compiten por el mismo origen+SKU, no por fila — el consumo real solo cuadra agregando por origen+SKU, no viendo una tienda a la vez.
+Los archivos son temporales dentro de la sesión. Descárgalos antes de cerrar o dejar expirar la sesión.
 
-**Opcional en el Bulk de Fountain9** — `FOUNTAIN9_ALLOCATION_COLUMN = "Allocation (Store Based)"` en `modules/les_enfants_terribles.py`, mismo patrón que Duration/Lead Time: si el archivo no la trae, el reporte simplemente no aparece (no bloquea nada). Mismo criterio que ROQ_INPUT para filas/archivos duplicados de la misma tienda-SKU: se toma el **máximo**, nunca la suma.
+### Breakdown de resultados
 
-**Tres bloques, no uno:**
+La interfaz separa cuatro vistas para evitar mezclar causas diferentes:
 
-1. **Cara a cara** (`fountain9` / `mother_base_mismo_alcance`) — solo tienda-SKU donde Fountain9 sí trajo la columna. Aquí sí es comparable 1 a 1: Productos, Tiendas, Piezas y Tareas (tienda-SKU con asignación > 0) para cada lado, más el desglose de cobertura de rupturas de stock (`stock_base` propio = 0 en destino): cubiertas por ambos, solo por Fountain9, solo por Mother Base, o por ninguno. Esto es lo único donde "cubrió una ruptura" tiene sentido medirlo para Fountain9 — no puede cubrir algo que nunca vio.
-2. **Lo que desbloqueamos** (`mother_base_adicional`) — tienda-SKU que Fountain9 **nunca evaluó en absoluto** (ausentes de su Bulk, no solo con `Allocation` en 0). Incluye, entre otras cosas, lo que cubre Cobertura sin Fountain9 (§17), pero no se limita a eso — cualquier engine que haya cubierto algo fuera del alcance de Fountain9 cae aquí.
-3. **Total real** (`mother_base_total`) — bloque 1 (columna Mother Base) + bloque 2, sumados. La cifra grande: cuánto hace Mother Base en total, sin importar si Fountain9 lo vio o no.
+1. **Efectivamente planeado:** líneas con unidades asignadas, por engine y causal.
+2. **Cortes:** necesidades positivas que no recibieron unidades, agrupadas por restricción.
+3. **Sin recomendación:** explicación de por qué Fountain9 no pidió producto; usa solo datos del bulk de Fountain9.
+4. **Overview:** panorama general de los estados de la corrida.
 
-`build_fountain9_comparison_report()` en `modules/les_enfants_terribles.py`.
+`SIN RECOMENDACIÓN` no significa necesariamente que la demanda sea cero. Puede indicar que el inventario o transferencias entre tiendas ya cubrían la necesidad.
+
+### Reporte Fountain9 vs Mother Base
+
+Cuando existe `Allocation (Store Based)`, el reporte tiene tres bloques:
+
+| Bloque | Pregunta que responde |
+|---|---|
+| Cara a cara | En los casos que Fountain9 evaluó, ¿qué cubrió cada sistema? |
+| Mother Base adicional | ¿Qué atendió Mother Base que Fountain9 no evaluó? |
+| Total Mother Base | ¿Cuál es el impacto completo de Mother Base? |
+
+No se debe leer la comparación como una competencia de igualdad de condiciones: Mother Base incorpora mecanismos y universos que Fountain9 puede no tener en su archivo de entrada.
 
 ---
 
-## 23. KPIs
+## Operación diaria
 
-Las tarjetas distinguen tareas, unidades, productos, tiendas y m³. El tooltip explica cada denominador.
+### Antes de ejecutar
 
-- **Compliance de casos/tareas:** necesidades objetivo con asignación.
-- **Compliance de unidades:** unidades asignadas / objetivo.
-- **Exceso manual:** unidades agregadas sobre la recomendación natural.
-- **Stockouts solucionados:** tienda–SKU en cero que recibe unidades.
-- **Forecast 0 forzado:** casos de tres ceros enviados por Solidus.
-- **Tareas por engine:** combinaciones nuevas creadas.
-- **Unidades por engine:** cantidad física agregada.
+1. Confirme que Aleph y las fuentes de `DATA_TRANSFERS` estén actualizadas.
+2. Abra Mother Base y seleccione perfil.
+3. Ingrese a **Les Enfants Terribles**.
+4. Confirme que las tarjetas de salud estén verdes o investigue las alertas.
+5. Cargue los CSV de Fountain9 correspondientes a la corrida.
+6. Si usa 444, 831 o 856, cargue COPÉRNICO para cada origen requerido.
+7. Revise capacidad de recibo, tiendas en resguardo y bloqueos temporales.
 
-Una tarea puede contener muchas unidades; nunca compare ambos KPIs como si compartieran denominador.
+### Configuración en CODEC
+
+1. Seleccione los orígenes en orden de consumo.
+2. Defina el máximo de tareas.
+3. Agregue bloqueos temporales de tiendas, ciudades o SKUs cuando aplique.
+4. Configure INSUMOS, FRUVER y el calendario si corresponde.
+5. Active únicamente los engines requeridos para la corrida.
+6. Revise parámetros de objetivos y umbrales antes de confirmar.
+
+### Después de ejecutar
+
+1. Compare tareas utilizadas contra el máximo.
+2. Revise unidades, m³ y consumo por origen.
+3. Lea los cortes y sus motivos antes de entregar el bulk.
+4. Revise el check Golden / Infaltable / Anchor.
+5. Valide la separación por owner de 425 y 856.
+6. Descargue Excel, CSV, PDF y ZIP.
 
 ---
 
-## 24. Ejecución local
+## Instalación y despliegue
 
-### macOS / Linux
+### Requisitos
+
+- Python 3.12.
+- Acceso a la fuente `DATA_TRANSFERS`.
+- Credenciales configuradas en Streamlit Secrets cuando aplique.
 
 ```bash
-git clone https://github.com/bryanzuniga-rappi/MOTHER_BASE.git
-cd MOTHER_BASE
-python3.12 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
 pip install -r requirements.txt
-cp .streamlit/secrets.toml.example .streamlit/secrets.toml
 streamlit run app.py
 ```
 
-### Windows PowerShell
-
-```powershell
-git clone https://github.com/bryanzuniga-rappi/MOTHER_BASE.git
-cd MOTHER_BASE
-py -3.12 -m venv .venv
-.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-Copy-Item .streamlit\secrets.toml.example .streamlit\secrets.toml
-streamlit run app.py
-```
-
-Normalmente abre en `http://localhost:8501`.
-
-### Pruebas
+Para desarrollo y pruebas:
 
 ```bash
 pip install -r requirements-dev.txt
 pytest -q
 ```
 
-La suite cubre selección de engines, prioridad, exclusiones, bloqueos regionales, diferimiento de solicitudes grandes, Liquid, Shalashaska, tareas y capacidad.
+### Configuración local
+
+Copie el ejemplo y rellene valores reales exclusivamente en su entorno local:
+
+```bash
+cp .streamlit/secrets.toml.example .streamlit/secrets.toml
+```
+
+Variables relevantes:
+
+```toml
+BIG_BOSS_PASSWORD = "un-secreto-fuerte-y-unico"
+DATA_TRANSFERS_SPREADSHEET_ID = "id-del-sheet"
+DATA_DASHBOARD_SPREADSHEET_ID = "id-del-dashboard"
+```
+
+> **Seguridad:** `.streamlit/secrets.toml` debe estar en `.gitignore`. Si un secreto llegó al repositorio, elimínelo del historial y rótelo antes de desplegar.
+
+### Streamlit Community Cloud
+
+1. Suba el proyecto a GitHub sin archivos secretos.
+2. Cree una app y seleccione la rama de producción.
+3. Configure `app.py` como main file.
+4. Agregue secrets desde la configuración del deployment.
+5. Revise logs, perfiles, fuentes y una corrida controlada antes de liberar a operación.
 
 ---
 
-## 25. Despliegue en Streamlit Community Cloud
+## Guía de desarrollo
 
-La raíz de la rama debe contener `app.py`, `requirements.txt`, `runtime.txt`, `engines/`, `modules/` y `.streamlit/`.
+### Contrato de una nueva regla
 
-1. Suba el proyecto a GitHub.
-2. En Streamlit Community Cloud seleccione **Create app**.
-3. Elija repositorio y rama, normalmente `main`.
-4. Configure `app.py` como Main file path.
-5. En **App settings → Secrets** agregue:
+Toda regla nueva debe responder, como mínimo:
 
-   ```toml
-   BIG_BOSS_PASSWORD = "un-secreto-fuerte-y-unico"
-   DATA_TRANSFERS_SPREADSHEET_ID = "el-id-real-de-su-sheet"
-   DATA_DASHBOARD_SPREADSHEET_ID = "el-id-real-de-su-sheet"
-   ```
+1. ¿Cuál es su fuente y qué columnas necesita?
+2. ¿En qué posición de la secuencia corre?
+3. ¿Consume tareas?
+4. ¿Consume capacidad?
+5. ¿De qué stock descuenta?
+6. ¿Qué bloqueos debe respetar?
+7. ¿Cómo aparecerá en breakdown, Excel, CSV y PDF?
+8. ¿Cuál será su `PLANNING_REASON` y su prueba automatizada?
 
-6. Despliegue y revise logs.
-7. Pruebe Big Boss y Raiden.
-8. Confirme todas las fuentes verdes.
-9. Ejecute una corrida controlada y concilie tareas, unidades, stock y m³.
+Una regla no puede elevar el inventario utilizable por encima de `STOCK_DISPONIBLE_FINAL` sin redefinir explícitamente el contrato de stock mandante.
 
-El flujo no necesita APIs de pago: DATA_TRANSFERS se exporta por URL pública y los CSV se suben desde el navegador.
+### Patrón recomendado para un engine
 
-Antes de cada release:
+```mermaid
+flowchart TD
+    A["Definir universo candidato"] --> B["Filtrar bloqueos y elegibilidad"]
+    B --> C["Calcular objetivo"]
+    C --> D["Consumir ledger permitido"]
+    D --> E["Etiquetar razón y diagnóstico"]
+    E --> F["Cubrir con pruebas"]
+```
+
+Los engines deben conservar la trazabilidad de cada decisión: motivo, cantidad objetivo, cantidad asignada, fuente de stock y causa de corte.
+
+### Convenciones importantes
+
+- `modelo_abasto.py` debe mantenerse libre de UI de Streamlit.
+- La UI orquesta; el motor decide y devuelve estructuras comprobables.
+- Las pruebas deben declarar la regla con un caso de entrada y resultado esperado, no solo validar que una función no falle.
+- No modifique las etiquetas de salida sin actualizar el breakdown, los exports y pruebas relacionadas.
+- No fusionar líneas de Venom con líneas del resto de engines.
+
+---
+
+## Pruebas y liberaciones
+
+### Validación mínima antes de merge
 
 ```bash
 python -m compileall app.py auth.py modelo_abasto.py engines modules
 pytest -q
 ```
 
+Además de la suite, pruebe manualmente:
+
+- Con y sin COPÉRNICO.
+- Orígenes 444, 425 y 856.
+- Bloqueos regionales, rackeados, rutas y frecuencia.
+- Límite de tareas y capacidad de tienda.
+- Engines activados y desactivados.
+- Excel, CSV, PDF y ZIP resultantes.
+
+### Go-live y conciliación
+
+Antes de confiar una liberación a operación, reprocesar al menos tres fechas históricas y conciliar:
+
+1. Tareas y unidades naturales de Fountain9.
+2. Manuales y coberturas por engine.
+3. Consumo de stock por origen–SKU.
+4. Capacidad utilizada por destino.
+5. Bloqueos, rackeados, owners y cortes.
+6. Diferencias contra la versión previa, clasificadas por regla.
+
+### Estrategia de versiones
+
+- `main` representa producción.
+- Trabaje en ramas cortas.
+- Cada pull request debe incluir caso de negocio, cambio de regla y evidencia de prueba.
+- Etiquete releases conciliados para permitir rollback.
+
 ---
 
-## 26. Checklist de producción
+## Limitaciones conocidas
 
-### Infraestructura y seguridad
+- Big Boss usa una contraseña compartida; no es autenticación corporativa.
+- Raiden es un perfil operativo sin contraseña.
+- La base `DATA_TRANSFERS` se consume como fuente pública.
+- Los resultados y workspaces de corrida son temporales.
+- No existe una bitácora persistente de parámetros, inputs y entregables.
+- Los CSV grandes se consolidan en memoria.
+- `Militaires Sans Frontières` continúa en evolución.
+- `STOCK.INCOMING` no interviene en la planeación base.
+- `OVER_ORIGEN_STORAGE` conserva compatibilidad de backend, pero no se usa en interfaz.
+- El calendario se evalúa contra la fecha real del servidor; no contra una fecha histórica o simulada de entrega.
 
-- [ ] Python 3.12 disponible.
-- [ ] Dependencias instaladas.
-- [ ] Memoria probada con los archivos máximos reales.
-- [ ] HTTPS activo y XSRF habilitado.
-- [ ] `BIG_BOSS_PASSWORD` distinta de `Admin`.
-- [ ] `DATA_TRANSFERS_SPREADSHEET_ID` y `DATA_DASHBOARD_SPREADSHEET_ID` configurados en Secrets — nunca hardcodeados en el código ni documentados en el README.
-- [ ] `secrets.toml` fuera de Git.
-- [ ] Riesgo del Sheet público aprobado.
-- [ ] Política de logs, reinicio y acceso definida.
+Para una operación crítica y multiusuario, los siguientes pasos recomendados son SSO, auditoría persistente, monitoreo de fuentes, control de concurrencia, pruebas de carga y una fuente de datos autenticada.
+
+---
+
+## Checklist de producción
+
+### Infraestructura
+
+- [ ] Python y dependencias instaladas.
+- [ ] Secrets configurados fuera de Git.
+- [ ] HTTPS y protección XSRF activos.
+- [ ] Memoria y timeout validados con archivos reales de mayor tamaño.
 
 ### Datos
 
-- [ ] Las 23 hojas obligatorias existen con nombres exactos.
-- [ ] Encabezados cumplen contrato.
-- [ ] C7 de Aleph es válido.
-- [ ] Fuentes de 1.2 horas y 24 horas dentro del SLA.
-- [ ] A1 de IMPORTRANGE sin `#REF!`.
-- [ ] TIENDAS_CERRADAS con encabezado correcto.
+- [ ] Hojas obligatorias disponibles y con encabezados correctos.
+- [ ] Fuentes Aleph dentro de SLA.
+- [ ] `IMPORTRANGE` sin errores de permisos.
+- [ ] COPÉRNICO cargado para orígenes que lo requieren.
 - [ ] OWNER suficiente para 425/856.
-- [ ] TIENDA contiene orígenes y destinos.
-- [ ] Si se carga COPÉRNICO, revise el saldo excluido por ZonaPiso = LOST en advertencias.
-- [ ] Si el origen es 444, 831 o 856, confirme que su archivo COPÉRNICO específico está cargado (la corrida no avanza sin él).
 
 ### Negocio
 
-- [ ] Ningún Bulk supera stock ajustado por origen–SKU.
-- [ ] Ninguna tienda supera CAP_RECIBO.
-- [ ] Tareas ≤ MAX_TASKS.
-- [ ] BLOQUEOS no viajan CDMX → GDL/MTY.
-- [ ] Con el toggle de frecuencia activo, ningún Bulk usa un origen fuera de los días de SCHEDULE.
-- [ ] Tiendas cerradas/excluidas no aparecen.
-- [ ] Rackeados 444 no consumen stock 444.
-- [ ] Owners no se mezclan.
-- [ ] INSUMOS respeta MOQ y stock 444.
-- [ ] PLANNING_REASON coincide con el engine.
-- [ ] Si Venom está activo, sus líneas aparecen SEPARADAS (nunca consolidadas) en DETALLE_ASIGNACION y en los CSV, marcadas "ENVIADO POR VENOM ENGINE".
-- [ ] SKU 86195 (BOLSA 2) sale únicamente en múltiplos de 200 en INSUMOS.
-- [ ] SKUs 92462, 92463 y 9151 no aparecen en ningún Bulk (exclusión backend, no depende de CODEC).
-
-### Antes de hacer clic en "EJECUTAR PLANEACIÓN"
-
-Un diálogo de confirmación obligatorio interrumpe la ejecución con el texto: *"CONFIRMA QUE SE VALIDÓ LA CAPACIDAD DE RECIBO Y SE TIENEN EN CUENTA LAS TIENDAS QUE SE ENCUENTRAN EN RESGUARDO"*. La persona debe hacer clic en "Confirmar y ejecutar" dentro del diálogo; "Cancelar" o cerrar el diálogo no ejecuta nada.
-
-### Conciliación de go-live
-
-Ejecute al menos tres fechas históricas y compare:
-
-1. Tareas/unidades naturales Fountain9.
-2. Manuales Solidus por separado.
-3. Stock consumido por origen–SKU.
-4. Tiendas cubiertas y cortes.
-5. Capacidad por destino.
-6. Rackeados y bloqueos.
-7. Diferencias contra el modelo anterior clasificadas por regla.
+- [ ] Ningún bulk supera el stock ajustado.
+- [ ] Ninguna tienda supera su capacidad de recibo.
+- [ ] Tareas dentro del máximo.
+- [ ] Tiendas cerradas y bloqueos no aparecen en los CSV.
+- [ ] Productos regionalmente restringidos no viajan CDMX → GDL/MTY.
+- [ ] INSUMOS respeta MOQ, stock y elegibilidad.
+- [ ] Venom permanece separado en el detalle de asignación.
 
 ---
 
-## 27. Runbook diario
+## Soporte y troubleshooting
 
-### Antes
-
-1. Confirme actualizaciones Aleph.
-2. Abra Mother Base y elija perfil.
-3. Entre a Les Enfants Terribles.
-4. Revise todas las tarjetas verdes.
-5. Revalide si la base cambió recientemente.
-6. Cargue COPÉRNICO si aplica.
-7. Cargue todos los CSV Fountain9.
-
-### Configure
-
-1. Orígenes en orden de consumo.
-2. Máximo de tareas.
-3. Bloqueos temporales de ciudad/tienda.
-5. SKUs excluidos.
-6. Insumos y FRUVER 811.
-7. Engines y parámetros.
-
-### Después
-
-1. Revise tareas vs máximo.
-2. Revise unidades y m³.
-3. Lea breakdown y advertencias.
-4. Revise análisis general, por origen y de prioridades.
-5. Descargue PDF, Excel, CSV y ZIP.
-6. Valide owners 425/856 antes de cargar Bulks.
-
----
-
-## 28. Troubleshooting
-
-| Síntoma | Causa probable | Acción |
-|---|---|---|
-| `C7 SIN FECHA VÁLIDA` | Formato, fórmula o celda incorrecta | Revise C7 y revalide. CST/GMT-5 están soportados. |
-| IMPORTRANGE rojo | `#REF!` en A1 | Repare permisos y revalide. |
-| No aparece upload COPÉRNICO | Deployment viejo/ruta equivocada | Confirme `02 — INVENTARIO COPÉRNICO` en `modules/les_enfants_terribles.py`. |
-| Toggle revalida la base | Caché invalidada o versión vieja | Confirme recurso cacheado y redeploy. |
-| Muchos cortes por ciudad | Versión vieja o ciudad no deseada | Solo necesidades positivas deben entrar al bucket. |
-| Golden bloqueado regionalmente | Versión vieja | La actual solo usa BLOQUEOS. |
-| SKU 444 corta por stock | Rackeado, NO_DISPONIBLE o COPÉRNICO | Revise diagnóstico en BASE_TRANSFERS. |
-| Muchas más tareas que modelo viejo | Hardcodes/engines o uploads duplicados | Compare PLANNING_REASON; concilie Naked solo. |
-| OWNER recorta | Owner insuficiente o división sin tarea | Revise advertencias y owner stock. |
-| No hay Bulk de un origen | No tuvo asignaciones | Revise DETALLE_ASIGNACION. |
-| Un origen no envía y el toggle de frecuencia está activo | Hoy no está en `SCHEDULE.DAYS` para ese destino-origen | Revise `BLOQUEO_FRECUENCIA_<origen>` en BASE_TRANSFERS; confirme el día en SCHEDULE. |
-| COPÉRNICO 856 falla | Falta ZonaPiso | Agregue ZonaPiso. |
-| Saldo LOST no se descuenta en una bodega distinta de 856 | El CSV no incluye la columna ZonaPiso | Agregue ZonaPiso al CSV; es opcional pero requerida para detectar LOST. |
-| STORAGE 856 incorrecto | Ambiente dominante COPÉRNICO | Revise saldos E/RCC/RR. |
-| App reinicia con CSV grande | RAM/timeout | Aumente recursos o reduzca concurrencia. |
-| GitHub no permite Commit | Archivo idéntico o ruta distinta | Compare diff y confirme el archivo desplegado. |
-
-El código actual no guarda una bitácora persistente. En producción conviene registrar fecha, perfil, commit, nombres/tamaños de inputs, parámetros, tareas, unidades, m³, advertencias y entregables sin exponer contraseña ni inventario sensible.
-
----
-
-## 29. Releases y rollback
-
-Antes de un merge:
-
-1. Actualice pruebas si cambia una regla.
-2. Ejecute compileall y pytest.
-3. Pruebe variantes de encabezado.
-4. Pruebe con/sin COPÉRNICO.
-5. Pruebe 444, 425 y 856.
-6. Revise Excel, CSV y PDF.
-7. Confirme que engines apagados no operen.
-
-Recomendación: `main` para producción, ramas cortas, Pull Request con caso de entrada/salida y tags por versión.
-
-Rollback:
-
-1. Identifique el último tag conciliado.
-2. Revierta por Git.
-3. Espere redeploy.
-4. Confirme versión en logs.
-5. Reprocese una corrida controlada.
-
----
-
-## 30. Limitaciones conocidas
-
-- Big Boss usa contraseña compartida, no autenticación empresarial.
-- Raiden no requiere autenticación.
-- DATA_TRANSFERS es público.
-- Resultados temporales, sin historial persistente.
-- Sin auditoría individual de parámetros.
-- Los CSV grandes conservan estructuras consolidadas en memoria.
-- Reporting histórico sigue WIP.
-- `INCOMING` no afecta la planeación.
-- `OVER_ORIGEN_STORAGE` está dormido.
-- Solo 444 y 831 tienen HV por origen; otros reportan `REGULAR`.
-- El bloqueo por frecuencia (SCHEDULE) se evalúa contra la fecha real del servidor, no contra una fecha de entrega simulada o histórica.
-
-Para misión crítica agregue SSO, persistencia, auditoría, monitoreo, control de concurrencia, pruebas de carga y una fuente autenticada.
-
----
-
-## 31. Glosario
-
-| Término | Definición |
+| Síntoma | Revisión inicial |
 |---|---|
-| ADU | Average Daily Units; unidades diarias promedio. |
-| AVL | Availability; cobertura de catálogo en stockout. |
-| DOH | Days on Hand; inventario / ADU. |
-| F9 | Fountain9, recomendación natural. |
-| ROQ | Replenishment Order Quantity; el CSV conserva `(MOV)`. |
-| Stockout | Inventario actual ≤0. |
-| Tarea | Línea única origen–destino–SKU. |
-| OWNER | Propietario/razón social del inventario 425/856. |
-| MOQ | Múltiplo mínimo de envío. |
-| CODEC | Variables compartidas. |
-| SCHEDULE | Hoja de frecuencia de envío permitida por destino–origen. |
-| DDMRP | Demand Driven MRP; metodología de buffers roja/amarilla/verde que usa Venom Engine. |
-| NFP | Net Flow Position; On-Hand + On-Order − Demanda Calificada. |
-| LTF | Lead Time Factor; tamaño de la zona roja/verde según el lead time. Venom usa el factor medio (0.5). |
-| VF | Variability Factor; tamaño de la zona de seguridad roja. Venom usa el factor medio (0.5). |
-| Top of Green (TOG) | Techo de la zona verde de un buffer DDMRP; el objetivo de llenado de Venom. |
-| Top of Yellow (TOY) | Techo de la zona amarilla; si el NFP cae por debajo, se dispara un reabasto. |
-| OOWL | En Venom, tienda-SKU con stock en origen y cero stock/incoming en destino, sin ADU para construir un buffer; se manda el mínimo operativo. |
-| Outer Heaven | Interfaz táctica de planeación. |
+| Fuente en rojo | Valide fecha, permisos e `IMPORTRANGE` en DATA_TRANSFERS. |
+| No hay envío desde un origen | Revise stock ajustado, COPÉRNICO, rackeado, ruta, frecuencia y orden de orígenes. |
+| Corte por owner | Revise saldo de OWNER y posibilidad de separar la tarea. |
+| Corte por capacidad | Valide `CAP_RECIBO`, volumen por unidad y asignaciones previas en la corrida. |
+| Corte por frecuencia | Compruebe la pareja origen–destino y el día configurado en `SCHEDULE`. |
+| No aparece un CSV de origen | Ese origen no tuvo asignaciones; revise `DETALLE_ASIGNACION`. |
+| Reinicio con archivos grandes | Revise uso de memoria, concurrencia y tamaño de los inputs. |
 
 ---
 
-## 32. Regla para cambios futuros
+## Glosario rápido
 
-Toda nueva regla debe documentar:
+| Sigla | Definición |
+|---|---|
+| ADU | Average Daily Units. |
+| AVL | Availability. |
+| DOH | Days on Hand. |
+| DDMRP | Demand Driven Material Requirements Planning. |
+| F9 | Fountain9. |
+| NFP | Net Flow Position. |
+| ROQ | Replenishment Order Quantity. |
+| TOG / TOY | Top of Green / Top of Yellow en buffers DDMRP. |
 
-1. Fuente y columnas.
-2. Posición en la secuencia.
-3. Consumo de tareas.
-4. Consumo de capacidad.
-5. Descuento de stock.
-6. Restricciones mandantes.
-7. BREAKDOWN.
-8. PLANNING_REASON.
-9. Efecto en Excel/CSV/PDF/ZIP.
-10. Pruebas y conciliación.
+---
 
-Si una regla pudiera elevar inventario utilizable por encima de `STOCK_DISPONIBLE_FINAL`, debe rechazarse o redefinirse explícitamente el contrato mandante.
-
-### Verificación rápida
-
-```bash
-python -m compileall app.py auth.py modelo_abasto.py engines modules && pytest -q
-```
-
-Una liberación no está lista solo porque la página carga: debe pasar pruebas, validar fuentes y conciliar stock, capacidad, tareas y entregables.
+MOTHER BASE debe tratarse como un sistema operativo de planeación: una página que carga no garantiza una corrida correcta. Antes de ejecutar o liberar, valide siempre **stock, capacidad, tareas, restricciones, fuentes y entregables**.
