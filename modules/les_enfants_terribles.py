@@ -278,12 +278,26 @@ MANUAL_FORECAST_ZERO_RULES = frozenset(
         "HARDCODE_3_NET_TRANSFER_BAJO",
     }
 )
+# TIPO_DE_CORTE específico por motivo real de hardcode — antes los 3 caían
+# juntos bajo "OK MANUAL POR FORECAST 0", etiqueta que solo describe con
+# precisión al primero. Separados para que la tabla de planeado-por-engine
+# distinga "sin demanda y sin stock" de "inventario menor a demanda" de
+# "net transfer bajo", en vez de mezclarlos.
+HARDCODE_CUT_LABELS: dict[str, str] = {
+    "HARDCODE_4_CERO_TOTAL": "OK MANUAL POR FORECAST Y STOCK EN CERO",
+    "HARDCODE_3_INVENTARIO_MENOR_DEMANDA": (
+        "OK MANUAL POR INVENTARIO MENOR A DEMANDA"
+    ),
+    "HARDCODE_3_NET_TRANSFER_BAJO": "OK MANUAL POR NET TRANSFER BAJO",
+}
 
 BREAKDOWN_ORDER = (
     "CORTE POR CIUDAD BLOQUEADA",
     "CORTE POR PRODUCTO RACKEADO 444",
     "CORTE POR STOCK",
-    "OK MANUAL POR FORECAST 0",
+    "OK MANUAL POR FORECAST Y STOCK EN CERO",
+    "OK MANUAL POR INVENTARIO MENOR A DEMANDA",
+    "OK MANUAL POR NET TRANSFER BAJO",
     "OK MANUAL PARCIAL POR CUPO DE TAREAS",
     "OK COMPLETO POR FOUNTAIN9",
     "OK PARCIAL - CORTE POR PRODUCTO RACKEADO 444",
@@ -2623,8 +2637,12 @@ ENGINE_CUT_ATTRIBUTION: dict[str, str] = {
 
 def attribute_engine(tipo_de_corte: str) -> str:
     """Engine que generó esta línea de BASE_TRANSFERS. Todo lo que no sea de
-    un engine de cobertura opcional viene de la pasada base Naked/Solidus."""
-    return ENGINE_CUT_ATTRIBUTION.get(tipo_de_corte, "Naked/Solidus")
+    un engine de cobertura opcional de Solidus (AVL/Preventivo/Refuerzo/
+    Cobertura sin Fountain9) u otro engine aparte viene de la pasada base
+    de Naked — nada genuinamente de Solidus cae en este fallback, porque
+    la salida de cada engine de Solidus ya tiene su propia atribución
+    explícita arriba en ENGINE_CUT_ATTRIBUTION."""
+    return ENGINE_CUT_ATTRIBUTION.get(tipo_de_corte, "Naked")
 
 
 def build_planned_by_engine_rows(
@@ -2650,8 +2668,9 @@ def build_planned_by_engine_rows(
         counts[key] += int(insumos_summary["lines_added"])
         units[key] += int(insumos_summary.get("units_added", 0))
 
-    engine_order = ["Naked/Solidus", "AVL", "Preventivo",
-                     "Refuerzo Golden/Infaltable/Anchor", "Shalashaska",
+    engine_order = ["Naked", "AVL", "Preventivo",
+                     "Refuerzo Golden/Infaltable/Anchor",
+                     "Cobertura sin Fountain9", "Shalashaska",
                      "Liquid", "Venom", "Insumos"]
     cut_order = {label: index for index, label in enumerate(BREAKDOWN_ORDER)}
 
@@ -3367,10 +3386,8 @@ def apply_reporting_labels(result) -> None:
         }
         current_cut = row.get("TIPO_DE_CORTE")
         if current_cut == "OK":
-            row["TIPO_DE_CORTE"] = (
-                "OK MANUAL POR FORECAST 0"
-                if demand_rule in MANUAL_FORECAST_ZERO_RULES
-                else "OK COMPLETO POR FOUNTAIN9"
+            row["TIPO_DE_CORTE"] = HARDCODE_CUT_LABELS.get(
+                demand_rule, "OK COMPLETO POR FOUNTAIN9"
             )
         elif (
             current_cut == "OK PARCIAL - CORTE POR CAPACIDAD DE TAREAS"

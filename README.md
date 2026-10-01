@@ -904,7 +904,9 @@ Los resultados son temporales: deben descargarse antes de que expire la sesión.
 | CORTE POR CIUDAD BLOQUEADA | Había necesidad positiva y la ciudad se bloqueó temporalmente. |
 | CORTE POR PRODUCTO RACKEADO 444 | El SKU no puede usar el stock 444. |
 | CORTE POR STOCK | No existe stock utilizable. |
-| OK MANUAL POR FORECAST 0 | Protección Solidus ejecutada. |
+| OK MANUAL POR FORECAST Y STOCK EN CERO | Hardcode de Naked: demanda=0 y opening=0, forzado al mínimo configurado. |
+| OK MANUAL POR INVENTARIO MENOR A DEMANDA | Hardcode de Naked: ROQ≤0 pero opening < demanda, forzado al mínimo. |
+| OK MANUAL POR NET TRANSFER BAJO | Hardcode de Naked: ROQ≤0, net transfer≤3 y stock destino<3, forzado a 3. |
 | OK MANUAL PARCIAL POR CUPO DE TAREAS | Parte manual ejecutada antes del máximo. |
 | OK COMPLETO POR FOUNTAIN9 | ROQ natural cubierto. |
 | OK PARCIAL - CORTE POR PRODUCTO RACKEADO 444 | Otro origen cubrió parte; 444 quedó bloqueado. |
@@ -912,6 +914,7 @@ Los resultados son temporales: deben descargarse antes de que expire la sesión.
 | ENVIADOS PARA CUBRIR AVL | Cobertura de stockout de CATALOGO. |
 | ENVIADOS PARA PREVENIR QUIEBRE | Refuerzo preventivo Solidus. |
 | ENVIADOS PARA REFORZAR GOLDEN/INFALTABLE/ANCHOR | Refuerzo de DOH para productos especiales Solidus. |
+| ENVIADOS PARA CUBRIR QUIEBRE SIN FOUNTAIN9 | Cobertura sin Fountain9: última pasada de Solidus (ver §17). |
 | ENVIADOS POR SHALASHASKA ENGINE | Evacuación próxima a caducar. |
 | ENVIADOS POR LIQUID ENGINE | Liquidación de remanente. |
 | SIN RECOMENDACIÓN | No hubo necesidad positiva; no equivale necesariamente a forecast cero. |

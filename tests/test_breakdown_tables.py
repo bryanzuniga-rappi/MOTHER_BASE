@@ -29,10 +29,88 @@ def _row(destination, sku, objetivo, asignado, tipo, regla="MOV_MINIMO_3"):
 
 # --- attribute_engine -----------------------------------------------------
 
-def test_attribute_engine_naked_solidus_default():
-    assert m.attribute_engine("OK") == "Naked/Solidus"
-    assert m.attribute_engine("CORTE POR STOCK") == "Naked/Solidus"
-    assert m.attribute_engine("CORTE POR COPÉRNICO CANCELADOS") == "Naked/Solidus"
+def test_attribute_engine_naked_default():
+    assert m.attribute_engine("OK") == "Naked"
+    assert m.attribute_engine("CORTE POR STOCK") == "Naked"
+    assert m.attribute_engine("CORTE POR COPÉRNICO CANCELADOS") == "Naked"
+
+
+def test_hardcode_cases_get_their_own_distinct_tipo_de_corte():
+    """Los 3 motivos reales de hardcode (antes todos caían juntos bajo "OK
+    MANUAL POR FORECAST 0") deben quedar separados, cada uno con su propia
+    etiqueta precisa."""
+    expectations = {
+        "HARDCODE_4_CERO_TOTAL": "OK MANUAL POR FORECAST Y STOCK EN CERO",
+        "HARDCODE_3_INVENTARIO_MENOR_DEMANDA": (
+            "OK MANUAL POR INVENTARIO MENOR A DEMANDA"
+        ),
+        "HARDCODE_3_NET_TRANSFER_BAJO": "OK MANUAL POR NET TRANSFER BAJO",
+    }
+    for regla, expected_label in expectations.items():
+        result = SimpleNamespace(
+            base_rows=[
+                {
+                    "TIPO_DE_CORTE": "OK",
+                    "REGLA_DEMANDA": regla,
+                    "CANTIDAD_ASIGNADA": 3,
+                    "CANTIDAD_OBJETIVO": 3,
+                }
+            ]
+        )
+        m.apply_reporting_labels(result)
+        assert result.base_rows[0]["TIPO_DE_CORTE"] == expected_label, regla
+
+
+def test_genuine_fountain9_recommendation_unaffected_by_hardcode_split():
+    """Una recomendación real de Fountain9 (REGLA_DEMANDA no es ninguno de
+    los 3 hardcodes) debe seguir etiquetándose igual que siempre."""
+    result = SimpleNamespace(
+        base_rows=[
+            {
+                "TIPO_DE_CORTE": "OK",
+                "REGLA_DEMANDA": "MOV_MINIMO_3",
+                "CANTIDAD_ASIGNADA": 5,
+                "CANTIDAD_OBJETIVO": 5,
+            }
+        ]
+    )
+    m.apply_reporting_labels(result)
+    assert result.base_rows[0]["TIPO_DE_CORTE"] == "OK COMPLETO POR FOUNTAIN9"
+
+
+def test_hardcode_labels_registered_in_breakdown_order():
+    for label in (
+        "OK MANUAL POR FORECAST Y STOCK EN CERO",
+        "OK MANUAL POR INVENTARIO MENOR A DEMANDA",
+        "OK MANUAL POR NET TRANSFER BAJO",
+    ):
+        assert label in m.BREAKDOWN_ORDER
+
+
+def test_no_fountain9_coverage_sorted_before_shalashaska():
+    """Regresión: otro gap de la sesión anterior — 'Cobertura sin
+    Fountain9' faltaba en el orden de despliegue de esta tabla, lo que la
+    mandaba al final en vez de a su lugar real en la secuencia del
+    pipeline (justo después de Refuerzo, antes de Shalashaska)."""
+    result = SimpleNamespace(
+        base_rows=[
+            {
+                "TIPO_DE_CORTE": m.SHALASHASKA_CUT,
+                "CANTIDAD_ASIGNADA": 1,
+                "CANTIDAD_OBJETIVO": 1,
+            },
+            {
+                "TIPO_DE_CORTE": m.NO_FOUNTAIN9_CUT,
+                "CANTIDAD_ASIGNADA": 1,
+                "CANTIDAD_OBJETIVO": 1,
+            },
+        ]
+    )
+    rows = m.build_planned_by_engine_rows(result)
+    engines_in_order = [row["ENGINE"] for row in rows]
+    assert engines_in_order.index("Cobertura sin Fountain9") < engines_in_order.index(
+        "Shalashaska"
+    )
 
 
 def test_attribute_engine_known_add_on_engines():
@@ -57,8 +135,8 @@ def test_planned_by_engine_only_includes_assigned_rows():
     )
     rows = m.build_planned_by_engine_rows(result)
     engines = {row["ENGINE"] for row in rows}
-    assert engines == {"Naked/Solidus", "AVL"}
-    naked_row = next(r for r in rows if r["ENGINE"] == "Naked/Solidus")
+    assert engines == {"Naked", "AVL"}
+    naked_row = next(r for r in rows if r["ENGINE"] == "Naked")
     assert naked_row["CASOS"] == 1
     assert naked_row["UNIDADES"] == 10
     avl_row = next(r for r in rows if r["ENGINE"] == "AVL")
@@ -77,8 +155,8 @@ def test_planned_by_engine_groups_multiple_causales_within_same_engine():
     )
     rows = m.build_planned_by_engine_rows(result)
     causales = {(row["ENGINE"], row["CAUSAL"]): row["CASOS"] for row in rows}
-    assert causales[("Naked/Solidus", "OK")] == 2
-    assert causales[("Naked/Solidus", "OK PARCIAL - CORTE POR STOCK")] == 1
+    assert causales[("Naked", "OK")] == 2
+    assert causales[("Naked", "OK PARCIAL - CORTE POR STOCK")] == 1
 
 
 def test_planned_by_engine_includes_insumos_when_summary_given():
