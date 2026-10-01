@@ -899,6 +899,24 @@ Los resultados son temporales: deben descargarse antes de que expire la sesión.
 
 ## 22. BREAKDOWN
 
+La sección de resultados muestra 4 tablas independientes:
+
+1. **Efectivamente planeado** — por engine y causal, solo `CANTIDAD_ASIGNADA > 0`.
+2. **Cortes** — todo lo que no se mandó (`CANTIDAD_ASIGNADA == 0`), por motivo específico. **Ya no incluye `SIN RECOMENDACIÓN`** — ver la tabla 3.
+3. **Sin recomendación** — por qué Fountain9 no pidió nada para esa tienda-SKU, usando únicamente columnas propias del Bulk de Fountain9 (`PREDICTED_DEMAND`, `PREDICTED_OPENING_INVENTORY`, `NET_INTER_STORE_TRANSFERS`) — nunca CATALOGO/STOCK ni otros engines. Exclusivo de Naked por construcción (ningún otro engine genera `TIPO_DE_CORTE = "SIN RECOMENDACIÓN"`). `build_no_recommendation_breakdown` / `classify_no_recommendation_reason` en `modules/les_enfants_terribles.py`.
+
+   Todo SKU que llega aquí ya tiene, por construcción de `calculate_target_quantity`, `opening ≥ demand` (si no, cae en el hardcode de déficit en vez de `SIN_DEMANDA`) — así que "inventario cubre la demanda" no distingue nada por sí solo. Los 5 motivos, evaluados en este orden:
+
+   | Motivo | Condición |
+   |---|---|
+   | SIN DEMANDA PROYECTADA | `demand ≤ 0` |
+   | TRANSFERENCIA ENTRE TIENDAS CUBRE LA NECESIDAD | `net_transfer ≥ demand` |
+   | INVENTARIO CON AMPLIO MARGEN | `opening ≥ 2 × demand` |
+   | INVENTARIO SUFICIENTE CON MARGEN AJUSTADO | `demand ≤ opening < 2 × demand` |
+   | SIN MOTIVO IDENTIFICADO | comodín defensivo; no debería ocurrir salvo datos inconsistentes |
+
+4. **Overview general** — tablas 1 y 2 combinadas (`status_counts`, independiente de las anteriores) — **sí sigue incluyendo** `SIN RECOMENDACIÓN`, solo se quitó de la tabla 2.
+
 | BREAKDOWN | Significado |
 |---|---|
 | CORTE POR CIUDAD BLOQUEADA | Había necesidad positiva y la ciudad se bloqueó temporalmente. |

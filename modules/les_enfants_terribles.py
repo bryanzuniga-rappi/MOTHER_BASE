@@ -2704,13 +2704,20 @@ def build_cuts_detail_rows(
     motivo específico (incluye los sub-motivos de COPÉRNICO: LOST,
     CANCELADOS, ZONA 856, etc., no solo el bucket genérico). TIENDAS_CERRADAS
     y ciudades bloqueadas se excluyen ANTES de llegar a base_rows, así que
-    se agregan aparte con lo que ya reportan sus propios resúmenes."""
+    se agregan aparte con lo que ya reportan sus propios resúmenes.
+
+    "SIN RECOMENDACIÓN" vive aparte, en build_no_recommendation_breakdown
+    — no es un corte (no había nada que cubrir), así que no pertenece a
+    esta tabla de cortes.
+    """
     counts: Counter[str] = Counter()
     units_missing: Counter[str] = Counter()
     for row in result.base_rows:
         if int(row.get("CANTIDAD_ASIGNADA", 0) or 0) > 0:
             continue
         tipo = str(row.get("TIPO_DE_CORTE", ""))
+        if tipo == "SIN RECOMENDACIÓN":
+            continue
         counts[tipo] += 1
         units_missing[tipo] += int(row.get("CANTIDAD_OBJETIVO", 0) or 0)
 
@@ -2735,6 +2742,71 @@ def build_cuts_detail_rows(
         for tipo, count in sorted(
             counts.items(),
             key=lambda item: (order.get(item[0], len(order)), item[0]),
+        )
+        if count
+    ]
+
+
+# Motivos de "SIN RECOMENDACIÓN" — por qué Fountain9 no pidió nada, usando
+# ÚNICAMENTE columnas que vienen de su propio Bulk (demanda, opening,
+# transferencia entre tiendas). Nunca mezcla datos de CATALOGO/STOCK/otros
+# engines — es deliberadamente angosto, solo lo que el archivo de
+# Fountain9 ya traía consigo.
+#
+# Todo SKU que llega aquí cumple, por construcción de calculate_target_
+# quantity, opening >= demand (si no, habría caído en el hardcode de
+# déficit en vez de SIN_DEMANDA) — así que "inventario cubre la demanda"
+# no puede ser el único criterio, siempre sería cierto. Los motivos de
+# abajo distinguen el PORQUÉ específico de esa cobertura.
+NO_RECOMMENDATION_AMPLE_MARGIN_MULTIPLIER = 2.0
+
+NO_RECOMMENDATION_REASONS = (
+    "SIN DEMANDA PROYECTADA",
+    "TRANSFERENCIA ENTRE TIENDAS CUBRE LA NECESIDAD",
+    "INVENTARIO CON AMPLIO MARGEN",
+    "INVENTARIO SUFICIENTE CON MARGEN AJUSTADO",
+    "SIN MOTIVO IDENTIFICADO",
+)
+
+
+def classify_no_recommendation_reason(row: dict[str, Any]) -> str:
+    """Clasifica UNA fila SIN RECOMENDACIÓN en su motivo específico, usando
+    solo PREDICTED_DEMAND, PREDICTED_OPENING_INVENTORY y
+    NET_INTER_STORE_TRANSFERS — las tres columnas que vienen directo del
+    Bulk de Fountain9 y ya se preservan en base_rows."""
+    demand = float(row.get("PREDICTED_DEMAND", 0) or 0)
+    opening = float(row.get("PREDICTED_OPENING_INVENTORY", 0) or 0)
+    net_transfer = float(row.get("NET_INTER_STORE_TRANSFERS", 0) or 0)
+
+    if demand <= 0:
+        return "SIN DEMANDA PROYECTADA"
+    if net_transfer >= demand:
+        return "TRANSFERENCIA ENTRE TIENDAS CUBRE LA NECESIDAD"
+    if opening >= demand * NO_RECOMMENDATION_AMPLE_MARGIN_MULTIPLIER:
+        return "INVENTARIO CON AMPLIO MARGEN"
+    if opening >= demand:
+        return "INVENTARIO SUFICIENTE CON MARGEN AJUSTADO"
+    return "SIN MOTIVO IDENTIFICADO"
+
+
+def build_no_recommendation_breakdown(result) -> list[dict[str, Any]]:
+    """Cuarto breakdown, separado de los otros 3: específicamente por qué
+    Fountain9 no pidió nada para cada tienda-SKU (TIPO_DE_CORTE =
+    "SIN RECOMENDACIÓN"). Exclusivo de la pasada base de Naked por
+    construcción — Shalashaska/Liquid/Venom/Insumos nunca generan este
+    TIPO_DE_CORTE, así que no hace falta filtrarlos aparte."""
+    counts: Counter[str] = Counter()
+    for row in result.base_rows:
+        if row.get("TIPO_DE_CORTE") != "SIN RECOMENDACIÓN":
+            continue
+        reason = classify_no_recommendation_reason(row)
+        counts[reason] += 1
+
+    order = {label: index for index, label in enumerate(NO_RECOMMENDATION_REASONS)}
+    return [
+        {"MOTIVO": reason, "CASOS": count}
+        for reason, count in sorted(
+            counts.items(), key=lambda item: (order.get(item[0], len(order)), item[0])
         )
         if count
     ]
@@ -6066,6 +6138,7 @@ def execute_planning(
         cuts_detail_rows = build_cuts_detail_rows(
             result, closed_summary, block_summary
         )
+        no_recommendation_rows = build_no_recommendation_breakdown(result)
         if closed_summary["requirements"]:
             status_counts["CORTE POR TIENDA CERRADA"] += closed_summary[
                 "requirements"
@@ -6226,6 +6299,7 @@ def execute_planning(
         "status_counts": dict(status_counts),
         "planned_by_engine_rows": planned_by_engine_rows,
         "cuts_detail_rows": cuts_detail_rows,
+        "no_recommendation_rows": no_recommendation_rows,
         "warnings": list(result.warnings),
         "logs": captured.getvalue(),
         "origins": list(origins),
@@ -7650,8 +7724,10 @@ def render_results(run: dict[str, Any]) -> None:
             EFECTIVAMENTE PLANEADO = casos que sí recibieron al menos una unidad,
             agrupados por engine y su causal · CORTES = todo lo que se quedó sin
             enviar, con el motivo específico (incluye COPÉRNICO desglosado por
-            LOST/CANCELADOS/ZONA 856/etc.) · OVERVIEW = las dos tablas anteriores
-            combinadas en una sola, para una vista general.
+            LOST/CANCELADOS/ZONA 856/etc.) · SIN RECOMENDACIÓN = por qué
+            Fountain9 no pidió nada, usando solo sus propias columnas (aparte de
+            CORTES porque no es un corte: no había nada que cubrir) · OVERVIEW =
+            planeado + cortes combinados en una sola vista general.
         </div>
         """,
         unsafe_allow_html=True,
@@ -7673,6 +7749,21 @@ def render_results(run: dict[str, Any]) -> None:
         key="cuts_detail",
         offer_download=True,
         file_label="cortes_por_motivo",
+    )
+
+    st.markdown("##### Sin recomendación — por qué Fountain9 no pidió nada")
+    st.caption(
+        "Solo Naked (Fountain9 nunca recomendó nada para esta tienda-SKU). "
+        "Usa únicamente Demanda, Opening y Net Inter-Store Transfers — las "
+        "columnas propias del Bulk de Fountain9, sin mezclar datos de "
+        "CATALOGO/STOCK ni de otros engines."
+    )
+    no_recommendation_rows = run.get("no_recommendation_rows", [])
+    render_capped_dataframe(
+        no_recommendation_rows,
+        key="no_recommendation_breakdown",
+        offer_download=True,
+        file_label="sin_recomendacion_por_motivo",
     )
 
     st.markdown("##### Overview general")

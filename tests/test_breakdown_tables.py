@@ -7,6 +7,7 @@
 3. ordered_breakdown_rows — el overview general (ya existía, sin cambios).
 """
 
+from collections import Counter
 from types import SimpleNamespace
 
 from tests._streamlit_stub import install as _install_streamlit_stub
@@ -255,3 +256,93 @@ def test_planned_and_cuts_tables_partition_all_assigned_vs_unassigned():
     assert total_planned_casos == 2  # SKU 10 y 11 tienen algo asignado
     assert total_cut_casos == 1  # SKU 12 no tiene nada asignado
     assert total_planned_casos + total_cut_casos == len(result.base_rows)
+
+
+# --- SIN RECOMENDACIÓN: breakdown aparte, por motivo -----------------------
+
+def _no_rec_row(destination, sku, demand, opening, net_transfer=0.0):
+    return {
+        "WAREHOUSE_DESTINATION": destination,
+        "RETAIL_ID": sku,
+        "CANTIDAD_OBJETIVO": 0,
+        "CANTIDAD_ASIGNADA": 0,
+        "TIPO_DE_CORTE": "SIN RECOMENDACIÓN",
+        "REGLA_DEMANDA": "SIN_RECOMENDACION",
+        "PREDICTED_DEMAND": demand,
+        "PREDICTED_OPENING_INVENTORY": opening,
+        "NET_INTER_STORE_TRANSFERS": net_transfer,
+    }
+
+
+def test_classify_zero_demand():
+    row = _no_rec_row(100, 10, demand=0, opening=5)
+    assert m.classify_no_recommendation_reason(row) == "SIN DEMANDA PROYECTADA"
+
+
+def test_classify_transfer_covers_need():
+    row = _no_rec_row(100, 10, demand=10, opening=2, net_transfer=15)
+    assert (
+        m.classify_no_recommendation_reason(row)
+        == "TRANSFERENCIA ENTRE TIENDAS CUBRE LA NECESIDAD"
+    )
+
+
+def test_classify_ample_margin():
+    row = _no_rec_row(100, 10, demand=10, opening=25, net_transfer=0)
+    assert m.classify_no_recommendation_reason(row) == "INVENTARIO CON AMPLIO MARGEN"
+
+
+def test_classify_tight_margin():
+    row = _no_rec_row(100, 10, demand=10, opening=12, net_transfer=0)
+    assert (
+        m.classify_no_recommendation_reason(row)
+        == "INVENTARIO SUFICIENTE CON MARGEN AJUSTADO"
+    )
+
+
+def test_classify_fallback_when_data_does_not_fit_any_bucket():
+    """Caso sintético que viola la invariante esperada (opening < demand,
+    sin transferencia) — no debe tronar, debe caer al comodín."""
+    row = _no_rec_row(100, 10, demand=10, opening=3, net_transfer=0)
+    assert m.classify_no_recommendation_reason(row) == "SIN MOTIVO IDENTIFICADO"
+
+
+def test_build_no_recommendation_breakdown_counts_correctly():
+    result = SimpleNamespace(
+        base_rows=[
+            _no_rec_row(100, 10, demand=0, opening=5),
+            _no_rec_row(100, 11, demand=0, opening=2),
+            _no_rec_row(100, 12, demand=10, opening=25),
+            _row(100, 13, 5, 5, "OK"),  # no es SIN RECOMENDACIÓN, debe ignorarse
+        ],
+    )
+    rows = m.build_no_recommendation_breakdown(result)
+    by_motivo = {r["MOTIVO"]: r["CASOS"] for r in rows}
+    assert by_motivo["SIN DEMANDA PROYECTADA"] == 2
+    assert by_motivo["INVENTARIO CON AMPLIO MARGEN"] == 1
+    assert "OK" not in by_motivo
+    assert sum(r["CASOS"] for r in rows) == 3
+
+
+def test_cuts_detail_no_longer_includes_sin_recomendacion():
+    """Punto central de esta sesión: SIN RECOMENDACIÓN debe salir por
+    completo de la tabla de cortes general."""
+    result = SimpleNamespace(
+        base_rows=[
+            _no_rec_row(100, 10, demand=0, opening=5),
+            _row(100, 11, 5, 0, "CORTE POR STOCK"),
+        ],
+    )
+    cuts = m.build_cuts_detail_rows(result)
+    causales = {row["CAUSAL"] for row in cuts}
+    assert "SIN RECOMENDACIÓN" not in causales
+    assert "CORTE POR STOCK" in causales
+
+
+def test_overview_breakdown_still_includes_sin_recomendacion():
+    """El overview (tabla 3, independiente) NO debe perder SIN
+    RECOMENDACIÓN — solo se quitó de la tabla de cortes, no de ahí."""
+    status_counts = Counter({"SIN RECOMENDACIÓN": 7, "CORTE POR STOCK": 3})
+    rows = m.ordered_breakdown_rows(status_counts)
+    breakdown_labels = {row["BREAKDOWN"] for row in rows}
+    assert "SIN RECOMENDACIÓN" in breakdown_labels
