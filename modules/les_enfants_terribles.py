@@ -2837,24 +2837,57 @@ def build_no_recommendation_breakdown(result) -> list[dict[str, Any]]:
     ]
 
 
+def _coverage_stats(keys_with_qty: list[tuple[tuple[int, int], float]]) -> dict[str, Any]:
+    """Productos/tiendas/piezas/tareas a partir de pares (llave, cantidad),
+    contando solo cantidades > 0."""
+    productos: set[int] = set()
+    tiendas: set[int] = set()
+    piezas = 0.0
+    tareas = 0
+    for (destination, sku), qty in keys_with_qty:
+        if qty > 0:
+            productos.add(sku)
+            tiendas.add(destination)
+            piezas += qty
+            tareas += 1
+    return {
+        "productos": len(productos),
+        "tiendas": len(tiendas),
+        "piezas": int(piezas),
+        "tareas": tareas,
+    }
+
+
 def build_fountain9_comparison_report(
     result,
     catalogs,
     consolidated: dict[tuple[int, int], dict[str, Any]],
 ) -> dict[str, Any]:
-    """Compara la asignación que YA trae Fountain9 en su propio Bulk
-    (columna opcional "Allocation (Store Based)" — confirmado por análisis
-    de archivos reales que es la que refleja su decisión final, incluso
-    cuando su mecanismo de Multi Source reasigna el origen) contra la
-    nuestra, para exactamente las mismas tienda-SKU.
+    """No es una comparación "pareja" — es para demostrar que Mother Base
+    desbloquea más de lo que Fountain9 siquiera llega a evaluar. Tres
+    bloques:
 
-    Universo: solo combinaciones donde Fountain9 trajo esa columna con
-    valor. Si el archivo no la trae en ninguna fila, el reporte queda
-    deshabilitado — no es un error, simplemente no hay con qué comparar.
+    1. "fountain9" / "mother_base_mismo_alcance": cara a cara, solo sobre
+       las tienda-SKU donde Fountain9 trajo "Allocation (Store Based)"
+       (confirmado por análisis de archivos reales que esa columna es su
+       decisión final, incluso con reasignación por Multi Source).
+    2. "mother_base_adicional": todo lo que Mother Base asignó FUERA de
+       ese alcance — tienda-SKU que Fountain9 nunca evaluó en absoluto
+       (incluye, pero no se limita a, lo que cubre el engine "Cobertura
+       sin Fountain9" de §17).
+    3. "mother_base_total" = mismo alcance + adicional — el número grande,
+       la cifra real de "cuánto más hacemos".
+
+    Si el Bulk no trae la columna en ninguna fila, el reporte queda
+    deshabilitado — no hay con qué comparar el bloque 1, aunque Mother
+    Base sí haya operado (ese caso no es un error, solo no se puede armar
+    el comparativo).
 
     "Cubrió una ruptura" = stock en destino (el nuestro, catalogs.stock_base,
     para no mezclar dos fuentes de verdad distintas) era 0 Y esa fuente
-    asignó algo > 0.
+    asignó algo > 0. Esto solo aplica al bloque 1 (cara a cara) — Fountain9
+    no puede "cubrir" algo que nunca vio, así que no tendría sentido
+    medirlo ahí.
     """
     universe = [
         (key, record)
@@ -2864,6 +2897,7 @@ def build_fountain9_comparison_report(
     if not universe:
         return {"enabled": False}
 
+    universe_keys = {key for key, _record in universe}
     our_assigned: dict[tuple[int, int], float] = defaultdict(float)
     for row in result.allocation_rows:
         key = (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"])
@@ -2920,9 +2954,35 @@ def build_fountain9_comparison_report(
             else:
                 ninguno_cubrio += 1
 
+    # Bloque 3: todo lo que Mother Base asignó a tienda-SKU que Fountain9
+    # nunca evaluó (ausentes de "universe" por completo) — el "desbloqueo"
+    # real, lo que Fountain9 ni siquiera alcanza a ver.
+    additional_pairs = [
+        (key, qty)
+        for key, qty in our_assigned.items()
+        if key not in universe_keys
+    ]
+    mother_base_adicional = _coverage_stats(additional_pairs)
+
+    mother_base_mismo_alcance = {
+        "productos": len(mb_productos),
+        "tiendas": len(mb_tiendas),
+        "piezas": int(mb_piezas),
+        "tareas": mb_tareas,
+        "rupturas_cubiertas": mb_rupturas_cubiertas,
+    }
+    mother_base_total = {
+        "productos": len(mb_productos | {sku for (_d, sku), q in additional_pairs if q > 0}),
+        "tiendas": len(mb_tiendas | {d for (d, _sku), q in additional_pairs if q > 0}),
+        "piezas": mother_base_mismo_alcance["piezas"] + mother_base_adicional["piezas"],
+        "tareas": mother_base_mismo_alcance["tareas"] + mother_base_adicional["tareas"],
+    }
+
     return {
         "enabled": True,
         "universo_total": len(universe),
+        "mother_base_adicional": mother_base_adicional,
+        "mother_base_total": mother_base_total,
         "fountain9": {
             "productos": len(f9_productos),
             "tiendas": len(f9_tiendas),
@@ -2930,13 +2990,7 @@ def build_fountain9_comparison_report(
             "tareas": f9_tareas,
             "rupturas_cubiertas": f9_rupturas_cubiertas,
         },
-        "mother_base": {
-            "productos": len(mb_productos),
-            "tiendas": len(mb_tiendas),
-            "piezas": int(mb_piezas),
-            "tareas": mb_tareas,
-            "rupturas_cubiertas": mb_rupturas_cubiertas,
-        },
+        "mother_base_mismo_alcance": mother_base_mismo_alcance,
         "total_rupturas": total_rupturas,
         "ambos_cubrieron": ambos_cubrieron,
         "solo_fountain9": solo_f9,
@@ -7919,16 +7973,22 @@ def render_results(run: dict[str, Any]) -> None:
             unsafe_allow_html=True,
         )
         st.caption(
-            "Compara la asignación que YA trae el Bulk de Fountain9 "
-            "('Allocation (Store Based)') contra la nuestra, para las "
-            f"mismas {fountain9_comparison['universo_total']:,} "
-            "combinaciones tienda-SKU donde esa columna venía presente. "
-            "No es el ROQ/MOV que Fountain9 recomienda — es su propia "
-            "decisión final de a quién darle stock cuando el origen no "
-            "alcanza para todos."
+            "No es una comparación en igualdad de condiciones — el punto es "
+            "mostrar cuánto más desbloquea Mother Base de lo que Fountain9 "
+            "siquiera alcanza a evaluar. 'Allocation (Store Based)' es la "
+            "decisión final de Fountain9 (confirmado por análisis de "
+            "archivos reales), no el ROQ/MOV que recomienda."
         )
         f9 = fountain9_comparison["fountain9"]
-        mb = fountain9_comparison["mother_base"]
+        mb_mismo = fountain9_comparison["mother_base_mismo_alcance"]
+        mb_adicional = fountain9_comparison["mother_base_adicional"]
+        mb_total = fountain9_comparison["mother_base_total"]
+
+        st.markdown(
+            f"###### Cara a cara — mismas "
+            f"{fountain9_comparison['universo_total']:,} tienda-SKU que "
+            "Fountain9 sí evaluó"
+        )
         render_kpi_cards(
             [
                 {
@@ -7941,8 +8001,8 @@ def render_results(run: dict[str, Any]) -> None:
                 {
                     "category": "MOTHER BASE · PRODUCTOS",
                     "label": "SKUs CON ASIGNACIÓN",
-                    "value": f"{mb['productos']:,}",
-                    "description": "SKUs distintos que nosotros asignamos a al menos una tienda.",
+                    "value": f"{mb_mismo['productos']:,}",
+                    "description": "Mismo universo — SKUs que nosotros asignamos.",
                     "tone": "acid",
                 },
                 {
@@ -7955,36 +8015,112 @@ def render_results(run: dict[str, Any]) -> None:
                 {
                     "category": "MOTHER BASE · TIENDAS",
                     "label": "TIENDAS CON ASIGNACIÓN",
-                    "value": f"{mb['tiendas']:,}",
-                    "description": "Tiendas distintas que recibieron algo de nosotros.",
+                    "value": f"{mb_mismo['tiendas']:,}",
+                    "description": "Mismo universo — tiendas que nosotros cubrimos.",
                     "tone": "acid",
                 },
                 {
                     "category": "FOUNTAIN9 · PIEZAS",
                     "label": "UNIDADES ASIGNADAS",
                     "value": f"{f9['piezas']:,}",
-                    "description": "Suma de 'Allocation (Store Based)' en todo el universo comparado.",
+                    "description": "Suma de 'Allocation (Store Based)' en el universo compartido.",
                     "tone": "blue",
                 },
                 {
                     "category": "MOTHER BASE · PIEZAS",
                     "label": "UNIDADES ASIGNADAS",
-                    "value": f"{mb['piezas']:,}",
-                    "description": "Suma de lo que nosotros asignamos en el mismo universo.",
+                    "value": f"{mb_mismo['piezas']:,}",
+                    "description": "Mismo universo — unidades que nosotros asignamos.",
                     "tone": "acid",
                 },
                 {
                     "category": "FOUNTAIN9 · TAREAS",
                     "label": "LÍNEAS TIENDA-SKU",
                     "value": f"{f9['tareas']:,}",
-                    "description": "Una tienda-SKU con asignación > 0 = una tarea (mismo criterio que usamos nosotros).",
+                    "description": "Una tienda-SKU con asignación > 0 = una tarea.",
                     "tone": "blue",
                 },
                 {
                     "category": "MOTHER BASE · TAREAS",
                     "label": "LÍNEAS TIENDA-SKU",
-                    "value": f"{mb['tareas']:,}",
-                    "description": "Una tienda-SKU con asignación > 0 = una tarea.",
+                    "value": f"{mb_mismo['tareas']:,}",
+                    "description": "Mismo universo — tareas que nosotros generamos.",
+                    "tone": "acid",
+                },
+            ],
+            columns_count=4,
+        )
+
+        st.markdown("###### Lo que desbloqueamos — fuera del alcance de Fountain9")
+        st.caption(
+            "Tienda-SKU que Fountain9 nunca evaluó en absoluto (ni una fila "
+            "en su Bulk) — incluye, entre otras cosas, lo que cubre "
+            "'Cobertura sin Fountain9' (§17). Esto es lo que Mother Base "
+            "ve y Fountain9 ni siquiera alcanza a mirar."
+        )
+        render_kpi_cards(
+            [
+                {
+                    "category": "ADICIONAL · PRODUCTOS",
+                    "label": "SKUs FUERA DEL ALCANCE DE F9",
+                    "value": f"{mb_adicional['productos']:,}",
+                    "description": "SKUs que Mother Base cubrió y Fountain9 nunca vio.",
+                    "tone": "violet",
+                },
+                {
+                    "category": "ADICIONAL · TIENDAS",
+                    "label": "TIENDAS FUERA DEL ALCANCE DE F9",
+                    "value": f"{mb_adicional['tiendas']:,}",
+                    "description": "Tiendas que recibieron algo fuera de lo que Fountain9 evaluó.",
+                    "tone": "violet",
+                },
+                {
+                    "category": "ADICIONAL · PIEZAS",
+                    "label": "UNIDADES FUERA DEL ALCANCE DE F9",
+                    "value": f"{mb_adicional['piezas']:,}",
+                    "description": "Unidades que Mother Base entrega sin que Fountain9 las haya pedido.",
+                    "tone": "violet",
+                },
+                {
+                    "category": "ADICIONAL · TAREAS",
+                    "label": "TAREAS FUERA DEL ALCANCE DE F9",
+                    "value": f"{mb_adicional['tareas']:,}",
+                    "description": "Líneas operativas que no existirían si solo siguiéramos a Fountain9.",
+                    "tone": "violet",
+                },
+            ],
+            columns_count=4,
+        )
+
+        st.markdown("###### Mother Base — total real (mismo alcance + adicional)")
+        render_kpi_cards(
+            [
+                {
+                    "category": "TOTAL · PRODUCTOS",
+                    "label": "SKUs CON ASIGNACIÓN",
+                    "value": f"{mb_total['productos']:,}",
+                    "description": "Todo lo que Mother Base cubrió, dentro y fuera del alcance de Fountain9.",
+                    "tone": "acid",
+                },
+                {
+                    "category": "TOTAL · TIENDAS",
+                    "label": "TIENDAS CON ASIGNACIÓN",
+                    "value": f"{mb_total['tiendas']:,}",
+                    "description": "Todas las tiendas cubiertas, dentro y fuera del alcance de Fountain9.",
+                    "tone": "acid",
+                },
+                {
+                    "category": "TOTAL · PIEZAS",
+                    "label": "UNIDADES ASIGNADAS",
+                    "value": f"{mb_total['piezas']:,}",
+                    "description": "Todas las unidades, dentro y fuera del alcance de Fountain9.",
+                    "tone": "acid",
+                },
+                {
+                    "category": "TOTAL · TAREAS",
+                    "label": "LÍNEAS TIENDA-SKU",
+                    "value": f"{mb_total['tareas']:,}",
+                    "description": "Todas las tareas generadas, dentro y fuera del alcance de Fountain9.",
                     "tone": "acid",
                 },
             ],

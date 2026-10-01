@@ -80,10 +80,10 @@ def test_basic_counts_both_sides():
     assert report["fountain9"]["tiendas"] == 2  # 100 y 200
     assert report["fountain9"]["piezas"] == 13  # 5+8
     assert report["fountain9"]["tareas"] == 2
-    assert report["mother_base"]["productos"] == 1
-    assert report["mother_base"]["tiendas"] == 2
-    assert report["mother_base"]["piezas"] == 11  # 3+8
-    assert report["mother_base"]["tareas"] == 2
+    assert report["mother_base_mismo_alcance"]["productos"] == 1
+    assert report["mother_base_mismo_alcance"]["tiendas"] == 2
+    assert report["mother_base_mismo_alcance"]["piezas"] == 11  # 3+8
+    assert report["mother_base_mismo_alcance"]["tareas"] == 2
 
 
 def test_stockout_coverage_categorization():
@@ -123,6 +123,63 @@ def test_only_stockouts_count_toward_coverage_not_full_universe():
     report = m.build_fountain9_comparison_report(result, catalogs, consolidated)
     assert report["total_rupturas"] == 0
     assert report["fountain9"]["piezas"] == 5  # sigue contando en piezas
+
+
+def test_mother_base_adicional_captures_what_fountain9_never_saw():
+    """El punto central de esta sesión: Mother Base cubre tienda-SKU que
+    Fountain9 nunca evaluó en absoluto (ausentes de 'consolidated') — eso
+    debe aparecer en 'mother_base_adicional', separado del cara a cara."""
+    consolidated = dict(
+        [
+            _consolidated_record(100, 10, 5.0),  # Fountain9 SÍ evaluó esto
+        ]
+    )
+    result = SimpleNamespace(
+        allocation_rows=[
+            _alloc_row(100, 10, 5),   # dentro del alcance de Fountain9
+            _alloc_row(200, 99, 7),   # FUERA: Fountain9 nunca vio el sku 99
+            _alloc_row(300, 50, 4),   # FUERA: otra tienda-sku que F9 no vio
+        ]
+    )
+    catalogs = make_catalogs()
+    report = m.build_fountain9_comparison_report(result, catalogs, consolidated)
+
+    assert report["mother_base_adicional"]["productos"] == 2  # skus 99 y 50
+    assert report["mother_base_adicional"]["tiendas"] == 2  # tiendas 200 y 300
+    assert report["mother_base_adicional"]["piezas"] == 11  # 7+4
+    assert report["mother_base_adicional"]["tareas"] == 2
+
+
+def test_mother_base_total_equals_mismo_alcance_mas_adicional():
+    consolidated = dict([_consolidated_record(100, 10, 5.0)])
+    result = SimpleNamespace(
+        allocation_rows=[
+            _alloc_row(100, 10, 5),
+            _alloc_row(200, 99, 7),
+        ]
+    )
+    catalogs = make_catalogs()
+    report = m.build_fountain9_comparison_report(result, catalogs, consolidated)
+
+    mismo = report["mother_base_mismo_alcance"]
+    adicional = report["mother_base_adicional"]
+    total = report["mother_base_total"]
+    assert total["piezas"] == mismo["piezas"] + adicional["piezas"]
+    assert total["tareas"] == mismo["tareas"] + adicional["tareas"]
+    assert total["piezas"] == 12  # 5 + 7
+    assert total["tareas"] == 2
+
+
+def test_mother_base_adicional_empty_when_nothing_outside_scope():
+    """Si Mother Base solo asignó dentro de lo que Fountain9 ya vio, el
+    bloque adicional debe quedar en ceros, no tronar."""
+    consolidated = dict([_consolidated_record(100, 10, 5.0)])
+    result = SimpleNamespace(allocation_rows=[_alloc_row(100, 10, 5)])
+    catalogs = make_catalogs()
+    report = m.build_fountain9_comparison_report(result, catalogs, consolidated)
+    assert report["mother_base_adicional"] == {
+        "productos": 0, "tiendas": 0, "piezas": 0, "tareas": 0,
+    }
 
 
 # --- lectura opcional de Allocation (Store Based) en consolidate_plan_files
