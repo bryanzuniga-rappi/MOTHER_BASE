@@ -196,6 +196,40 @@ def test_data_sheet_in_required_and_aleph_lists():
     assert m.ALEPH_MAX_AGE_HOURS["DATA"] == 24.0
 
 
+def test_health_cards_grouped_importrange_and_backend_before_aleph():
+    """Las tarjetas del panel de salud deben agruparse por tipo — antes
+    aparecían mezcladas en el orden de REQUIRED_DATABASE_SHEETS."""
+    rows = [
+        {"HOJA": "CATALOGO", "TIPO": "ALEPH"},
+        {"HOJA": "VOLUMETRIA", "TIPO": "IMPORTRANGE"},
+        {"HOJA": "TIENDAS_CERRADAS", "TIPO": "BACKEND"},
+        {"HOJA": "STOCK", "TIPO": "ALEPH"},
+        {"HOJA": "SCHEDULE", "TIPO": "IMPORTRANGE"},
+    ]
+    ordered = m.sort_health_rows_for_display(rows)
+    tipos = [row["TIPO"] for row in ordered]
+    primer_aleph = tipos.index("ALEPH")
+    # Ningún IMPORTRANGE/BACKEND debe aparecer después del primer ALEPH.
+    assert all(t == "ALEPH" for t in tipos[primer_aleph:])
+    # Orden estable dentro del grupo IMPORTRANGE/BACKEND: se conserva el
+    # orden relativo original (VOLUMETRIA, TIENDAS_CERRADAS, SCHEDULE),
+    # sin importar que STOCK (ALEPH) estuviera entre ellas en la lista de
+    # entrada.
+    hojas_antes_de_aleph = [row["HOJA"] for row in ordered[:primer_aleph]]
+    assert hojas_antes_de_aleph == ["VOLUMETRIA", "TIENDAS_CERRADAS", "SCHEDULE"]
+
+
+def test_swa_sheet_in_required_and_aleph_lists():
+    """SWA (SWA_POTENTIAL_GAIN_COUNTRY por WAREHOUSE_ID/PRODUCT_ID) se
+    actualiza cada hora vía Aleph — mismo umbral que STOCK/INSUMOS/
+    NO_DISPONIBLE/OWNER, no el de 24h que usan los catálogos maestros."""
+    assert "SWA" in m.REQUIRED_DATABASE_SHEETS
+    assert "SWA" in m.ALEPH_SHEETS
+    assert "SWA" in m.SHEET_DESCRIPTIONS
+    assert "SWA" in m.ALEPH_MAX_AGE_HOURS
+    assert m.ALEPH_MAX_AGE_HOURS["SWA"] == 1.2
+
+
 def test_globally_blocked_skus_empty_sheet_means_no_exclusion(tmp_path):
     import openpyxl
 

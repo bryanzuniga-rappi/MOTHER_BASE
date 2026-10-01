@@ -106,6 +106,7 @@ ALEPH_SHEETS = {
     "STORAGE",
     "OWNER",
     "DATA",
+    "SWA",
 }
 
 MANUAL_BACKEND_SHEETS = {"TIENDAS_CERRADAS"}
@@ -134,6 +135,7 @@ REQUIRED_DATABASE_SHEETS = (
     "OWNER",
     "SCHEDULE",
     "DATA",
+    "SWA",
 )
 
 SHEET_DESCRIPTIONS = {
@@ -244,6 +246,12 @@ SHEET_DESCRIPTIONS = {
         "Se usa para darle nombre y categoría legibles a reportes y "
         "entregables, no para ninguna regla de negocio."
     ),
+    "SWA": (
+        "Stockout-Weighted Availability por WAREHOUSE_ID/PRODUCT_ID "
+        "(SWA_POTENTIAL_GAIN_COUNTRY), actualizada cada hora vía Aleph. "
+        "Aún sin consumir en ninguna regla de negocio — cargada para uso "
+        "futuro."
+    ),
 }
 
 ALEPH_MAX_AGE_HOURS = {
@@ -259,6 +267,7 @@ ALEPH_MAX_AGE_HOURS = {
     "SHARE_VENTAS": 24.0,
     "OWNER": 1.2,
     "DATA": 24.0,
+    "SWA": 1.2,
 }
 
 DEMAND_RULE_LABELS = {
@@ -2573,6 +2582,17 @@ def rewrite_bulk_csvs_with_planning_reason(
         )
 
 
+def sort_health_rows_for_display(
+    rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Agrupa las tarjetas de salud por tipo — IMPORTRANGE/BACKEND primero,
+    ALEPH después — en vez del orden de REQUIRED_DATABASE_SHEETS, que los
+    mezcla. Orden estable: dentro de cada grupo se conserva el orden
+    original."""
+    card_type_priority = {"IMPORTRANGE": 0, "BACKEND": 0, "ALEPH": 1}
+    return sorted(rows, key=lambda row: card_type_priority.get(row["TIPO"], 0))
+
+
 def render_database_health(health: dict[str, Any]) -> None:
     online = health["online"]
     css_class = "online" if online else "review"
@@ -2586,7 +2606,7 @@ def render_database_health(health: dict[str, Any]) -> None:
         unsafe_allow_html=True,
     )
 
-    rows = health["rows"]
+    rows = sort_health_rows_for_display(health["rows"])
     for start in range(0, len(rows), 4):
         columns = st.columns(4)
         for column, row in zip(columns, rows[start : start + 4]):

@@ -209,6 +209,10 @@ COPÉRNICO es opcional para la aplicación en general, pero es obligatorio cuand
 
 La hoja `SCHEDULE` define días permitidos para una pareja origen–destino. Su bloqueo está apagado por defecto. Si se activa, la validación se hace contra la fecha real de la corrida en la zona horaria de Ciudad de México.
 
+### SWA
+
+Hoja Aleph con `SWA_POTENTIAL_GAIN_COUNTRY` por tienda–SKU, actualizada cada hora. Hoy solo participa del panel de salud (mismo SLA de frescura que STOCK/INSUMOS); aún no se usa en ninguna regla de asignación.
+
 ---
 
 ## Reglas mandantes
