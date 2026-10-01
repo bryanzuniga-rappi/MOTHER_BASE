@@ -211,7 +211,20 @@ La hoja `SCHEDULE` define días permitidos para una pareja origen–destino. Su 
 
 ### SWA
 
-Hoja Aleph con `SWA_POTENTIAL_GAIN_COUNTRY` por tienda–SKU, actualizada cada hora. Hoy solo participa del panel de salud (mismo SLA de frescura que STOCK/INSUMOS); aún no se usa en ninguna regla de asignación.
+Hoja Aleph con `SWA_POTENTIAL_GAIN_COUNTRY` por tienda–SKU (Sales Weighted Availability — métrica clave de negocio), actualizada cada hora. Nunca participa en ninguna regla de asignación, solo en reportería — pero esa reportería ahora cubre todos los entregables principales.
+
+**Ganado es binario, no proporcional.** Basta con sacar a una tienda-SKU del quiebre (cualquier unidad > 0 asignada) para capturar el `SWA_POTENTIAL_GAIN_COUNTRY` completo de esa fila — así es como se calcula el dato en origen (la condición de Aleph es `STOCK_UNITS > 0`, no una proporción). Ausente de la hoja SWA = 0 por descarte; nunca bloquea ningún reporte.
+
+**Universo: todo quiebre del catálogo**, no solo lo que algún engine intentó cubrir — incluye tienda-SKU donde ni siquiera había stock en ningún origen para intentarlo. `build_swa_report()` en `modules/les_enfants_terribles.py` es el cálculo autoritativo: itera CATALOGO completo, identifica quiebres (`stock_base` = 0) y compara contra `build_assigned_totals_by_key()` (suma por destino-SKU a través de todos los engines, para no contar doble si dos engines tocan la misma combinación).
+
+**Dónde aparece:**
+
+- Sección dedicada al inicio de resultados (SWA ganado, SWA perdido/en riesgo, universo total, quiebres sin SWA registrado).
+- `SWA_POTENTIAL_GAIN_COUNTRY` como columna en los CSV operativos, `BASE_TRANSFERS` y `DETALLE_ASIGNACION` (vía `enrich_rows_with_product_info`, mismo punto de enriquecimiento que `PRODUCT_NAME`/`CATEGORY_NAME` — una sola pasada antes de escribir cualquier archivo). Es informativo por fila; si la misma tienda-SKU recibe varias líneas, el valor se repite en cada una — no debe sumarse a través de filas sin deduplicar primero.
+- `SWA_GANADO` por engine/causal en la tabla "Efectivamente planeado", `SWA_PERDIDO` por motivo en la tabla "Cortes".
+- Reporte de universo Golden/Infaltable/Anchor (detalle completo y micro-detalle de no cubiertos).
+
+**Pendiente** (no todos los reportes lo tienen todavía): PDF ejecutivo, tabla "Sin recomendación", y el reporte Fountain9 vs Mother Base.
 
 ---
 

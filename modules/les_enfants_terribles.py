@@ -2184,6 +2184,9 @@ def build_bucket_universe_report(
                 "RETAIL_ID": sku,
                 "PRODUCT_NAME": product_info.get("PRODUCT_NAME", ""),
                 "CATEGORY_NAME": product_info.get("CATEGORY_NAME", ""),
+                "SWA_POTENTIAL_GAIN_COUNTRY": get_swa_potential_gain(
+                    catalogs, destination, sku
+                ),
                 "ADU": round(adu, 4),
                 "ADU_ORIGEN": adu_source_by_key.get(key, "SIN_DATO"),
                 "STOCK_INICIAL": int(stock_initial),
@@ -2699,6 +2702,7 @@ def build_planned_by_engine_rows(
     así que se agrega aparte con lo que ya reporta su propio resumen."""
     counts: Counter[tuple[str, str]] = Counter()
     units: Counter[tuple[str, str]] = Counter()
+    swa_ganado: Counter[tuple[str, str]] = Counter()
     for row in result.base_rows:
         if int(row.get("CANTIDAD_ASIGNADA", 0) or 0) <= 0:
             continue
@@ -2707,6 +2711,7 @@ def build_planned_by_engine_rows(
         key = (engine_name, tipo)
         counts[key] += 1
         units[key] += int(row.get("CANTIDAD_ASIGNADA", 0) or 0)
+        swa_ganado[key] += float(row.get("SWA_POTENTIAL_GAIN_COUNTRY", 0.0) or 0.0)
 
     if insumos_summary and insumos_summary.get("lines_added"):
         key = ("Insumos", "INSUMOS")
@@ -2734,6 +2739,7 @@ def build_planned_by_engine_rows(
             "CAUSAL": tipo,
             "CASOS": count,
             "UNIDADES": units[(engine_name, tipo)],
+            "SWA_GANADO": round(swa_ganado[(engine_name, tipo)], 4),
         }
         for (engine_name, tipo), count in sorted(counts.items(), key=sort_key)
         if count
@@ -2757,6 +2763,7 @@ def build_cuts_detail_rows(
     """
     counts: Counter[str] = Counter()
     units_missing: Counter[str] = Counter()
+    swa_perdido: Counter[str] = Counter()
     for row in result.base_rows:
         if int(row.get("CANTIDAD_ASIGNADA", 0) or 0) > 0:
             continue
@@ -2765,6 +2772,7 @@ def build_cuts_detail_rows(
             continue
         counts[tipo] += 1
         units_missing[tipo] += int(row.get("CANTIDAD_OBJETIVO", 0) or 0)
+        swa_perdido[tipo] += float(row.get("SWA_POTENTIAL_GAIN_COUNTRY", 0.0) or 0.0)
 
     if closed_summary and closed_summary.get("requirements"):
         counts["CORTE POR TIENDA CERRADA"] += int(closed_summary["requirements"])
@@ -2783,6 +2791,7 @@ def build_cuts_detail_rows(
             "CAUSAL": tipo,
             "CASOS": count,
             "UNIDADES_SIN_CUBRIR": units_missing[tipo],
+            "SWA_PERDIDO": round(swa_perdido[tipo], 4),
         }
         for tipo, count in sorted(
             counts.items(),
@@ -2875,6 +2884,105 @@ def _coverage_stats(keys_with_qty: list[tuple[tuple[int, int], float]]) -> dict[
         "tiendas": len(tiendas),
         "piezas": int(piezas),
         "tareas": tareas,
+    }
+
+
+def build_assigned_totals_by_key(result) -> dict[tuple[int, int], float]:
+    """Suma CANTIDAD/QUANTITY asignada por (destino, SKU) a través de
+    TODOS los engines de esta corrida — una sola vez, para no repetir este
+    cálculo en cada reporte que necesite saber "cuánto se mandó en total a
+    esta tienda-SKU", sin importar cuántas líneas/engines distintos lo
+    hayan tocado."""
+    totals: dict[tuple[int, int], float] = defaultdict(float)
+    for row in result.allocation_rows:
+        key = (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"])
+        totals[key] += row["QUANTITY"]
+    return totals
+
+
+def get_swa_potential_gain(catalogs, destination: int, sku: int) -> float:
+    """SWA país que se ganaría si esta tienda-SKU sale del quiebre. 0 si
+    no aparece en la hoja SWA — nunca bloquea nada, es puramente
+    informativo."""
+    return catalogs.swa_potential_gain.get((destination, sku), 0.0)
+
+
+def build_swa_report(
+    catalog_rows: list[dict[str, Any]],
+    catalogs,
+    result,
+) -> dict[str, Any]:
+    """El reporte central de SWA: sobre TODO el universo de quiebres del
+    catálogo (no solo lo que algún engine intentó cubrir), cuánto SWA país
+    se ganó esta corrida (tienda-SKU que estaba en 0 y terminó con
+    asignación > 0) contra cuánto se quedó sin ganar (siguió en 0 al
+    final, con o sin intento de cubrirlo).
+
+    "Ganado" es binario, no proporcional a la cantidad enviada — basta con
+    sacar a la tienda-SKU del quiebre (cualquier unidad > 0) para capturar
+    el SWA_POTENTIAL_GAIN_COUNTRY completo de esa fila. Así es como se
+    calcula la métrica en origen (Aleph): STOCK_UNITS > 0 es la condición,
+    no una proporción.
+
+    Universo: TODA combinación destino-SKU de CATALOGO con stock inicial
+    en 0, sin importar si tenía SWA registrado, si había stock en algún
+    origen, o si algún engine llegó a intentarlo.
+    """
+    assigned_totals = build_assigned_totals_by_key(result)
+
+    swa_ganado = 0.0
+    swa_perdido = 0.0
+    casos_ganados = 0
+    casos_perdidos = 0
+    casos_sin_swa_registrado = 0
+    detail_rows: list[dict[str, Any]] = []
+
+    seen_keys: set[tuple[int, int]] = set()
+    for row in catalog_rows:
+        destination = row["WAREHOUSE_DESTINATION"]
+        sku = row["RETAIL_ID"]
+        key = (destination, sku)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+
+        stock_initial = max(catalogs.stock_base.get(key, 0.0), 0.0)
+        if stock_initial > 0:
+            continue  # no es quiebre, SWA no aplica aquí
+
+        swa_value = get_swa_potential_gain(catalogs, destination, sku)
+        total_assigned = assigned_totals.get(key, 0.0)
+        ganado = total_assigned > 0
+
+        if swa_value <= 0:
+            casos_sin_swa_registrado += 1
+
+        if ganado:
+            swa_ganado += swa_value
+            casos_ganados += 1
+        else:
+            swa_perdido += swa_value
+            casos_perdidos += 1
+
+        detail_rows.append(
+            {
+                "WAREHOUSE_DESTINATION": destination,
+                "RETAIL_ID": sku,
+                "SWA_POTENTIAL_GAIN_COUNTRY": swa_value,
+                "UNIDADES_ASIGNADAS": int(total_assigned),
+                "GANADO": ganado,
+            }
+        )
+
+    return {
+        "enabled": bool(catalogs.swa_potential_gain),
+        "swa_ganado": round(swa_ganado, 4),
+        "swa_perdido": round(swa_perdido, 4),
+        "casos_ganados": casos_ganados,
+        "casos_perdidos": casos_perdidos,
+        "casos_sin_swa_registrado": casos_sin_swa_registrado,
+        "universo_total": casos_ganados + casos_perdidos,
+        "rows": detail_rows,
     }
 
 
@@ -6349,6 +6457,18 @@ def execute_planning(
         fountain9_comparison = build_fountain9_comparison_report(
             result, catalogs, consolidated_input
         )
+        # SWA necesita el universo COMPLETO del catálogo, sin importar si
+        # algún engine de cobertura está activo — reusa el catálogo si ya
+        # se cargó para otro propósito en esta corrida, si no, lo carga
+        # aparte solo para esto.
+        if catalog_fill_rows_cache is None:
+            swa_catalog_rows, swa_catalog_warnings = load_avl_catalog_rows(
+                data_path
+            )
+            result.warnings.extend(swa_catalog_warnings)
+        else:
+            swa_catalog_rows = catalog_fill_rows_cache
+        swa_report = build_swa_report(swa_catalog_rows, catalogs, result)
         if closed_summary["requirements"]:
             status_counts["CORTE POR TIENDA CERRADA"] += closed_summary[
                 "requirements"
@@ -6511,6 +6631,7 @@ def execute_planning(
         "cuts_detail_rows": cuts_detail_rows,
         "no_recommendation_rows": no_recommendation_rows,
         "fountain9_comparison": fountain9_comparison,
+        "swa_report": swa_report,
         "warnings": list(result.warnings),
         "logs": captured.getvalue(),
         "origins": list(origins),
@@ -7565,6 +7686,7 @@ def render_bucket_universe_report(bucket_label: str, report: dict[str, Any]) -> 
                     "RETAIL_ID": row["RETAIL_ID"],
                     "PRODUCT_NAME": row["PRODUCT_NAME"],
                     "CATEGORY_NAME": row["CATEGORY_NAME"],
+                    "SWA_POTENTIAL_GAIN_COUNTRY": row["SWA_POTENTIAL_GAIN_COUNTRY"],
                     "DOH_FINAL": row["DOH_FINAL"],
                     "MOTIVO_NO_CUBIERTO": row["MOTIVO_NO_CUBIERTO"],
                 }
@@ -7596,6 +7718,78 @@ def render_results(run: dict[str, Any]) -> None:
         """,
         unsafe_allow_html=True,
     )
+
+    swa_report = run.get("swa_report", {})
+    if swa_report.get("enabled"):
+        st.markdown(
+            '<div class="report-title">SWA · SALES WEIGHTED AVAILABILITY.</div>',
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            "Sobre TODO el universo de quiebres del catálogo (stock=0), "
+            "no solo lo que algún engine intentó cubrir. 'Ganado' es "
+            "binario: cualquier envío que saque a la tienda-SKU del "
+            "quiebre captura el SWA_POTENTIAL_GAIN_COUNTRY completo de "
+            "esa fila (hoja SWA, actualizada cada hora) — no es "
+            "proporcional a la cantidad enviada. Ausente de la hoja SWA "
+            "= 0 por descarte."
+        )
+        render_kpi_cards(
+            [
+                {
+                    "category": "SWA · GANADO",
+                    "label": "SWA GANADO ESTA CORRIDA",
+                    "value": f"{swa_report['swa_ganado']:,.4f}",
+                    "description": (
+                        f"{swa_report['casos_ganados']:,} tienda-SKU que estaban "
+                        "en quiebre y recibieron envío — SWA país capturado."
+                    ),
+                    "tone": "acid",
+                },
+                {
+                    "category": "SWA · PERDIDO",
+                    "label": "SWA EN RIESGO (NO GANADO)",
+                    "value": f"{swa_report['swa_perdido']:,.4f}",
+                    "description": (
+                        f"{swa_report['casos_perdidos']:,} tienda-SKU que "
+                        "siguen en quiebre al final de la corrida, con o sin "
+                        "intento de cobertura — SWA país que se sigue "
+                        "perdiendo."
+                    ),
+                    "tone": "coral",
+                },
+                {
+                    "category": "SWA · UNIVERSO",
+                    "label": "TOTAL DE QUIEBRES EVALUADOS",
+                    "value": f"{swa_report['universo_total']:,}",
+                    "description": (
+                        "Toda tienda-SKU del catálogo con stock inicial en "
+                        "cero, sin importar si tenía SWA registrado o si "
+                        "algún engine la tocó."
+                    ),
+                    "tone": "blue",
+                },
+                {
+                    "category": "SWA · SIN DATO",
+                    "label": "QUIEBRES SIN SWA EN LA HOJA",
+                    "value": f"{swa_report['casos_sin_swa_registrado']:,}",
+                    "description": (
+                        "Tienda-SKU en quiebre que no aparecen en la hoja "
+                        "SWA — se cuentan en el universo con SWA=0 por "
+                        "descarte, no se excluyen."
+                    ),
+                    "tone": "blue",
+                },
+            ],
+            columns_count=4,
+        )
+    elif "swa_report" in run:
+        st.caption(
+            "ℹ️ La hoja SWA no está cargada en este archivo de "
+            "DATA_TRANSFERS — no hay con qué calcular SWA ganado/perdido "
+            "esta corrida."
+        )
+
     render_kpi_cards(
         [
             {

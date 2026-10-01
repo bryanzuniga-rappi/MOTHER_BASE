@@ -665,6 +665,33 @@ def test_enrich_rows_with_product_info_fills_known_sku():
     assert rows[0]["CATEGORY_NAME"] == "Huevo"
 
 
+def test_enrich_rows_with_product_info_adds_swa_potential_gain():
+    catalogs = engine.Catalogs(
+        volume_m3={}, blocked_products=set(), route_cost_blocks=set(),
+        store_priority={}, high_value={}, rackeados_444=set(),
+        store_capacity={}, copernico_unusable_444={}, unavailable_stock={},
+        stock_base={}, golden_infaltables=set(), stores={}, storage={},
+        warnings=[],
+        swa_potential_gain={(100, 10): 2.75},
+    )
+    rows = [{"WAREHOUSE_DESTINATION": 100, "RETAIL_ID": 10, "QUANTITY": 5}]
+    engine.enrich_rows_with_product_info(rows, catalogs)
+    assert rows[0]["SWA_POTENTIAL_GAIN_COUNTRY"] == 2.75
+
+
+def test_enrich_rows_with_product_info_swa_zero_when_absent():
+    catalogs = engine.Catalogs(
+        volume_m3={}, blocked_products=set(), route_cost_blocks=set(),
+        store_priority={}, high_value={}, rackeados_444=set(),
+        store_capacity={}, copernico_unusable_444={}, unavailable_stock={},
+        stock_base={}, golden_infaltables=set(), stores={}, storage={},
+        warnings=[],
+    )  # swa_potential_gain vacío por default
+    rows = [{"WAREHOUSE_DESTINATION": 999, "RETAIL_ID": 999, "QUANTITY": 1}]
+    engine.enrich_rows_with_product_info(rows, catalogs)
+    assert rows[0]["SWA_POTENTIAL_GAIN_COUNTRY"] == 0.0
+
+
 def test_enrich_rows_with_product_info_blank_for_unknown_sku():
     """Sin dato en DATA (hoja ausente o SKU no encontrado): cadena vacía,
     nunca truena ni inventa un nombre."""

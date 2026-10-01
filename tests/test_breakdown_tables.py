@@ -88,6 +88,36 @@ def test_hardcode_labels_registered_in_breakdown_order():
         assert label in m.BREAKDOWN_ORDER
 
 
+def _row_with_swa(destination, sku, objetivo, asignado, tipo, swa, regla="MOV_MINIMO_3"):
+    row = _row(destination, sku, objetivo, asignado, tipo, regla)
+    row["SWA_POTENTIAL_GAIN_COUNTRY"] = swa
+    return row
+
+
+def test_planned_by_engine_sums_swa_ganado():
+    result = SimpleNamespace(
+        base_rows=[
+            _row_with_swa(100, 10, 5, 5, "ENVIADOS PARA CUBRIR AVL", 1.5),
+            _row_with_swa(200, 20, 3, 3, "ENVIADOS PARA CUBRIR AVL", 2.0),
+        ],
+    )
+    rows = m.build_planned_by_engine_rows(result)
+    avl_row = next(r for r in rows if r["CAUSAL"] == "ENVIADOS PARA CUBRIR AVL")
+    assert avl_row["SWA_GANADO"] == 3.5
+
+
+def test_cuts_detail_sums_swa_perdido():
+    result = SimpleNamespace(
+        base_rows=[
+            _row_with_swa(100, 10, 5, 0, "CORTE POR STOCK", 1.2),
+            _row_with_swa(200, 20, 3, 0, "CORTE POR STOCK", 0.8),
+        ],
+    )
+    rows = m.build_cuts_detail_rows(result)
+    stock_row = next(r for r in rows if r["CAUSAL"] == "CORTE POR STOCK")
+    assert stock_row["SWA_PERDIDO"] == 2.0
+
+
 def test_no_fountain9_coverage_sorted_before_shalashaska():
     """Regresión: otro gap de la sesión anterior — 'Cobertura sin
     Fountain9' faltaba en el orden de despliegue de esta tabla, lo que la

@@ -68,6 +68,7 @@ OUTPUT_COLUMNS = [
     "VALUE",
     "PRODUCT_NAME",
     "CATEGORY_NAME",
+    "SWA_POTENTIAL_GAIN_COUNTRY",
 ]
 
 OWNER_SPLIT_SOURCES = {425, 856}
@@ -317,6 +318,26 @@ def iter_product_catalog_records(workbook) -> Iterator[dict[str, Any]]:
             "CATEGORY_NAME",
             "SUBCATEGORY_NAME",
         ],
+    )
+
+
+def iter_swa_records(workbook) -> Iterator[dict[str, Any]]:
+    """Lee la hoja SWA (Sales Weighted Availability): cuánto SWA país se
+    ganaría si esta tienda-SKU saliera del quiebre
+    (SWA_POTENTIAL_GAIN_COUNTRY), por WAREHOUSE_ID/PRODUCT_ID — la misma
+    llave destino-SKU que usa el resto del sistema.
+
+    Igual que DATA: opcional, defensivo. Si la hoja no está, simplemente no
+    hay SWA disponible para ningún reporte — nunca participa en ninguna
+    regla de asignación, solo en reportería.
+    """
+    if "SWA" not in workbook.sheetnames:
+        return
+    yield from iter_sheet_records(
+        workbook,
+        "SWA",
+        ["WAREHOUSE_ID", "PRODUCT_ID", "SWA_POTENTIAL_GAIN_COUNTRY"],
+        ["WAREHOUSE_ID", "PRODUCT_ID", "SWA_POTENTIAL_GAIN_COUNTRY"],
     )
 
 
@@ -681,6 +702,10 @@ class Catalogs:
     # corrida. Se resta al calcular cuánto falta cubrir en el mecanismo de
     # cobertura sin Fountain9, para no sobre-enviar.
     incoming_stock: dict[tuple[int, int], float] = field(default_factory=dict)
+    # Sales Weighted Availability: cuánto SWA país se ganaría si esta
+    # tienda-SKU sale del quiebre (hoja SWA, SWA_POTENTIAL_GAIN_COUNTRY).
+    # Ausente de la hoja = 0 por descarte, nunca bloquea ningún reporte.
+    swa_potential_gain: dict[tuple[int, int], float] = field(default_factory=dict)
 
 
 def load_catalogs(
@@ -1100,6 +1125,24 @@ def load_catalogs(
                     )
                 continue
             product_catalog[sku] = info
+
+        swa_potential_gain: dict[tuple[int, int], float] = {}
+        for row in iter_swa_records(workbook):
+            swa_warehouse = to_id(row["WAREHOUSE_ID"], "SWA.WAREHOUSE_ID", True)
+            swa_sku = to_id(row["PRODUCT_ID"], "SWA.PRODUCT_ID", True)
+            if swa_warehouse is None or swa_sku is None:
+                continue
+            swa_value = to_float(row.get("SWA_POTENTIAL_GAIN_COUNTRY"))
+            swa_key = (swa_warehouse, swa_sku)
+            if swa_key in swa_potential_gain:
+                # Misma tienda-SKU repetida: se conserva el mayor, nunca se
+                # suma (el valor representa un porcentaje de ganancia, no
+                # una cantidad acumulable).
+                swa_potential_gain[swa_key] = max(
+                    swa_potential_gain[swa_key], swa_value
+                )
+            else:
+                swa_potential_gain[swa_key] = swa_value
     finally:
         workbook.close()
 
@@ -1145,6 +1188,7 @@ def load_catalogs(
         copernico_unusable_by_reason=copernico_unusable_by_reason,
         globally_blocked_skus=globally_blocked_skus,
         product_catalog=product_catalog,
+        swa_potential_gain=swa_potential_gain,
         incoming_stock=dict(incoming_stock),
     )
 
@@ -2420,23 +2464,35 @@ def enrich_rows_with_product_info(
     rows: list[dict[str, Any]],
     catalogs: Catalogs,
     sku_field: str = "RETAIL_ID",
+    destination_field: str = "WAREHOUSE_DESTINATION",
 ) -> None:
-    """Le pega PRODUCT_NAME y CATEGORY_NAME a cada fila, buscando por SKU en
-    catalogs.product_catalog (hoja DATA, indexado por SYNC_ID). Muta las
+    """Le pega PRODUCT_NAME, CATEGORY_NAME y SWA_POTENTIAL_GAIN_COUNTRY a
+    cada fila. PRODUCT_NAME/CATEGORY_NAME buscan por SKU en
+    catalogs.product_catalog (hoja DATA, indexado por SYNC_ID); SWA busca
+    por (destino, SKU) en catalogs.swa_potential_gain (hoja SWA). Muta las
     filas en el lugar — se llama UNA vez sobre cada lista de filas
     (base_rows, allocation_rows, o cualquier lista de Insumos/Refuerzo)
     antes de que esa lista se escriba a cualquier CSV/Excel, para que todo
     lo que lea de ahí después ya lo tenga sin tener que repetir el lookup.
 
-    Si catalogs.product_catalog está vacío (hoja DATA ausente) o el SKU no
-    aparece ahí, deja las columnas en cadena vacía — nunca truena, nunca
-    inventa un nombre.
+    Si las hojas DATA/SWA están vacías o la llave no aparece ahí, deja las
+    columnas en cadena vacía / 0 — nunca truena, nunca inventa un valor.
+    Nota: SWA_POTENTIAL_GAIN_COUNTRY aquí es puramente informativo por
+    fila — si la misma tienda-SKU recibe varias líneas (de distintos
+    engines), el valor se repite en cada una; no debe sumarse a través de
+    filas sin deduplicar por (destino, SKU) primero (ver build_swa_report
+    para el cálculo agregado correcto).
     """
     for row in rows:
         sku = row.get(sku_field)
         info = catalogs.product_catalog.get(sku, {}) if sku is not None else {}
         row["PRODUCT_NAME"] = info.get("PRODUCT_NAME", "")
         row["CATEGORY_NAME"] = info.get("CATEGORY_NAME", "")
+        destination = row.get(destination_field)
+        swa_key = (destination, sku) if destination is not None and sku is not None else None
+        row["SWA_POTENTIAL_GAIN_COUNTRY"] = (
+            catalogs.swa_potential_gain.get(swa_key, 0.0) if swa_key else 0.0
+        )
 
 
 def excel_safe(value: Any) -> Any:
