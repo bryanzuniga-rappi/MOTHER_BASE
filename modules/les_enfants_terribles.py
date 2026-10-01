@@ -353,6 +353,13 @@ INPUT_PLAN_COLUMNS = (
 # tumban la carga.
 DURATION_COLUMN = "Duration"
 LEAD_TIME_COLUMN = "Primary Source Lead Time (Days)"
+# La columna que de verdad refleja la decisión final de asignación de
+# Fountain9 — confirmado por análisis de archivos reales: es idéntica a
+# "Allocation Quantity for Plan Duration" en 99%+ de los casos, y es la
+# ÚNICA de las variantes de "Allocation" que sigue cuadrando incluso
+# cuando el mecanismo de Multi Source reasigna el origen. Opcional: la
+# mayoría de las cargas de hoy no la traen.
+FOUNTAIN9_ALLOCATION_COLUMN = "Allocation (Store Based)"
 
 MOV_MAX_OPTIONAL_COLUMNS = (
     "Replenishment Quantity for Plan Duration (Batch Size Rounded)",
@@ -1356,6 +1363,11 @@ def consolidate_plan_files(
             # de esa tienda en el archivo, sin importar el SKU.
             duration_field = field_lookup.get(engine.normalize_header(DURATION_COLUMN))
             lead_time_field = field_lookup.get(engine.normalize_header(LEAD_TIME_COLUMN))
+            # Asignación real de Fountain9 (opcional) — para el reporte
+            # comparativo contra la nuestra, ver build_fountain9_comparison_report.
+            fountain9_allocation_field = field_lookup.get(
+                engine.normalize_header(FOUNTAIN9_ALLOCATION_COLUMN)
+            )
 
             for csv_row, raw in enumerate(reader, start=2):
                 if not any(engine.clean_text(value) for value in raw.values()):
@@ -1404,6 +1416,10 @@ def consolidate_plan_files(
                         "NET_INTER_STORE_TRANSFERS": 0.0,
                         "SOURCE_FILES": set(),
                         "SOURCE_ROWS": 0,
+                        # None = la columna nunca estuvo presente para esta
+                        # llave en ningún archivo; se vuelve número en
+                        # cuanto se encuentra al menos una vez.
+                        "FOUNTAIN9_ALLOCATION": None,
                     }
                 record = consolidated[key]
                 record["PREDICTED_DEMAND"] += engine.to_float(
@@ -1435,6 +1451,15 @@ def consolidate_plan_files(
                 # evita sumar o duplicar cuando la misma combinación
                 # aparece más de una vez.
                 record["ROQ_INPUT"] = max(record["ROQ_INPUT"], row_mov_max)
+                if fountain9_allocation_field is not None:
+                    row_f9_allocation = engine.to_float(
+                        raw.get(fountain9_allocation_field, "")
+                    )
+                    # Mismo criterio que ROQ_INPUT: máximo entre filas/
+                    # archivos duplicados, nunca suma.
+                    record["FOUNTAIN9_ALLOCATION"] = max(
+                        record["FOUNTAIN9_ALLOCATION"] or 0.0, row_f9_allocation
+                    )
                 record["NET_INTER_STORE_TRANSFERS"] += engine.to_float(
                     raw.get(required_lookup["Net Inter-Store Transfers"], "")
                 )
@@ -2810,6 +2835,114 @@ def build_no_recommendation_breakdown(result) -> list[dict[str, Any]]:
         )
         if count
     ]
+
+
+def build_fountain9_comparison_report(
+    result,
+    catalogs,
+    consolidated: dict[tuple[int, int], dict[str, Any]],
+) -> dict[str, Any]:
+    """Compara la asignación que YA trae Fountain9 en su propio Bulk
+    (columna opcional "Allocation (Store Based)" — confirmado por análisis
+    de archivos reales que es la que refleja su decisión final, incluso
+    cuando su mecanismo de Multi Source reasigna el origen) contra la
+    nuestra, para exactamente las mismas tienda-SKU.
+
+    Universo: solo combinaciones donde Fountain9 trajo esa columna con
+    valor. Si el archivo no la trae en ninguna fila, el reporte queda
+    deshabilitado — no es un error, simplemente no hay con qué comparar.
+
+    "Cubrió una ruptura" = stock en destino (el nuestro, catalogs.stock_base,
+    para no mezclar dos fuentes de verdad distintas) era 0 Y esa fuente
+    asignó algo > 0.
+    """
+    universe = [
+        (key, record)
+        for key, record in consolidated.items()
+        if record.get("FOUNTAIN9_ALLOCATION") is not None
+    ]
+    if not universe:
+        return {"enabled": False}
+
+    our_assigned: dict[tuple[int, int], float] = defaultdict(float)
+    for row in result.allocation_rows:
+        key = (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"])
+        our_assigned[key] += row["QUANTITY"]
+
+    f9_productos: set[int] = set()
+    f9_tiendas: set[int] = set()
+    f9_piezas = 0.0
+    f9_tareas = 0
+    mb_productos: set[int] = set()
+    mb_tiendas: set[int] = set()
+    mb_piezas = 0.0
+    mb_tareas = 0
+    total_rupturas = 0
+    f9_rupturas_cubiertas = 0
+    mb_rupturas_cubiertas = 0
+    ambos_cubrieron = 0
+    solo_f9 = 0
+    solo_mb = 0
+    ninguno_cubrio = 0
+
+    for key, record in universe:
+        destination, sku = key
+        f9_qty = record["FOUNTAIN9_ALLOCATION"] or 0.0
+        mb_qty = our_assigned.get(key, 0.0)
+        destination_stock = max(catalogs.stock_base.get(key, 0.0), 0.0)
+        is_stockout = destination_stock <= 0
+        f9_covered = f9_qty > 0
+        mb_covered = mb_qty > 0
+
+        if f9_covered:
+            f9_productos.add(sku)
+            f9_tiendas.add(destination)
+            f9_piezas += f9_qty
+            f9_tareas += 1
+        if mb_covered:
+            mb_productos.add(sku)
+            mb_tiendas.add(destination)
+            mb_piezas += mb_qty
+            mb_tareas += 1
+
+        if is_stockout:
+            total_rupturas += 1
+            if f9_covered:
+                f9_rupturas_cubiertas += 1
+            if mb_covered:
+                mb_rupturas_cubiertas += 1
+            if f9_covered and mb_covered:
+                ambos_cubrieron += 1
+            elif f9_covered:
+                solo_f9 += 1
+            elif mb_covered:
+                solo_mb += 1
+            else:
+                ninguno_cubrio += 1
+
+    return {
+        "enabled": True,
+        "universo_total": len(universe),
+        "fountain9": {
+            "productos": len(f9_productos),
+            "tiendas": len(f9_tiendas),
+            "piezas": int(f9_piezas),
+            "tareas": f9_tareas,
+            "rupturas_cubiertas": f9_rupturas_cubiertas,
+        },
+        "mother_base": {
+            "productos": len(mb_productos),
+            "tiendas": len(mb_tiendas),
+            "piezas": int(mb_piezas),
+            "tareas": mb_tareas,
+            "rupturas_cubiertas": mb_rupturas_cubiertas,
+        },
+        "total_rupturas": total_rupturas,
+        "ambos_cubrieron": ambos_cubrieron,
+        "solo_fountain9": solo_f9,
+        "solo_mother_base": solo_mb,
+        "ninguno_cubrio": ninguno_cubrio,
+    }
 
 
 def clear_previous_workspace() -> None:
@@ -6139,6 +6272,9 @@ def execute_planning(
             result, closed_summary, block_summary
         )
         no_recommendation_rows = build_no_recommendation_breakdown(result)
+        fountain9_comparison = build_fountain9_comparison_report(
+            result, catalogs, consolidated_input
+        )
         if closed_summary["requirements"]:
             status_counts["CORTE POR TIENDA CERRADA"] += closed_summary[
                 "requirements"
@@ -6300,6 +6436,7 @@ def execute_planning(
         "planned_by_engine_rows": planned_by_engine_rows,
         "cuts_detail_rows": cuts_detail_rows,
         "no_recommendation_rows": no_recommendation_rows,
+        "fountain9_comparison": fountain9_comparison,
         "warnings": list(result.warnings),
         "logs": captured.getvalue(),
         "origins": list(origins),
@@ -7774,6 +7911,140 @@ def render_results(run: dict[str, Any]) -> None:
         offer_download=True,
         file_label="breakdown_overview",
     )
+
+    fountain9_comparison = run.get("fountain9_comparison", {})
+    if fountain9_comparison.get("enabled"):
+        st.markdown(
+            '<div class="report-title">FOUNTAIN9 VS MOTHER BASE.</div>',
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            "Compara la asignación que YA trae el Bulk de Fountain9 "
+            "('Allocation (Store Based)') contra la nuestra, para las "
+            f"mismas {fountain9_comparison['universo_total']:,} "
+            "combinaciones tienda-SKU donde esa columna venía presente. "
+            "No es el ROQ/MOV que Fountain9 recomienda — es su propia "
+            "decisión final de a quién darle stock cuando el origen no "
+            "alcanza para todos."
+        )
+        f9 = fountain9_comparison["fountain9"]
+        mb = fountain9_comparison["mother_base"]
+        render_kpi_cards(
+            [
+                {
+                    "category": "FOUNTAIN9 · PRODUCTOS",
+                    "label": "SKUs CON ASIGNACIÓN",
+                    "value": f"{f9['productos']:,}",
+                    "description": "SKUs distintos que Fountain9 asignó a al menos una tienda.",
+                    "tone": "blue",
+                },
+                {
+                    "category": "MOTHER BASE · PRODUCTOS",
+                    "label": "SKUs CON ASIGNACIÓN",
+                    "value": f"{mb['productos']:,}",
+                    "description": "SKUs distintos que nosotros asignamos a al menos una tienda.",
+                    "tone": "acid",
+                },
+                {
+                    "category": "FOUNTAIN9 · TIENDAS",
+                    "label": "TIENDAS CON ASIGNACIÓN",
+                    "value": f"{f9['tiendas']:,}",
+                    "description": "Tiendas distintas que recibieron algo según Fountain9.",
+                    "tone": "blue",
+                },
+                {
+                    "category": "MOTHER BASE · TIENDAS",
+                    "label": "TIENDAS CON ASIGNACIÓN",
+                    "value": f"{mb['tiendas']:,}",
+                    "description": "Tiendas distintas que recibieron algo de nosotros.",
+                    "tone": "acid",
+                },
+                {
+                    "category": "FOUNTAIN9 · PIEZAS",
+                    "label": "UNIDADES ASIGNADAS",
+                    "value": f"{f9['piezas']:,}",
+                    "description": "Suma de 'Allocation (Store Based)' en todo el universo comparado.",
+                    "tone": "blue",
+                },
+                {
+                    "category": "MOTHER BASE · PIEZAS",
+                    "label": "UNIDADES ASIGNADAS",
+                    "value": f"{mb['piezas']:,}",
+                    "description": "Suma de lo que nosotros asignamos en el mismo universo.",
+                    "tone": "acid",
+                },
+                {
+                    "category": "FOUNTAIN9 · TAREAS",
+                    "label": "LÍNEAS TIENDA-SKU",
+                    "value": f"{f9['tareas']:,}",
+                    "description": "Una tienda-SKU con asignación > 0 = una tarea (mismo criterio que usamos nosotros).",
+                    "tone": "blue",
+                },
+                {
+                    "category": "MOTHER BASE · TAREAS",
+                    "label": "LÍNEAS TIENDA-SKU",
+                    "value": f"{mb['tareas']:,}",
+                    "description": "Una tienda-SKU con asignación > 0 = una tarea.",
+                    "tone": "acid",
+                },
+            ],
+            columns_count=4,
+        )
+
+        st.markdown("###### Cobertura de rupturas de stock (stock = 0 en destino)")
+        st.caption(
+            "'Cubrió' = esa fuente asignó algo > 0 a una tienda-SKU que "
+            "tenía stock en cero. Usa nuestro propio stock (catalogs."
+            "stock_base) como única fuente de verdad para decidir qué es "
+            "una ruptura, para no comparar con dos criterios distintos."
+        )
+        render_kpi_cards(
+            [
+                {
+                    "category": "RUPTURAS · UNIVERSO",
+                    "label": "TOTAL CON STOCK EN CERO",
+                    "value": f"{fountain9_comparison['total_rupturas']:,}",
+                    "description": "Tienda-SKU con stock=0 dentro del universo comparado.",
+                    "tone": "blue",
+                },
+                {
+                    "category": "RUPTURAS · AMBOS",
+                    "label": "CUBIERTAS POR LOS DOS",
+                    "value": f"{fountain9_comparison['ambos_cubrieron']:,}",
+                    "description": "Fountain9 y Mother Base asignaron algo.",
+                    "tone": "acid",
+                },
+                {
+                    "category": "RUPTURAS · SOLO FOUNTAIN9",
+                    "label": "SOLO FOUNTAIN9 CUBRIÓ",
+                    "value": f"{fountain9_comparison['solo_fountain9']:,}",
+                    "description": "Fountain9 asignó algo; nosotros no.",
+                    "tone": "coral",
+                },
+                {
+                    "category": "RUPTURAS · SOLO MOTHER BASE",
+                    "label": "SOLO MOTHER BASE CUBRIÓ",
+                    "value": f"{fountain9_comparison['solo_mother_base']:,}",
+                    "description": "Nosotros asignamos algo; Fountain9 no.",
+                    "tone": "acid",
+                },
+                {
+                    "category": "RUPTURAS · NINGUNO",
+                    "label": "NINGUNO CUBRIÓ",
+                    "value": f"{fountain9_comparison['ninguno_cubrio']:,}",
+                    "description": "Ni Fountain9 ni nosotros asignamos nada — sin stock en ningún origen, probablemente.",
+                    "tone": "coral",
+                },
+            ],
+            columns_count=5,
+        )
+    elif run.get("fountain9_comparison") is not None:
+        st.caption(
+            "ℹ️ El Bulk de Fountain9 de esta corrida no trae la columna "
+            "'Allocation (Store Based)' — no hay con qué comparar. No es "
+            "un error, solo significa que este archivo no incluye el "
+            "módulo de asignación propio de Fountain9."
+        )
 
     if run.get("analytics"):
         render_planning_analytics(run["analytics"], run)

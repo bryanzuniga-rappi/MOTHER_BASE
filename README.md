@@ -955,6 +955,26 @@ La tabla web muestra al menos 12 filas sin scroll vertical.
 
 ---
 
+## 22.1 Fountain9 vs Mother Base (reporte comparativo)
+
+Reporte aparte, no una tabla más de BREAKDOWN — compara la asignación que **ya trae calculada** el propio Bulk de Fountain9 contra la nuestra, para las mismas tienda-SKU.
+
+**La columna clave: `Allocation (Store Based)`.** Confirmado por análisis directo de archivos reales de Fountain9 (no por documentación de su producto, que es confusa): esta es la columna que refleja la decisión **final** de asignación de Fountain9 — no es el ROQ/MOV que recomienda mandar, es a quién le dio el stock cuando el origen no alcanzaba para todas las tiendas que lo pedían. Se verificó que:
+
+- Coincide con `Allocation Quantity for Plan Duration` (el campo que de verdad se resta del origen) en 99%+ de los casos, incluso cuando el mecanismo de "Multi Source" de Fountain9 reasigna a un origen distinto del original.
+- `Allocation (DOI Based)` es un método alternativo que Fountain9 calcula pero **no usa** como decisión final — casi nunca coincide con el resultado real.
+- `Source Current Inventory` / `Source Inventory After Allocation` son **compartidos entre todas las tiendas** que compiten por el mismo origen+SKU, no por fila — el consumo real solo cuadra agregando por origen+SKU, no viendo una tienda a la vez.
+
+**Opcional en el Bulk de Fountain9** — `FOUNTAIN9_ALLOCATION_COLUMN = "Allocation (Store Based)"` en `modules/les_enfants_terribles.py`, mismo patrón que Duration/Lead Time: si el archivo no la trae, el reporte simplemente no aparece (no bloquea nada). Mismo criterio que ROQ_INPUT para filas/archivos duplicados de la misma tienda-SKU: se toma el **máximo**, nunca la suma.
+
+**Universo**: solo tienda-SKU donde esa columna venía presente — no se compara contra todo lo que Mother Base cubrió (que incluye casos Fountain9 nunca evaluó, como Cobertura sin Fountain9 en §17), para que la comparación sea justa sobre exactamente lo mismo que Fountain9 sí alcanzó a procesar.
+
+**Métricas**: Productos, Tiendas, Piezas y Tareas (tienda-SKU con asignación > 0) para cada lado, más el desglose de cobertura de rupturas de stock (`stock_base` propio = 0 en destino): cubiertas por ambos, solo por Fountain9, solo por Mother Base, o por ninguno.
+
+`build_fountain9_comparison_report()` en `modules/les_enfants_terribles.py`.
+
+---
+
 ## 23. KPIs
 
 Las tarjetas distinguen tareas, unidades, productos, tiendas y m³. El tooltip explica cada denominador.
