@@ -2343,6 +2343,8 @@ def append_insumos_to_bulk_444(
         "lines_blocked_schedule": 0,
         "lines_blocked_city_restriction": 0,
         "stock_detail": [],
+        "swa_ganado": 0.0,
+        "assigned_keys": set(),
     }
     if not summary["enabled"]:
         return summary
@@ -2532,6 +2534,23 @@ def append_insumos_to_bulk_444(
         regular_444_rows + selected,
         BULK_OUTPUT_COLUMNS,
     )
+    # SWA de Insumos: calculado directo desde sus propias filas (no vive en
+    # result.allocation_rows, así que build_swa_report no las ve). Binario
+    # igual que el resto: cualquier línea con SWA_POTENTIAL_GAIN_COUNTRY >
+    # 0 cuenta completo. Nota: es un cálculo aparte del reporte central de
+    # SWA, no reconciliado contra él — si la misma tienda-SKU también
+    # recibió algo por la asignación regular, el SWA ya se contó ahí.
+    swa_seen_keys: set[tuple[int, int]] = set()
+    swa_ganado_insumos = 0.0
+    assigned_keys: set[tuple[int, int]] = set()
+    for row in selected:
+        key = (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"])
+        if row.get("QUANTITY", 0) > 0:
+            assigned_keys.add(key)
+        if key in swa_seen_keys:
+            continue
+        swa_seen_keys.add(key)
+        swa_ganado_insumos += row.get("SWA_POTENTIAL_GAIN_COUNTRY", 0.0) or 0.0
     summary.update(
         {
             "lines_added": len(selected),
@@ -2539,6 +2558,13 @@ def append_insumos_to_bulk_444(
             "stores_added": len(
                 {row["WAREHOUSE_DESTINATION"] for row in selected}
             ),
+            "swa_ganado": round(swa_ganado_insumos, 4),
+            # (destino, SKU) que Insumos cubrió — build_swa_report lo
+            # necesita porque estas filas no viven en result.allocation_rows
+            # (Insumos corre aparte, sin tareas), así que sin esto el
+            # reporte central las marcaría como "perdido" aunque sí se
+            # hayan cubierto.
+            "assigned_keys": assigned_keys,
         }
     )
     summary["stock_detail"].sort(key=lambda row: row["PRODUCT_ID"])
@@ -2657,10 +2683,20 @@ def create_zip(paths: list[Path], destination: Path) -> Path:
 
 def ordered_breakdown_rows(
     status_counts: dict[str, int] | Counter[str],
+    status_swa: dict[str, float] | None = None,
 ) -> list[dict[str, Any]]:
+    """status_swa (opcional): SWA_POTENTIAL_GAIN_COUNTRY sumado por el
+    mismo TIPO_DE_CORTE que agrupa status_counts. Si no se pasa, la
+    columna SWA simplemente no aparece — mantiene compatible a quien
+    llame a esta función sin ese dato."""
     order = {label: index for index, label in enumerate(BREAKDOWN_ORDER)}
+    status_swa = status_swa or {}
     return [
-        {"BREAKDOWN": status, "FILAS": int(count)}
+        {
+            "BREAKDOWN": status,
+            "FILAS": int(count),
+            **({"SWA": round(status_swa[status], 4)} if status_swa else {}),
+        }
         for status, count in sorted(
             status_counts.items(),
             key=lambda item: (order.get(item[0], len(order)), item[0]),
@@ -2744,6 +2780,33 @@ def build_planned_by_engine_rows(
         for (engine_name, tipo), count in sorted(counts.items(), key=sort_key)
         if count
     ]
+
+
+def swa_card(engine_name: str, swa_by_engine: dict[str, float]) -> dict[str, Any]:
+    """Tarjeta KPI estándar de 'SWA ganado' para la sección de un engine
+    específico — mismo formato en las 9 secciones de REPORTE POR ENGINE."""
+    return {
+        "category": "SWA · GANADO",
+        "label": "SWA PAÍS CAPTURADO",
+        "value": f"{swa_by_engine.get(engine_name, 0.0):,.4f}",
+        "description": (
+            f"SWA país ganado específicamente por {engine_name} — tienda-SKU "
+            "que estaban en quiebre y este engine sacó del quiebre."
+        ),
+        "tone": "acid",
+    }
+
+
+def swa_ganado_by_engine(
+    planned_by_engine_rows: list[dict[str, Any]],
+) -> dict[str, float]:
+    """SWA total ganado por cada engine, sumando sus causales — reusa lo
+    que ya calculó build_planned_by_engine_rows en vez de recorrer
+    base_rows otra vez por cada sección de engine en la UI."""
+    totals: dict[str, float] = defaultdict(float)
+    for row in planned_by_engine_rows:
+        totals[row["ENGINE"]] += row.get("SWA_GANADO", 0.0)
+    return dict(totals)
 
 
 def build_cuts_detail_rows(
@@ -2850,15 +2913,23 @@ def build_no_recommendation_breakdown(result) -> list[dict[str, Any]]:
     construcción — Shalashaska/Liquid/Venom/Insumos nunca generan este
     TIPO_DE_CORTE, así que no hace falta filtrarlos aparte."""
     counts: Counter[str] = Counter()
+    swa_informativo: Counter[str] = Counter()
     for row in result.base_rows:
         if row.get("TIPO_DE_CORTE") != "SIN RECOMENDACIÓN":
             continue
         reason = classify_no_recommendation_reason(row)
         counts[reason] += 1
+        swa_informativo[reason] += float(
+            row.get("SWA_POTENTIAL_GAIN_COUNTRY", 0.0) or 0.0
+        )
 
     order = {label: index for index, label in enumerate(NO_RECOMMENDATION_REASONS)}
     return [
-        {"MOTIVO": reason, "CASOS": count}
+        {
+            "MOTIVO": reason,
+            "CASOS": count,
+            "SWA_INFORMATIVO": round(swa_informativo[reason], 4),
+        }
         for reason, count in sorted(
             counts.items(), key=lambda item: (order.get(item[0], len(order)), item[0])
         )
@@ -2887,16 +2958,30 @@ def _coverage_stats(keys_with_qty: list[tuple[tuple[int, int], float]]) -> dict[
     }
 
 
-def build_assigned_totals_by_key(result) -> dict[tuple[int, int], float]:
+def build_assigned_totals_by_key(
+    result,
+    extra_assigned_keys: set[tuple[int, int]] | None = None,
+) -> dict[tuple[int, int], float]:
     """Suma CANTIDAD/QUANTITY asignada por (destino, SKU) a través de
     TODOS los engines de esta corrida — una sola vez, para no repetir este
     cálculo en cada reporte que necesite saber "cuánto se mandó en total a
     esta tienda-SKU", sin importar cuántas líneas/engines distintos lo
-    hayan tocado."""
+    hayan tocado.
+
+    ``extra_assigned_keys`` cubre lo que no vive en result.allocation_rows
+    — hoy, específicamente Insumos (corre aparte, sin tareas, anexado
+    directo al CSV). Sin esto, esas combinaciones se verían como "sin
+    asignación" aunque sí hayan recibido algo. Se marcan con 1.0 (no la
+    cantidad real, que no está disponible aquí) — alcanza porque todo lo
+    que lee este diccionario solo pregunta ">0", nunca usa la magnitud de
+    estas llaves extra."""
     totals: dict[tuple[int, int], float] = defaultdict(float)
     for row in result.allocation_rows:
         key = (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"])
         totals[key] += row["QUANTITY"]
+    for key in extra_assigned_keys or set():
+        if totals[key] <= 0:
+            totals[key] = 1.0
     return totals
 
 
@@ -2911,6 +2996,7 @@ def build_swa_report(
     catalog_rows: list[dict[str, Any]],
     catalogs,
     result,
+    insumos_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """El reporte central de SWA: sobre TODO el universo de quiebres del
     catálogo (no solo lo que algún engine intentó cubrir), cuánto SWA país
@@ -2927,8 +3013,14 @@ def build_swa_report(
     Universo: TODA combinación destino-SKU de CATALOGO con stock inicial
     en 0, sin importar si tenía SWA registrado, si había stock en algún
     origen, o si algún engine llegó a intentarlo.
+
+    ``insumos_summary`` se pasa para incluir lo que Insumos cubrió (vive
+    aparte de result.allocation_rows) — sin esto, una tienda-SKU cubierta
+    únicamente por Insumos se marcaría "perdida" aquí aunque sí se haya
+    cubierto.
     """
-    assigned_totals = build_assigned_totals_by_key(result)
+    extra_keys = (insumos_summary or {}).get("assigned_keys", set())
+    assigned_totals = build_assigned_totals_by_key(result, extra_keys)
 
     swa_ganado = 0.0
     swa_perdido = 0.0
@@ -3046,6 +3138,8 @@ def build_fountain9_comparison_report(
     solo_f9 = 0
     solo_mb = 0
     ninguno_cubrio = 0
+    f9_swa_ganado = 0.0
+    mb_swa_ganado_mismo_alcance = 0.0
 
     for key, record in universe:
         destination, sku = key
@@ -3069,10 +3163,13 @@ def build_fountain9_comparison_report(
 
         if is_stockout:
             total_rupturas += 1
+            swa_value = get_swa_potential_gain(catalogs, destination, sku)
             if f9_covered:
                 f9_rupturas_cubiertas += 1
+                f9_swa_ganado += swa_value
             if mb_covered:
                 mb_rupturas_cubiertas += 1
+                mb_swa_ganado_mismo_alcance += swa_value
             if f9_covered and mb_covered:
                 ambos_cubrieron += 1
             elif f9_covered:
@@ -3084,13 +3181,20 @@ def build_fountain9_comparison_report(
 
     # Bloque 3: todo lo que Mother Base asignó a tienda-SKU que Fountain9
     # nunca evaluó (ausentes de "universe" por completo) — el "desbloqueo"
-    # real, lo que Fountain9 ni siquiera alcanza a ver.
+    # real, lo que Fountain9 ni siquiera alcanza a ver. SWA aquí también
+    # requiere stock=0 (mismo criterio que arriba), no solo asignación.
     additional_pairs = [
         (key, qty)
         for key, qty in our_assigned.items()
         if key not in universe_keys
     ]
     mother_base_adicional = _coverage_stats(additional_pairs)
+    mb_swa_ganado_adicional = sum(
+        get_swa_potential_gain(catalogs, destination, sku)
+        for (destination, sku), qty in additional_pairs
+        if qty > 0 and max(catalogs.stock_base.get((destination, sku), 0.0), 0.0) <= 0
+    )
+    mother_base_adicional["swa_ganado"] = round(mb_swa_ganado_adicional, 4)
 
     mother_base_mismo_alcance = {
         "productos": len(mb_productos),
@@ -3098,12 +3202,14 @@ def build_fountain9_comparison_report(
         "piezas": int(mb_piezas),
         "tareas": mb_tareas,
         "rupturas_cubiertas": mb_rupturas_cubiertas,
+        "swa_ganado": round(mb_swa_ganado_mismo_alcance, 4),
     }
     mother_base_total = {
         "productos": len(mb_productos | {sku for (_d, sku), q in additional_pairs if q > 0}),
         "tiendas": len(mb_tiendas | {d for (d, _sku), q in additional_pairs if q > 0}),
         "piezas": mother_base_mismo_alcance["piezas"] + mother_base_adicional["piezas"],
         "tareas": mother_base_mismo_alcance["tareas"] + mother_base_adicional["tareas"],
+        "swa_ganado": round(mb_swa_ganado_mismo_alcance + mb_swa_ganado_adicional, 4),
     }
 
     return {
@@ -3117,6 +3223,7 @@ def build_fountain9_comparison_report(
             "piezas": int(f9_piezas),
             "tareas": f9_tareas,
             "rupturas_cubiertas": f9_rupturas_cubiertas,
+            "swa_ganado": round(f9_swa_ganado, 4),
         },
         "mother_base_mismo_alcance": mother_base_mismo_alcance,
         "total_rupturas": total_rupturas,
@@ -5035,6 +5142,8 @@ def write_executive_pdf(
     origins: tuple[int, ...],
     analytics: dict[str, Any],
     status_counts: dict[str, int] | Counter[str],
+    status_swa: dict[str, float] | None = None,
+    swa_report: dict[str, Any] | None = None,
     input_requirements: int,
     evaluated_requirements: int,
     tasks: int,
@@ -5154,6 +5263,9 @@ def write_executive_pdf(
 
     def fmt_m3(value: Any) -> str:
         return f"{float(value or 0):,.2f}"
+
+    def fmt_float(value: Any) -> str:
+        return f"{float(value or 0):,.4f}"
 
     def report_table_pdf(
         rows: list[dict[str, Any]],
@@ -5393,17 +5505,45 @@ def write_executive_pdf(
             ]
         )
     )
+    swa_summary_block: list[Any] = []
+    if swa_report and swa_report.get("enabled"):
+        swa_summary_block = [
+            Paragraph("SWA · SALES WEIGHTED AVAILABILITY", section_style),
+            report_table_pdf(
+                [
+                    {
+                        "METRICA": "SWA GANADO (tienda-SKU sacadas del quiebre)",
+                        "VALOR": f"{swa_report.get('swa_ganado', 0.0):,.4f}",
+                    },
+                    {
+                        "METRICA": "SWA PERDIDO (siguen en quiebre)",
+                        "VALOR": f"{swa_report.get('swa_perdido', 0.0):,.4f}",
+                    },
+                    {
+                        "METRICA": "Universo total de quiebres evaluados",
+                        "VALOR": f"{swa_report.get('universo_total', 0):,}",
+                    },
+                ],
+                [
+                    ("METRICA", "MÉTRICA", str),
+                    ("VALOR", "VALOR", str),
+                ],
+                [220 * mm, 45 * mm],
+            ),
+        ]
     story.extend(
         [
             executive_table,
+            *swa_summary_block,
             Paragraph("BREAKDOWN DE LA PLANEACIÓN", section_style),
             report_table_pdf(
-                ordered_breakdown_rows(status_counts),
+                ordered_breakdown_rows(status_counts, status_swa),
                 [
                     ("BREAKDOWN", "BREAKDOWN", str),
                     ("FILAS", "CASOS / LÍNEAS", fmt_int),
+                    *([("SWA", "SWA PAÍS", fmt_float)] if status_swa else []),
                 ],
-                [220 * mm, 45 * mm],
+                [220 * mm, 45 * mm] + ([40 * mm] if status_swa else []),
             ),
             PageBreak(),
             Paragraph("ANÁLISIS GENERAL", title_style),
@@ -6447,6 +6587,11 @@ def execute_planning(
         status_counts = Counter(
             row["TIPO_DE_CORTE"] for row in result.base_rows
         )
+        status_swa: Counter[str] = Counter()
+        for row in result.base_rows:
+            status_swa[row["TIPO_DE_CORTE"]] += float(
+                row.get("SWA_POTENTIAL_GAIN_COUNTRY", 0.0) or 0.0
+            )
         planned_by_engine_rows = build_planned_by_engine_rows(
             result, insumos_summary
         )
@@ -6468,7 +6613,9 @@ def execute_planning(
             result.warnings.extend(swa_catalog_warnings)
         else:
             swa_catalog_rows = catalog_fill_rows_cache
-        swa_report = build_swa_report(swa_catalog_rows, catalogs, result)
+        swa_report = build_swa_report(
+            swa_catalog_rows, catalogs, result, insumos_summary
+        )
         if closed_summary["requirements"]:
             status_counts["CORTE POR TIENDA CERRADA"] += closed_summary[
                 "requirements"
@@ -6491,6 +6638,8 @@ def execute_planning(
             origins=origins,
             analytics=analytics,
             status_counts=status_counts,
+            status_swa=status_swa,
+            swa_report=swa_report,
             input_requirements=consolidation_summary["unique_requirements"],
             evaluated_requirements=requirements,
             tasks=result.tasks_used,
@@ -6627,6 +6776,7 @@ def execute_planning(
         "requirements": requirements,
         "input_requirements": consolidation_summary["unique_requirements"],
         "status_counts": dict(status_counts),
+        "status_swa": dict(status_swa),
         "planned_by_engine_rows": planned_by_engine_rows,
         "cuts_detail_rows": cuts_detail_rows,
         "no_recommendation_rows": no_recommendation_rows,
@@ -7790,6 +7940,13 @@ def render_results(run: dict[str, Any]) -> None:
             "esta corrida."
         )
 
+    # Disponible para cada sección de engine más abajo (REPORTE POR
+    # ENGINE), para mostrar cuánto SWA capturó específicamente ese engine
+    # — reusa lo ya calculado en planned_by_engine_rows, no recorre
+    # base_rows otra vez por cada sección.
+    swa_by_engine = swa_ganado_by_engine(run.get("planned_by_engine_rows", []))
+    swa_enabled = bool(swa_report.get("enabled"))
+
     render_kpi_cards(
         [
             {
@@ -8161,7 +8318,12 @@ def render_results(run: dict[str, Any]) -> None:
         "Solo Naked (Fountain9 nunca recomendó nada para esta tienda-SKU). "
         "Usa únicamente Demanda, Opening y Net Inter-Store Transfers — las "
         "columnas propias del Bulk de Fountain9, sin mezclar datos de "
-        "CATALOGO/STOCK ni de otros engines."
+        "CATALOGO/STOCK ni de otros engines. SWA_INFORMATIVO es justamente "
+        "eso — informativo, no 'perdido': estas filas tienen opening ≥ "
+        "demanda por definición, así que normalmente no son rupturas "
+        "reales contra nuestro propio stock. Si aparece algo aquí, suele "
+        "ser un desfase entre el opening predicho de Fountain9 y nuestro "
+        "stock actual."
     )
     no_recommendation_rows = run.get("no_recommendation_rows", [])
     render_capped_dataframe(
@@ -8172,7 +8334,9 @@ def render_results(run: dict[str, Any]) -> None:
     )
 
     st.markdown("##### Overview general")
-    breakdown = ordered_breakdown_rows(run["status_counts"])
+    breakdown = ordered_breakdown_rows(
+        run["status_counts"], run.get("status_swa")
+    )
     render_capped_dataframe(
         breakdown,
         key="breakdown_overview",
@@ -8261,6 +8425,20 @@ def render_results(run: dict[str, Any]) -> None:
                     "description": "Mismo universo — tareas que nosotros generamos.",
                     "tone": "acid",
                 },
+                {
+                    "category": "FOUNTAIN9 · SWA",
+                    "label": "SWA PAÍS GANADO",
+                    "value": f"{f9['swa_ganado']:,.4f}",
+                    "description": "SWA capturado por Fountain9 sobre rupturas (stock=0) en el mismo universo.",
+                    "tone": "blue",
+                },
+                {
+                    "category": "MOTHER BASE · SWA",
+                    "label": "SWA PAÍS GANADO",
+                    "value": f"{mb_mismo['swa_ganado']:,.4f}",
+                    "description": "SWA capturado por nosotros sobre las mismas rupturas.",
+                    "tone": "acid",
+                },
             ],
             columns_count=4,
         )
@@ -8302,6 +8480,13 @@ def render_results(run: dict[str, Any]) -> None:
                     "description": "Líneas operativas que no existirían si solo siguiéramos a Fountain9.",
                     "tone": "violet",
                 },
+                {
+                    "category": "ADICIONAL · SWA",
+                    "label": "SWA PAÍS GANADO FUERA DE F9",
+                    "value": f"{mb_adicional['swa_ganado']:,.4f}",
+                    "description": "SWA capturado en rupturas que Fountain9 nunca evaluó — invisible para ellos.",
+                    "tone": "violet",
+                },
             ],
             columns_count=4,
         )
@@ -8335,6 +8520,13 @@ def render_results(run: dict[str, Any]) -> None:
                     "label": "LÍNEAS TIENDA-SKU",
                     "value": f"{mb_total['tareas']:,}",
                     "description": "Todas las tareas generadas, dentro y fuera del alcance de Fountain9.",
+                    "tone": "acid",
+                },
+                {
+                    "category": "TOTAL · SWA",
+                    "label": "SWA PAÍS GANADO",
+                    "value": f"{mb_total['swa_ganado']:,.4f}",
+                    "description": "Todo el SWA país que capturamos, dentro y fuera del alcance de Fountain9.",
                     "tone": "acid",
                 },
             ],
@@ -8505,6 +8697,7 @@ def render_results(run: dict[str, Any]) -> None:
                     "description": "Volumen de esas líneas (mismo dato que pallets).",
                     "tone": "blue",
                 },
+                *([swa_card("Naked", swa_by_engine)] if swa_enabled else []),
             ],
             columns_count=4,
         )
@@ -8550,8 +8743,9 @@ def render_results(run: dict[str, Any]) -> None:
                     ),
                     "tone": "acid",
                 },
+                *([swa_card("AVL", swa_by_engine)] if swa_enabled else []),
             ],
-            columns_count=3,
+            columns_count=4 if swa_enabled else 3,
         )
         st.success(
             f"Cobertura AVL a {avl.get('doh', 0):g} DOH: "
@@ -8611,6 +8805,7 @@ def render_results(run: dict[str, Any]) -> None:
                         "origen y tareas disponibles."
                     ),
                 },
+                *([swa_card("Preventivo", swa_by_engine)] if swa_enabled else []),
             ],
             columns_count=4,
         )
@@ -8674,6 +8869,11 @@ def render_results(run: dict[str, Any]) -> None:
                         "capacidad, stock de origen y tareas disponibles."
                     ),
                 },
+                *(
+                    [swa_card("Refuerzo Golden/Infaltable/Anchor", swa_by_engine)]
+                    if swa_enabled
+                    else []
+                ),
             ],
             columns_count=4,
         )
@@ -8744,6 +8944,11 @@ def render_results(run: dict[str, Any]) -> None:
                     ),
                     "tone": "coral",
                 },
+                *(
+                    [swa_card("Cobertura sin Fountain9", swa_by_engine)]
+                    if swa_enabled
+                    else []
+                ),
             ],
             columns_count=4,
         )
@@ -8805,6 +9010,7 @@ def render_results(run: dict[str, Any]) -> None:
                         "venta garantizada ni ahorro contable realizado."
                     ),
                 },
+                *([swa_card("Shalashaska", swa_by_engine)] if swa_enabled else []),
             ],
             columns_count=4,
         )
@@ -8864,6 +9070,7 @@ def render_results(run: dict[str, Any]) -> None:
                         "unidades)."
                     ),
                 },
+                *([swa_card("Liquid", swa_by_engine)] if swa_enabled else []),
             ],
             columns_count=4,
         )
@@ -8940,6 +9147,7 @@ def render_results(run: dict[str, Any]) -> None:
                         "Venom en esta corrida."
                     ),
                 },
+                *([swa_card("Venom", swa_by_engine)] if swa_enabled else []),
             ],
             columns_count=4,
         )
@@ -9020,6 +9228,24 @@ def render_results(run: dict[str, Any]) -> None:
                     ),
                     "tone": "blue",
                 },
+                *(
+                    [
+                        {
+                            "category": "SWA · GANADO",
+                            "label": "SWA PAÍS CAPTURADO",
+                            "value": f"{insumos.get('swa_ganado', 0.0):,.4f}",
+                            "description": (
+                                "Calculado aparte del reporte central de SWA "
+                                "(Insumos no pasa por la asignación regular) "
+                                "— tienda-SKU con SWA registrado que recibieron "
+                                "una línea de insumos."
+                            ),
+                            "tone": "acid",
+                        }
+                    ]
+                    if swa_enabled
+                    else []
+                ),
             ],
             columns_count=4,
         )

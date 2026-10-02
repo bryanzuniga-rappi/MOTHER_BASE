@@ -118,6 +118,21 @@ def test_cuts_detail_sums_swa_perdido():
     assert stock_row["SWA_PERDIDO"] == 2.0
 
 
+def test_swa_ganado_by_engine_sums_across_causales():
+    planned_rows = [
+        {"ENGINE": "AVL", "CAUSAL": "ENVIADOS PARA CUBRIR AVL", "CASOS": 1, "UNIDADES": 5, "SWA_GANADO": 1.5},
+        {"ENGINE": "Naked", "CAUSAL": "OK COMPLETO POR FOUNTAIN9", "CASOS": 2, "UNIDADES": 10, "SWA_GANADO": 2.0},
+        {"ENGINE": "Naked", "CAUSAL": "OK MANUAL POR NET TRANSFER BAJO", "CASOS": 1, "UNIDADES": 3, "SWA_GANADO": 0.5},
+    ]
+    totals = m.swa_ganado_by_engine(planned_rows)
+    assert totals["AVL"] == 1.5
+    assert totals["Naked"] == 2.5  # suma de sus dos causales
+
+
+def test_swa_ganado_by_engine_empty_when_no_rows():
+    assert m.swa_ganado_by_engine([]) == {}
+
+
 def test_no_fountain9_coverage_sorted_before_shalashaska():
     """Regresión: otro gap de la sesión anterior — 'Cobertura sin
     Fountain9' faltaba en el orden de despliegue de esta tabla, lo que la
@@ -352,6 +367,15 @@ def test_build_no_recommendation_breakdown_counts_correctly():
     assert by_motivo["INVENTARIO CON AMPLIO MARGEN"] == 1
     assert "OK" not in by_motivo
     assert sum(r["CASOS"] for r in rows) == 3
+
+
+def test_no_recommendation_breakdown_includes_swa_informativo():
+    row = _no_rec_row(100, 10, demand=0, opening=5)
+    row["SWA_POTENTIAL_GAIN_COUNTRY"] = 0.75
+    result = SimpleNamespace(base_rows=[row])
+    rows = m.build_no_recommendation_breakdown(result)
+    sin_demanda = next(r for r in rows if r["MOTIVO"] == "SIN DEMANDA PROYECTADA")
+    assert sin_demanda["SWA_INFORMATIVO"] == 0.75
 
 
 def test_cuts_detail_no_longer_includes_sin_recomendacion():

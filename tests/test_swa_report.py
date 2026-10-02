@@ -145,6 +145,34 @@ def test_duplicate_catalog_rows_deduplicated():
     assert report["universo_total"] == 1
 
 
+def test_insumos_only_coverage_counts_as_ganado():
+    """Punto central de esta sesión: una tienda-SKU cubierta ÚNICAMENTE
+    por Insumos (que no vive en result.allocation_rows) debe contar como
+    'ganado', no 'perdido'."""
+    catalogs = make_catalogs(
+        stock_base={(100, 10): 0},
+        swa_potential_gain={(100, 10): 1.8},
+    )
+    result = SimpleNamespace(allocation_rows=[])  # nada por la vía regular
+    insumos_summary = {"assigned_keys": {(100, 10)}}
+    report = m.build_swa_report(
+        [_catalog_row(100, 10)], catalogs, result, insumos_summary
+    )
+    assert report["swa_ganado"] == 1.8
+    assert report["casos_ganados"] == 1
+    assert report["swa_perdido"] == 0.0
+
+
+def test_swa_report_works_without_insumos_summary():
+    """insumos_summary es opcional (None por default) — no debe tronar."""
+    catalogs = make_catalogs(
+        stock_base={(100, 10): 0}, swa_potential_gain={(100, 10): 1.0}
+    )
+    result = SimpleNamespace(allocation_rows=[])
+    report = m.build_swa_report([_catalog_row(100, 10)], catalogs, result)
+    assert report["swa_perdido"] == 1.0
+
+
 # --- carga de la hoja SWA en Catalogs (modelo_abasto.py) -----------------
 
 def test_iter_swa_records_absent_sheet_yields_nothing():

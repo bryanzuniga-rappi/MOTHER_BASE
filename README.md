@@ -217,14 +217,19 @@ Hoja Aleph con `SWA_POTENTIAL_GAIN_COUNTRY` por tienda–SKU (Sales Weighted Ava
 
 **Universo: todo quiebre del catálogo**, no solo lo que algún engine intentó cubrir — incluye tienda-SKU donde ni siquiera había stock en ningún origen para intentarlo. `build_swa_report()` en `modules/les_enfants_terribles.py` es el cálculo autoritativo: itera CATALOGO completo, identifica quiebres (`stock_base` = 0) y compara contra `build_assigned_totals_by_key()` (suma por destino-SKU a través de todos los engines, para no contar doble si dos engines tocan la misma combinación).
 
-**Dónde aparece:**
+**Insumos es un caso especial.** Sus filas no viven en `result.allocation_rows` (corre aparte, anexado directo al CSV sin consumir tareas), así que `build_assigned_totals_by_key()` recibe sus llaves cubiertas por separado (`insumos_summary["assigned_keys"]`) para que el reporte central no las marque como "perdidas" por error. Su propio "SWA ganado" también se calcula aparte, directo desde sus filas ya enriquecidas — no está perfectamente reconciliado contra el reporte central si la misma tienda-SKU también recibió algo por la vía regular, pero ambos números son correctos por separado.
+
+**Dónde aparece — cobertura completa de los entregables principales:**
 
 - Sección dedicada al inicio de resultados (SWA ganado, SWA perdido/en riesgo, universo total, quiebres sin SWA registrado).
-- `SWA_POTENTIAL_GAIN_COUNTRY` como columna en los CSV operativos, `BASE_TRANSFERS` y `DETALLE_ASIGNACION` (vía `enrich_rows_with_product_info`, mismo punto de enriquecimiento que `PRODUCT_NAME`/`CATEGORY_NAME` — una sola pasada antes de escribir cualquier archivo). Es informativo por fila; si la misma tienda-SKU recibe varias líneas, el valor se repite en cada una — no debe sumarse a través de filas sin deduplicar primero.
-- `SWA_GANADO` por engine/causal en la tabla "Efectivamente planeado", `SWA_PERDIDO` por motivo en la tabla "Cortes".
+- `SWA_POTENTIAL_GAIN_COUNTRY` como columna en los CSV operativos, `BASE_TRANSFERS` y `DETALLE_ASIGNACION` (vía `enrich_rows_with_product_info`, mismo punto de enriquecimiento que `PRODUCT_NAME`/`CATEGORY_NAME`). Es informativo por fila — si la misma tienda-SKU recibe varias líneas, el valor se repite; no debe sumarse a través de filas sin deduplicar primero.
+- `SWA_GANADO` por engine/causal en "Efectivamente planeado", `SWA_PERDIDO` por motivo en "Cortes", columna `SWA` en el Overview general (`ordered_breakdown_rows`), `SWA_INFORMATIVO` en "Sin recomendación" (ver nota abajo).
 - Reporte de universo Golden/Infaltable/Anchor (detalle completo y micro-detalle de no cubiertos).
+- **Cada una de las 9 secciones de REPORTE POR ENGINE** (Naked, AVL, Preventivo, Refuerzo, Cobertura sin Fountain9, Shalashaska, Liquid, Venom, Insumos) trae su propia tarjeta "SWA GANADO" — `swa_ganado_by_engine()` reusa lo ya calculado en `planned_by_engine_rows`, salvo Insumos que usa su cálculo propio.
+- **Fountain9 vs Mother Base**: los tres bloques (cara a cara, adicional, total) ahora incluyen SWA — permite ver cuánto SWA capturamos que Fountain9 ni siquiera evalúa.
+- **PDF ejecutivo**: tabla de breakdown con columna SWA, más un bloque resumen (ganado/perdido/universo) junto a la tabla ejecutiva principal.
 
-**Pendiente** (no todos los reportes lo tienen todavía): PDF ejecutivo, tabla "Sin recomendación", y el reporte Fountain9 vs Mother Base.
+**"Sin recomendación" es informativo, no "perdido".** Estas filas tienen `opening ≥ demanda` por definición (así decide Fountain9 no recomendar nada), así que normalmente no son rupturas reales contra nuestro propio `stock_base` — el campo se llama `SWA_INFORMATIVO` a propósito, para no confundirlo con una pérdida real. Si aparece algo distinto de cero, suele ser un desfase entre el opening predicho de Fountain9 y el stock actual.
 
 ---
 

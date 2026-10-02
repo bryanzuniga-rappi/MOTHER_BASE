@@ -179,7 +179,47 @@ def test_mother_base_adicional_empty_when_nothing_outside_scope():
     report = m.build_fountain9_comparison_report(result, catalogs, consolidated)
     assert report["mother_base_adicional"] == {
         "productos": 0, "tiendas": 0, "piezas": 0, "tareas": 0,
+        "swa_ganado": 0.0,
     }
+
+
+def test_swa_tracked_in_all_three_blocks():
+    consolidated = dict(
+        [
+            _consolidated_record(100, 10, 5.0),  # F9 cubre, MB también
+            _consolidated_record(100, 11, 0.0),  # ninguno cubre
+        ]
+    )
+    result = SimpleNamespace(
+        allocation_rows=[
+            _alloc_row(100, 10, 3),   # mismo alcance
+            _alloc_row(200, 99, 7),   # adicional: F9 nunca vio el sku 99
+        ]
+    )
+    catalogs = make_catalogs(
+        stock_base={(100, 10): 0, (100, 11): 0, (200, 99): 0},
+        swa_potential_gain={(100, 10): 2.0, (200, 99): 1.5},
+    )
+    report = m.build_fountain9_comparison_report(result, catalogs, consolidated)
+
+    assert report["fountain9"]["swa_ganado"] == 2.0
+    assert report["mother_base_mismo_alcance"]["swa_ganado"] == 2.0
+    assert report["mother_base_adicional"]["swa_ganado"] == 1.5
+    assert report["mother_base_total"]["swa_ganado"] == 3.5
+
+
+def test_swa_not_counted_when_not_a_stockout():
+    """F9/MB pueden asignar algo a un SKU con stock > 0 (no es ruptura) —
+    SWA no debe sumar ahí, aunque la asignación sí cuente en piezas."""
+    consolidated = dict([_consolidated_record(100, 10, 5.0)])
+    result = SimpleNamespace(allocation_rows=[_alloc_row(100, 10, 5)])
+    catalogs = make_catalogs(
+        stock_base={(100, 10): 50},  # no es ruptura
+        swa_potential_gain={(100, 10): 9.9},
+    )
+    report = m.build_fountain9_comparison_report(result, catalogs, consolidated)
+    assert report["fountain9"]["swa_ganado"] == 0.0
+    assert report["mother_base_mismo_alcance"]["swa_ganado"] == 0.0
 
 
 # --- lectura opcional de Allocation (Store Based) en consolidate_plan_files
