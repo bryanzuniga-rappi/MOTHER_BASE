@@ -75,20 +75,48 @@ def test_basic_coverage_when_sku_absent_from_fountain9():
     assert sum(r["QUANTITY"] for r in rows) == 16
 
 
-def test_skips_sku_present_in_fountain9_even_with_zero_target():
-    """El punto central de esta sesión: si Fountain9 SÍ tuvo la fila (aunque
-    el target haya sido 0), este mecanismo NO debe tocarla."""
+def test_skips_key_explicitly_in_excluded_keys():
+    """Mecánica genérica: cualquier llave en excluded_keys se salta. Desde
+    la sesión de "sin recomendación como quiebre real", quien llama a esta
+    función decide exactamente qué va en excluded_keys — típicamente
+    fountain_recommended_keys (solo recomendación positiva), ya no
+    cualquier fila de Fountain9."""
     catalogs = make_catalogs()
     result = make_result()
     summary = m.apply_avl_fill(
         result, catalog_rows(adu_10=2.0), catalogs, CONFIG, set(), (), 1.0,
         candidate_mode="no_fountain9_coverage",
-        excluded_keys={(100, 10)},  # Fountain9 SÍ tuvo esta fila
+        excluded_keys={(100, 10)},
         duration_mode_by_store={100: 5.0},
         lead_time_mode_by_store={100: 3.0},
     )
     assert summary["units_added"] == 0
     assert summary["cases_sent"] == 0
+
+
+def test_sin_recomendacion_real_stockout_now_eligible():
+    """El punto central de esta sesión: un "sin recomendación" de
+    Fountain9 (CANTIDAD_OBJETIVO=0, por lo tanto NO entra en
+    fountain_recommended_keys) cuyo stock_base real es 0 debe ser
+    candidato elegible aquí — es un quiebre real que Fountain9 no vio
+    porque se basó en su propio Predicted Opening Inventory, no en
+    nuestro stock real. Antes de este cambio, CUALQUIER fila de Fountain9
+    (incluida esta) quedaba excluida; ahora solo se excluyen las
+    recomendaciones positivas."""
+    catalogs = make_catalogs()  # stock_base[(100,10)] = 0 por el fixture
+    result = make_result()
+    # excluded_keys = fountain_recommended_keys simulado: vacío, porque
+    # esta tienda-SKU tuvo CANTIDAD_OBJETIVO=0 (sin recomendación), no
+    # entra en ese set aunque SÍ tuvo fila en Fountain9.
+    summary = m.apply_avl_fill(
+        result, catalog_rows(adu_10=2.0), catalogs, CONFIG, set(), (), 1.0,
+        candidate_mode="no_fountain9_coverage",
+        excluded_keys=set(),
+        duration_mode_by_store={100: 5.0},
+        lead_time_mode_by_store={100: 3.0},
+    )
+    assert summary["units_added"] > 0
+    assert summary["cases_sent"] == 1
 
 
 def test_skips_when_destination_stock_positive():

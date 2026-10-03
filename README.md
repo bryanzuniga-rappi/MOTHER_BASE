@@ -300,7 +300,7 @@ Solidus utiliza stock, capacidad y tareas restantes en este orden:
 1. **AVL:** cobertura de catálogo con stock final cero y sin servicio positivo previo.
 2. **Prevención:** producto con poco inventario o menos de un DOH, sin recomendación positiva de Fountain9.
 3. **Refuerzo Golden / Infaltable / Anchor:** lleva el inventario hacia un DOH objetivo específico cuando Fountain9 no solicitó el caso.
-4. **Cobertura sin Fountain9:** opcional y apagada por defecto; cubre stockouts que ni siquiera tienen fila en el bulk de Fountain9.
+4. **Cobertura sin Fountain9:** opcional y apagada por defecto; cubre stockouts sin recomendación positiva de Fountain9 — ya sea porque el SKU no tiene fila en su bulk, o porque la tiene pero con "sin recomendación" (basada en su propio Predicted Opening Inventory, que puede no coincidir con el stock real).
 
 Para resolver ADU, las coberturas usan esta cascada:
 

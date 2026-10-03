@@ -414,8 +414,9 @@ SPECIAL_DOH_CUT = "ENVIADOS PARA REFORZAR GOLDEN/INFALTABLE/ANCHOR"
 PLANNING_REASON_NO_FOUNTAIN9 = "COBERTURA SIN FOUNTAIN9 · SOLIDUS ENGINE"
 NO_FOUNTAIN9_CUT = "ENVIADOS PARA CUBRIR QUIEBRE SIN FOUNTAIN9"
 # ADU de respaldo cuando el SKU no tiene ADU propio ni de ciudad (cascada
-# de resolve_adu_with_city_fallback) Y además Fountain9 nunca lo evaluó —
-# a falta de cualquier señal de venta, 0.14/día es el piso de negocio.
+# de resolve_adu_with_city_fallback) Y además no tuvo recomendación
+# positiva de Fountain9 — a falta de cualquier señal de venta, 0.14/día
+# es el piso de negocio.
 FICTITIOUS_ADU_NO_FOUNTAIN9 = 0.14
 PLANNING_REASON_INSUMOS = "INSUMOS"
 BULK_OUTPUT_COLUMNS = [*engine.OUTPUT_COLUMNS, PLANNING_REASON_COLUMN]
@@ -4645,11 +4646,14 @@ def apply_avl_fill(
             )
             summary["preventive_candidates"] += 1
         elif candidate_mode == "no_fountain9_coverage":
-            # Quebrado (stock=0) Y Fountain9 nunca evaluó esta tienda-SKU
-            # (el filtro de "ya excluido por excluded_keys", más abajo,
-            # es lo que descarta lo que Fountain9 sí trae). Duration/Lead
-            # Time moda por TIENDA sustituyen el DOH fijo de CODEC; sin
-            # esos dos datos para esta tienda, no hay base para calcular.
+            # Quebrado (stock=0) Y esta tienda-SKU no está en excluded_keys
+            # — quien llama decide qué cuenta como "ya cubierto por
+            # Fountain9": hoy es fountain_recommended_keys (solo
+            # recomendación positiva), así que un "sin recomendación" con
+            # quiebre real también es candidato aquí, no solo los SKUs
+            # ausentes del archivo por completo. Duration/Lead Time moda
+            # por TIENDA sustituyen el DOH fijo de CODEC; sin esos dos
+            # datos para esta tienda, no hay base para calcular.
             if destination_stock > 0:
                 summary["skipped_not_stockout"] += 1
                 continue
@@ -6093,16 +6097,6 @@ def execute_planning(
             for row in result.base_rows
             if int(row.get("CANTIDAD_OBJETIVO", 0) or 0) > 0
         }
-        # TODA tienda-SKU que tuvo fila en Fountain9, sin importar el
-        # target (a diferencia de fountain_recommended_keys, que solo
-        # cuenta target>0). Se captura AQUÍ, antes de que AVL/Preventivo/
-        # Refuerzo agreguen sus propias filas a base_rows por candidatos
-        # de CATALOGO que Fountain9 nunca tuvo — si se calculara después,
-        # incluiría por error esas filas ajenas a Fountain9.
-        fountain9_seen_keys = {
-            (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"])
-            for row in result.base_rows
-        }
         closed_summary = closed_store_summary(
             closed_plan_rows,
             closed_store_ids,
@@ -6292,7 +6286,13 @@ def execute_planning(
                 blocked_cities,
                 1.0,  # dummy: este modo no usa un DOH fijo de CODEC
                 candidate_mode="no_fountain9_coverage",
-                excluded_keys=fountain9_seen_keys,
+                # Solo excluye recomendación POSITIVA de Fountain9 — a
+                # propósito, no "cualquier fila" (ver discusión de esta
+                # sesión): un "sin recomendación" cuyo stock_base real
+                # resulta en 0 es un quiebre genuino que Fountain9 no vio
+                # (se basó en su propio Predicted Opening Inventory, no en
+                # nuestro stock real), y debe quedar elegible aquí.
+                excluded_keys=fountain_recommended_keys,
                 duration_mode_by_store=consolidation_summary.get(
                     "duration_mode_by_store", {}
                 ),
@@ -6305,8 +6305,10 @@ def execute_planning(
                 f"{no_fountain9_summary['cases_sent']:,} casos, "
                 f"{no_fountain9_summary['tasks_added']:,} tareas y "
                 f"{no_fountain9_summary['units_added']:,} unidades para SKUs "
-                "de catálogo quebrados que Fountain9 nunca evaluó, usando la "
-                "moda de Duration/Lead Time por tienda de su propio Bulk."
+                "de catálogo quebrados sin recomendación positiva de "
+                "Fountain9 (ausentes del archivo o con sin recomendación "
+                "pero quiebre real), usando la moda de Duration/Lead Time "
+                "por tienda de su propio Bulk."
             )
 
         attach_consolidated_input_to_result(result, consolidated_input)
@@ -8892,8 +8894,11 @@ def render_results(run: dict[str, Any]) -> None:
             unsafe_allow_html=True,
         )
         st.caption(
-            "SKUs de catálogo con stock en cero que Fountain9 nunca evaluó — "
-            "ni una fila en su Bulk, ni siquiera con MOV=0. Usa la moda de "
+            "SKUs de catálogo con stock en cero sin recomendación positiva "
+            "de Fountain9 — ya sea porque el SKU no tiene ninguna fila en "
+            "su Bulk, o porque sí la tiene pero con 'sin recomendación' "
+            "(Fountain9 confió en su propio Predicted Opening Inventory, "
+            "que puede diferir de nuestro stock real). Usa la moda de "
             "Duration y Lead Time por tienda del propio Bulk en vez del DOH "
             "fijo de CODEC, y resta STOCK.INCOMING si está disponible."
         )
@@ -9868,17 +9873,20 @@ def render() -> None:
                 )
             with no_f9_right:
                 include_no_fountain9_coverage = st.toggle(
-                    "Cubrir quiebres sin fila de Fountain9",
+                    "Cubrir quiebres sin recomendación positiva de Fountain9",
                     value=False,
                     help=(
                         "Corre al final de Solidus, con lo que sobró después de "
                         "AVL/Preventivo/Refuerzo. Cubre SKUs de catálogo con stock "
-                        "en cero que Fountain9 nunca evaluó (ni siquiera con MOV=0 "
-                        "— la fila no existe en su Bulk). Usa la moda de Duration "
-                        "y Lead Time por tienda del propio Bulk de Fountain9 en "
-                        "vez del DOH fijo, y resta STOCK.INCOMING si está "
-                        "disponible. Sin ADU (propio ni de ciudad), usa un ADU "
-                        f"ficticio de {FICTITIOUS_ADU_NO_FOUNTAIN9:g}/día."
+                        "en cero sin recomendación positiva de Fountain9 — ya sea "
+                        "porque la fila no existe en su Bulk, o porque existe pero "
+                        "dice 'sin recomendación' (basado en su propio Predicted "
+                        "Opening Inventory, que puede no coincidir con el stock "
+                        "real). Usa la moda de Duration y Lead Time por tienda del "
+                        "propio Bulk de Fountain9 en vez del DOH fijo, y resta "
+                        "STOCK.INCOMING si está disponible. Sin ADU (propio ni de "
+                        f"ciudad), usa un ADU ficticio de "
+                        f"{FICTITIOUS_ADU_NO_FOUNTAIN9:g}/día."
                     ),
                 )
             doh_left, doh_right = st.columns(2)
