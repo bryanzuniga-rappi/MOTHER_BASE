@@ -2695,7 +2695,7 @@ def ordered_breakdown_rows(
         {
             "BREAKDOWN": status,
             "FILAS": int(count),
-            **({"SWA": round(status_swa[status], 4)} if status_swa else {}),
+            **({"SWA": round(status_swa.get(status, 0.0), 4)} if status_swa else {}),
         }
         for status, count in sorted(
             status_counts.items(),

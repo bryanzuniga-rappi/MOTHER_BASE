@@ -393,6 +393,22 @@ def test_cuts_detail_no_longer_includes_sin_recomendacion():
     assert "CORTE POR STOCK" in causales
 
 
+def test_ordered_breakdown_rows_handles_status_missing_from_swa():
+    """Regresión del bug real en producción: status_counts recibe llaves
+    extra después de construirse (CORTE POR TIENDA CERRADA, CORTE POR
+    CIUDAD BLOQUEADA, INSUMOS) que status_swa nunca tiene, porque esas
+    requisiciones no llegan a result.base_rows. Antes esto tronaba con
+    KeyError; ahora debe tratarse como SWA=0 sin problema."""
+    status_counts = Counter(
+        {"OK COMPLETO POR FOUNTAIN9": 5, "CORTE POR TIENDA CERRADA": 3}
+    )
+    status_swa = {"OK COMPLETO POR FOUNTAIN9": 2.5}  # sin la otra llave
+    rows = m.ordered_breakdown_rows(status_counts, status_swa)
+    by_status = {r["BREAKDOWN"]: r for r in rows}
+    assert by_status["OK COMPLETO POR FOUNTAIN9"]["SWA"] == 2.5
+    assert by_status["CORTE POR TIENDA CERRADA"]["SWA"] == 0.0
+
+
 def test_overview_breakdown_still_includes_sin_recomendacion():
     """El overview (tabla 3, independiente) NO debe perder SIN
     RECOMENDACIÓN — solo se quitó de la tabla de cortes, no de ahí."""
