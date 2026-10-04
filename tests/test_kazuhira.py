@@ -266,3 +266,118 @@ def test_post_kazuhira_cut_appears_in_cuts_detail():
     )
     causales = {r["CAUSAL"] for r in m.build_cuts_detail_rows(result)}
     assert m.CATALOG_UNIVERSE_POST_KAZUHIRA_CUT in causales
+
+
+# --- disparador por DOH (stock + incoming + asignado) ------------------------
+
+def _stock(dest_stock, origin=1000.0):
+    return make_catalogs(stock_base={(444, 10): origin, (100, 10): dest_stock})
+
+
+def test_triggers_when_stock_positive_but_under_one_doh():
+    # stock 0.5 con ADU 1 => 0.5 DOH < 1
+    summary = run_kazuhira(make_result(), catalog_rows(100, adu=1.0), _stock(0.5))
+    assert summary["cases_sent"] == 1
+
+
+def test_does_not_trigger_at_or_above_one_doh():
+    summary = run_kazuhira(make_result(), catalog_rows(100, adu=1.0), _stock(1.0))
+    assert summary["cases_sent"] == 0
+    assert summary["skipped_doh_sufficient"] == 1
+
+
+def test_incoming_counts_toward_doh_and_can_suppress_trigger():
+    catalogs = _stock(0.0)
+    catalogs.incoming_stock[(100, 10)] = 2.0  # 2 DOH con ADU 1
+    summary = run_kazuhira(make_result(), catalog_rows(100, adu=1.0), catalogs)
+    assert summary["cases_sent"] == 0
+
+
+def test_insufficient_incoming_still_triggers_and_is_subtracted():
+    catalogs = _stock(0.0)
+    catalogs.incoming_stock[(100, 10)] = 0.4  # < 1 DOH
+    summary = run_kazuhira(make_result(), catalog_rows(100, adu=2.0), catalogs)
+    # ADU 2 x (5+3) - 0.4 = 15.6 -> 16
+    assert summary["units_added"] == 16
+
+
+def test_already_assigned_units_count_as_position_not_exclusion():
+    """Una unidad enviada por otro engine con ADU 5 deja 0.2 DOH: Kazuhira
+    debe completar, no darse por servido."""
+    result = make_result(allocation_rows=[{
+        "WAREHOUSE_DESTINATION": 100, "WAREHOUSE_SOURCE": 444,
+        "RETAIL_ID": 10, "QUANTITY": 1,
+    }])
+    summary = run_kazuhira(result, catalog_rows(100, adu=5.0), _stock(0.0))
+    assert summary["cases_sent"] == 1
+    # 5 x (5+3) - 0 - 0 - 1 ya asignada = 39
+    assert summary["units_added"] == 39
+
+
+def test_missing_stock_row_is_treated_as_zero():
+    catalogs = make_catalogs(stock_base={(444, 10): 1000.0})  # sin (100, 10)
+    summary = run_kazuhira(make_result(), catalog_rows(100), catalogs)
+    assert summary["cases_sent"] == 1
+    assert summary["missing_stock_treated_as_zero"] == 1
+
+
+def test_missing_stock_row_still_skipped_by_no_fountain9_mode():
+    catalogs = make_catalogs(stock_base={(444, 10): 1000.0})
+    summary = run_kazuhira(
+        make_result(), catalog_rows(100), catalogs,
+        candidate_mode="no_fountain9_coverage",
+    )
+    assert summary["cases_sent"] == 0
+    assert summary["skipped_missing_stock"] == 1
+
+
+# --- universo de tiendas: Fountain9 + SCHEDULE de hoy -------------------------
+
+def test_allowed_destinations_restricts_kazuhira():
+    summary = run_kazuhira(
+        make_result(), catalog_rows(100, 200), make_catalogs(),
+        allowed_destinations={100},
+    )
+    assert summary["cases_sent"] == 1
+    assert summary["skipped_outside_universe"] == 1
+
+
+def test_scheduled_destinations_today_uses_run_weekday_and_selected_origins():
+    catalogs = make_catalogs(
+        schedule_days={
+            (100, 444): frozenset({"LUNES", "MARTES"}),
+            (200, 444): frozenset({"MARTES"}),
+            (300, 831): frozenset({"LUNES"}),  # origen no seleccionado
+        },
+        run_weekday_norm="LUNES",
+    )
+    assert m.scheduled_destinations_today(catalogs, (444,)) == {100}
+
+
+def test_scheduled_destinations_ignores_the_schedule_block_toggle():
+    catalogs = make_catalogs(
+        schedule_days={(100, 444): frozenset({"LUNES"})},
+        run_weekday_norm="LUNES",
+        schedule_block_enabled=False,
+    )
+    assert m.scheduled_destinations_today(catalogs, (444,)) == {100}
+
+
+def test_planned_store_universe_unions_fountain9_and_schedule():
+    catalogs = make_catalogs(
+        schedule_days={(200, 444): frozenset({"LUNES"})}, run_weekday_norm="LUNES"
+    )
+    universe = m.build_planned_store_universe(
+        [(100, 10), (100, 11)], catalogs, (444,)
+    )
+    assert universe["stores"] == {100, 200}
+    assert universe["from_fountain9"] == {100}
+    assert universe["schedule_only"] == {200}
+
+
+def test_sweep_restricted_to_planned_universe():
+    catalogs = make_catalogs(stock_base={(100, 10): 0.0, (200, 10): 0.0})
+    rows = m.build_catalog_universe_sweep_rows(
+        catalog_rows(100, 200), catalogs, set(), allowed_destinations={100}
+    )
+    assert [r["WAREHOUSE_DESTINATION"] for r in rows] == [100]

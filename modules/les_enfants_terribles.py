@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from collections.abc import Iterable
 from contextlib import redirect_stdout
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -3002,6 +3003,39 @@ def _coverage_stats(keys_with_qty: list[tuple[tuple[int, int], float]]) -> dict[
     }
 
 
+def scheduled_destinations_today(
+    catalogs, origins: Iterable[int]
+) -> set[int]:
+    """Tiendas que SCHEDULE marca con día válido HOY para al menos uno de
+    los orígenes seleccionados. Independiente del toggle de bloqueo por
+    SCHEDULE (schedule_block_enabled): aquí SCHEDULE se usa para saber qué
+    tiendas toca planear hoy, no para bloquear nada."""
+    origin_set = set(origins)
+    return {
+        destination
+        for (destination, source), days in catalogs.schedule_days.items()
+        if source in origin_set and catalogs.run_weekday_norm in days
+    }
+
+
+def build_planned_store_universe(
+    consolidated_keys: Iterable[tuple[int, int]],
+    catalogs,
+    origins: Iterable[int],
+) -> dict[str, set[int]]:
+    """Universo de tiendas "que se planean hoy": las que traen filas en el
+    Bulk de Fountain9 de esta corrida MÁS las que SCHEDULE marca con día
+    válido hoy aunque Fountain9 no las haya arrojado."""
+    from_fountain9 = {destination for destination, _sku in consolidated_keys}
+    from_schedule = scheduled_destinations_today(catalogs, origins)
+    return {
+        "stores": from_fountain9 | from_schedule,
+        "from_fountain9": from_fountain9,
+        "from_schedule": from_schedule,
+        "schedule_only": from_schedule - from_fountain9,
+    }
+
+
 def compute_fallback_duration_and_lead_time(
     duration_mode_by_store: dict[int, float],
     lead_time_mode_by_store: dict[int, float],
@@ -3062,6 +3096,7 @@ def build_catalog_universe_sweep_rows(
     catalogs,
     existing_keys: set[tuple[int, int]],
     kazuhira_active: bool = False,
+    allowed_destinations: set[int] | None = None,
 ) -> list[dict[str, Any]]:
     """Barrido de visibilidad: una fila por cada tienda-SKU de CATALOGO que
     NINGÚN engine tocó esta corrida (ni Fountain9, ni AVL/Preventivo/
@@ -3088,6 +3123,8 @@ def build_catalog_universe_sweep_rows(
         destination = row["WAREHOUSE_DESTINATION"]
         sku = row["RETAIL_ID"]
         key = (destination, sku)
+        if allowed_destinations is not None and destination not in allowed_destinations:
+            continue
         if key in existing_keys or key in seen_in_sweep:
             continue
         seen_in_sweep.add(key)
@@ -4632,6 +4669,7 @@ def apply_avl_fill(
     fallback_lead_time: float | None = None,
     ignore_task_budget: bool = False,
     ignore_store_capacity: bool = False,
+    allowed_destinations: set[int] | None = None,
 ) -> dict[str, Any]:
     """Usa tareas remanentes para stockouts, inventario preventivo, refuerzo
     de Golden/Infaltable/Anchor del catálogo, cobertura de quiebres sin
@@ -4649,6 +4687,13 @@ def apply_avl_fill(
     data``), porque no tiene mandato de garantía absoluta.
     ``ignore_task_budget``/``ignore_store_capacity``: solo relevantes para
     Kazuhira (el resto de los modos siempre respeta ambos límites).
+    ``allowed_destinations``: si se pasa, solo se evalúan esas tiendas
+    (Kazuhira: las del Bulk de Fountain9 de esta corrida + las que SCHEDULE
+    marca con día válido hoy). None = todas las del catálogo.
+
+    Kazuhira dispara cuando (stock + incoming + lo ya asignado en esta
+    corrida) / ADU efectivo < 1 DOH, no solo con stock = 0; una
+    combinación sin fila en STOCK cuenta como stock 0 (no se salta).
     """
     if candidate_mode not in {
         "stockout", "preventive", "special_doh", "no_fountain9_coverage",
@@ -4746,6 +4791,11 @@ def apply_avl_fill(
         destination = catalog_row["WAREHOUSE_DESTINATION"]
         sku = catalog_row["RETAIL_ID"]
         key = (destination, sku)
+        if allowed_destinations is not None and destination not in allowed_destinations:
+            summary["skipped_outside_universe"] = (
+                summary.get("skipped_outside_universe", 0) + 1
+            )
+            continue
         if sku in catalogs.excluded_products:
             continue
         if destination in closed_store_ids:
@@ -4759,9 +4809,14 @@ def apply_avl_fill(
             summary["skipped_blocked_city"] += 1
             continue
         if key not in catalogs.stock_base:
-            summary["skipped_missing_stock"] += 1
-            continue
-        destination_stock = max(float(catalogs.stock_base[key]), 0.0)
+            if candidate_mode != "kazuhira":
+                summary["skipped_missing_stock"] += 1
+                continue
+            # Garantía total: sin fila en STOCK = 0 unidades, no "sin dato".
+            summary["missing_stock_treated_as_zero"] = (
+                summary.get("missing_stock_treated_as_zero", 0) + 1
+            )
+        destination_stock = max(float(catalogs.stock_base.get(key, 0.0)), 0.0)
         adu = adu_by_key.get(key, 0.0)
         current_doh = destination_stock / adu if adu > 0 else math.inf
         priority_profile = engine.product_priority_profile(
@@ -4799,7 +4854,21 @@ def apply_avl_fill(
             # es solo lo ya asignado esta corrida (garantía total, sin
             # importar el origen del quiebre). Duration/Lead Time moda por
             # TIENDA sustituyen el DOH fijo de CODEC.
-            if destination_stock > 0:
+            effective_adu = adu if adu > 0 else FICTITIOUS_ADU_NO_FOUNTAIN9
+            incoming = max(catalogs.incoming_stock.get(key, 0.0), 0.0)
+            assigned_now = 0
+            if candidate_mode == "kazuhira":
+                # Disparador por posición: lo que ya hay + lo que viene +
+                # lo que otros engines ya mandaron en esta corrida. Si
+                # alcanza para al menos 1 DOH, no hace falta Kazuhira.
+                assigned_now = assigned_units_by_key.get(key, 0)
+                current_doh = (
+                    destination_stock + incoming + assigned_now
+                ) / effective_adu
+                if current_doh >= 1.0:
+                    summary["skipped_doh_sufficient"] += 1
+                    continue
+            elif destination_stock > 0:
                 summary["skipped_not_stockout"] += 1
                 continue
             duration_mode = duration_mode_by_store.get(destination)
@@ -4823,12 +4892,11 @@ def apply_avl_fill(
                     summary.get("skipped_no_duration_data", 0) + 1
                 )
                 continue
-            effective_adu = adu if adu > 0 else FICTITIOUS_ADU_NO_FOUNTAIN9
-            incoming = max(catalogs.incoming_stock.get(key, 0.0), 0.0)
             raw_target = (
                 effective_adu * (duration_mode + lead_time_mode)
                 - destination_stock
                 - incoming
+                - assigned_now
             )
             raw_target = max(raw_target, 0.0)
             if raw_target <= 0:
@@ -4875,7 +4943,13 @@ def apply_avl_fill(
                     summary.get("special_candidates_no_adu", 0) + 1
                 )
             summary["special_candidates"] += 1
-        if candidate_mode != "special_doh" and (
+        if candidate_mode == "kazuhira":
+            # Lo ya asignado cuenta como posición (ver arriba), no como
+            # exclusión: una sola unidad enviada no garantiza 1 DOH.
+            if key in excluded_key_set:
+                summary["skipped_already_served"] += 1
+                continue
+        elif candidate_mode != "special_doh" and (
             key in assigned_keys or key in excluded_key_set
         ):
             summary["skipped_already_served"] += 1
@@ -6621,6 +6695,12 @@ def execute_planning(
                     "presupuesto compartido."
                 )
 
+        # Tiendas que se planean hoy: las del Bulk de Fountain9 + las que
+        # SCHEDULE marca con día válido hoy. Lo usan Kazuhira y el barrido.
+        planned_store_universe = build_planned_store_universe(
+            consolidated_input.keys(), catalogs, config.origin_warehouses
+        )
+
         kazuhira_summary = empty_avl_summary(include_kazuhira_engine, 1.0)
         kazuhira_summary["mode"] = "kazuhira"
         if include_kazuhira_engine:
@@ -6666,6 +6746,16 @@ def execute_planning(
                 fallback_lead_time=kazuhira_fallback_lead_time,
                 ignore_task_budget=kazuhira_ignore_task_budget,
                 ignore_store_capacity=kazuhira_ignore_store_capacity,
+                allowed_destinations=planned_store_universe["stores"],
+            )
+            kazuhira_summary["universe_stores"] = len(
+                planned_store_universe["stores"]
+            )
+            kazuhira_summary["universe_from_fountain9"] = len(
+                planned_store_universe["from_fountain9"]
+            )
+            kazuhira_summary["universe_schedule_only"] = len(
+                planned_store_universe["schedule_only"]
             )
             result.warnings.append(
                 "Kazuhira Engine (garantía total): se agregaron "
@@ -6838,6 +6928,7 @@ def execute_planning(
                 catalogs,
                 existing_keys,
                 kazuhira_active=include_kazuhira_engine,
+                allowed_destinations=planned_store_universe["stores"],
             )
             result.base_rows.extend(sweep_rows)
 
@@ -9487,12 +9578,17 @@ def render_results(run: dict[str, Any]) -> None:
             unsafe_allow_html=True,
         )
         st.caption(
-            "Última pasada de todo el pipeline (después de Venom): cualquier "
-            "tienda-SKU del catálogo que siga con stock en cero, sin "
-            "importar si Fountain9 la recomendó. Misma fórmula que Cobertura "
-            "sin Fountain9, con promedio país de Duration/Lead Time cuando "
-            "la tienda no tiene dato propio. Lo que no se cubrió se explica "
-            "abajo — no hay quiebres 'olvidados', cada uno queda con motivo."
+            "Última pasada de todo el pipeline (después de Venom). Universo: "
+            f"{kazuhira.get('universe_stores', 0):,} tiendas que se planean "
+            f"hoy ({kazuhira.get('universe_from_fountain9', 0):,} del Bulk de "
+            f"Fountain9 + {kazuhira.get('universe_schedule_only', 0):,} que "
+            "solo aparecen en SCHEDULE con día válido). Cubre toda "
+            "tienda-SKU cuya posición (stock + incoming + lo ya asignado) "
+            "sea < 1 DOH; una combinación sin fila en STOCK cuenta como 0 "
+            f"({kazuhira.get('missing_stock_treated_as_zero', 0):,} en esta "
+            "corrida). Misma fórmula que Cobertura sin Fountain9, con "
+            "promedio país de Duration/Lead Time cuando la tienda no tiene "
+            "dato propio. Lo que no se cubrió se explica abajo."
         )
         render_kpi_cards(
             [
@@ -10633,11 +10729,12 @@ def render() -> None:
             eyebrow="ENGINE / 06 · GARANTÍA TOTAL",
             title="KAZUHIRA ENGINE",
             description=(
-                "Corre al final de todo, después de Venom. Cubre CUALQUIER "
-                "tienda-SKU del catálogo que siga en quiebre (stock=0), sin "
-                "importar si Fountain9 la recomendó o no — misma fórmula que "
-                "Cobertura sin Fountain9 (ADU × Duration+LeadTime), con "
-                "respaldo propio si la tienda nunca tuvo fila en el Bulk."
+                "Corre al final de todo, después de Venom. Sobre las tiendas "
+                "que se planean hoy (Bulk de Fountain9 + SCHEDULE con día "
+                "válido), cubre toda tienda-SKU del catálogo cuya posición "
+                "(stock + incoming + lo ya asignado) esté por debajo de 1 "
+                "DOH, sin importar si Fountain9 la recomendó. Sin fila en "
+                "STOCK cuenta como 0. Fórmula: ADU × (Duration+LeadTime)."
                 if not is_raiden
                 else "Bloqueado para el perfil Raiden."
             ),
