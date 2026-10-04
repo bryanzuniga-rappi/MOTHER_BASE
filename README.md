@@ -339,6 +339,12 @@ Cuando al menos uno de los 4 toggles de cobertura de Solidus está activo (AVL, 
 - Con stock > 0 (sano, nada que cubrir): `OK SIN NECESIDAD · FUERA DEL BULK DE FOUNTAIN9` — excluido de la tabla de Cortes (igual que "SIN RECOMENDACIÓN"), porque no es un corte real.
 - Con stock = 0 (quiebre que nadie evaluó): `QUIEBRE SIN EVALUAR · FUERA DE COBERTURA ACTIVA` — sí aparece en Cortes, con su propio `SWA_PERDIDO`, porque genuinamente es un hueco sin cubrir.
 
+**Dónde vive cada cosa (decisión de memoria).** Los *huecos* (quiebres sin cubrir, con su motivo) entran a `base_rows`: aparecen en el breakdown, en el Excel y en el SWA. Las filas *sanas* **no** se acumulan en memoria ni van al Excel: se cuentan en el Overview (`OK SIN NECESIDAD · FUERA DEL BULK DE FOUNTAIN9`) y se escriben en streaming a `Universo_Catalogo_Sin_Necesidad_<fecha>.csv`, dentro del zip. El barrido es un generador (`iter_catalog_universe_sweep_rows`); `build_catalog_universe_sweep_rows` es solo su versión en lista, para pruebas.
+
+**CATALOGO se carga una sola vez por corrida** (`ensure_catalog_rows` en `execute_planning`) y se reutiliza en AVL/Preventivo/Refuerzo, Kazuhira, el barrido, el chequeo de salud y SWA. Antes cada uno cargaba su propia copia completa, todas vivas hasta el final.
+
+Medición con datos sintéticos (85 % de las combinaciones con stock; Kazuhira activo; presupuesto de 5,000 tareas): a 500 mil combinaciones tienda-SKU, **206 s y 1,207 MB de pico antes; 66 s y 549 MB ahora**. A 1.2 millones: 159 s y 1,155 MB. Streamlit Community Cloud limita la memoria a aproximadamente 1 GB.
+
 Con los 4 toggles apagados (el estado por defecto), este barrido no corre — el reporte sigue reflejando únicamente lo que Fountain9 trajo, como siempre. Activar cualquiera de los 4 puede aumentar mucho el total de filas si el catálogo es grande (hay una advertencia visible en CODEC para esto).
 
 ### Shalashaska Engine

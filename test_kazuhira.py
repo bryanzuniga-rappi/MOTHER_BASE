@@ -457,8 +457,20 @@ def _reasons(rows, catalogs, config=CONFIG, **kwargs):
     return log
 
 
-def test_reason_healthy_when_position_reaches_one_doh():
+def test_healthy_with_positive_stock_is_not_logged():
+    """Con stock > 0 y >= 1 DOH no se guarda una entrada por SKU sano (en un
+    catálogo grande serían cientos de miles); el barrido ya lo trata como
+    sano por ausencia."""
     log = _reasons(catalog_rows(100, adu=1.0), _stock(5.0))
+    assert (100, 10) not in log
+
+
+def test_healthy_with_zero_stock_covered_by_incoming_is_logged():
+    """Stock 0 pero el incoming ya da >= 1 DOH: sin esta entrada el barrido
+    lo vería como quiebre."""
+    catalogs = _stock(0.0)
+    catalogs.incoming_stock[(100, 10)] = 3.0
+    log = _reasons(catalog_rows(100, adu=1.0), catalogs)
     assert log[(100, 10)] == m.KAZUHIRA_REASON_HEALTHY
 
 
@@ -587,5 +599,37 @@ def test_budget_exhausted_at_start_still_separates_healthy_from_pending():
     log = _reasons(
         catalog_rows(100, 200), catalogs, config, result=make_result(tasks_used=1)
     )
-    assert log[(100, 10)] == m.KAZUHIRA_REASON_HEALTHY
+    assert (100, 10) not in log  # sano: stock 50, sin entrada
     assert log[(200, 10)] == "SIN_TAREAS"
+
+
+# --- barrido en streaming (memoria) -------------------------------------------
+
+def test_sweep_iterator_is_lazy_and_matches_list_version():
+    catalogs = make_catalogs(stock_base={(100, 10): 0.0, (200, 10): 50.0})
+    it = m.iter_catalog_universe_sweep_rows(catalog_rows(100, 200), catalogs, set())
+    assert iter(it) is it  # generador: no materializa la lista
+    as_list = m.build_catalog_universe_sweep_rows(catalog_rows(100, 200), catalogs, set())
+    assert [r["TIPO_DE_CORTE"] for r in as_list] == [
+        m.CATALOG_UNIVERSE_UNCOVERED_CUT, m.CATALOG_UNIVERSE_HEALTHY_CUT
+    ]
+
+
+def test_sweep_does_not_remember_healthy_keys_but_dedupes_gaps():
+    catalogs = make_catalogs(stock_base={(100, 10): 0.0})
+    rows = m.build_catalog_universe_sweep_rows(
+        catalog_rows(100, 100), catalogs, set()
+    )
+    assert len(rows) == 1  # hueco duplicado -> una sola fila
+
+
+def test_swa_report_no_longer_keeps_one_row_per_stockout():
+    from tests.test_swa_report import make_catalogs as swa_catalogs
+    catalogs = swa_catalogs(
+        stock_base={(100, 10): 0}, swa_potential_gain={(100, 10): 1.0}
+    )
+    report = m.build_swa_report(
+        catalog_rows(100), catalogs, SimpleNamespace(allocation_rows=[])
+    )
+    assert "rows" not in report
+    assert report["casos_perdidos"] == 1

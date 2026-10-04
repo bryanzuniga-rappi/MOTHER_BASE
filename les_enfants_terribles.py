@@ -353,6 +353,18 @@ KAZUHIRA_UNCOVERED_LABELS: dict[str, str] = {
     "SIN_DURATION": "QUIEBRE NO CUBIERTO · SIN DURATION/LEAD TIME",
 }
 
+# Columnas del CSV de universo sano (filas que NO viven en base_rows).
+HEALTHY_UNIVERSE_COLUMNS = [
+    "WAREHOUSE_DESTINATION",
+    "WAREHOUSE_NAME",
+    "CITY",
+    "RETAIL_ID",
+    "PRODUCT_NAME",
+    "CATEGORY_NAME",
+    "PREDICTED_OPENING_INVENTORY",
+    "TIPO_DE_CORTE",
+]
+
 BREAKDOWN_ORDER = (
     "CORTE POR CIUDAD BLOQUEADA",
     "CORTE POR PRODUCTO RACKEADO 444",
@@ -3171,7 +3183,7 @@ def get_swa_potential_gain(catalogs, destination: int, sku: int) -> float:
     return catalogs.swa_potential_gain.get((destination, sku), 0.0)
 
 
-def build_catalog_universe_sweep_rows(
+def iter_catalog_universe_sweep_rows(
     catalog_rows: list[dict[str, Any]],
     catalogs,
     existing_keys: set[tuple[int, int]],
@@ -3200,7 +3212,6 @@ def build_catalog_universe_sweep_rows(
       evaluar — a diferencia de "sin recomendación" (que sí tuvo una fila
       de Fountain9), aquí puede que ni eso haya habido.
     """
-    rows: list[dict[str, Any]] = []
     seen_in_sweep: set[tuple[int, int]] = set()
     blocked_city_set = set(blocked_cities)
     for row in catalog_rows:
@@ -3222,7 +3233,6 @@ def build_catalog_universe_sweep_rows(
             continue
         if key in existing_keys or key in seen_in_sweep:
             continue
-        seen_in_sweep.add(key)
 
         destination_stock = max(catalogs.stock_base.get(key, 0.0), 0.0)
         store = catalogs.stores.get(destination, {})
@@ -3250,8 +3260,12 @@ def build_catalog_universe_sweep_rows(
             tipo_de_corte = CATALOG_UNIVERSE_UNCOVERED_CUT
             regla_demanda = CATALOG_UNIVERSE_UNCOVERED_REGLA
 
-        rows.append(
-            {
+        if tipo_de_corte != CATALOG_UNIVERSE_HEALTHY_CUT:
+            # Solo los huecos se recuerdan para deduplicar: guardar cada
+            # llave sana costaría cientos de MB en un catálogo grande, y
+            # load_avl_catalog_rows ya entrega una fila por tienda-SKU.
+            seen_in_sweep.add(key)
+        yield {
                 "WAREHOUSE_DESTINATION": destination,
                 "RETAIL_ID": sku,
                 "CITY": store.get("city", ""),
@@ -3265,9 +3279,21 @@ def build_catalog_universe_sweep_rows(
                 "PREDICTED_DEMAND": 0.0,
                 "PREDICTED_OPENING_INVENTORY": destination_stock,
                 "NET_INTER_STORE_TRANSFERS": 0.0,
-            }
-        )
-    return rows
+        }
+
+
+def build_catalog_universe_sweep_rows(
+    catalog_rows: list[dict[str, Any]],
+    catalogs,
+    existing_keys: set[tuple[int, int]],
+    **kwargs: Any,
+) -> list[dict[str, Any]]:
+    """Versión en lista de iter_catalog_universe_sweep_rows (tests y
+    catálogos chicos). En producción se usa el iterador para no guardar en
+    memoria las filas sanas."""
+    return list(
+        iter_catalog_universe_sweep_rows(catalog_rows, catalogs, existing_keys, **kwargs)
+    )
 
 
 def build_swa_report(
@@ -3305,7 +3331,6 @@ def build_swa_report(
     casos_ganados = 0
     casos_perdidos = 0
     casos_sin_swa_registrado = 0
-    detail_rows: list[dict[str, Any]] = []
 
     seen_keys: set[tuple[int, int]] = set()
     for row in catalog_rows:
@@ -3334,15 +3359,6 @@ def build_swa_report(
             swa_perdido += swa_value
             casos_perdidos += 1
 
-        detail_rows.append(
-            {
-                "WAREHOUSE_DESTINATION": destination,
-                "RETAIL_ID": sku,
-                "SWA_POTENTIAL_GAIN_COUNTRY": swa_value,
-                "UNIDADES_ASIGNADAS": int(total_assigned),
-                "GANADO": ganado,
-            }
-        )
 
     return {
         "enabled": bool(catalogs.swa_potential_gain),
@@ -3352,7 +3368,6 @@ def build_swa_report(
         "casos_perdidos": casos_perdidos,
         "casos_sin_swa_registrado": casos_sin_swa_registrado,
         "universo_total": casos_ganados + casos_perdidos,
-        "rows": detail_rows,
     }
 
 
@@ -4995,7 +5010,12 @@ def apply_avl_fill(
                 ) / effective_adu
                 if current_doh >= 1.0:
                     summary["skipped_doh_sufficient"] += 1
-                    log_skip(key, KAZUHIRA_REASON_HEALTHY)
+                    # Solo se registra si el stock es 0 (lo cubren incoming
+                    # o lo ya asignado): con stock > 0 el barrido ya lo
+                    # trata como sano sin necesidad de una entrada por
+                    # cada SKU sano del catálogo (cientos de miles).
+                    if destination_stock <= 0:
+                        log_skip(key, KAZUHIRA_REASON_HEALTHY)
                     continue
             elif destination_stock > 0:
                 summary["skipped_not_stockout"] += 1
@@ -6572,6 +6592,19 @@ def execute_planning(
 
         store_shares_cache: dict[int, float] | None = None
         catalog_fill_rows_cache: list[dict[str, Any]] | None = None
+
+        def ensure_catalog_rows() -> list[dict[str, Any]]:
+            """CATALOGO se carga UNA sola vez por corrida y se reutiliza en
+            AVL/Preventivo/Refuerzo, Kazuhira, el barrido, el chequeo de
+            salud y SWA. Antes cada uno cargaba su propia copia completa y
+            todas seguían vivas hasta el final de la función: con un
+            catálogo grande eso multiplica memoria y tiempo."""
+            nonlocal catalog_fill_rows_cache
+            if catalog_fill_rows_cache is None:
+                loaded_rows, loaded_warnings = load_avl_catalog_rows(data_path)
+                result.warnings.extend(loaded_warnings)
+                catalog_fill_rows_cache = loaded_rows
+            return catalog_fill_rows_cache
         shalashaska_summary = empty_shalashaska_summary(
             include_shalashaska_engine
         )
@@ -6624,11 +6657,7 @@ def execute_planning(
             or include_special_doh_fill
             or include_no_fountain9_coverage
         ):
-            if catalog_fill_rows_cache is None:
-                avl_catalog_rows, avl_warnings = load_avl_catalog_rows(data_path)
-                result.warnings.extend(avl_warnings)
-            else:
-                avl_catalog_rows = catalog_fill_rows_cache
+            avl_catalog_rows = ensure_catalog_rows()
             catalog_fill_rows = [
                 row
                 for row in avl_catalog_rows
@@ -6867,13 +6896,7 @@ def execute_planning(
             # Independiente de los 4 toggles de Solidus: puede estar
             # activo aunque todos ellos estén apagados, así que el
             # catálogo puede no estar cargado todavía en esta corrida.
-            if catalog_fill_rows_cache is None:
-                kazuhira_catalog_rows, kazuhira_catalog_warnings = (
-                    load_avl_catalog_rows(data_path)
-                )
-                result.warnings.extend(kazuhira_catalog_warnings)
-            else:
-                kazuhira_catalog_rows = catalog_fill_rows_cache
+            kazuhira_catalog_rows = ensure_catalog_rows()
             kazuhira_duration_by_store = consolidation_summary.get(
                 "duration_mode_by_store", {}
             )
@@ -6974,9 +6997,7 @@ def execute_planning(
             catalogs,
             config,
         )
-        health_check_catalog_rows, _health_check_warnings = load_avl_catalog_rows(
-            data_path
-        )
+        health_check_catalog_rows = ensure_catalog_rows()
         golden_health_check = build_golden_infaltable_anchor_health_check(
             result,
             catalogs,
@@ -7097,6 +7118,8 @@ def execute_planning(
         # para que estas filas también reciban PRODUCT_NAME/CATEGORY_NAME/
         # SWA, y ANTES de status_counts/status_swa, para que el universo
         # completo cuente ahí también.
+        sweep_healthy_count = 0
+        sweep_healthy_path: Path | None = None
         if (
             include_avl_fill
             or include_preventive_fill
@@ -7104,28 +7127,57 @@ def execute_planning(
             or include_no_fountain9_coverage
             or include_kazuhira_engine
         ):
-            if catalog_fill_rows_cache is None:
-                sweep_catalog_rows, sweep_warnings = load_avl_catalog_rows(
-                    data_path
-                )
-                result.warnings.extend(sweep_warnings)
-            else:
-                sweep_catalog_rows = catalog_fill_rows_cache
+            sweep_catalog_rows = ensure_catalog_rows()
             existing_keys = {
                 (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"])
                 for row in result.base_rows
             }
-            sweep_rows = build_catalog_universe_sweep_rows(
-                sweep_catalog_rows,
-                catalogs,
-                existing_keys,
-                kazuhira_active=include_kazuhira_engine,
-                allowed_destinations=planned_store_universe["stores"],
-                skip_reasons=kazuhira_skip_reasons,
-                closed_store_ids=engine_blocked_store_ids,
-                blocked_cities=blocked_cities,
+            # Los HUECOS (quiebres sin cubrir) entran a base_rows: son lo
+            # que hay que atender y deben verse en breakdown/Excel. Las
+            # filas SANAS (cientos de miles en un catálogo grande) NO se
+            # acumulan en memoria ni van al Excel — se cuentan y se
+            # escriben directo a un CSV, así el universo completo sigue
+            # siendo visible y descargable sin tumbar la sesión.
+            output_dir.mkdir(parents=True, exist_ok=True)
+            sweep_healthy_path = output_dir / (
+                f"Universo_Catalogo_Sin_Necesidad_{run_date:%d-%m-%Y}.csv"
             )
-            result.base_rows.extend(sweep_rows)
+            sweep_gap_rows: list[dict[str, Any]] = []
+            with sweep_healthy_path.open(
+                "w", newline="", encoding="utf-8-sig"
+            ) as healthy_handle:
+                healthy_writer = csv.DictWriter(
+                    healthy_handle,
+                    fieldnames=HEALTHY_UNIVERSE_COLUMNS,
+                    extrasaction="ignore",
+                )
+                healthy_writer.writeheader()
+                for sweep_row in iter_catalog_universe_sweep_rows(
+                    sweep_catalog_rows,
+                    catalogs,
+                    existing_keys,
+                    kazuhira_active=include_kazuhira_engine,
+                    allowed_destinations=planned_store_universe["stores"],
+                    skip_reasons=kazuhira_skip_reasons,
+                    closed_store_ids=engine_blocked_store_ids,
+                    blocked_cities=blocked_cities,
+                ):
+                    if sweep_row["TIPO_DE_CORTE"] == CATALOG_UNIVERSE_HEALTHY_CUT:
+                        product_info = catalogs.product_catalog.get(
+                            sweep_row["RETAIL_ID"], {}
+                        )
+                        sweep_row["PRODUCT_NAME"] = product_info.get(
+                            "PRODUCT_NAME", ""
+                        )
+                        sweep_row["CATEGORY_NAME"] = product_info.get(
+                            "CATEGORY_NAME", ""
+                        )
+                        healthy_writer.writerow(sweep_row)
+                        sweep_healthy_count += 1
+                    else:
+                        sweep_gap_rows.append(sweep_row)
+            result.base_rows.extend(sweep_gap_rows)
+            del sweep_gap_rows
 
         # Nombre + categoría del producto en todos los entregables (hoja
         # DATA, por SYNC_ID). Se hace UNA sola vez, sobre las dos listas
@@ -7141,6 +7193,10 @@ def execute_planning(
             output_dir,
         )
         local_files = [Path(path) for path in local_files]
+        if sweep_healthy_path is not None and sweep_healthy_count:
+            local_files.append(sweep_healthy_path)
+        elif sweep_healthy_path is not None:
+            sweep_healthy_path.unlink(missing_ok=True)
         fountain9_zero_path = output_dir / (
             f"Fountain9_Sin_Recomendacion_{run_date:%d-%m-%Y}.csv"
         )
@@ -7193,16 +7249,12 @@ def execute_planning(
         # algún engine de cobertura está activo — reusa el catálogo si ya
         # se cargó para otro propósito en esta corrida, si no, lo carga
         # aparte solo para esto.
-        if catalog_fill_rows_cache is None:
-            swa_catalog_rows, swa_catalog_warnings = load_avl_catalog_rows(
-                data_path
-            )
-            result.warnings.extend(swa_catalog_warnings)
-        else:
-            swa_catalog_rows = catalog_fill_rows_cache
+        swa_catalog_rows = ensure_catalog_rows()
         swa_report = build_swa_report(
             swa_catalog_rows, catalogs, result, insumos_summary
         )
+        if sweep_healthy_count:
+            status_counts[CATALOG_UNIVERSE_HEALTHY_CUT] += sweep_healthy_count
         if closed_summary["requirements"]:
             status_counts["CORTE POR TIENDA CERRADA"] += closed_summary[
                 "requirements"
@@ -10547,10 +10599,11 @@ def render() -> None:
             st.caption(
                 "⚠️ Activar cualquiera de estos 4 también activa el barrido "
                 "de universo completo de CATALOGO: toda tienda-SKU que "
-                "ningún engine toque (sana o en quiebre sin cubrir) "
-                "aparecerá como fila de solo visibilidad en el reporte, "
-                "sin consumir stock/tareas. Puede aumentar mucho el total "
-                "de filas si el catálogo es grande."
+                "ningún engine toque queda declarada: los huecos (quiebres "
+                "sin cubrir, con su motivo) van al reporte y al Excel; las "
+                "tiendas-SKU sanas se cuentan en el Overview y se listan en "
+                "un CSV aparte (Universo_Catalogo_Sin_Necesidad), sin "
+                "consumir stock/tareas ni saturar la memoria."
             )
             avl_left, preventive_mid, special_right, no_f9_right = st.columns(4)
             with avl_left:
@@ -11086,6 +11139,7 @@ def render() -> None:
             or include_shalashaska_engine
             or include_liquid_engine
             or include_venom_engine
+            or include_kazuhira_engine
         ):
             st.error("Activa al menos un engine para ejecutar la misión.")
             st.stop()
