@@ -669,3 +669,47 @@ def test_swa_report_no_longer_keeps_one_row_per_stockout():
     )
     assert "rows" not in report
     assert report["casos_perdidos"] == 1
+
+
+# --- prioridad por SWA cuando falta capacidad ----------------------------------
+
+def _two_skus_one_fits(**extra):
+    """Capacidad para UNA sola línea de 16 unidades (16 m³ por línea)."""
+    catalogs = make_catalogs(
+        volume_m3={10: 1.0, 11: 1.0},
+        store_capacity={100: 16.0},
+        stock_base={(444, 10): 1000.0, (444, 11): 1000.0, (100, 10): 0.0, (100, 11): 0.0},
+        **extra,
+    )
+    rows = [
+        {"WAREHOUSE_DESTINATION": 100, "RETAIL_ID": 10, "ADU": 2.0},
+        {"WAREHOUSE_DESTINATION": 100, "RETAIL_ID": 11, "ADU": 2.0},
+    ]
+    return catalogs, rows
+
+
+def _sent_skus(result):
+    return {r["RETAIL_ID"] for r in result.allocation_rows}
+
+
+def test_swa_priority_off_keeps_default_order():
+    catalogs, rows = _two_skus_one_fits(swa_potential_gain={(100, 11): 9.0})
+    result = make_result()
+    run_kazuhira(result, rows, catalogs)
+    assert _sent_skus(result) == {10}     # orden por SKU, no por SWA
+
+
+def test_swa_priority_on_serves_highest_swa_first_when_capacity_is_short():
+    catalogs, rows = _two_skus_one_fits(swa_potential_gain={(100, 11): 9.0})
+    result = make_result()
+    summary = run_kazuhira(result, rows, catalogs, swa_priority=True)
+    assert _sent_skus(result) == {11}
+    assert summary["cases_sent"] == 1
+
+
+def test_swa_priority_changes_nothing_without_scarcity():
+    catalogs, rows = _two_skus_one_fits(swa_potential_gain={(100, 11): 9.0})
+    catalogs.store_capacity[100] = 1000.0
+    result = make_result()
+    run_kazuhira(result, rows, catalogs, swa_priority=True)
+    assert _sent_skus(result) == {10, 11}

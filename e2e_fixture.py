@@ -55,6 +55,8 @@ def build_workbook_bytes(
     origin_stock: float = 100000.0,
     destination_stock: dict[tuple[int, int], float] | None = None,
     adu: float = 1.0,
+    incoming: dict[tuple[int, int], float] | None = None,
+    incoming_column: str | None = "INCOMING_TR",
 ) -> bytes:
     destination_stock = destination_stock or {}
     wb = openpyxl.Workbook(write_only=True)
@@ -76,12 +78,19 @@ def build_workbook_bytes(
         "CATALOGO", ["WAREHOUSE_ID", "PRODUCT_ID", "ADU"],
         ((store, sku, adu) for store in stores for sku in skus),
     )
+    incoming = incoming or {}
     stock_rows = [(origin, sku, origin_stock) for sku in skus]
     stock_rows += (
         (store, sku, destination_stock.get((store, sku), 0.0))
         for store in stores for sku in skus
     )
-    sheet("STOCK", ["WAREHOUSE_ID", "PRODUCT_ID", "STOCK_DISPONIBLE_FINAL"], stock_rows)
+    stock_headers = ["WAREHOUSE_ID", "PRODUCT_ID", "STOCK_DISPONIBLE_FINAL"]
+    if incoming_column:
+        stock_headers.append(incoming_column)
+        stock_rows = [
+            (*row, incoming.get((row[0], row[1]), 0.0)) for row in stock_rows
+        ]
+    sheet("STOCK", stock_headers, stock_rows)
     sheet(
         "SCHEDULE", ["CITY", "WAREHOUSE_ID", "WAREHOUSE_NAME", "ORIGEN", "DAYS"],
         ((stores[s], s, f"S{s}", origin, ALL_DAYS) for s in schedule_only_stores),

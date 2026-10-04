@@ -126,3 +126,44 @@ def test_explain_reports_units_and_reason_for_a_sent_line():
     info = m.explain_store_sku(run["zip"], 300, 11)
     assert info["verdict"].startswith("SE ENVIÓ: 8")
     assert info["sent"][0]["MOTIVO"] == m.PLANNING_REASON_KAZUHIRA
+
+
+# --- incoming: la columna real de DATA_TRANSFERS es INCOMING_TR --------------------
+
+def _load_catalogs_from(workbook_bytes, tmp_path):
+    path = tmp_path / "dt.xlsx"
+    path.write_bytes(workbook_bytes)
+    config = engine.Config(origin_warehouses=(444,), max_tasks=100)
+    return engine.load_catalogs(path, config)
+
+
+def test_incoming_tr_column_is_read(tmp_path):
+    wb = build_workbook_bytes(STORES, SKUS, incoming={(100, 11): 7.0}, incoming_column="INCOMING_TR")
+    catalogs = _load_catalogs_from(wb, tmp_path)
+    assert catalogs.incoming_stock[(100, 11)] == 7.0
+
+
+def test_legacy_incoming_column_name_still_works(tmp_path):
+    wb = build_workbook_bytes(STORES, SKUS, incoming={(100, 11): 4.0}, incoming_column="INCOMING")
+    catalogs = _load_catalogs_from(wb, tmp_path)
+    assert catalogs.incoming_stock[(100, 11)] == 4.0
+
+
+def test_missing_incoming_column_means_no_incoming(tmp_path):
+    wb = build_workbook_bytes(STORES, SKUS, incoming_column=None)
+    catalogs = _load_catalogs_from(wb, tmp_path)
+    assert len(catalogs.incoming_stock) == 0
+
+
+def test_incoming_suppresses_kazuhira_end_to_end():
+    """(100, 11) tiene 3 de incoming con ADU 1 => 3 DOH: no hace falta
+    enviar. Antes de leer INCOMING_TR se enviaban 8 unidades de más."""
+    run = _run(
+        database_bytes=build_workbook_bytes(
+            STORES, SKUS, schedule_only_stores={300},
+            destination_stock={(101, 12): 50.0}, incoming={(100, 11): 3.0},
+        )
+    )
+    lines = _bulk_lines(run)
+    assert (100, 11) not in lines
+    assert lines[(100, 12)] == 8        # sin incoming sigue cubriéndose

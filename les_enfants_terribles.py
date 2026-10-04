@@ -4903,6 +4903,7 @@ def apply_avl_fill(
     allowed_destinations: set[int] | None = None,
     duration_source_by_store: dict[int, str] | None = None,
     skip_reasons: dict[tuple[int, int], str] | None = None,
+    swa_priority: bool = False,
 ) -> dict[str, Any]:
     """Usa tareas remanentes para stockouts, inventario preventivo, refuerzo
     de Golden/Infaltable/Anchor del catálogo, cobertura de quiebres sin
@@ -4923,6 +4924,11 @@ def apply_avl_fill(
     ``allowed_destinations``: si se pasa, solo se evalúan esas tiendas
     (Kazuhira: las del Bulk de Fountain9 de esta corrida + las que SCHEDULE
     marca con día válido hoy). None = todas las del catálogo.
+
+    ``swa_priority``: si es True, cuando tareas o capacidad no alcanzan para
+    todos, se atiende primero lo que más SWA país recupera
+    (SWA_POTENTIAL_GAIN_COUNTRY, hoja SWA) en vez del orden por prioridad
+    de producto/tienda. Apagado por defecto: no cambia nada si no se pide.
 
     ``skip_reasons``: si se pasa un dict, se llena con el motivo por el que
     cada tienda-SKU evaluada NO se cubrió (llaves de KAZUHIRA_UNCOVERED_
@@ -5274,6 +5280,13 @@ def apply_avl_fill(
 
     candidates.sort(
         key=lambda row: (
+            (
+                -catalogs.swa_potential_gain.get(
+                    (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"]), 0.0
+                )
+                if swa_priority
+                else 0.0
+            ),
             row["PRODUCT_PRIORITY_RANK"],
             row["PRIORITY"],
             row["CURRENT_DOH"],
@@ -6407,6 +6420,7 @@ def execute_planning(
     include_kazuhira_engine: bool = False,
     kazuhira_ignore_task_budget: bool = False,
     kazuhira_ignore_store_capacity: bool = False,
+    kazuhira_swa_priority: bool = False,
     venom_origins: tuple[int, ...] = (),
     venom_destinations: tuple[int, ...] = (),
     venom_section_types: frozenset[str] = frozenset(),
@@ -7062,6 +7076,7 @@ def execute_planning(
                 allowed_destinations=planned_store_universe["stores"],
                 duration_source_by_store=kazuhira_duration_source,
                 skip_reasons=kazuhira_skip_reasons,
+                swa_priority=kazuhira_swa_priority,
             )
             annotate_base_rows_with_kazuhira_reasons(
                 result.base_rows, kazuhira_skip_reasons
@@ -10653,6 +10668,7 @@ def render() -> None:
     st.session_state.setdefault("mb_engine_kazuhira_enabled", False)
     st.session_state.setdefault("mb_kazuhira_ignore_task_budget", False)
     st.session_state.setdefault("mb_kazuhira_ignore_store_capacity", False)
+    st.session_state.setdefault("mb_kazuhira_swa_priority", False)
 
     with st.container(border=True, key="engine_naked_module"):
         include_naked_engine = bool(
@@ -11175,6 +11191,7 @@ def render() -> None:
             )
             kazuhira_ignore_task_budget = False
             kazuhira_ignore_store_capacity = False
+            kazuhira_swa_priority = False
         elif include_kazuhira_engine:
             st.warning(
                 "⚠️ Kazuhira busca cubrir TODO el universo de catálogo en "
@@ -11216,9 +11233,22 @@ def render() -> None:
                 st.session_state["mb_kazuhira_ignore_store_capacity"] = (
                     kazuhira_ignore_store_capacity
                 )
+            kazuhira_swa_priority = st.toggle(
+                "Priorizar por SWA cuando falte capacidad o tareas",
+                value=bool(st.session_state["mb_kazuhira_swa_priority"]),
+                help=(
+                    "Cuando la capacidad de la tienda o el presupuesto de "
+                    "tareas no alcanzan para todos los quiebres, atiende "
+                    "primero los que más SWA país recuperan (hoja SWA) en "
+                    "vez del orden por prioridad de producto/tienda. No "
+                    "cambia nada si no hay escasez."
+                ),
+            )
+            st.session_state["mb_kazuhira_swa_priority"] = kazuhira_swa_priority
         else:
             kazuhira_ignore_task_budget = False
             kazuhira_ignore_store_capacity = False
+            kazuhira_swa_priority = False
             st.caption(
                 "Kazuhira Engine está apagado. Ningún quiebre adicional se "
                 "cubrirá más allá de lo que ya hagan los demás engines."
@@ -11451,6 +11481,7 @@ def render() -> None:
                     include_kazuhira_engine=include_kazuhira_engine,
                     kazuhira_ignore_task_budget=kazuhira_ignore_task_budget,
                     kazuhira_ignore_store_capacity=kazuhira_ignore_store_capacity,
+                    kazuhira_swa_priority=kazuhira_swa_priority,
                     venom_origins=tuple(venom_origins),
                     venom_destinations=tuple(venom_destinations),
                     venom_section_types=frozenset(venom_section_types) - {"OOWL"},

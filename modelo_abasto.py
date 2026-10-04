@@ -55,6 +55,9 @@ class Config:
 CONFIG = Config()
 
 
+# Columnas aceptadas para el incoming de la hoja STOCK, en orden de preferencia.
+STOCK_INCOMING_COLUMN_ALIASES = ("INCOMING_TR", "INCOMING")
+
 OUTPUT_COLUMNS = [
     "WAREHOUSE_DESTINATION",
     "WAREHOUSE_SOURCE",
@@ -940,10 +943,22 @@ def load_catalogs(
         # traen en su STOCK.
         stock_required = ["WAREHOUSE_ID", "PRODUCT_ID", "STOCK_DISPONIBLE_FINAL"]
         _, stock_header_positions = find_header_row(workbook["STOCK"], stock_required)
-        has_incoming_column = normalize_header("INCOMING") in stock_header_positions
+        # El nombre real en DATA_TRANSFERS es INCOMING_TR (transferencias en
+        # camino); INCOMING se conserva como alias por compatibilidad. Antes
+        # solo se buscaba "INCOMING", así que con INCOMING_TR en la hoja el
+        # incoming de TODO el sistema quedaba silenciosamente en 0.
+        incoming_column = next(
+            (
+                alias
+                for alias in STOCK_INCOMING_COLUMN_ALIASES
+                if normalize_header(alias) in stock_header_positions
+            ),
+            None,
+        )
+        has_incoming_column = incoming_column is not None
         stock_selected = list(stock_required)
         if has_incoming_column:
-            stock_selected.append("INCOMING")
+            stock_selected.append(incoming_column)
 
         stock_base: dict[tuple[int, int], float] = {}
         incoming_stock: dict[tuple[int, int], float] = defaultdict(float)
@@ -958,7 +973,7 @@ def load_catalogs(
             put_unique(stock_base, (warehouse, sku), stock, warnings, "STOCK", "min")
             if has_incoming_column:
                 incoming_stock[(warehouse, sku)] += max(
-                    to_float(row.get("INCOMING")), 0.0
+                    to_float(row.get(incoming_column)), 0.0
                 )
 
         owner_stock: dict[tuple[int, int, str], int] = defaultdict(int)
