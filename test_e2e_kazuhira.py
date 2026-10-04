@@ -199,3 +199,24 @@ def test_run_is_stamped_with_the_engine_build():
     run = _run()
     assert run["build"] == m.APP_BUILD
     assert run["warnings"][0] == f"Versión del motor: {m.APP_BUILD}."
+
+
+def test_excel_carries_motivo_column_and_build_stamp():
+    """Dos huellas para identificar con qué código se generó un Excel: la
+    columna MOTIVO_KAZUHIRA en BASE_TRANSFERS (desde la v4, siempre que
+    Kazuhira corre) y el sello de versión en RESUMEN."""
+    import io, zipfile
+    import openpyxl
+    run = _run()
+    with zipfile.ZipFile(run["zip"]) as archive:
+        name = next(n for n in archive.namelist() if n.endswith(".xlsx"))
+        workbook = openpyxl.load_workbook(
+            io.BytesIO(archive.read(name)), read_only=True, data_only=True
+        )
+        header = next(workbook["BASE_TRANSFERS"].iter_rows(values_only=True))
+        resumen = " | ".join(
+            str(cell) for row in workbook["RESUMEN"].iter_rows(values_only=True)
+            for cell in row if cell
+        )
+    assert "MOTIVO_KAZUHIRA" in header
+    assert m.APP_BUILD in resumen
