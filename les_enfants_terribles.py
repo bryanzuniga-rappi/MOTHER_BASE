@@ -321,6 +321,15 @@ CATALOG_UNIVERSE_UNCOVERED_REGLA = "CATALOGO_QUIEBRE_SIN_EVALUAR"
 # declara aparte de "sin evaluar" para que nada quede ambiguo.
 CATALOG_UNIVERSE_POST_KAZUHIRA_CUT = "QUIEBRE NO CUBIERTO · EVALUADO POR KAZUHIRA"
 CATALOG_UNIVERSE_POST_KAZUHIRA_REGLA = "CATALOGO_QUIEBRE_POST_KAZUHIRA"
+# Quiebres que ningún engine puede cubrir por una regla de configuración, no
+# por falta de stock: antes se omitían en silencio (producto excluido) o
+# ni siquiera dejaban rastro (tienda sin registro en TIENDA).
+CATALOG_UNIVERSE_EXCLUDED_PRODUCT_CUT = (
+    "QUIEBRE NO CUBIERTO · PRODUCTO EXCLUIDO (BLOQUEOS O CODEC)"
+)
+CATALOG_UNIVERSE_EXCLUDED_PRODUCT_REGLA = "CATALOGO_PRODUCTO_EXCLUIDO"
+CATALOG_UNIVERSE_NO_STORE_CUT = "QUIEBRE NO CUBIERTO · TIENDA SIN REGISTRO EN TIENDA"
+CATALOG_UNIVERSE_NO_STORE_REGLA = "CATALOGO_TIENDA_SIN_REGISTRO"
 
 # Kazuhira: última pasada del pipeline completo (después de Venom), no un
 # toggle más de Solidus. Mandato distinto por diseño — "ni una sola
@@ -385,6 +394,8 @@ BREAKDOWN_ORDER = (
     KAZUHIRA_CUT,
     "SIN RECOMENDACIÓN",
     *KAZUHIRA_UNCOVERED_LABELS.values(),
+    CATALOG_UNIVERSE_EXCLUDED_PRODUCT_CUT,
+    CATALOG_UNIVERSE_NO_STORE_CUT,
     CATALOG_UNIVERSE_POST_KAZUHIRA_CUT,
     CATALOG_UNIVERSE_UNCOVERED_CUT,
     CATALOG_UNIVERSE_HEALTHY_CUT,
@@ -3063,6 +3074,97 @@ def build_planned_store_universe(
     }
 
 
+def explain_store_sku(zip_path, store: int, sku: int) -> dict[str, Any]:
+    """Responde "¿qué pasó con este SKU en esta tienda?" leyendo lo que ya
+    quedó en el zip de la corrida (no necesita el estado en memoria):
+    líneas enviadas (BulkCD_*.csv), filas declaradas (BASE_TRANSFERS) y
+    universo sano (CSV aparte). Si no aparece en NINGUNO, lo dice
+    explícitamente: es un hueco sin declarar, justo lo que no debe pasar."""
+    result: dict[str, Any] = {
+        "store": store, "sku": sku, "sent": [], "declared": [],
+        "healthy": None, "verdict": "",
+    }
+    with zipfile.ZipFile(zip_path) as archive:
+        names = archive.namelist()
+        for name in names:
+            base = Path(name).name
+            if base.startswith("BulkCD_") and base.endswith(".csv"):
+                text = archive.read(name).decode("utf-8-sig", errors="replace")
+                for row in csv.DictReader(io.StringIO(text)):
+                    if (
+                        str(row.get("WAREHOUSE_DESTINATION", "")).strip() == str(store)
+                        and str(row.get("RETAIL_ID", "")).strip() == str(sku)
+                    ):
+                        result["sent"].append(
+                            {
+                                "ARCHIVO": base,
+                                "ORIGEN": row.get("WAREHOUSE_SOURCE"),
+                                "UNIDADES": row.get("QUANTITY"),
+                                "MOTIVO": row.get("PLANNING_REASON", ""),
+                            }
+                        )
+            elif base.startswith("Universo_Catalogo_Sin_Necesidad") and base.endswith(".csv"):
+                with archive.open(name) as handle:
+                    reader = csv.DictReader(
+                        io.TextIOWrapper(handle, encoding="utf-8-sig", newline="")
+                    )
+                    for row in reader:
+                        if (
+                            str(row.get("WAREHOUSE_DESTINATION", "")).strip() == str(store)
+                            and str(row.get("RETAIL_ID", "")).strip() == str(sku)
+                        ):
+                            result["healthy"] = {
+                                "STOCK": row.get("PREDICTED_OPENING_INVENTORY"),
+                                "ESTADO": row.get("TIPO_DE_CORTE"),
+                            }
+                            break
+            elif base.endswith(".xlsx"):
+                workbook = openpyxl.load_workbook(
+                    io.BytesIO(archive.read(name)), read_only=True, data_only=True
+                )
+                try:
+                    if "BASE_TRANSFERS" in workbook.sheetnames:
+                        rows = workbook["BASE_TRANSFERS"].iter_rows(values_only=True)
+                        headers = list(next(rows, ()) or ())
+                        position = {h: i for i, h in enumerate(headers)}
+                        wanted = (
+                            "TIPO_DE_CORTE", "DETALLE_MOTIVO", "MOTIVO_KAZUHIRA",
+                            "REGLA_DEMANDA", "CANTIDAD_OBJETIVO", "CANTIDAD_ASIGNADA",
+                        )
+                        d_idx = position.get("WAREHOUSE_DESTINATION")
+                        s_idx = position.get("RETAIL_ID")
+                        if d_idx is not None and s_idx is not None:
+                            for row in rows:
+                                if row[d_idx] == store and row[s_idx] == sku:
+                                    result["declared"].append(
+                                        {
+                                            h: row[position[h]]
+                                            for h in wanted
+                                            if h in position
+                                        }
+                                    )
+                finally:
+                    workbook.close()
+
+    if result["sent"]:
+        total = sum(int(float(item["UNIDADES"] or 0)) for item in result["sent"])
+        result["verdict"] = f"SE ENVIÓ: {total:,} unidades en {len(result['sent'])} línea(s)."
+    elif result["declared"]:
+        result["verdict"] = "NO SE ENVIÓ, y la corrida declara por qué (ver detalle)."
+    elif result["healthy"]:
+        result["verdict"] = "SANO: no necesitaba envío (ver stock)."
+    else:
+        result["verdict"] = (
+            "SIN RASTRO: no aparece enviado, declarado ni como sano. Es un "
+            "hueco sin declarar. Revisa, en este orden: (1) ¿Kazuhira o algún "
+            "engine de cobertura estaba activo? Sin ninguno, el barrido no "
+            "corre. (2) ¿La tienda está en el Bulk de Fountain9 o en SCHEDULE "
+            "con día válido hoy? (3) ¿La tienda-SKU está en la hoja CATALOGO? "
+            "(4) ¿La tienda está cerrada o en una ciudad bloqueada?"
+        )
+    return result
+
+
 def kazuhira_reason_text(reason: str | None) -> str:
     """Texto corto del motivo por el que Kazuhira no cubrió una tienda-SKU
     (vacío si no aplica o si era SANO — no es un hueco)."""
@@ -3224,8 +3326,6 @@ def iter_catalog_universe_sweep_rows(
         # reportan por sus propios resúmenes: no son huecos de cobertura.
         if closed_store_ids and destination in closed_store_ids:
             continue
-        if sku in catalogs.excluded_products:
-            continue
         if blocked_city_set and (
             catalogs.stores.get(destination, {}).get("city_norm", "")
             in blocked_city_set
@@ -3242,7 +3342,13 @@ def iter_catalog_universe_sweep_rows(
         kazuhira_reason = (
             skip_reasons.get(key) if (kazuhira_active and skip_reasons) else None
         )
-        if kazuhira_reason == KAZUHIRA_REASON_HEALTHY:
+        if destination_stock <= 0 and sku in catalogs.excluded_products:
+            tipo_de_corte = CATALOG_UNIVERSE_EXCLUDED_PRODUCT_CUT
+            regla_demanda = CATALOG_UNIVERSE_EXCLUDED_PRODUCT_REGLA
+        elif destination_stock <= 0 and destination not in catalogs.stores:
+            tipo_de_corte = CATALOG_UNIVERSE_NO_STORE_CUT
+            regla_demanda = CATALOG_UNIVERSE_NO_STORE_REGLA
+        elif kazuhira_reason == KAZUHIRA_REASON_HEALTHY:
             tipo_de_corte = CATALOG_UNIVERSE_HEALTHY_CUT
             regla_demanda = CATALOG_UNIVERSE_HEALTHY_REGLA
         elif kazuhira_reason is not None:
@@ -4940,12 +5046,18 @@ def apply_avl_fill(
             )
             continue
         if sku in catalogs.excluded_products:
+            summary["skipped_excluded_product"] = (
+                summary.get("skipped_excluded_product", 0) + 1
+            )
             continue
         if destination in closed_store_ids:
             summary["skipped_closed_store"] += 1
             continue
         store = catalogs.stores.get(destination)
         if not store:
+            summary["skipped_store_not_registered"] = (
+                summary.get("skipped_store_not_registered", 0) + 1
+            )
             continue
         city_norm = store.get("city_norm", "")
         if city_norm in blocked_city_set:
@@ -8812,6 +8924,41 @@ def render_results(run: dict[str, Any]) -> None:
             mime="application/zip",
             use_container_width=True,
         )
+
+        with st.expander("¿Por qué no salió este SKU en esta tienda? · consulta puntual"):
+            st.caption(
+                "Busca la tienda-SKU en lo que ya quedó en el zip de esta "
+                "corrida: líneas enviadas, filas declaradas (con su motivo) "
+                "y universo sano. Si no aparece en ninguno, te lo dice — "
+                "eso sería un hueco sin declarar."
+            )
+            query_store_col, query_sku_col = st.columns(2)
+            with query_store_col:
+                query_store = st.number_input(
+                    "Tienda (WAREHOUSE_ID)", min_value=0, step=1, value=0,
+                    key="explain_store_id",
+                )
+            with query_sku_col:
+                query_sku = st.number_input(
+                    "SKU (RETAIL_ID)", min_value=0, step=1, value=0,
+                    key="explain_sku_id",
+                )
+            if st.button("Consultar", key="explain_store_sku_button") and query_store and query_sku:
+                with st.spinner("Buscando en los archivos de la corrida…"):
+                    explanation = explain_store_sku(zip_path, int(query_store), int(query_sku))
+                if explanation["sent"]:
+                    st.success(explanation["verdict"])
+                    st.dataframe(explanation["sent"], use_container_width=True)
+                elif explanation["declared"] or explanation["healthy"]:
+                    st.info(explanation["verdict"])
+                else:
+                    st.error(explanation["verdict"])
+                if explanation["declared"]:
+                    st.markdown("**Declarado en BASE_TRANSFERS:**")
+                    st.dataframe(explanation["declared"], use_container_width=True)
+                if explanation["healthy"]:
+                    st.markdown("**Universo sano:**")
+                    st.json(explanation["healthy"])
 
         st.markdown('<span class="section-label">ARCHIVOS INDIVIDUALES</span>', unsafe_allow_html=True)
 

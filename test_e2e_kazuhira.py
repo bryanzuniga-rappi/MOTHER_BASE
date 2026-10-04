@@ -99,3 +99,30 @@ def test_run_without_kazuhira_has_no_healthy_csv():
     run = _run(include_kazuhira_engine=False, include_avl_fill=False)
     names = read_zip_names(run["zip"])
     assert not any("Universo_Catalogo_Sin_Necesidad" in n for n in names)
+
+
+# --- explain_store_sku: "¿por qué no salió X en la tienda Y?" ------------------
+
+def test_explain_sent_declared_healthy_and_no_trace():
+    run = _run(max_tasks=4)          # presupuesto corto => habrá huecos declarados
+    sent = m.explain_store_sku(run["zip"], 300, 10)
+    healthy = m.explain_store_sku(run["zip"], 101, 12)
+    nothing = m.explain_store_sku(run["zip"], 999, 10)
+    assert healthy["verdict"].startswith("SANO") and healthy["healthy"]["STOCK"] == "50.0"
+    assert nothing["verdict"].startswith("SIN RASTRO")
+    assert "Kazuhira" in nothing["verdict"]
+    # Con 4 tareas: 2 de Fountain9 + 2 de Kazuhira; el resto debe quedar DECLARADO.
+    all_keys = [(s_, k) for s_ in STORES for k in SKUS]
+    verdicts = {key: m.explain_store_sku(run["zip"], *key) for key in all_keys}
+    assert not any(v["verdict"].startswith("SIN RASTRO") for v in verdicts.values())
+    declared = [v for v in verdicts.values() if not v["sent"] and v["declared"]]
+    assert declared, "con presupuesto corto debe haber huecos declarados"
+    labels = {d["TIPO_DE_CORTE"] for v in declared for d in v["declared"]}
+    assert m.KAZUHIRA_UNCOVERED_LABELS["SIN_TAREAS"] in labels
+
+
+def test_explain_reports_units_and_reason_for_a_sent_line():
+    run = _run()
+    info = m.explain_store_sku(run["zip"], 300, 11)
+    assert info["verdict"].startswith("SE ENVIÓ: 8")
+    assert info["sent"][0]["MOTIVO"] == m.PLANNING_REASON_KAZUHIRA

@@ -345,6 +345,10 @@ Cuando al menos uno de los 4 toggles de cobertura de Solidus está activo (AVL, 
 
 Medición con datos sintéticos (85 % de las combinaciones con stock; Kazuhira activo; presupuesto de 5,000 tareas): a 500 mil combinaciones tienda-SKU, **206 s y 1,207 MB de pico antes; 66 s y 549 MB ahora**. A 1.2 millones: 159 s y 1,155 MB. Streamlit Community Cloud limita la memoria a aproximadamente 1 GB.
 
+**Consulta puntual ("¿por qué no salió el SKU X en la tienda Y?").** En los resultados, `explain_store_sku` busca la tienda-SKU en lo que ya quedó en el zip (líneas de `BulkCD_*.csv`, `BASE_TRANSFERS` y el CSV de universo sano) y responde: se envió (con unidades y motivo), no se envió y está declarado (con `TIPO_DE_CORTE`, `DETALLE_MOTIVO` y `MOTIVO_KAZUHIRA`), es sano, o **sin rastro** — un hueco sin declarar, con la lista de verificación. Una prueba de punta a punta confirma que, con presupuesto corto, ninguna combinación queda sin rastro.
+
+**Quiebres que ninguna regla de cobertura puede cubrir se declaran, no se omiten:** `PRODUCTO EXCLUIDO (BLOQUEOS O CODEC)` (antes se saltaban en silencio) y `TIENDA SIN REGISTRO EN TIENDA`. Tiendas cerradas y ciudades bloqueadas siguen fuera del barrido porque ya se reportan por sus propios resúmenes.
+
 Con los 4 toggles apagados (el estado por defecto), este barrido no corre — el reporte sigue reflejando únicamente lo que Fountain9 trajo, como siempre. Activar cualquiera de los 4 puede aumentar mucho el total de filas si el catálogo es grande (hay una advertencia visible en CODEC para esto).
 
 ### Shalashaska Engine

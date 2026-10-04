@@ -42,7 +42,10 @@ def test_healthy_sku_gets_healthy_label():
 
 
 def test_stockout_sku_gets_uncovered_label():
-    catalogs = make_catalogs(stock_base={(100, 10): 0})
+    catalogs = make_catalogs(
+        stock_base={(100, 10): 0},
+        stores={100: {"city": "CDMX", "city_norm": "CDMX", "warehouse_name": "S"}},
+    )
     rows = m.build_catalog_universe_sweep_rows(
         [_catalog_row(100, 10)], catalogs, existing_keys=set()
     )

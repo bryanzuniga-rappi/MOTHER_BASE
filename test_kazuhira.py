@@ -553,7 +553,10 @@ def test_sweep_every_reason_has_a_distinct_registered_label():
         assert label in m.BREAKDOWN_ORDER
 
 
-def test_sweep_skips_closed_stores_blocked_cities_and_excluded_products():
+def test_sweep_skips_closed_stores_but_declares_excluded_products():
+    """Cerradas/ciudades bloqueadas ya se reportan por sus resúmenes. Un
+    producto excluido (BLOQUEOS o CODEC) en quiebre NO tiene otro reporte:
+    antes se omitía en silencio; ahora queda declarado."""
     catalogs = make_catalogs(
         stock_base={(100, 10): 0.0, (200, 10): 0.0, (100, 99): 0.0},
         excluded_products={99},
@@ -564,7 +567,40 @@ def test_sweep_skips_closed_stores_blocked_cities_and_excluded_products():
         ],
         catalogs, set(), closed_store_ids={200},
     )
-    assert [(r["WAREHOUSE_DESTINATION"], r["RETAIL_ID"]) for r in rows] == [(100, 10)]
+    by_key = {(r["WAREHOUSE_DESTINATION"], r["RETAIL_ID"]): r["TIPO_DE_CORTE"] for r in rows}
+    assert (200, 10) not in by_key                       # tienda cerrada: fuera
+    assert by_key[(100, 10)] == m.CATALOG_UNIVERSE_UNCOVERED_CUT
+    assert by_key[(100, 99)] == m.CATALOG_UNIVERSE_EXCLUDED_PRODUCT_CUT
+
+
+def test_sweep_excluded_product_with_stock_is_healthy_not_a_gap():
+    catalogs = make_catalogs(stock_base={(100, 99): 40.0}, excluded_products={99})
+    rows = m.build_catalog_universe_sweep_rows(
+        [{"WAREHOUSE_DESTINATION": 100, "RETAIL_ID": 99, "ADU": 1.0}], catalogs, set()
+    )
+    assert rows[0]["TIPO_DE_CORTE"] == m.CATALOG_UNIVERSE_HEALTHY_CUT
+
+
+def test_sweep_declares_store_missing_from_tienda_sheet():
+    catalogs = make_catalogs(stock_base={(777, 10): 0.0}, stores={})
+    rows = m.build_catalog_universe_sweep_rows(
+        [{"WAREHOUSE_DESTINATION": 777, "RETAIL_ID": 10, "ADU": 1.0}], catalogs, set()
+    )
+    assert rows[0]["TIPO_DE_CORTE"] == m.CATALOG_UNIVERSE_NO_STORE_CUT
+
+
+def test_new_declared_cuts_are_registered_in_breakdown_order():
+    assert m.CATALOG_UNIVERSE_EXCLUDED_PRODUCT_CUT in m.BREAKDOWN_ORDER
+    assert m.CATALOG_UNIVERSE_NO_STORE_CUT in m.BREAKDOWN_ORDER
+
+
+def test_kazuhira_counts_excluded_product_and_unregistered_store_skips():
+    catalogs = make_catalogs(excluded_products={10})
+    summary = run_kazuhira(make_result(), catalog_rows(100), catalogs)
+    assert summary["skipped_excluded_product"] == 1
+    catalogs = make_catalogs(stores={444: {"city": "CDMX", "city_norm": "CDMX", "warehouse_name": "O"}})
+    summary = run_kazuhira(make_result(), catalog_rows(100), catalogs)
+    assert summary["skipped_store_not_registered"] == 1
 
 
 def test_sweep_skips_blocked_city():
