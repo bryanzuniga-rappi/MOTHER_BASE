@@ -193,3 +193,9 @@ def test_missing_stock_row_is_not_reported_as_skipped_anywhere():
     run = _run(database_bytes=workbook)
     assert run["kazuhira"]["skipped_missing_stock"] == 0
     assert run["kazuhira"]["missing_stock_treated_as_zero"] == 1
+
+
+def test_run_is_stamped_with_the_engine_build():
+    run = _run()
+    assert run["build"] == m.APP_BUILD
+    assert run["warnings"][0] == f"Versión del motor: {m.APP_BUILD}."

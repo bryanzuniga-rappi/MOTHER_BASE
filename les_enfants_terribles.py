@@ -467,6 +467,12 @@ MOV_MAX_OPTIONAL_COLUMNS = (
 
 PLANNING_REASON_COLUMN = "PLANNING_REASON"
 
+# Sello de versión: aparece en la pantalla de resultados, en las advertencias
+# de la corrida y en run["build"], para saber con QUÉ código se generó cada
+# resultado (un despliegue desactualizado produce resultados que parecen
+# bugs del código nuevo). Súbelo en cada entrega.
+APP_BUILD = "2026-10-05 · kazuhira-v9"
+
 # REGLA_DEMANDA que solo generan los engines de cobertura (AVL, Preventivo,
 # Refuerzo Golden/Infaltable/Anchor, Shalashaska, Liquid, Venom) — nunca la
 # necesidad original de Fountain9. "Requerido" en Planeación Lista se calcula
@@ -7121,6 +7127,7 @@ def execute_planning(
                 + "."
             )
 
+        result.warnings.insert(0, f"Versión del motor: {APP_BUILD}.")
         missing_stock_by_engine = {
             label: summary_item.get("missing_stock_treated_as_zero", 0)
             for label, summary_item in (
@@ -7596,6 +7603,7 @@ def execute_planning(
         "copernico_cuts": copernico_cuts,
         "venom": venom_summary,
         "kazuhira": kazuhira_summary,
+        "build": APP_BUILD,
         "input_consolidation": consolidation_summary,
         "engine_selection": engine_selection,
         "excluded_skus": sorted(excluded_sku_set),
@@ -8647,6 +8655,15 @@ def render_bucket_universe_report(bucket_label: str, report: dict[str, Any]) -> 
 def render_results(run: dict[str, Any]) -> None:
     planning_summary = run.get("analytics", {}).get("summary", {})
     st.markdown('<div class="result-title">PLANEACIÓN LISTA.</div>', unsafe_allow_html=True)
+    run_build = run.get("build")
+    if run_build == APP_BUILD:
+        st.caption(f"Versión del motor: {APP_BUILD}")
+    else:
+        st.warning(
+            f"Esta corrida se generó con la versión: "
+            f"{run_build or 'sin sello (anterior a kazuhira-v9)'}. "
+            f"El código actual es {APP_BUILD}."
+        )
     st.markdown(
         """
         <div class="report-note">
