@@ -1228,7 +1228,7 @@ def render() -> None:
     is_big_boss = st.session_state.get("mb_profile") == "BIG BOSS"
 
     if is_big_boss:
-        with st.expander("🔧 Conexión a Drive (diagnóstico)", expanded=False):
+        with st.expander("Conexión a Drive (diagnóstico)", expanded=False):
             st.caption(
                 "Prueba que la cuenta de servicio pueda alcanzar el Drive "
                 "compartido configurado, sin subir ni descargar nada todavía."
@@ -1262,7 +1262,7 @@ def render() -> None:
                     else:
                         st.error(direct_result)
 
-        with st.expander("🔑 Conectar mi cuenta personal de Google (OAuth)", expanded=False):
+        with st.expander("Conectar mi cuenta personal de Google (OAuth)", expanded=False):
             st.caption(
                 "Alternativa a la cuenta de servicio, para cuando políticas "
                 "de DLP/clasificación bloquean su acceso y no hay un admin "
@@ -1323,7 +1323,7 @@ def render() -> None:
                         "Conectar mi cuenta personal de Google", auth_url
                     )
 
-        with st.expander("📤 Cargar snapshot diario", expanded=False):
+        with st.expander("Cargar snapshot diario", expanded=False):
             st.caption(
                 "Sube el export de Snowflake del día (CSV). Se guarda "
                 "completo en Drive y se agrega un resumen a la tendencia "
@@ -1395,10 +1395,10 @@ def render() -> None:
 
     col_date, col_refresh = st.columns([3, 1])
     selected_date = col_date.selectbox(
-        "FECHA DEL SNAPSHOT", available_dates, index=0, key="msf_selected_date"
+        "Fecha del snapshot", available_dates, index=0, key="msf_selected_date"
     )
     col_refresh.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True)
-    if col_refresh.button("ACTUALIZAR", key="msf_refresh"):
+    if col_refresh.button("Actualizar", key="msf_refresh"):
         list_available_snapshot_dates.clear()
         read_snapshot_for_date.clear()
         read_rollup_history.clear()
@@ -1426,26 +1426,26 @@ def render() -> None:
     with st.container(border=True, key="msf_filters"):
         col1, col2, col3, col4 = st.columns(4)
         cities = sorted(df.get_column("CITY").drop_nulls().unique().to_list())
-        selected_city = col1.selectbox("ZONA OPERATIVA", ["TODAS"] + cities)
+        selected_city = col1.selectbox("Zona operativa", ["Todas"] + cities)
         categories = sorted(
             df.get_column("MACRO_CATEGORY").drop_nulls().unique().to_list()
         )
-        selected_category = col2.selectbox("CATEGORÍA", ["TODAS"] + categories)
+        selected_category = col2.selectbox("Categoría", ["Todas"] + categories)
         makers = sorted(df.get_column("MAKER").drop_nulls().unique().to_list())
-        selected_maker = col3.selectbox("MAKER", ["TODOS"] + makers)
+        selected_maker = col3.selectbox("Maker", ["Todos"] + makers)
         proveedores = sorted(
             df.get_column("FINAL_PROVEEDOR_NAME").drop_nulls().unique().to_list()
         )
-        selected_proveedor = col4.selectbox("PROVEEDOR", ["TODOS"] + proveedores)
+        selected_proveedor = col4.selectbox("Proveedor", ["Todos"] + proveedores)
 
     scoped = df
-    if selected_city != "TODAS":
+    if selected_city != "Todas":
         scoped = scoped.filter(pl.col("CITY") == selected_city)
-    if selected_category != "TODAS":
+    if selected_category != "Todas":
         scoped = scoped.filter(pl.col("MACRO_CATEGORY") == selected_category)
-    if selected_maker != "TODOS":
+    if selected_maker != "Todos":
         scoped = scoped.filter(pl.col("MAKER") == selected_maker)
-    if selected_proveedor != "TODOS":
+    if selected_proveedor != "Todos":
         scoped = scoped.filter(pl.col("FINAL_PROVEEDOR_NAME") == selected_proveedor)
 
     # --- SITUACIÓN ACTUAL (siempre a nivel país completo, sin importar
@@ -1458,7 +1458,7 @@ def render() -> None:
     st.markdown(
         f'<div class="msf-kpi-row">'
         f'{_kpi_card("AVL PAÍS", avl_country_label, "Available: pct de SKUs del catálogo con inventario.", "kpi-acid")}'
-        f'{_kpi_card("SWA PAÍS", swa_country_label, "Stockout-Weighted Availability: disponibilidad ponderada por relevancia.", "kpi-blue")}'
+        f'{_kpi_card("SWA PAÍS", swa_country_label, "Sales Weighted Availability: disponibilidad ponderada por ventas.", "kpi-blue")}'
         f'{_kpi_card("NODOS MEDIDOS", f"{warehouses_medidos:,}", "Número de tiendas/almacenes en este snapshot.", "")}'
         f'{_kpi_card("LÍNEAS TOTALES", f"{df.height:,}", "Filas producto-tienda en el snapshot completo.", "")}'
         f"</div>",
@@ -1499,7 +1499,7 @@ def render() -> None:
         "esto NO es SWA — es el % de líneas con 0 unidades de stock, un "
         "número 100% verificable a partir de STOCK_UNITS."
     )
-    tab_cat, tab_maker, tab_prov = st.tabs(["CATEGORÍA", "MAKER", "PROVEEDOR"])
+    tab_cat, tab_maker, tab_prov = st.tabs(["Categoría", "Maker", "Proveedor"])
     with tab_cat:
         render_capped_dataframe(
             build_stockout_rate_breakdown(scoped, "MACRO_CATEGORY"),
@@ -1524,13 +1524,13 @@ def render() -> None:
 
     # --- DETALLE PRODUCTO-TIENDA: "¿dónde exactamente está el problema?" ---
     st.markdown("### DETALLE PRODUCTO-TIENDA")
-    only_gia = st.checkbox("Solo Golden/Infaltable/Anchor", key="msf_only_gia")
+    only_gia = st.checkbox("Solo Golden / Infaltable / Anchor", key="msf_only_gia")
     drilldown_rows = build_drilldown_rows(
         df,
-        city=None if selected_city == "TODAS" else selected_city,
-        macro_category=None if selected_category == "TODAS" else selected_category,
-        maker=None if selected_maker == "TODOS" else selected_maker,
-        proveedor=None if selected_proveedor == "TODOS" else selected_proveedor,
+        city=None if selected_city == "Todas" else selected_city,
+        macro_category=None if selected_category == "Todas" else selected_category,
+        maker=None if selected_maker == "Todos" else selected_maker,
+        proveedor=None if selected_proveedor == "Todos" else selected_proveedor,
         only_golden_infaltable_anchor=only_gia,
     )
     render_capped_dataframe(

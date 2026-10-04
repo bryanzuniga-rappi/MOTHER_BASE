@@ -21,7 +21,7 @@ Si es tu primera vez en Mother Base, lee estas cuatro ideas antes de entrar al d
 1. **Fountain9 propone; Mother Base decide si la propuesta es ejecutable.** Una recomendación no se envía si no hay stock, capacidad, ruta, calendario o tarea disponible.
 2. **El inventario no se puede inventar.** STOCK es el límite físico; COPÉRNICO, OWNER, rackeados y bloqueos únicamente pueden reducirlo.
 3. **Los engines compiten por recursos reales.** Una asignación consume stock, m³ de recibo y, salvo excepciones explícitas, una tarea operativa.
-4. **Cada salida debe poder explicarse.** Una tienda–SKU se envía, se corta por un motivo concreto o queda declarada como sana/sin necesidad; nunca debe quedar como un hueco silencioso.
+4. **Cada salida debe poder explicarse.** Una tienda-SKU se envía, se corta por un motivo concreto o queda declarada como sana/sin necesidad; nunca debe quedar como un hueco silencioso.
 
 La ruta normal para Supply es: validar fuentes → cargar Fountain9/COPÉRNICO → configurar CODEC → ejecutar → revisar cortes y alertas → descargar los archivos. La ruta normal para Desarrollo es: entender los contratos de datos → cambiar una regla en el motor → añadir prueba → conciliar una corrida histórica.
 
@@ -92,7 +92,7 @@ flowchart TD
 2. Se valida que las fuentes y hojas requeridas estén disponibles y con una frescura aceptable.
 3. Se cargan uno o varios CSV de Fountain9. Opcionalmente se agregan los archivos de COPÉRNICO.
 4. Supply define orígenes, máximo de tareas, bloqueos temporales y engines activos en el panel **CODEC**.
-5. El motor consolida las necesidades por tienda–SKU y asigna respetando todas las restricciones.
+5. El motor consolida las necesidades por tienda-SKU y asigna respetando todas las restricciones.
 6. Se generan diagnósticos, KPIs y archivos de salida.
 
 La aplicación pide una confirmación explícita antes de ejecutar. Esa confirmación es parte del control operativo: confirma que se validó la capacidad de recibo y que se consideraron tiendas en resguardo.
@@ -227,7 +227,7 @@ La hoja `SCHEDULE` define días permitidos para una pareja origen–destino. Su 
 
 ### SWA
 
-Hoja Aleph (cada hora) con `SWA_POTENTIAL_GAIN_COUNTRY` por tienda–SKU: el SWA país que se gana si esa combinación sale del quiebre. Solo se usa en reportería, nunca en reglas de asignación.
+Hoja Aleph (cada hora) con `SWA_POTENTIAL_GAIN_COUNTRY` por tienda-SKU: el SWA país que se gana si esa combinación sale del quiebre. Solo se usa en reportería, nunca en reglas de asignación.
 
 - **Ganado es binario:** cualquier envío que saque la tienda-SKU del quiebre captura su valor completo. Ausente de la hoja = 0.
 - **Universo:** todo quiebre del catálogo (`stock_base` = 0), lo haya intentado cubrir un engine o no. Cálculo autoritativo: `build_swa_report()`, que suma lo asignado por destino-SKU de todos los engines. Insumos corre aparte: se pasan sus llaves cubiertas y su SWA se calcula desde sus propias filas.
@@ -243,16 +243,16 @@ Mother Base tolera columnas opcionales y varios alias, pero no puede inferir una
 
 | Fuente / hoja | Llave principal | Aporta | Si falta o es inconsistente |
 |---|---|---|---|
-| **Fountain9 CSV** | Tienda–SKU | Demanda, opening, MOV/ROQ, Duration y Lead Time cuando existan | La planeación natural no puede construirse; las coberturas de catálogo pueden seguir aplicando según su regla. |
-| **STOCK** | Origen–SKU / Tienda–SKU | Stock final, no disponible e incoming | Limita el envío desde origen; combinaciones de catálogo sin fila se tratan como inventario 0 en los engines de cobertura. |
+| **Fountain9 CSV** | Tienda-SKU | Demanda, opening, MOV/ROQ, Duration y Lead Time cuando existan | La planeación natural no puede construirse; las coberturas de catálogo pueden seguir aplicando según su regla. |
+| **STOCK** | Origen–SKU / Tienda-SKU | Stock final, no disponible e incoming | Limita el envío desde origen; combinaciones de catálogo sin fila se tratan como inventario 0 en los engines de cobertura. |
 | **TIENDA** | Warehouse | Ciudad, nombre y elegibilidad del destino | Sin tienda registrada no se puede enrutar ni calcular restricciones regionales. |
 | **CAP_RECIBO** | Tienda | Capacidad máxima de recibo en m³ | Se usa el default configurado si falta el dato; Supply debe revisar cualquier excepción. |
-| **CATALOGO** | Tienda–SKU | ADU, datos para cobertura y universo de visibilidad | Sin ADU se aplican fallbacks únicamente donde la regla los permite. |
+| **CATALOGO** | Tienda-SKU | ADU, datos para cobertura y universo de visibilidad | Sin ADU se aplican fallbacks únicamente donde la regla los permite. |
 | **POR_MERMAR** | Origen–SKU | Inventario próximo a caducar y fechas | Shalashaska no tiene candidato que evacuar. |
 | **COPÉRNICO** | Bodega–SKU | Inventario no pickeable y condición del 856 | Requerido para 444, 831 y 856 antes de ejecutar desde esos orígenes. |
 | **SCHEDULE** | Origen–destino | Días permitidos y universo operativo de Kazuhira | Si la pareja no existe, no se inventa una restricción de frecuencia. |
 | **OWNER** | Origen–SKU–owner | Inventario separable de 425/856 | Un owner insuficiente recorta o divide el bulk; no aumenta stock. |
-| **BLOQUEOS / RUTA_COSTOS / RACKEADOS** | SKU o tienda–SKU | Restricciones explícitas | Siempre ganan frente a una recomendación o engine. |
+| **BLOQUEOS / RUTA_COSTOS / RACKEADOS** | SKU o tienda-SKU | Restricciones explícitas | Siempre ganan frente a una recomendación o engine. |
 
 ---
 
@@ -342,7 +342,7 @@ Solidus utiliza stock, capacidad y tareas restantes en este orden:
 
 Para resolver ADU, las coberturas usan esta cascada:
 
-1. ADU de la tienda–SKU.
+1. ADU de la tienda-SKU.
 2. Promedio del mismo SKU en otras tiendas de la misma ciudad.
 3. Sin ADU disponible: se aplica el tratamiento propio de cada cobertura.
 
@@ -389,7 +389,7 @@ flowchart TD
     E --> F["Registrar m³, tarea y motivo"]
 ```
 
-- Si existe ADU tienda–SKU, primero nivela hacia el DOH seguro, limitado por los días que faltan para caducar.
+- Si existe ADU tienda-SKU, primero nivela hacia el DOH seguro, limitado por los días que faltan para caducar.
 - Si el SKU no existe en CATALOGO o no tiene ADU para una tienda, esa ruta **no se descarta**: puede recibir el remanente mediante `SHARE_VENTAS`.
 - Si solo hay una ruta elegible, recibe el 100 % del share permitido por capacidad.
 - Lo que no se evacúa debe explicarse por stock mandante, restricción, capacidad o presupuesto de tareas; nunca por la simple ausencia de ADU.
@@ -406,7 +406,7 @@ Venom no consume el ledger de capacidad usado por los engines anteriores ni se c
 
 ### Checks posteriores
 
-Al terminar la corrida, Mother Base revisa el universo Golden / Infaltable / Anchor. El check de salud es informativo: identifica tienda–SKU que quedaron debajo del objetivo de DOH después de todos los engines; no replantea automáticamente.
+Al terminar la corrida, Mother Base revisa el universo Golden / Infaltable / Anchor. El check de salud es informativo: identifica tienda-SKU que quedaron debajo del objetivo de DOH después de todos los engines; no replantea automáticamente.
 
 ---
 
@@ -614,6 +614,13 @@ Se asume que quien mantiene el proyecto conoce el negocio; se documenta lo que e
 - **Comentario en línea:** el *porqué* de lo no obvio (restricción, orden obligatorio, trampa), en una o dos líneas. No narra lo que hace el código.
 - **No incluir historia** ("antes…", "ahora…", "se decidió en…"): eso vive en el control de versiones. Tampoco repetir lo que ya dice este README.
 - **Texto de pantalla:** los avisos con cifras (resultados de la corrida) se conservan; las notas descriptivas fijas, una línea. Las definiciones de cada KPI van en su tooltip.
+- **Etiquetas de controles** (toggles, campos, botones, expanders; las hace cumplir `tests/test_ui_labels.py`):
+  - Español en *sentence case*: solo la primera letra en mayúscula; siglas y nombres propios se respetan (SKU, DOH, SWA, AVL, Fountain9).
+  - Sin guiones bajos: los nombres técnicos de hojas y columnas van en el tooltip (`help`).
+  - Calificadores entre paréntesis, nunca con `—` ni `·`; "(opcional)" siempre al final.
+  - Toggles y botones con verbo en infinitivo ("Aplicar…", "Bloquear…", "Cubrir…").
+  - Un solo término por concepto: **quiebre** (no stockout ni ruptura) y **tienda-SKU** (con guion corto).
+  - Títulos de sección, eyebrows y tarjetas KPI van en MAYÚSCULAS por diseño; los encabezados Markdown, en *sentence case*.
 
 ---
 

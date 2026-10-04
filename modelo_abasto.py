@@ -1160,7 +1160,7 @@ def product_priority_profile(
     destination: int,
     sku: int,
 ) -> dict[str, Any]:
-    """Clasifica tienda–SKU con jerarquía INFALTABLE > GOLDEN > ANCHOR."""
+    """Clasifica tienda-SKU con jerarquía INFALTABLE > GOLDEN > ANCHOR."""
     key = (destination, sku)
     is_infaltable = key in catalogs.infaltable_products
     is_golden = key in catalogs.golden_products
@@ -1550,7 +1550,7 @@ def apply_owner_inventory_partition(
                 )
             ] += int(allocation["QUANTITY"])
 
-        # Puede haber más de un renglón de reporte para el mismo tienda–SKU
+        # Puede haber más de un renglón de reporte para el mismo tienda-SKU
         # (por ejemplo Naked + Shalashaska).
         for row in result.base_rows:
             destination = int(row["WAREHOUSE_DESTINATION"])

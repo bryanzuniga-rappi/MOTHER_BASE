@@ -44,7 +44,7 @@ def render_big_boss_authentication() -> None:
             placeholder="••••••••",
         )
         submitted = st.form_submit_button(
-            "DESBLOQUEAR ACCESO →",
+            "Desbloquear acceso →",
             use_container_width=True,
         )
     if submitted:
