@@ -14,24 +14,39 @@ La aplicación está construida en Streamlit y utiliza un motor de planeación p
 
 ---
 
+## Empieza aquí
+
+Si es tu primera vez en Mother Base, lee estas cuatro ideas antes de entrar al detalle:
+
+1. **Fountain9 propone; Mother Base decide si la propuesta es ejecutable.** Una recomendación no se envía si no hay stock, capacidad, ruta, calendario o tarea disponible.
+2. **El inventario no se puede inventar.** STOCK es el límite físico; COPÉRNICO, OWNER, rackeados y bloqueos únicamente pueden reducirlo.
+3. **Los engines compiten por recursos reales.** Una asignación consume stock, m³ de recibo y, salvo excepciones explícitas, una tarea operativa.
+4. **Cada salida debe poder explicarse.** Una tienda–SKU se envía, se corta por un motivo concreto o queda declarada como sana/sin necesidad; nunca debe quedar como un hueco silencioso.
+
+La ruta normal para Supply es: validar fuentes → cargar Fountain9/COPÉRNICO → configurar CODEC → ejecutar → revisar cortes y alertas → descargar los archivos. La ruta normal para Desarrollo es: entender los contratos de datos → cambiar una regla en el motor → añadir prueba → conciliar una corrida histórica.
+
+---
+
 ## Contenido
 
-1. [Qué problema resuelve](#qué-problema-resuelve)
-2. [Qué hace una corrida](#qué-hace-una-corrida)
-3. [Conceptos clave](#conceptos-clave)
-4. [Arquitectura técnica](#arquitectura-técnica)
-5. [Flujo de planeación](#flujo-de-planeación)
-6. [Fuentes de datos](#fuentes-de-datos)
-7. [Reglas mandantes](#reglas-mandantes)
-8. [Engines de planeación](#engines-de-planeación)
-9. [Restricciones y bloqueos](#restricciones-y-bloqueos)
-10. [Perfiles de acceso](#perfiles-de-acceso)
-11. [Resultados y cómo leerlos](#resultados-y-cómo-leerlos)
-12. [Operación diaria](#operación-diaria)
-13. [Instalación y despliegue](#instalación-y-despliegue)
-14. [Guía de desarrollo](#guía-de-desarrollo)
-15. [Pruebas y liberaciones](#pruebas-y-liberaciones)
-16. [Limitaciones conocidas](#limitaciones-conocidas)
+1. [Empieza aquí](#empieza-aquí)
+2. [Qué problema resuelve](#qué-problema-resuelve)
+3. [Qué hace una corrida](#qué-hace-una-corrida)
+4. [Conceptos clave](#conceptos-clave)
+5. [Arquitectura técnica](#arquitectura-técnica)
+6. [Flujo de planeación](#flujo-de-planeación)
+7. [Fuentes de datos](#fuentes-de-datos)
+8. [Contrato mínimo de datos](#contrato-mínimo-de-datos)
+9. [Reglas mandantes](#reglas-mandantes)
+10. [Engines de planeación](#engines-de-planeación)
+11. [Restricciones y bloqueos](#restricciones-y-bloqueos)
+12. [Perfiles de acceso](#perfiles-de-acceso)
+13. [Resultados y cómo leerlos](#resultados-y-cómo-leerlos)
+14. [Operación diaria](#operación-diaria)
+15. [Instalación y despliegue](#instalación-y-despliegue)
+16. [Guía de desarrollo](#guía-de-desarrollo)
+17. [Pruebas y liberaciones](#pruebas-y-liberaciones)
+18. [Limitaciones conocidas](#limitaciones-conocidas)
 
 ---
 
@@ -129,6 +144,7 @@ flowchart TD
 | `engines/liquid_engine.py` | Liquidación de remanente. |
 | `engines/venom_engine.py` | Cobertura DDMRP posterior a la planeación. |
 | `modules/militaires_sans_frontieres.py` | Reporting histórico y ejecutivo; módulo en evolución. |
+| `modules/install_check.py` | Detecta una instalación aplanada, duplicados en raíz o una versión de planeación equivocada. |
 | `mother_base_theme.py` | Sistema visual de la aplicación. |
 | `tests/` | Pruebas de reglas de negocio y contratos críticos. |
 
@@ -233,6 +249,25 @@ Hoja Aleph con `SWA_POTENTIAL_GAIN_COUNTRY` por tienda–SKU (Sales Weighted Ava
 
 ---
 
+## Contrato mínimo de datos
+
+Mother Base tolera columnas opcionales y varios alias, pero no puede inferir una operación si faltan sus datos fundamentales. Esta tabla resume para qué existe cada fuente; el detalle exacto de encabezados se valida en el código al cargarla.
+
+| Fuente / hoja | Llave principal | Aporta | Si falta o es inconsistente |
+|---|---|---|---|
+| **Fountain9 CSV** | Tienda–SKU | Demanda, opening, MOV/ROQ, Duration y Lead Time cuando existan | La planeación natural no puede construirse; las coberturas de catálogo pueden seguir aplicando según su regla. |
+| **STOCK** | Origen–SKU / Tienda–SKU | Stock final, no disponible e incoming | Limita el envío desde origen; combinaciones de catálogo sin fila se tratan como inventario 0 en los engines de cobertura. |
+| **TIENDA** | Warehouse | Ciudad, nombre y elegibilidad del destino | Sin tienda registrada no se puede enrutar ni calcular restricciones regionales. |
+| **CAP_RECIBO** | Tienda | Capacidad máxima de recibo en m³ | Se usa el default configurado si falta el dato; Supply debe revisar cualquier excepción. |
+| **CATALOGO** | Tienda–SKU | ADU, datos para cobertura y universo de visibilidad | Sin ADU se aplican fallbacks únicamente donde la regla los permite. |
+| **POR_MERMAR** | Origen–SKU | Inventario próximo a caducar y fechas | Shalashaska no tiene candidato que evacuar. |
+| **COPÉRNICO** | Bodega–SKU | Inventario no pickeable y condición del 856 | Requerido para 444, 831 y 856 antes de ejecutar desde esos orígenes. |
+| **SCHEDULE** | Origen–destino | Días permitidos y universo operativo de Kazuhira | Si la pareja no existe, no se inventa una restricción de frecuencia. |
+| **OWNER** | Origen–SKU–owner | Inventario separable de 425/856 | Un owner insuficiente recorta o divide el bulk; no aumenta stock. |
+| **BLOQUEOS / RUTA_COSTOS / RACKEADOS** | SKU o tienda–SKU | Restricciones explícitas | Siempre ganan frente a una recomendación o engine. |
+
+---
+
 ## Reglas mandantes
 
 Estas reglas no deben cambiarse sin una revisión conjunta de Supply y Desarrollo.
@@ -276,11 +311,12 @@ Los engines se aplican en una secuencia explícita. Activar uno no le otorga rec
 
 ```mermaid
 flowchart TD
-    A["Naked · demanda Fountain9"] --> B["Solidus · coberturas"]
-    B --> C["Shalashaska · mermar"]
+    A["Naked · demanda Fountain9"] --> B["Shalashaska · mermar"]
+    B --> C["Solidus · coberturas"]
     C --> D["Liquid · remanentes"]
     D --> E["Venom · DDMRP"]
-    E --> F["Chequeos y entregables"]
+    E --> F["Kazuhira · garantía total"]
+    F --> G["OWNER, Insumos y entregables"]
 ```
 
 ### Naked Engine
@@ -338,7 +374,7 @@ Por qué no es un toggle más de Solidus: Solidus corre a mitad del pipeline (an
 
 `plan_transfers` (la pasada base de Naked) solo procesa lo que viene del Bulk de Fountain9 — nunca toca CATALOGO directamente. Sin este barrido, cualquier tienda-SKU de CATALOGO ausente de Fountain9 **y** que ningún engine de cobertura toque queda completamente invisible: ni en el reporte, ni en ningún Excel, ni evaluada en absoluto.
 
-Cuando al menos uno de los 4 toggles de cobertura de Solidus está activo (AVL, Prevención, Refuerzo o Cobertura sin Fountain9), `build_catalog_universe_sweep_rows()` agrega una fila de **solo visibilidad** por cada tienda-SKU de CATALOGO que nadie tocó — nunca consume stock, tareas ni capacidad, solo garantiza que el universo completo se vea:
+Cuando al menos una cobertura de Solidus o Kazuhira está activa, `build_catalog_universe_sweep_rows()` agrega una fila de **solo visibilidad** por cada tienda-SKU de CATALOGO que nadie tocó — nunca consume stock, tareas ni capacidad, solo garantiza que el universo completo se vea:
 
 - Con stock > 0 (sano, nada que cubrir): `OK SIN NECESIDAD · FUERA DEL BULK DE FOUNTAIN9` — excluido de la tabla de Cortes (igual que "SIN RECOMENDACIÓN"), porque no es un corte real.
 - Con stock = 0 (quiebre que nadie evaluó): `QUIEBRE SIN EVALUAR · FUERA DE COBERTURA ACTIVA` — sí aparece en Cortes, con su propio `SWA_PERDIDO`, porque genuinamente es un hueco sin cubrir.
@@ -353,11 +389,25 @@ Medición con datos sintéticos (85 % de las combinaciones con stock; Kazuhira a
 
 **Quiebres que ninguna regla de cobertura puede cubrir se declaran, no se omiten:** `PRODUCTO EXCLUIDO (BLOQUEOS O CODEC)` (antes se saltaban en silencio) y `TIENDA SIN REGISTRO EN TIENDA`. Tiendas cerradas y ciudades bloqueadas siguen fuera del barrido porque ya se reportan por sus propios resúmenes.
 
-Con los 4 toggles apagados (el estado por defecto), este barrido no corre — el reporte sigue reflejando únicamente lo que Fountain9 trajo, como siempre. Activar cualquiera de los 4 puede aumentar mucho el total de filas si el catálogo es grande (hay una advertencia visible en CODEC para esto).
+Con todas las coberturas y Kazuhira apagados (el estado por defecto), este barrido no corre — el reporte sigue reflejando únicamente lo que Fountain9 trajo, como siempre. Activar cualquiera de estas coberturas puede aumentar mucho el total de filas si el catálogo es grande (hay una advertencia visible en CODEC para esto).
 
 ### Shalashaska Engine
 
-Propone evacuar inventario marcado como **por mermar**, respetando los bloqueos, la capacidad de las tiendas y el presupuesto compartido de tareas.
+Evacúa inventario marcado como **POR_MERMAR**. No usa ese valor para inflar el stock disponible: primero confirma que las unidades siguen existiendo en el stock ajustado del origen. Después distribuye solo hacia tiendas que ya tienen una transferencia efectiva desde ese mismo origen durante la corrida; así aprovecha rutas operativas reales.
+
+```mermaid
+flowchart TD
+    A["POR_MERMAR origen-SKU"] --> B["Validar stock ajustado"]
+    B --> C["Tomar rutas efectivas desde el origen"]
+    C --> D["Nivelar por ADU y DOH seguro"]
+    D --> E["Evacuar remanente por SHARE_VENTAS"]
+    E --> F["Registrar m³, tarea y motivo"]
+```
+
+- Si existe ADU tienda–SKU, primero nivela hacia el DOH seguro, limitado por los días que faltan para caducar.
+- Si el SKU no existe en CATALOGO o no tiene ADU para una tienda, esa ruta **no se descarta**: puede recibir el remanente mediante `SHARE_VENTAS`.
+- Si solo hay una ruta elegible, recibe el 100 % del share permitido por capacidad.
+- Lo que no se evacúa debe explicarse por stock mandante, restricción, capacidad o presupuesto de tareas; nunca por la simple ausencia de ADU.
 
 ### Liquid Engine
 
