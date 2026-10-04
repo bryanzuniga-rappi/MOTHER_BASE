@@ -1,3 +1,12 @@
+"""Solidus Engine — protección manual sin ROQ positivo.
+
+Posición: junto a Naked, sobre la misma fila consolidada del Bulk.
+Entrada: fila con ROQ <= 0 pero con objetivo > 0 por reglas de mínimo/hardcode.
+Salida: predicado is_solidus_requirement.
+Las coberturas de catálogo de Solidus (AVL, Preventivo, Refuerzo, Cobertura
+sin Fountain9) viven en modules/les_enfants_terribles.py (apply_avl_fill).
+"""
+
 from __future__ import annotations
 
 from typing import Any

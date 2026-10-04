@@ -1,4 +1,11 @@
-"""Dashboard de comando AVL/SWA para Militaires Sans Frontières (Mother Base)."""
+"""Militaires Sans Frontières — dashboard AVL/SWA de inteligencia.
+
+Entrada: snapshot diario de Snowflake (CSV) en Google Drive (RAW_<fecha>.csv)
+y ROLLUP.csv histórico.
+Salida: KPIs país, cascada por ciudad, tendencia, % de quiebre por categoría,
+maker y proveedor, y detalle producto-tienda.
+Acceso a Drive: OAuth de usuario, o cuenta de servicio (con suplantación opcional).
+"""
 
 from __future__ import annotations
 
@@ -29,12 +36,7 @@ from modules.les_enfants_terribles import render_capped_dataframe, rows_to_csv_b
 
 
 def configured_data_dashboard_spreadsheet_id() -> str:
-    """Lee el ID del Google Sheet DATA_DASHBOARD desde Streamlit Secrets.
-
-    Igual que DATA_TRANSFERS_SPREADSHEET_ID en les_enfants_terribles.py: no
-    hardcodear el ID real en el código fuente de un repo compartido. Ver
-    .streamlit/secrets.toml.example.
-    """
+    """Lee el ID del Google Sheet DATA_DASHBOARD desde Streamlit Secrets."""
     try:
         return str(st.secrets.get("DATA_DASHBOARD_SPREADSHEET_ID", ""))
     except Exception:
@@ -74,14 +76,7 @@ def configured_data_dashboard_drive_folder_id() -> str:
 
 
 def _drive_service_account_info() -> dict | None:
-    """Lee el bloque [gcp_service_account] de Secrets como dict plano.
-
-    A propósito NO atrapa cualquier excepción en silencio: si la tabla
-    existe pero algo en ella truena (una llave TOML mal formada, por
-    ejemplo), eso debe verse en el mensaje de error real en vez de
-    disfrazarse siempre como "falta configurar" — ese mensaje genérico solo
-    debe aparecer cuando la tabla de verdad no está.
-    """
+    """Lee el bloque [gcp_service_account] de Secrets como dict plano."""
     try:
         available_keys = list(st.secrets.keys())
     except Exception as exc:
@@ -103,11 +98,9 @@ def _drive_service_account_info() -> dict | None:
 
 
 def configured_impersonate_email() -> str:
-    """Correo de Workspace que la cuenta de servicio suplanta vía Domain-
-    Wide Delegation. Vacío = sin suplantación, la cuenta de servicio actúa
-    con su propia identidad (el comportamiento original, que topa con
-    políticas de DLP atadas a etiquetas de clasificación como
-    "Confidential" — ver README)."""
+    """Correo de Workspace que la cuenta de servicio suplanta (Domain-Wide Delegation);
+    vacío = sin suplantación.
+    """
     try:
         return str(st.secrets.get("DATA_DASHBOARD_IMPERSONATE_EMAIL", ""))
     except Exception:
@@ -151,10 +144,9 @@ def configured_oauth_redirect_uri() -> str:
 
 
 def configured_oauth_refresh_token() -> str:
-    """El token de larga duración obtenido tras la autorización única. Su
-    presencia es lo que activa el modo "actuar como el usuario" en
-    get_drive_service — mientras no esté, la app sigue usando la cuenta de
-    servicio (con o sin suplantación) como hoy."""
+    """Refresh token de OAuth; su presencia activa el modo 'actuar como el usuario' en
+    get_drive_service.
+    """
     try:
         return str(st.secrets.get("DATA_DASHBOARD_OAUTH_REFRESH_TOKEN", ""))
     except Exception:
@@ -170,12 +162,7 @@ def oauth_is_configured() -> bool:
 
 
 def build_oauth_authorization_url() -> str:
-    """URL de Google donde el usuario inicia sesión y autoriza la app.
-    ``access_type=offline`` es lo que hace que Google entregue un refresh
-    token (no solo un access token de una hora); ``prompt=consent`` fuerza
-    a que SIEMPRE lo entregue, incluso si el usuario ya había autorizado
-    la app antes (si no se fuerza, Google a veces omite el refresh token
-    en autorizaciones repetidas)."""
+    """URL de autorización de Google (access_type=offline entrega refresh token)."""
     params = {
         "client_id": configured_oauth_client_id(),
         "redirect_uri": configured_oauth_redirect_uri(),
@@ -188,10 +175,7 @@ def build_oauth_authorization_url() -> str:
 
 
 def exchange_oauth_code_for_tokens(code: str) -> dict[str, Any]:
-    """Intercambia el código de autorización (que Google regresó en la URL
-    de redirección) por tokens — el paso final del flujo, ejecutado una
-    sola vez. Devuelve el JSON completo de Google; lo que a nosotros nos
-    importa es la llave "refresh_token"."""
+    """Cambia el código de autorización por tokens (paso único del flujo OAuth)."""
     payload = urllib.parse.urlencode(
         {
             "code": code,
@@ -219,25 +203,7 @@ def exchange_oauth_code_for_tokens(code: str) -> dict[str, Any]:
 
 
 def get_drive_service():
-    """Construye el cliente de la API de Drive v3.
-
-    Prioridad de autenticación:
-    1. Si hay un refresh token de OAuth de usuario configurado (obtenido
-       una vez vía el flujo de "Conectar mi cuenta personal de Google"),
-       se usa ese — la app actúa exactamente como ese usuario, con sus
-       mismos permisos. No requiere ninguna acción de un admin de
-       Workspace.
-    2. Si no, cae a la cuenta de servicio [gcp_service_account]. Si además
-       DATA_DASHBOARD_IMPERSONATE_EMAIL está configurado, la cuenta de
-       servicio suplanta a ese usuario (Domain-Wide Delegation) — esto SÍ
-       requiere que un admin de Workspace haya autorizado el Client ID de
-       la cuenta de servicio en Admin Console → Seguridad → Controles de
-       API → Delegación en todo el dominio, con el scope de Drive.
-
-    Lanza RuntimeError con un mensaje claro (no una excepción críptica de
-    Google) si falta cualquier pieza de configuración, para que el error se
-    entienda sin tener que leer el traceback.
-    """
+    """Construye el cliente de la API de Drive v3."""
     folder_id = configured_data_dashboard_drive_folder_id()
     if not folder_id:
         raise RuntimeError(
@@ -306,17 +272,8 @@ def get_drive_service():
 
 
 def _resolve_shared_drive_id(service, folder_id: str) -> str | None:
-    """Devuelve el ID del Drive compartido que contiene ``folder_id``, o
-    None si es una carpeta normal de Mi unidad.
-
-    Esto es lo oficialmente recomendado por Google para listar contenido
-    de un Drive compartido de forma confiable: ``corpora="drive"`` +
-    ``driveId=<id del Drive compartido>`` — NO el ID de la subcarpeta
-    (en este proyecto, la carpeta configurada es "SWA", que vive DENTRO
-    del Drive compartido "MOTHER-BASE"; son IDs distintos). El intento
-    anterior con ``corpora="allDrives"`` sin ``driveId`` no es tan
-    confiable — Google la documenta como más lenta/menos consistente que
-    apuntar directo al Drive compartido correcto.
+    """Devuelve el ID del Drive compartido que contiene ``folder_id``, o None si es una
+    carpeta normal de Mi unidad.
     """
     folder = (
         service.files()
@@ -327,10 +284,9 @@ def _resolve_shared_drive_id(service, folder_id: str) -> str | None:
 
 
 def _drive_list_query(service, folder_id: str, q: str, **list_kwargs) -> dict:
-    """Ejecuta ``files().list()`` apuntando correctamente al Drive
-    compartido de ``folder_id`` (ver _resolve_shared_drive_id). Centraliza
-    esto en un solo lugar para no repetir la resolución de driveId en cada
-    función que necesita listar/buscar archivos."""
+    """Ejecuta ``files().list()`` apuntando correctamente al Drive compartido de
+    ``folder_id`` (ver _resolve_shared_drive_id).
+    """
     drive_id = _resolve_shared_drive_id(service, folder_id)
     kwargs = {
         "q": q,
@@ -348,10 +304,8 @@ def _drive_list_query(service, folder_id: str, q: str, **list_kwargs) -> dict:
 
 
 def _drive_find_file(service, folder_id: str, filename: str) -> dict | None:
-    """Busca un archivo por nombre EXACTO dentro del folder. Devuelve
-    {"id", "name", "modifiedTime"} o None. ``supportsAllDrives`` es
-    obligatorio para que esto funcione con Drives compartidos, no solo Mi
-    unidad — omitirlo es el error más común con este tipo de integración.
+    """Busca un archivo por nombre EXACTO dentro del folder. Devuelve {"id", "name",
+    "modifiedTime"} o None.
     """
     safe_name = filename.replace("'", "\\'")
     query = (
@@ -395,8 +349,9 @@ def _drive_upload_or_replace(
     mime_type: str = "text/csv",
     properties: dict[str, str] | None = None,
 ) -> str:
-    """Crea el archivo si no existe, o sobreescribe su contenido si ya
-    existe con ese nombre exacto. Devuelve el file id."""
+    """Crea el archivo si no existe, o sobreescribe su contenido si ya existe con ese
+    nombre exacto.
+    """
     existing = _drive_find_file(service, folder_id, filename)
     media = MediaIoBaseUpload(
         io.BytesIO(content_bytes), mimetype=mime_type, resumable=False
@@ -410,7 +365,6 @@ def _drive_upload_or_replace(
         if properties:
             # No pasar body=None explícito: algunas versiones del cliente
             # intentan serializarlo como metadata real y la API lo rechaza.
-            # Si no hay properties nuevas, simplemente se omite el kwarg.
             update_kwargs["body"] = {"properties": properties}
         updated = service.files().update(**update_kwargs).execute()
         return updated["id"]
@@ -437,13 +391,7 @@ def _drive_download(service, file_id: str) -> bytes:
 
 
 def test_direct_file_access(file_id: str) -> str:
-    """Diagnóstico: intenta leer un archivo por ID directo (.get + descarga
-    de contenido), sin pasar por búsqueda/list en absoluto. Si esto
-    funciona mientras "Probar conexión" sigue viendo 0 archivos, confirma
-    que el problema es específico de list()/búsqueda (por ejemplo, DLP
-    ligado a una etiqueta de clasificación que oculta contenido de
-    búsquedas por API pero no bloquea el acceso directo por ID) y no un
-    problema de permisos generales de la cuenta de servicio."""
+    """Diagnóstico: lee un archivo por ID directo, sin list/search."""
     try:
         service = get_drive_service()
     except RuntimeError as exc:
@@ -484,10 +432,9 @@ def test_direct_file_access(file_id: str) -> str:
 
 
 def test_drive_connection() -> str:
-    """Prueba end-to-end mínima: conecta, y confirma que el folder
-    configurado existe y es alcanzable. No sube ni descarga nada. Pensada
-    para el botón "Probar conexión" — devuelve un mensaje humano, nunca
-    lanza una excepción cruda a la UI."""
+    """Prueba end-to-end mínima: conecta, y confirma que el folder configurado existe y
+    es alcanzable.
+    """
     try:
         service = get_drive_service()
         impersonate_email = configured_impersonate_email()
@@ -547,11 +494,8 @@ def test_drive_connection() -> str:
 def upload_daily_snapshot(
     file_bytes: bytes, filename: str, uploaded_by: str
 ) -> tuple[str, dict[str, Any]]:
-    """Parsea, valida, y sube el snapshot del día a Drive (RAW_<fecha>.csv,
-    sobreescribe si ya se subió algo ese mismo día), y actualiza el rollup
-    histórico con el resumen de ese día. Devuelve (fecha, resumen_del_día).
-
-    No usa caché — cada subida debe golpear Drive de verdad.
+    """Valida y sube el snapshot del día (RAW_<fecha>.csv; sobrescribe el mismo día) y
+    actualiza ROLLUP.csv.
     """
     df = parse_daily_snapshot(file_bytes, filename)
     date_str = snapshot_date(df)
@@ -579,9 +523,9 @@ def upload_daily_snapshot(
 
 
 def _append_rollup_row(service, folder_id: str, new_row: dict[str, Any]) -> None:
-    """Agrega o actualiza la fila de un día en ROLLUP.csv. Si el archivo no
-    existe todavía, lo crea con esa sola fila. Si el día ya tenía una fila
-    (re-subida del mismo día), la reemplaza en vez de duplicarla."""
+    """Agrega o actualiza la fila de un día en ROLLUP.csv. Si el archivo no existe
+    todavía, lo crea con esa sola fila.
+    """
     existing = _drive_find_file(service, folder_id, ROLLUP_FILENAME)
     rows: list[dict[str, Any]] = []
     if existing:
@@ -626,8 +570,9 @@ def read_snapshot_for_date(date_str: str) -> pl.DataFrame:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def read_rollup_history() -> list[dict]:
-    """Lee el rollup histórico completo (chico, un renglón por día) para
-    alimentar la tendencia. Lista vacía si todavía no existe."""
+    """Lee el rollup histórico completo (chico, un renglón por día) para alimentar la
+    tendencia.
+    """
     service = get_drive_service()
     folder_id = configured_data_dashboard_drive_folder_id()
     found = _drive_find_file(service, folder_id, ROLLUP_FILENAME)
@@ -716,12 +661,7 @@ def _number(value: object) -> float:
 # todo el procesamiento pesado usa polars, nunca listas de dicts de Python.
 # ---------------------------------------------------------------------------
 
-# Columnas que el dashboard necesita sí o sí. Si faltan, se rechaza el
-# archivo con un mensaje claro en vez de fallar más adelante con un
-# KeyError críptico en medio de una agregación. BLOCKING_REASON y
-# COMENTARIO deliberadamente NO están aquí — negocio confirmó que el
-# indicador de bloqueo es solo interno de Snowflake, sin valor accionable
-# en este dashboard, así que ni se exige ni se muestra en ningún lado.
+# Columnas obligatorias: si faltan, se rechaza el archivo con un mensaje claro.
 SNAPSHOT_REQUIRED_COLUMNS = {
     "DATE", "CITY", "WAREHOUSE_ID", "WAREHOUSE_NAME", "PRODUCT_ID",
     "PRODUCT_NAME", "MACRO_CATEGORY", "CATEGORY", "SUB_CATEGORY", "MAKER",
@@ -730,10 +670,7 @@ SNAPSHOT_REQUIRED_COLUMNS = {
     "SWA_CITY", "AVL_WH", "SWA_WH",
 }
 
-# Columnas numéricas: se fuerzan a float al leer, cualquier valor no
-# parseable (vacío, texto) se vuelve null sin tronar la carga completa.
-# Lista alineada 1:1 con las columnas reales de la query de Snowflake
-# (confirmadas por negocio), no solo con lo que traía la muestra chica.
+# Columnas numéricas: se fuerzan a float; lo no parseable queda null.
 SNAPSHOT_NUMERIC_COLUMNS = [
     "STOCK_UNITS", "FULL_SALES_28", "FULL_SALES_56", "AVG_SALES", "ADU",
     "AVL_LAST_DAY",
@@ -770,10 +707,9 @@ class SnapshotValidationError(ValueError):
 
 
 def parse_daily_snapshot(file_bytes: bytes, filename: str) -> pl.DataFrame:
-    """Lee el export diario de Snowflake (CSV, el formato real confirmado
-    con la muestra) a un DataFrame de polars, valida columnas mínimas y
-    normaliza tipos. No agrega ni resume nada — eso lo hacen las funciones
-    build_* de abajo, cada una sobre este mismo DataFrame ya limpio."""
+    """Lee el export diario de Snowflake (CSV) a polars, valida columnas mínimas y
+    normaliza tipos.
+    """
     lower_name = filename.lower()
     try:
         if lower_name.endswith((".xlsx", ".xls")):
@@ -815,16 +751,7 @@ def parse_daily_snapshot(file_bytes: bytes, filename: str) -> pl.DataFrame:
 
 
 def snapshot_date(df: pl.DataFrame) -> str:
-    """La fecha del snapshot, normalizada a YYYY-MM-DD sin importar el
-    formato en que Snowflake la exportó (se asume un solo día por archivo,
-    que es el contrato acordado con negocio).
-
-    El export real trae DATE como texto "28/09/2026" (DD/MM/YYYY) — nunca
-    se debe usar tal cual en el nombre del archivo ni para ordenar: como
-    texto libre, "28/09/2026" no ordena cronológicamente contra otras
-    fechas (compara caracter por caracter, no como fecha), y las diagonales
-    además rompen la convención de nombre de archivo del resto del código.
-    """
+    """Fecha del snapshot normalizada a YYYY-MM-DD (un solo día por archivo)."""
     values = df.get_column("DATE").unique().to_list()
     if not values:
         return ""
@@ -854,9 +781,9 @@ def build_country_kpis(df: pl.DataFrame) -> dict[str, float]:
 
 
 def build_city_breakdown(df: pl.DataFrame) -> list[dict]:
-    """Una fila por CITY con su AVL/SWA ya calculado (mismo insumo que
-    antes alimentaba el waterfall) — compatible tal cual con
-    _build_waterfall, que espera CITY + SWA_CITY."""
+    """Una fila por CITY con su AVL/SWA ya calculado — compatible tal cual con
+    _build_waterfall, que espera CITY + SWA_CITY.
+    """
     if df.is_empty():
         return []
     grouped = (
@@ -868,24 +795,12 @@ def build_city_breakdown(df: pl.DataFrame) -> list[dict]:
 
 
 def build_blocking_reason_breakdown(df: pl.DataFrame) -> list[dict]:
-    """Deprecado: negocio confirmó que BLOCKING_REASON/COMENTARIO son solo
-    un indicador interno de Snowflake sin valor accionable en este
-    dashboard. Se deja como stub inerte (nunca se llama desde render())
-    por si algún día vuelve a hacer falta, en vez de borrar la función y
-    tener que reescribirla desde cero."""
+    """Deprecado: BLOCKING_REASON/COMENTARIO no tienen valor accionable; stub inerte."""
     return []
 
 
 def build_stockout_rate_breakdown(df: pl.DataFrame, group_col: str) -> list[dict]:
-    """% de líneas con STOCK_UNITS = 0 por categoría/maker/proveedor.
-
-    Deliberadamente NO se llama SWA: SWA por país/ciudad/tienda ya viene
-    calculado por Snowflake con su propia fórmula de ponderación (por
-    venta, seguramente), pero esa fórmula no existe a nivel categoría/maker/
-    proveedor en los datos que llegan — inventarla aquí sería adivinar un
-    número que alguien podría tomar como oficial. Este es un proxy honesto
-    y 100% verificable: cuántas líneas están literalmente en cero.
-    """
+    """% de líneas con STOCK_UNITS = 0 por categoría/maker/proveedor."""
     if df.is_empty() or group_col not in df.columns:
         return []
     grouped = (
@@ -913,14 +828,8 @@ def build_drilldown_rows(
     proveedor: str | None = None,
     only_golden_infaltable_anchor: bool = False,
 ) -> list[dict]:
-    """Detalle producto-tienda filtrado — esto es lo que responde "¿dónde
-    exactamente está el problema?". Se filtra en polars (rápido incluso con
-    200K filas) y el resultado ya capado (render_capped_dataframe) es lo
-    único que se manda al navegador.
-
-    BLOCKING_REASON/COMENTARIO deliberadamente excluidos — negocio
-    confirmó que es solo un indicador interno de Snowflake, sin valor
-    accionable aquí.
+    """Detalle producto-tienda filtrado — esto es lo que responde "¿dónde exactamente
+    está el problema?".
     """
     result = df
     if city:
@@ -945,8 +854,9 @@ def build_drilldown_rows(
 
 
 def build_rollup_row(df: pl.DataFrame, date_str: str) -> dict[str, Any]:
-    """Una sola fila resumen del día completo, para acumular en el rollup
-    histórico de Drive. Grano: un día = una fila (tendencia país)."""
+    """Una sola fila resumen del día completo, para acumular en el rollup histórico de
+    Drive.
+    """
     kpis = build_country_kpis(df)
     return {
         "FECHA": date_str,

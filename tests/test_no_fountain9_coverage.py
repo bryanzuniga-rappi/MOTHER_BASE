@@ -1,6 +1,6 @@
-"""Pruebas del mecanismo de cobertura de quiebres sin fila de Fountain9
-(apply_avl_fill con candidate_mode="no_fountain9_coverage"), y de la moda
-de Duration/Lead Time por tienda en consolidate_plan_files."""
+"""Pruebas del mecanismo de cobertura de quiebres sin fila de Fountain9 (apply_avl_fill
+con candidate_mode="no_fountain9_coverage").
+"""
 
 import csv
 from pathlib import Path
@@ -76,11 +76,10 @@ def test_basic_coverage_when_sku_absent_from_fountain9():
 
 
 def test_skips_key_explicitly_in_excluded_keys():
-    """Mecánica genérica: cualquier llave en excluded_keys se salta. Desde
-    la sesión de "sin recomendación como quiebre real", quien llama a esta
-    función decide exactamente qué va en excluded_keys — típicamente
-    fountain_recommended_keys (solo recomendación positiva), ya no
-    cualquier fila de Fountain9."""
+    """Mecánica genérica: cualquier llave en excluded_keys se salta. Desde la sesión de
+    "sin recomendación como quiebre real", quien llama a esta función decide
+    exactamente qué va en excluded_keys.
+    """
     catalogs = make_catalogs()
     result = make_result()
     summary = m.apply_avl_fill(
@@ -95,19 +94,15 @@ def test_skips_key_explicitly_in_excluded_keys():
 
 
 def test_sin_recomendacion_real_stockout_now_eligible():
-    """El punto central de esta sesión: un "sin recomendación" de
-    Fountain9 (CANTIDAD_OBJETIVO=0, por lo tanto NO entra en
-    fountain_recommended_keys) cuyo stock_base real es 0 debe ser
-    candidato elegible aquí — es un quiebre real que Fountain9 no vio
-    porque se basó en su propio Predicted Opening Inventory, no en
-    nuestro stock real. Antes de este cambio, CUALQUIER fila de Fountain9
-    (incluida esta) quedaba excluida; ahora solo se excluyen las
-    recomendaciones positivas."""
+    """Un "sin recomendación" de Fountain9 (CANTIDAD_OBJETIVO=0, por lo tanto NO entra
+    en fountain_recommended_keys) cuyo stock_base real es 0 debe ser candidato
+    elegible aquí.
+    """
     catalogs = make_catalogs()  # stock_base[(100,10)] = 0 por el fixture
     result = make_result()
-    # excluded_keys = fountain_recommended_keys simulado: vacío, porque
-    # esta tienda-SKU tuvo CANTIDAD_OBJETIVO=0 (sin recomendación), no
-    # entra en ese set aunque SÍ tuvo fila en Fountain9.
+    # Excluded_keys = fountain_recommended_keys simulado: vacío, porque esta
+    # tienda-SKU tuvo CANTIDAD_OBJETIVO=0 (sin recomendación), no entra en ese
+    # set aunque SÍ tuvo fila en Fountain9.
     summary = m.apply_avl_fill(
         result, catalog_rows(adu_10=2.0), catalogs, CONFIG, set(), (), 1.0,
         candidate_mode="no_fountain9_coverage",
@@ -215,10 +210,9 @@ def test_minimum_quantity_floor_applied():
 
 
 def test_no_fountain9_cut_registered_in_breakdown_order():
-    """Regresión: NO_FOUNTAIN9_CUT debe aparecer en BREAKDOWN_ORDER (si no,
-    el overview no lo muestra con orden correcto) — y, más grave, moverlo
-    a esa tupla por NOMBRE en vez de string literal rompía el import
-    completo del módulo por orden de definición. Esto fija ambas cosas."""
+    """Regresión: NO_FOUNTAIN9_CUT debe aparecer en BREAKDOWN_ORDER (si no, el overview
+    no lo muestra con orden correcto).
+    """
     assert m.NO_FOUNTAIN9_CUT in m.BREAKDOWN_ORDER
 
 

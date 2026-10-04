@@ -46,9 +46,9 @@ def test_disabled_when_no_swa_data_loaded():
 
 
 def test_ganado_is_binary_any_positive_shipment_captures_full_value():
-    """Punto central confirmado por negocio: no es proporcional. Enviar 1
-    unidad de las 50 necesarias captura el SWA completo igual que enviar
-    las 50."""
+    """No es proporcional. Enviar 1 unidad de las 50 necesarias captura el SWA completo
+    igual que enviar las 50.
+    """
     catalogs = make_catalogs(
         stock_base={(100, 10): 0},
         swa_potential_gain={(100, 10): 2.5},
@@ -72,9 +72,10 @@ def test_perdido_when_stockout_stays_uncovered():
 
 
 def test_universo_incluye_quiebres_sin_intento_de_cobertura():
-    """Confirmado por negocio: el universo es TODO quiebre del catálogo,
-    aunque ningún engine haya intentado cubrirlo (sin stock en ningún
-    origen, por ejemplo) — debe seguir contando como 'perdido'."""
+    """El universo es TODO quiebre del catálogo, aunque ningún engine haya intentado
+    cubrirlo (sin stock en ningún origen, por ejemplo) — debe seguir contando como
+    'perdido'.
+    """
     catalogs = make_catalogs(
         stock_base={(100, 10): 0, (200, 20): 0},
         swa_potential_gain={(100, 10): 1.0, (200, 20): 2.0},
@@ -102,9 +103,9 @@ def test_sku_con_stock_positivo_no_cuenta_en_el_universo():
 
 
 def test_sku_ausente_de_hoja_swa_usa_cero_por_descarte():
-    """Confirmado por negocio: si no está en la hoja SWA, es 0 — nunca
-    bloquea el reporte, el caso se sigue contando (ganado o perdido) solo
-    que con SWA=0."""
+    """Si no está en la hoja SWA, es 0 — nunca bloquea el reporte, el caso se sigue
+    contando (ganado o perdido) solo que con SWA=0.
+    """
     catalogs = make_catalogs(
         stock_base={(100, 10): 0},
         swa_potential_gain={},  # SKU 10 no aparece aquí
@@ -146,9 +147,9 @@ def test_duplicate_catalog_rows_deduplicated():
 
 
 def test_insumos_only_coverage_counts_as_ganado():
-    """Punto central de esta sesión: una tienda-SKU cubierta ÚNICAMENTE
-    por Insumos (que no vive en result.allocation_rows) debe contar como
-    'ganado', no 'perdido'."""
+    """Una tienda-SKU cubierta ÚNICAMENTE por Insumos (que no vive en
+    result.allocation_rows) debe contar como 'ganado', no 'perdido'.
+    """
     catalogs = make_catalogs(
         stock_base={(100, 10): 0},
         swa_potential_gain={(100, 10): 1.8},
@@ -164,7 +165,7 @@ def test_insumos_only_coverage_counts_as_ganado():
 
 
 def test_swa_report_works_without_insumos_summary():
-    """insumos_summary es opcional (None por default) — no debe tronar."""
+    """Insumos_summary es opcional (None por default) — no debe tronar."""
     catalogs = make_catalogs(
         stock_base={(100, 10): 0}, swa_potential_gain={(100, 10): 1.0}
     )

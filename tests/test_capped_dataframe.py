@@ -49,9 +49,9 @@ def test_rows_to_csv_bytes_roundtrip():
 
 
 def test_render_capped_dataframe_never_exceeds_max_display():
-    """El punto central del bug: antes se mandaban TODAS las filas al
-    frontend aunque la altura estuviera acotada. Ahora la lista que
-    realmente llega a st.dataframe debe estar truncada."""
+    """El punto central del bug: antes se mandaban TODAS las filas al frontend aunque la
+    altura estuviera acotada.
+    """
     captured = {}
 
     def fake_dataframe(data, **kwargs):
@@ -97,8 +97,9 @@ def test_render_capped_dataframe_offers_download_only_when_requested():
 
 
 def test_report_table_caps_rows_too():
-    """report_table es el helper compartido preexistente (ciudad/tienda) que
-    tenía el mismo bug: acotaba altura pero no filas reales."""
+    """Report_table es el helper compartido preexistente (ciudad/tienda) que tenía el
+    mismo bug: acotaba altura pero no filas reales.
+    """
     captured = {}
     with _patched(
         dataframe=lambda data, **k: captured.update(data=data),

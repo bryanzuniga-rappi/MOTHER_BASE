@@ -1,3 +1,13 @@
+"""Les Enfants Terribles — módulo de planeación (UI y orquestación).
+
+Posición: ejecuta, en orden, Naked → Solidus (AVL, Preventivo, Refuerzo,
+Cobertura sin Fountain9) → Shalashaska → Liquid → Venom → Kazuhira →
+partición OWNER → Insumos, con un presupuesto de tareas compartido.
+Entrada: Bulk de Fountain9, DATA_TRANSFERS y COPÉRNICO.
+Salida: zip con CSV de carga, Excel y PDF ejecutivo, más reportes en pantalla.
+Reglas y engines: ver README.
+"""
+
 from __future__ import annotations
 
 from collections import Counter, defaultdict
@@ -70,14 +80,7 @@ MAX_UPLOAD_MB = 500
 
 
 def configured_data_transfers_spreadsheet_id() -> str:
-    """Lee el ID del Google Sheet DATA_TRANSFERS desde Streamlit Secrets.
-
-    Nunca hardcodees el ID real en el código fuente: este repo es
-    compartido, y un ID de spreadsheet expuesto puede filtrar la ubicación
-    (y, si el Sheet queda mal configurado, el contenido) del inventario real
-    de la empresa. Se configura igual que BIG_BOSS_PASSWORD, ver
-    .streamlit/secrets.toml.example.
-    """
+    """Lee el ID del Google Sheet DATA_TRANSFERS desde Streamlit Secrets."""
     try:
         return str(st.secrets.get("DATA_TRANSFERS_SPREADSHEET_ID", ""))
     except Exception:
@@ -288,11 +291,7 @@ MANUAL_FORECAST_ZERO_RULES = frozenset(
         "HARDCODE_3_NET_TRANSFER_BAJO",
     }
 )
-# TIPO_DE_CORTE específico por motivo real de hardcode — antes los 3 caían
-# juntos bajo "OK MANUAL POR FORECAST 0", etiqueta que solo describe con
-# precisión al primero. Separados para que la tabla de planeado-por-engine
-# distinga "sin demanda y sin stock" de "inventario menor a demanda" de
-# "net transfer bajo", en vez de mezclarlos.
+# TIPO_DE_CORTE por motivo de hardcode (una etiqueta por regla).
 HARDCODE_CUT_LABELS: dict[str, str] = {
     "HARDCODE_4_CERO_TOTAL": "OK MANUAL POR FORECAST Y STOCK EN CERO",
     "HARDCODE_3_INVENTARIO_MENOR_DEMANDA": (
@@ -301,29 +300,19 @@ HARDCODE_CUT_LABELS: dict[str, str] = {
     "HARDCODE_3_NET_TRANSFER_BAJO": "OK MANUAL POR NET TRANSFER BAJO",
 }
 
-# Barrido de universo completo de CATALOGO (sesión "ver el universo entero
-# en todo momento"): cuando al menos un engine de cobertura está activo,
-# toda combinación tienda-SKU de CATALOGO que ningún engine tocó (ni
-# Fountain9, ni AVL/Preventivo/Refuerzo/Cobertura sin Fountain9) recibe
-# una fila de SOLO VISIBILIDAD — nunca consume stock/tareas/capacidad, es
-# puramente informativa para que nada quede invisible en el reporte.
-# Definidas ANTES de BREAKDOWN_ORDER a propósito: ese tuple se evalúa al
-# importar el módulo, así que cualquier constante que referencie ahí debe
-# existir antes, no solo más abajo en el archivo.
+# Barrido de universo de CATALOGO: etiquetas de filas de solo visibilidad (no
+# consumen stock, tareas ni capacidad). Se definen antes de BREAKDOWN_ORDER
+# porque ese tuple se evalúa al importar.
 CATALOG_UNIVERSE_HEALTHY_CUT = "OK SIN NECESIDAD · FUERA DEL BULK DE FOUNTAIN9"
 CATALOG_UNIVERSE_HEALTHY_REGLA = "CATALOGO_SIN_NECESIDAD"
 CATALOG_UNIVERSE_UNCOVERED_CUT = "QUIEBRE SIN EVALUAR · FUERA DE COBERTURA ACTIVA"
 CATALOG_UNIVERSE_UNCOVERED_REGLA = "CATALOGO_QUIEBRE_SIN_EVALUAR"
-# Con Kazuhira activo, un quiebre que sigue en cero YA fue evaluado: no se
-# pudo cubrir por un motivo legítimo (sin stock en CEDIS elegible, bloqueo
-# regional/schedule/ruta de costos, tienda cerrada o ciudad bloqueada,
-# incoming que lo cubre, o sin Duration/Lead Time en todo el Bulk). Se
-# declara aparte de "sin evaluar" para que nada quede ambiguo.
+# Con Kazuhira activo, un quiebre que sigue en cero ya fue evaluado y no se
+# pudo cubrir.
 CATALOG_UNIVERSE_POST_KAZUHIRA_CUT = "QUIEBRE NO CUBIERTO · EVALUADO POR KAZUHIRA"
 CATALOG_UNIVERSE_POST_KAZUHIRA_REGLA = "CATALOGO_QUIEBRE_POST_KAZUHIRA"
-# Quiebres que ningún engine puede cubrir por una regla de configuración, no
-# por falta de stock: antes se omitían en silencio (producto excluido) o
-# ni siquiera dejaban rastro (tienda sin registro en TIENDA).
+# Quiebres que ninguna regla de cobertura puede cubrir por configuración, no
+# por falta de stock.
 CATALOG_UNIVERSE_EXCLUDED_PRODUCT_CUT = (
     "QUIEBRE NO CUBIERTO · PRODUCTO EXCLUIDO (BLOQUEOS O CODEC)"
 )
@@ -331,26 +320,17 @@ CATALOG_UNIVERSE_EXCLUDED_PRODUCT_REGLA = "CATALOGO_PRODUCTO_EXCLUIDO"
 CATALOG_UNIVERSE_NO_STORE_CUT = "QUIEBRE NO CUBIERTO · TIENDA SIN REGISTRO EN TIENDA"
 CATALOG_UNIVERSE_NO_STORE_REGLA = "CATALOGO_TIENDA_SIN_REGISTRO"
 
-# Kazuhira: última pasada del pipeline completo (después de Venom), no un
-# toggle más de Solidus. Mandato distinto por diseño — "ni una sola
-# combinación tienda-SKU del universo de catálogo debe quedar en quiebre
-# si hay stock disponible en CEDIS", sin importar si Fountain9 la
-# evaluó o no. Reusa la MISMA fórmula que Cobertura sin Fountain9 (ADU ×
-# (Duration+LeadTime) − stock − incoming, cascada de ADU) — lo que cambia
-# es el alcance: exclusión mínima (solo lo ya asignado esta corrida, no
-# "fountain_recommended_keys"), fallback de Duration/LeadTime cuando la
-# tienda no tiene dato propio (para nunca saltarse un quiebre por falta
-# de ese dato), y dos toggles independientes para ignorar presupuesto de
-# tareas y capacidad de tienda.
+# Kazuhira: última pasada (después de Venom). Cubre todo quiebre del universo
+# de catálogo con stock en CEDIS, venga o no de Fountain9, con la fórmula de
+# Cobertura sin Fountain9. Ver README.
 PLANNING_REASON_KAZUHIRA = "COBERTURA TOTAL · KAZUHIRA ENGINE"
 KAZUHIRA_CUT = "ENVIADOS PARA GARANTIZAR COBERTURA TOTAL · KAZUHIRA"
 KAZUHIRA_REGLA_DEMANDA = "KAZUHIRA_COBERTURA_TOTAL"
 # (Definidas antes de BREAKDOWN_ORDER a propósito: ese tuple se evalúa al
 # importar el módulo y referencia KAZUHIRA_CUT.)
 
-# Motivos por los que Kazuhira NO pudo cubrir una tienda-SKU que evaluó,
-# registrados por apply_avl_fill (parámetro skip_reasons). "SANO" no es un
-# hueco: la posición (stock + incoming + asignado) ya alcanza 1 DOH.
+# Motivos por los que Kazuhira no cubrió una tienda-SKU evaluada (skip_reasons
+# de apply_avl_fill). SANO no es un hueco: ya hay 1 DOH.
 KAZUHIRA_REASON_HEALTHY = "SANO"
 KAZUHIRA_UNCOVERED_LABELS: dict[str, str] = {
     "SIN_STOCK_ORIGEN": "QUIEBRE NO CUBIERTO · SIN STOCK EN CEDIS",
@@ -435,20 +415,12 @@ INPUT_PLAN_COLUMNS = (
     "Net Inter-Store Transfers",
 )
 
-# El "MOV efectivo" con el que se planea ya no es solo la columna (MOV) —
-# se toma el MÁXIMO entre esta y estas otras 11 columnas relacionadas, si
-# están presentes en el archivo. Solo (MOV) es obligatoria (parte de
-# INPUT_PLAN_COLUMNS arriba); estas 11 son opcionales: si el archivo de
-# Fountain9 no las trae, simplemente no participan en el máximo — nunca
-# tumban la carga.
+# MOV efectivo = máximo entre la columna MOV y estas 11 columnas opcionales de
+# Fountain9.
 DURATION_COLUMN = "Duration"
 LEAD_TIME_COLUMN = "Primary Source Lead Time (Days)"
-# La columna que de verdad refleja la decisión final de asignación de
-# Fountain9 — confirmado por análisis de archivos reales: es idéntica a
-# "Allocation Quantity for Plan Duration" en 99%+ de los casos, y es la
-# ÚNICA de las variantes de "Allocation" que sigue cuadrando incluso
-# cuando el mecanismo de Multi Source reasigna el origen. Opcional: la
-# mayoría de las cargas de hoy no la traen.
+# Decisión final de asignación de Fountain9 (opcional; alimenta el comparativo
+# Fountain9 vs Mother Base).
 FOUNTAIN9_ALLOCATION_COLUMN = "Allocation (Store Based)"
 
 MOV_MAX_OPTIONAL_COLUMNS = (
@@ -467,20 +439,12 @@ MOV_MAX_OPTIONAL_COLUMNS = (
 
 PLANNING_REASON_COLUMN = "PLANNING_REASON"
 
-# Sello de versión: aparece en la pantalla de resultados, en las advertencias
-# de la corrida y en run["build"], para saber con QUÉ código se generó cada
-# resultado (un despliegue desactualizado produce resultados que parecen
-# bugs del código nuevo). Súbelo en cada entrega.
+# Sello de versión (resultados, advertencias y run['build']). Subir en cada
+# entrega.
 APP_BUILD = "2026-10-05 · kazuhira-v10"
 
-# REGLA_DEMANDA que solo generan los engines de cobertura (AVL, Preventivo,
-# Refuerzo Golden/Infaltable/Anchor, Shalashaska, Liquid, Venom) — nunca la
-# necesidad original de Fountain9. "Requerido" en Planeación Lista se calcula
-# EXCLUYENDO estas filas, para que siempre refleje solo la necesidad de
-# Naked/Solidus (la pasada base), sin mezclar con lo que el modelo decide
-# agregar después como cobertura. Se compara ANTES de que
-# apply_reporting_labels renombre REGLA_DEMANDA, así que estos valores nunca
-# cambian sin importar en qué momento se lea la fila.
+# REGLA_DEMANDA de filas de cobertura, nunca de la necesidad original de
+# Fountain9; 'Requerido' las excluye.
 ENGINE_TOPUP_REGLA_DEMANDA: frozenset[str] = frozenset(
     {
         "AVL_DOH",
@@ -500,10 +464,7 @@ PLANNING_REASON_SPECIAL_DOH = "REFUERZO GOLDEN/INFALTABLE/ANCHOR · SOLIDUS ENGI
 SPECIAL_DOH_CUT = "ENVIADOS PARA REFORZAR GOLDEN/INFALTABLE/ANCHOR"
 PLANNING_REASON_NO_FOUNTAIN9 = "COBERTURA SIN FOUNTAIN9 · SOLIDUS ENGINE"
 NO_FOUNTAIN9_CUT = "ENVIADOS PARA CUBRIR QUIEBRE SIN FOUNTAIN9"
-# ADU de respaldo cuando el SKU no tiene ADU propio ni de ciudad (cascada
-# de resolve_adu_with_city_fallback) Y además no tuvo recomendación
-# positiva de Fountain9 — a falta de cualquier señal de venta, 0.14/día
-# es el piso de negocio.
+# ADU de respaldo (unidades/día) cuando no hay ADU propio ni de ciudad.
 FICTITIOUS_ADU_NO_FOUNTAIN9 = 0.14
 PLANNING_REASON_INSUMOS = "INSUMOS"
 BULK_OUTPUT_COLUMNS = [*engine.OUTPUT_COLUMNS, PLANNING_REASON_COLUMN]
@@ -526,9 +487,8 @@ INSUMO_STOCK_RULES = {
     90532: {"name": "INSUMO 90532", "target_stock": 1_050, "moq": 350},
 }
 
-# SKUs de INSUMOS restringidos a un subconjunto de ciudades — un renglón de
-# la hoja INSUMOS para una tienda fuera de este set se descarta aunque la
-# tienda ya esté fondeada por el 444. Vacío u omitido = sin restricción.
+# SKUs de INSUMOS limitados a ciertas ciudades: los renglones de otras tiendas
+# se descartan.
 INSUMO_CITY_RESTRICTIONS: dict[int, frozenset[str]] = {
     90532: frozenset({"CDMX"}),
 }
@@ -1323,10 +1283,9 @@ COPERNICO_BODEGA_HEADER_ALIASES = {"BODEGA", "WAREHOUSE ID", "WAREHOUSE_ID"}
 
 
 def detect_copernico_warehouses(uploaded_files) -> set[int]:
-    """Lee la columna Bodega de cada archivo COPÉRNICO cargado, sin guardar
-    nada en disco, para saber qué warehouses cubre antes de validar la
-    corrida. Tolerante a variantes de encabezado y delimitador, igual que
-    ``load_copernico_unusable_csv``."""
+    """Lee la columna Bodega de cada archivo COPÉRNICO cargado, sin guardar nada en
+    disco, para saber qué warehouses cubre antes de validar la corrida.
+    """
     warehouses: set[int] = set()
     for uploaded_file in uploaded_files or ():
         try:
@@ -1443,10 +1402,8 @@ def consolidate_plan_files(
                     f"{path.name}: faltan columnas obligatorias: {missing}."
                 )
 
-            # Columnas opcionales para el máximo del MOV efectivo: se
-            # resuelven las que sí estén presentes en ESTE archivo, sin
-            # exigir ninguna. Cada archivo puede traer un subconjunto
-            # distinto.
+            # Columnas opcionales para el máximo del MOV efectivo: se resuelven
+            # las que sí estén presentes en ESTE archivo, sin exigir ninguna.
             optional_mov_lookup: dict[str, str] = {}
             for column in MOV_MAX_OPTIONAL_COLUMNS:
                 match = field_lookup.get(engine.normalize_header(column))
@@ -1455,9 +1412,7 @@ def consolidate_plan_files(
 
             # Duration/Lead Time: opcionales, para la moda por tienda que
             # alimenta la cobertura de SKUs sin fila de Fountain9 (ver
-            # build_no_fountain9_coverage_candidates). No es un promedio
-            # por SKU — es una sola moda por tienda, sobre TODAS las filas
-            # de esa tienda en el archivo, sin importar el SKU.
+            # build_no_fountain9_coverage_candidates).
             duration_field = field_lookup.get(engine.normalize_header(DURATION_COLUMN))
             lead_time_field = field_lookup.get(engine.normalize_header(LEAD_TIME_COLUMN))
             # Asignación real de Fountain9 (opcional) — para el reporte
@@ -1543,10 +1498,7 @@ def consolidate_plan_files(
                         engine.to_float(raw.get(field_name, ""))
                     )
                 row_mov_max = max(row_mov_candidates)
-                # Entre filas/archivos duplicados de la misma tienda-SKU se
-                # toma el MÁXIMO, no la suma — a propósito de esta sesión:
-                # evita sumar o duplicar cuando la misma combinación
-                # aparece más de una vez.
+                # Duplicados de la misma tienda-SKU: se toma el MÁXIMO, no la suma.
                 record["ROQ_INPUT"] = max(record["ROQ_INPUT"], row_mov_max)
                 if fountain9_allocation_field is not None:
                     row_f9_allocation = engine.to_float(
@@ -1831,14 +1783,7 @@ def load_closed_store_ids(database_path: Path) -> set[int]:
 def load_venom_catalog_lookup(
     database_path: Path,
 ) -> tuple[dict[tuple[int, int], dict[str, Any]], list[str]]:
-    """Carga CATALOGO completo (ADU + LIST_TYPE) para el Venom Engine.
-
-    A diferencia de ``load_avl_catalog_rows``, esta función NO descarta filas
-    con ADU <= 0: Venom necesita saber que una tienda-SKU está en CATALOGO
-    aunque su ADU sea cero, y necesita LIST_TYPE para identificar productos
-    ``BL``. LIST_TYPE es opcional: si la columna no existe en CATALOGO, todas
-    las filas quedan con LIST_TYPE vacío (ningún producto califica como BL).
-    """
+    """Carga CATALOGO completo (ADU + LIST_TYPE) para el Venom Engine."""
     consolidated: dict[tuple[int, int], dict[str, Any]] = {}
     warnings: list[str] = []
     workbook = openpyxl.load_workbook(database_path, read_only=True, data_only=True)
@@ -1902,13 +1847,7 @@ def load_venom_catalog_lookup(
 def load_avl_catalog_rows(
     database_path: Path,
 ) -> tuple[list[dict[str, Any]], list[str]]:
-    """Carga todo el catálogo y consolida una ADU por combinación tienda-SKU.
-
-    Ya NO descarta filas con ADU <= 0: AVL, Preventivo y el Refuerzo
-    Golden/Infaltable/Anchor necesitan ver esas combinaciones para poder
-    aplicarles la cascada de respaldo (ADU propio -> promedio de la misma
-    ciudad -> sin dato), en vez de quedar invisibles desde el arranque.
-    """
+    """Carga CATALOGO y consolida una ADU por tienda-SKU."""
     consolidated: dict[tuple[int, int], float] = {}
     warnings: list[str] = []
     workbook = openpyxl.load_workbook(database_path, read_only=True, data_only=True)
@@ -1964,25 +1903,8 @@ def resolve_adu_with_city_fallback(
     catalogs,
     keys_to_resolve: set[tuple[int, int]] | None = None,
 ) -> tuple[dict[tuple[int, int], float], dict[tuple[int, int], str]]:
-    """Cascada de ADU compartida por AVL, Preventivo y Refuerzo
-    Golden/Infaltable/Anchor:
-
-    1. ADU propio en CATALOGO para esa tienda-SKU -> se usa tal cual.
-    2. Sin ADU propio (ausente o <= 0) -> promedio de ADU del mismo SKU en
-       otras tiendas de la MISMA CIUDAD que sí tengan ADU > 0 en CATALOGO.
-    3. Ninguna tienda de la misma ciudad tiene ADU para ese SKU -> sin dato
-       (no aparece en el resultado).
-
-    ``keys_to_resolve`` son las combinaciones (destino, sku) que se quieren
-    resolver — típicamente el universo de candidatos de quien llama, que
-    para el Refuerzo Golden/Infaltable/Anchor NO es el mismo que las llaves
-    presentes en ``catalog_rows`` (viene de GOLDEN_INFALTABLES_ANCHOR, así
-    que muchas combinaciones ni siquiera tienen fila propia en CATALOGO).
-    Si se omite, se resuelven solo las llaves que sí aparecen en
-    ``catalog_rows`` (comportamiento histórico de AVL/Preventivo).
-
-    Devuelve ``(adu_by_key, source_by_key)`` — ``source_by_key`` vale
-    "PROPIO" o "PROMEDIO_CIUDAD", útil para trazabilidad/advertencias.
+    """Cascada de ADU de AVL, Preventivo y Refuerzo: propio → promedio de la ciudad →
+    sin dato.
     """
     own_adu: dict[tuple[int, int], float] = {}
     for row in catalog_rows:
@@ -2032,16 +1954,8 @@ def build_golden_infaltable_anchor_health_check(
     target_doh: float,
     catalog_rows: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Verificación de salud al final del pipeline (después de Shalashaska,
-    Liquid y Venom): compara el DOH final real de cada tienda-SKU
-    Golden/Infaltable/Anchor contra ``target_doh``, usando la posición final
-    real (stock inicial + todo lo asignado por cualquier engine en esta
-    corrida). Avisa si algo quedó por debajo del objetivo — por ejemplo
-    porque un engine que corrió DESPUÉS del Refuerzo consumió stock del
-    mismo origen y nadie volvió a revisarlo.
-
-    Es un chequeo informativo, no una re-planeación: no mueve nada, solo
-    reporta para que la corrida se pueda corregir ANTES de entregarse.
+    """Verificación de salud al final del pipeline (después de Shalashaska, Liquid y
+    Venom).
     """
     keys = (
         catalogs.golden_products
@@ -2113,12 +2027,7 @@ def _diagnose_uncovered_bucket_reason(
     blocked_cities: tuple[str, ...],
     capacity_by_store: dict[int, dict[str, Any]],
 ) -> str:
-    """Determina por qué una tienda-SKU del reporte de universo Golden/
-    Infaltable/Anchor sigue sin cubrirse. Revisa primero motivos a nivel
-    tienda (bloquean sin importar el origen); si ninguno aplica, revisa
-    origen por origen. Si de verdad no encuentra nada, regresa el texto
-    literal "SIN MOTIVO DE BLOQUEO IDENTIFICADO" — no inventa una
-    explicación, queda visible para revisión manual."""
+    """Por qué una tienda-SKU del universo Golden/Infaltable/Anchor sigue sin cubrirse."""
     if sku in catalogs.excluded_products:
         return "SKU EXCLUIDO GLOBALMENTE"
     if destination in closed_store_ids:
@@ -2188,12 +2097,8 @@ def build_bucket_universe_report(
     catalog_rows: list[dict[str, Any]],
     target_doh: float = GOLDEN_INFALTABLE_ANCHOR_RISK_DOH,
 ) -> dict[str, Any]:
-    """Reporte del universo COMPLETO de un bucket (Golden, Infaltable o
-    Anchor) — no solo lo que algún engine tocó hoy. Para cada tienda-SKU
-    marcada en la hoja GOLDEN_INFALTABLES_ANCHOR, compara DOH inicial vs
-    DOH final (con todo lo asignado por cualquier engine esta corrida) y
-    clasifica en una de 4 categorías. Para lo que sigue sin cubrirse,
-    agrega el motivo detallado (micro-detalle).
+    """Reporte del universo completo de un bucket (Golden, Infaltable o Anchor), no solo
+    lo que algún engine tocó.
     """
     if not bucket_keys:
         return {
@@ -2239,11 +2144,8 @@ def build_bucket_universe_report(
             else:
                 categoria = "NO_CUBIERTO"
         else:
-            # Sin ADU (ni propio ni de la ciudad) no hay forma de calcular
-            # un DOH real. "Infinito porque no sabemos" NO es lo mismo que
-            # "sin riesgo" — se trata siempre como NO_CUBIERTO para que
-            # quede visible y alguien lo revise, en vez de darle una
-            # confianza que no tenemos.
+            # Sin ADU (ni propio ni de la ciudad) no hay forma de calcular un
+            # DOH real.
             doh_initial = None
             doh_final = None
             categoria = "NO_CUBIERTO"
@@ -2622,12 +2524,8 @@ def append_insumos_to_bulk_444(
         regular_444_rows + selected,
         BULK_OUTPUT_COLUMNS,
     )
-    # SWA de Insumos: calculado directo desde sus propias filas (no vive en
-    # result.allocation_rows, así que build_swa_report no las ve). Binario
-    # igual que el resto: cualquier línea con SWA_POTENTIAL_GAIN_COUNTRY >
-    # 0 cuenta completo. Nota: es un cálculo aparte del reporte central de
-    # SWA, no reconciliado contra él — si la misma tienda-SKU también
-    # recibió algo por la asignación regular, el SWA ya se contó ahí.
+    # SWA de Insumos: se calcula desde sus propias filas (no pasan por
+    # allocation_rows); es independiente del reporte central.
     swa_seen_keys: set[tuple[int, int]] = set()
     swa_ganado_insumos = 0.0
     assigned_keys: set[tuple[int, int]] = set()
@@ -2647,11 +2545,8 @@ def append_insumos_to_bulk_444(
                 {row["WAREHOUSE_DESTINATION"] for row in selected}
             ),
             "swa_ganado": round(swa_ganado_insumos, 4),
-            # (destino, SKU) que Insumos cubrió — build_swa_report lo
-            # necesita porque estas filas no viven en result.allocation_rows
-            # (Insumos corre aparte, sin tareas), así que sin esto el
-            # reporte central las marcaría como "perdido" aunque sí se
-            # hayan cubierto.
+            # (destino, SKU) cubiertos por Insumos; build_swa_report los
+            # necesita porque Insumos no pasa por allocation_rows.
             "assigned_keys": assigned_keys,
         }
     )
@@ -2702,10 +2597,9 @@ def rewrite_bulk_csvs_with_planning_reason(
 def sort_health_rows_for_display(
     rows: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Agrupa las tarjetas de salud por tipo — IMPORTRANGE/BACKEND primero,
-    ALEPH después — en vez del orden de REQUIRED_DATABASE_SHEETS, que los
-    mezcla. Orden estable: dentro de cada grupo se conserva el orden
-    original."""
+    """Agrupa las tarjetas de salud por tipo — IMPORTRANGE/BACKEND primero, ALEPH
+    después — en vez del orden de REQUIRED_DATABASE_SHEETS, que los mezcla.
+    """
     card_type_priority = {"IMPORTRANGE": 0, "BACKEND": 0, "ALEPH": 1}
     return sorted(rows, key=lambda row: card_type_priority.get(row["TIPO"], 0))
 
@@ -2773,10 +2667,9 @@ def ordered_breakdown_rows(
     status_counts: dict[str, int] | Counter[str],
     status_swa: dict[str, float] | None = None,
 ) -> list[dict[str, Any]]:
-    """status_swa (opcional): SWA_POTENTIAL_GAIN_COUNTRY sumado por el
-    mismo TIPO_DE_CORTE que agrupa status_counts. Si no se pasa, la
-    columna SWA simplemente no aparece — mantiene compatible a quien
-    llame a esta función sin ese dato."""
+    """status_swa (opcional): SWA_POTENTIAL_GAIN_COUNTRY sumado por el mismo
+    TIPO_DE_CORTE que agrupa status_counts.
+    """
     order = {label: index for index, label in enumerate(BREAKDOWN_ORDER)}
     status_swa = status_swa or {}
     return [
@@ -2821,10 +2714,7 @@ def attribute_engine(tipo_de_corte: str) -> str:
 def build_planned_by_engine_rows(
     result, insumos_summary: dict[str, Any] | None = None
 ) -> list[dict[str, Any]]:
-    """Tabla 1: lo efectivamente planeado (CANTIDAD_ASIGNADA > 0), agrupado
-    por engine y, dentro de cada engine, por la causal (TIPO_DE_CORTE).
-    INSUMOS no vive en base_rows (es un anexo directo al CSV, sin tareas),
-    así que se agrega aparte con lo que ya reporta su propio resumen."""
+    """Tabla 1: lo efectivamente planeado (CANTIDAD_ASIGNADA > 0), por engine y causal."""
     counts: Counter[tuple[str, str]] = Counter()
     units: Counter[tuple[str, str]] = Counter()
     swa_ganado: Counter[tuple[str, str]] = Counter()
@@ -2903,15 +2793,8 @@ def build_cuts_detail_rows(
     closed_summary: dict[str, Any] | None = None,
     block_summary: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Tabla 2: todo lo que NO se mandó (CANTIDAD_ASIGNADA == 0), con el
-    motivo específico (incluye los sub-motivos de COPÉRNICO: LOST,
-    CANCELADOS, ZONA 856, etc., no solo el bucket genérico). TIENDAS_CERRADAS
-    y ciudades bloqueadas se excluyen ANTES de llegar a base_rows, así que
-    se agregan aparte con lo que ya reportan sus propios resúmenes.
-
-    "SIN RECOMENDACIÓN" vive aparte, en build_no_recommendation_breakdown
-    — no es un corte (no había nada que cubrir), así que no pertenece a
-    esta tabla de cortes.
+    """Tabla 2: lo no enviado (CANTIDAD_ASIGNADA == 0), con motivo específico (incluye
+    sub-motivos de COPÉRNICO).
     """
     counts: Counter[str] = Counter()
     units_missing: Counter[str] = Counter()
@@ -2953,17 +2836,9 @@ def build_cuts_detail_rows(
     ]
 
 
-# Motivos de "SIN RECOMENDACIÓN" — por qué Fountain9 no pidió nada, usando
-# ÚNICAMENTE columnas que vienen de su propio Bulk (demanda, opening,
-# transferencia entre tiendas). Nunca mezcla datos de CATALOGO/STOCK/otros
-# engines — es deliberadamente angosto, solo lo que el archivo de
-# Fountain9 ya traía consigo.
-#
-# Todo SKU que llega aquí cumple, por construcción de calculate_target_
-# quantity, opening >= demand (si no, habría caído en el hardcode de
-# déficit en vez de SIN_DEMANDA) — así que "inventario cubre la demanda"
-# no puede ser el único criterio, siempre sería cierto. Los motivos de
-# abajo distinguen el PORQUÉ específico de esa cobertura.
+# Motivos de SIN RECOMENDACIÓN, solo con columnas del Bulk de Fountain9. Todo
+# SKU aquí cumple opening >= demanda: los motivos distinguen el tipo de
+# cobertura.
 NO_RECOMMENDATION_AMPLE_MARGIN_MULTIPLIER = 2.0
 
 NO_RECOMMENDATION_REASONS = (
@@ -2976,10 +2851,9 @@ NO_RECOMMENDATION_REASONS = (
 
 
 def classify_no_recommendation_reason(row: dict[str, Any]) -> str:
-    """Clasifica UNA fila SIN RECOMENDACIÓN en su motivo específico, usando
-    solo PREDICTED_DEMAND, PREDICTED_OPENING_INVENTORY y
-    NET_INTER_STORE_TRANSFERS — las tres columnas que vienen directo del
-    Bulk de Fountain9 y ya se preservan en base_rows."""
+    """Clasifica UNA fila SIN RECOMENDACIÓN en su motivo específico, usando solo
+    PREDICTED_DEMAND, PREDICTED_OPENING_INVENTORY y NET_INTER_STORE_TRANSFERS.
+    """
     demand = float(row.get("PREDICTED_DEMAND", 0) or 0)
     opening = float(row.get("PREDICTED_OPENING_INVENTORY", 0) or 0)
     net_transfer = float(row.get("NET_INTER_STORE_TRANSFERS", 0) or 0)
@@ -2996,11 +2870,7 @@ def classify_no_recommendation_reason(row: dict[str, Any]) -> str:
 
 
 def build_no_recommendation_breakdown(result) -> list[dict[str, Any]]:
-    """Cuarto breakdown, separado de los otros 3: específicamente por qué
-    Fountain9 no pidió nada para cada tienda-SKU (TIPO_DE_CORTE =
-    "SIN RECOMENDACIÓN"). Exclusivo de la pasada base de Naked por
-    construcción — Shalashaska/Liquid/Venom/Insumos nunca generan este
-    TIPO_DE_CORTE, así que no hace falta filtrarlos aparte."""
+    """Tabla 3: por qué Fountain9 no pidió nada (TIPO_DE_CORTE = SIN RECOMENDACIÓN)."""
     counts: Counter[str] = Counter()
     swa_informativo: Counter[str] = Counter()
     for row in result.base_rows:
@@ -3050,10 +2920,9 @@ def _coverage_stats(keys_with_qty: list[tuple[tuple[int, int], float]]) -> dict[
 def scheduled_destinations_today(
     catalogs, origins: Iterable[int]
 ) -> set[int]:
-    """Tiendas que SCHEDULE marca con día válido HOY para al menos uno de
-    los orígenes seleccionados. Independiente del toggle de bloqueo por
-    SCHEDULE (schedule_block_enabled): aquí SCHEDULE se usa para saber qué
-    tiendas toca planear hoy, no para bloquear nada."""
+    """Tiendas con día válido hoy en SCHEDULE para algún origen seleccionado
+    (independiente del toggle de bloqueo).
+    """
     origin_set = set(origins)
     return {
         destination
@@ -3081,11 +2950,9 @@ def build_planned_store_universe(
 
 
 def explain_store_sku(zip_path, store: int, sku: int) -> dict[str, Any]:
-    """Responde "¿qué pasó con este SKU en esta tienda?" leyendo lo que ya
-    quedó en el zip de la corrida (no necesita el estado en memoria):
-    líneas enviadas (BulkCD_*.csv), filas declaradas (BASE_TRANSFERS) y
-    universo sano (CSV aparte). Si no aparece en NINGUNO, lo dice
-    explícitamente: es un hueco sin declarar, justo lo que no debe pasar."""
+    """Qué pasó con una tienda-SKU, leyendo el zip de la corrida: enviada, declarada,
+    sana o sin rastro.
+    """
     result: dict[str, Any] = {
         "store": store, "sku": sku, "sent": [], "declared": [],
         "healthy": None, "verdict": "",
@@ -3199,16 +3066,9 @@ def resolve_duration_lead_time_with_city_fallback(
     duration_mode_by_store: dict[int, float],
     lead_time_mode_by_store: dict[int, float],
 ) -> tuple[dict[int, float], dict[int, float], dict[int, str]]:
-    """Cascada de Duration/Lead Time por tienda, igual en espíritu a la del
-    ADU: moda propia (Bulk de Fountain9) -> promedio de las tiendas de la
-    MISMA CIUDAD que sí tienen dato propio -> (el promedio país lo aplica
-    quien llama, como último escalón, si aquí sigue sin resolverse).
-
-    Devuelve (duration, lead_time, fuente) por tienda; fuente es "PROPIA"
-    o "CIUDAD". Las tiendas sin dato propio ni de ciudad simplemente no
-    aparecen — caen al promedio país. Solo promedia entre tiendas que
-    tienen AMBOS datos propios, para no mezclar un Duration de una tienda
-    con el Lead Time de otra."""
+    """Cascada de Duration/Lead Time por tienda: propia → promedio de la misma ciudad
+    (el promedio país lo aplica quien llama).
+    """
     own = {
         store: (duration_mode_by_store[store], lead_time_mode_by_store[store])
         for store in duration_mode_by_store
@@ -3240,12 +3100,7 @@ def compute_fallback_duration_and_lead_time(
     duration_mode_by_store: dict[int, float],
     lead_time_mode_by_store: dict[int, float],
 ) -> tuple[float | None, float | None]:
-    """Promedio país de Duration y Lead Time entre las tiendas que sí
-    tienen su propia moda — el respaldo de Kazuhira para tiendas que nunca
-    tuvieron ni una fila en el Bulk de Fountain9 (por eso no tienen moda
-    propia). None si no hay ninguna tienda con dato (nada de qué
-    promediar) — en ese caso Kazuhira simplemente no puede cubrir esas
-    tiendas, no hay información alguna para intentarlo."""
+    """Promedio país de Duration y Lead Time entre las tiendas con moda propia."""
     duration_values = [v for v in duration_mode_by_store.values() if v is not None]
     lead_time_values = [v for v in lead_time_mode_by_store.values() if v is not None]
     fallback_duration = (
@@ -3261,19 +3116,9 @@ def build_assigned_totals_by_key(
     result,
     extra_assigned_keys: set[tuple[int, int]] | None = None,
 ) -> dict[tuple[int, int], float]:
-    """Suma CANTIDAD/QUANTITY asignada por (destino, SKU) a través de
-    TODOS los engines de esta corrida — una sola vez, para no repetir este
-    cálculo en cada reporte que necesite saber "cuánto se mandó en total a
-    esta tienda-SKU", sin importar cuántas líneas/engines distintos lo
-    hayan tocado.
-
-    ``extra_assigned_keys`` cubre lo que no vive en result.allocation_rows
-    — hoy, específicamente Insumos (corre aparte, sin tareas, anexado
-    directo al CSV). Sin esto, esas combinaciones se verían como "sin
-    asignación" aunque sí hayan recibido algo. Se marcan con 1.0 (no la
-    cantidad real, que no está disponible aquí) — alcanza porque todo lo
-    que lee este diccionario solo pregunta ">0", nunca usa la magnitud de
-    estas llaves extra."""
+    """Suma CANTIDAD/QUANTITY asignada por (destino, SKU) a través de TODOS los engines
+    de esta corrida.
+    """
     totals: dict[tuple[int, int], float] = defaultdict(float)
     for row in result.allocation_rows:
         key = (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"])
@@ -3301,24 +3146,8 @@ def iter_catalog_universe_sweep_rows(
     closed_store_ids: set[int] | None = None,
     blocked_cities: tuple[str, ...] = (),
 ) -> list[dict[str, Any]]:
-    """Barrido de visibilidad: una fila por cada tienda-SKU de CATALOGO que
-    NINGÚN engine tocó esta corrida (ni Fountain9, ni AVL/Preventivo/
-    Refuerzo/Cobertura sin Fountain9) — para que el universo completo
-    quede visible en el reporte, sin importar qué toggles de cobertura
-    estén activos.
-
-    Nunca consume stock, tareas ni capacidad — son filas de SOLO
-    VISIBILIDAD (CANTIDAD_OBJETIVO=0, CANTIDAD_ASIGNADA=0 siempre). No
-    intentan cubrir nada; eso lo deciden los engines de cobertura con sus
-    propios toggles. Esto solo garantiza que lo que nadie tocó no
-    desaparezca del reporte.
-
-    Dos motivos, distinguidos por si hay stock real (catalogs.stock_base)
-    o no:
-    - Con stock > 0: sano, no había nada que cubrir.
-    - Con stock = 0: quiebre real que ningún engine activo alcanzó a
-      evaluar — a diferencia de "sin recomendación" (que sí tuvo una fila
-      de Fountain9), aquí puede que ni eso haya habido.
+    """Filas de solo visibilidad: una por tienda-SKU de CATALOGO que ningún engine tocó
+    (etiquetas CATALOG_UNIVERSE_*).
     """
     seen_in_sweep: set[tuple[int, int]] = set()
     blocked_city_set = set(blocked_cities)
@@ -3400,9 +3229,7 @@ def build_catalog_universe_sweep_rows(
     existing_keys: set[tuple[int, int]],
     **kwargs: Any,
 ) -> list[dict[str, Any]]:
-    """Versión en lista de iter_catalog_universe_sweep_rows (tests y
-    catálogos chicos). En producción se usa el iterador para no guardar en
-    memoria las filas sanas."""
+    """Versión en lista de iter_catalog_universe_sweep_rows (tests y catálogos chicos)."""
     return list(
         iter_catalog_universe_sweep_rows(catalog_rows, catalogs, existing_keys, **kwargs)
     )
@@ -3414,26 +3241,9 @@ def build_swa_report(
     result,
     insumos_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """El reporte central de SWA: sobre TODO el universo de quiebres del
-    catálogo (no solo lo que algún engine intentó cubrir), cuánto SWA país
-    se ganó esta corrida (tienda-SKU que estaba en 0 y terminó con
-    asignación > 0) contra cuánto se quedó sin ganar (siguió en 0 al
-    final, con o sin intento de cubrirlo).
-
-    "Ganado" es binario, no proporcional a la cantidad enviada — basta con
-    sacar a la tienda-SKU del quiebre (cualquier unidad > 0) para capturar
-    el SWA_POTENTIAL_GAIN_COUNTRY completo de esa fila. Así es como se
-    calcula la métrica en origen (Aleph): STOCK_UNITS > 0 es la condición,
-    no una proporción.
-
-    Universo: TODA combinación destino-SKU de CATALOGO con stock inicial
-    en 0, sin importar si tenía SWA registrado, si había stock en algún
-    origen, o si algún engine llegó a intentarlo.
-
-    ``insumos_summary`` se pasa para incluir lo que Insumos cubrió (vive
-    aparte de result.allocation_rows) — sin esto, una tienda-SKU cubierta
-    únicamente por Insumos se marcaría "perdida" aquí aunque sí se haya
-    cubierto.
+    """SWA ganado/perdido sobre todo el universo de quiebres del catálogo. Ganado es
+    binario: cualquier envío que saque la tienda-SKU del quiebre captura su
+    SWA_POTENTIAL_GAIN_COUNTRY completo.
     """
     extra_keys = (insumos_summary or {}).get("assigned_keys", set())
     assigned_totals = build_assigned_totals_by_key(result, extra_keys)
@@ -3488,31 +3298,8 @@ def build_fountain9_comparison_report(
     catalogs,
     consolidated: dict[tuple[int, int], dict[str, Any]],
 ) -> dict[str, Any]:
-    """No es una comparación "pareja" — es para demostrar que Mother Base
-    desbloquea más de lo que Fountain9 siquiera llega a evaluar. Tres
-    bloques:
-
-    1. "fountain9" / "mother_base_mismo_alcance": cara a cara, solo sobre
-       las tienda-SKU donde Fountain9 trajo "Allocation (Store Based)"
-       (confirmado por análisis de archivos reales que esa columna es su
-       decisión final, incluso con reasignación por Multi Source).
-    2. "mother_base_adicional": todo lo que Mother Base asignó FUERA de
-       ese alcance — tienda-SKU que Fountain9 nunca evaluó en absoluto
-       (incluye, pero no se limita a, lo que cubre el engine "Cobertura
-       sin Fountain9" de §17).
-    3. "mother_base_total" = mismo alcance + adicional — el número grande,
-       la cifra real de "cuánto más hacemos".
-
-    Si el Bulk no trae la columna en ninguna fila, el reporte queda
-    deshabilitado — no hay con qué comparar el bloque 1, aunque Mother
-    Base sí haya operado (ese caso no es un error, solo no se puede armar
-    el comparativo).
-
-    "Cubrió una ruptura" = stock en destino (el nuestro, catalogs.stock_base,
-    para no mezclar dos fuentes de verdad distintas) era 0 Y esa fuente
-    asignó algo > 0. Esto solo aplica al bloque 1 (cara a cara) — Fountain9
-    no puede "cubrir" algo que nunca vio, así que no tendría sentido
-    medirlo ahí.
+    """Compara 'Allocation (Store Based)' de Fountain9 contra Mother Base en tres
+    bloques: mismo alcance, adicional (fuera del alcance de Fountain9) y total.
     """
     universe = [
         (key, record)
@@ -3584,10 +3371,8 @@ def build_fountain9_comparison_report(
             else:
                 ninguno_cubrio += 1
 
-    # Bloque 3: todo lo que Mother Base asignó a tienda-SKU que Fountain9
-    # nunca evaluó (ausentes de "universe" por completo) — el "desbloqueo"
-    # real, lo que Fountain9 ni siquiera alcanza a ver. SWA aquí también
-    # requiere stock=0 (mismo criterio que arriba), no solo asignación.
+    # Bloque adicional: lo asignado a tienda-SKU que Fountain9 nunca evaluó.
+    # SWA exige stock = 0, igual que arriba.
     additional_pairs = [
         (key, qty)
         for key, qty in our_assigned.items()
@@ -4332,13 +4117,8 @@ def is_copernico_cut_label(tipo_de_corte: str) -> bool:
 
 
 def copernico_cut_summary(result) -> dict[str, Any]:
-    """Cuantifica cuánta demanda no se planificó por exclusiones de COPÉRNICO
-    (ubicación no usable, LOST, etc.) — no confundir con COPERNICO_NO_USABLE
-    como dato informativo suelto: aquí se aísla como motivo de corte cuando,
-    sin esa exclusión, el requerimiento habría tenido stock elegible.
-
-    Debe llamarse después de ``apply_reporting_labels`` para leer las
-    etiquetas finales de TIPO_DE_CORTE.
+    """Cuantifica cuánta demanda no se planificó por exclusiones de COPÉRNICO (ubicación
+    no usable, LOST, etc.).
     """
     affected_rows = [
         row
@@ -4384,11 +4164,7 @@ def copernico_cut_summary(result) -> dict[str, Any]:
 
 
 def schedule_block_summary(result, catalogs) -> dict[str, Any]:
-    """Resume el efecto del toggle 'Bloquear envíos fuera de frecuencia'.
-
-    Debe llamarse después de ``apply_reporting_labels`` para leer las
-    etiquetas finales de TIPO_DE_CORTE.
-    """
+    """Resume el efecto del toggle 'Bloquear envíos fuera de frecuencia'."""
     weekday_display = engine.WEEKDAY_DISPLAY_NAMES.get(
         catalogs.run_weekday_norm, catalogs.run_weekday_norm
     )
@@ -4911,39 +4687,11 @@ def apply_avl_fill(
     skip_reasons: dict[tuple[int, int], str] | None = None,
     swa_priority: bool = False,
 ) -> dict[str, Any]:
-    """Usa tareas remanentes para stockouts, inventario preventivo, refuerzo
-    de Golden/Infaltable/Anchor del catálogo, cobertura de quiebres sin
-    fila de Fountain9 (candidate_mode="no_fountain9_coverage"), o la
-    garantía total de Kazuhira (candidate_mode="kazuhira" — misma fórmula
-    que "no_fountain9_coverage", alcance más amplio).
-
-    ``duration_mode_by_store``/``lead_time_mode_by_store`` aplican a
-    "no_fountain9_coverage" y "kazuhira" — la moda de Duration/Lead Time
-    del Bulk de Fountain9, una por tienda (ver consolidate_plan_files).
-    ``fallback_duration``/``fallback_lead_time`` solo aplican a
-    "kazuhira": si la tienda no tiene su propia moda (nunca tuvo fila en
-    el Bulk), se usa este valor en vez de saltarse el quiebre — "Cobertura
-    sin Fountain9" en cambio sí se salta ese caso (``skipped_no_duration_
-    data``), porque no tiene mandato de garantía absoluta.
-    ``ignore_task_budget``/``ignore_store_capacity``: solo relevantes para
-    Kazuhira (el resto de los modos siempre respeta ambos límites).
-    ``allowed_destinations``: si se pasa, solo se evalúan esas tiendas
-    (Kazuhira: las del Bulk de Fountain9 de esta corrida + las que SCHEDULE
-    marca con día válido hoy). None = todas las del catálogo.
-
-    ``swa_priority``: si es True, cuando tareas o capacidad no alcanzan para
-    todos, se atiende primero lo que más SWA país recupera
-    (SWA_POTENTIAL_GAIN_COUNTRY, hoja SWA) en vez del orden por prioridad
-    de producto/tienda. Apagado por defecto: no cambia nada si no se pide.
-
-    ``skip_reasons``: si se pasa un dict, se llena con el motivo por el que
-    cada tienda-SKU evaluada NO se cubrió (llaves de KAZUHIRA_UNCOVERED_
-    LABELS, o KAZUHIRA_REASON_HEALTHY si ya tenía 1 DOH) — para declarar
-    cada quiebre abierto en vez de solo contarlo.
-
-    Kazuhira dispara cuando (stock + incoming + lo ya asignado en esta
-    corrida) / ADU efectivo < 1 DOH, no solo con stock = 0; una
-    combinación sin fila en STOCK cuenta como stock 0 (no se salta).
+    """Cobertura de catálogo con las tareas remanentes. candidate_mode: stockout (AVL),
+    preventive, special_doh (Refuerzo), no_fountain9_coverage o kazuhira. Solo
+    Kazuhira usa fallback_duration, fallback_lead_time, ignore_task_budget,
+    ignore_store_capacity y swa_priority. skip_reasons recibe el motivo de cada
+    tienda-SKU no cubierta.
     """
     if candidate_mode not in {
         "stockout", "preventive", "special_doh", "no_fountain9_coverage",
@@ -5012,11 +4760,8 @@ def apply_avl_fill(
         row["WAREHOUSE_DESTINATION"]: row for row in result.capacity_rows
     }
 
-    # Posición ya asignada a cada tienda-SKU en esta corrida (por cualquier
-    # engine anterior, incluidos Naked/Solidus y AVL/Preventivo si ya
-    # corrieron). Solo se usa en modo special_doh, para hacer on-top sobre
-    # lo que ya dejaron otros engines de cobertura en vez de descartar el
-    # caso por completo.
+    # Unidades ya asignadas por tienda-SKU en esta corrida (engines
+    # anteriores).
     assigned_units_by_key: Counter[tuple[int, int]] = Counter()
     for allocation in result.allocation_rows:
         assigned_units_by_key[
@@ -5024,10 +4769,7 @@ def apply_avl_fill(
         ] += int(allocation.get("QUANTITY", 0) or 0)
 
     if candidate_mode == "special_doh":
-        # El universo de candidatos es GOLDEN_INFALTABLES_ANCHOR completo —
-        # no CATALOGO. Un SKU marcado Golden/Infaltable/Anchor sin fila en
-        # CATALOGO para esa tienda igual debe evaluarse (con ADU de respaldo
-        # o, en último caso, el mínimo de 3 sin DOH).
+        # Universo: GOLDEN_INFALTABLES_ANCHOR completo, no CATALOGO.
         iteration_keys = (
             catalogs.golden_products
             | catalogs.infaltable_products
@@ -5076,12 +4818,8 @@ def apply_avl_fill(
             summary["skipped_blocked_city"] += 1
             continue
         if key not in catalogs.stock_base:
-            # Decisión de negocio, para TODOS los modos de cobertura: una
-            # tienda-SKU que está en CATALOGO pero no aparece en STOCK se
-            # toma con stock 0 e incoming 0 (no hay inventario registrado),
-            # no como "sin dato". Antes AVL/Preventivo/Refuerzo/Cobertura
-            # sin Fountain9 la saltaban: en un DATA_TRANSFERS real eso era
-            # el 34 % del catálogo, con 96 % de esas filas con demanda.
+            # Combinación de CATALOGO sin fila en STOCK: stock 0 e incoming 0,
+            # en todos los modos.
             summary["missing_stock_treated_as_zero"] = (
                 summary.get("missing_stock_treated_as_zero", 0) + 1
             )
@@ -5116,20 +4854,14 @@ def apply_avl_fill(
             )
             summary["preventive_candidates"] += 1
         elif candidate_mode in ("no_fountain9_coverage", "kazuhira"):
-            # Quebrado (stock=0) Y esta tienda-SKU no está en excluded_keys
-            # — quien llama decide qué cuenta como "ya cubierto": para
-            # "no_fountain9_coverage" hoy es fountain_recommended_keys
-            # (solo recomendación positiva); para "kazuhira" normalmente
-            # es solo lo ya asignado esta corrida (garantía total, sin
-            # importar el origen del quiebre). Duration/Lead Time moda por
-            # TIENDA sustituyen el DOH fijo de CODEC.
+            # Quebrado (stock = 0) y fuera de excluded_keys; quien llama define
+            # qué cuenta como ya cubierto.
             effective_adu = adu if adu > 0 else FICTITIOUS_ADU_NO_FOUNTAIN9
             incoming = max(catalogs.incoming_stock.get(key, 0.0), 0.0)
             assigned_now = 0
             if candidate_mode == "kazuhira":
-                # Disparador por posición: lo que ya hay + lo que viene +
-                # lo que otros engines ya mandaron en esta corrida. Si
-                # alcanza para al menos 1 DOH, no hace falta Kazuhira.
+                # Kazuhira dispara por posición: (stock + incoming + asignado)
+                # / ADU < 1 DOH.
                 assigned_now = assigned_units_by_key.get(key, 0)
                 current_doh = (
                     destination_stock + incoming + assigned_now
@@ -5156,10 +4888,8 @@ def apply_avl_fill(
                 and fallback_duration is not None
                 and fallback_lead_time is not None
             ):
-                # Garantía total: esta tienda nunca tuvo fila en el Bulk de
-                # Fountain9 (por eso no tiene moda propia) — en vez de
-                # saltarse el quiebre como haría "Cobertura sin Fountain9",
-                # se usa el fallback global para no dejarlo sin cubrir.
+                # Tienda sin fila en el Bulk de Fountain9 (sin moda propia):
+                # Kazuhira usa el fallback en vez de saltarla.
                 duration_mode = fallback_duration
                 lead_time_mode = fallback_lead_time
                 used_fallback_duration = True
@@ -5208,9 +4938,8 @@ def apply_avl_fill(
                     summary["skipped_doh_sufficient"] += 1
                     continue
             else:
-                # Sin ADU propio ni de ninguna tienda de la misma ciudad:
-                # no hay forma de calcular un DOH objetivo. Mínimo operativo
-                # configurable, sin piso de DOH, marcado en advertencias.
+                # Sin ADU propio ni de ninguna tienda de la misma ciudad: no
+                # hay forma de calcular un DOH objetivo.
                 no_adu_anywhere = True
                 target = max(
                     config.minimum_positive_quantity - already_assigned, 0
@@ -6881,12 +6610,8 @@ def execute_planning(
                 blocked_cities,
                 1.0,  # dummy: este modo no usa un DOH fijo de CODEC
                 candidate_mode="no_fountain9_coverage",
-                # Solo excluye recomendación POSITIVA de Fountain9 — a
-                # propósito, no "cualquier fila" (ver discusión de esta
-                # sesión): un "sin recomendación" cuyo stock_base real
-                # resulta en 0 es un quiebre genuino que Fountain9 no vio
-                # (se basó en su propio Predicted Opening Inventory, no en
-                # nuestro stock real), y debe quedar elegible aquí.
+                # Solo se excluye la recomendación positiva de Fountain9; un
+                # 'sin recomendación' con stock real 0 sigue siendo candidato.
                 excluded_keys=fountain_recommended_keys,
                 duration_mode_by_store=consolidation_summary.get(
                     "duration_mode_by_store", {}
@@ -7017,8 +6742,8 @@ def execute_planning(
                     "presupuesto compartido."
                 )
 
-        # Tiendas que se planean hoy: las del Bulk de Fountain9 + las que
-        # SCHEDULE marca con día válido hoy. Lo usan Kazuhira y el barrido.
+        # Tiendas que se planean hoy: Bulk de Fountain9 + SCHEDULE con día
+        # válido.
         planned_store_universe = build_planned_store_universe(
             consolidated_input.keys(), catalogs, config.origin_warehouses
         )
@@ -7069,11 +6794,8 @@ def execute_planning(
                 blocked_cities,
                 1.0,  # dummy: este modo no usa un DOH fijo de CODEC
                 candidate_mode="kazuhira",
-                # Sin exclusión más allá de lo ya asignado esta corrida
-                # (que apply_avl_fill calcula internamente) — a propósito:
-                # la garantía de Kazuhira es "cubrir TODO lo que siga en
-                # quiebre", sin importar si vino o no de un requerimiento
-                # de Fountain9.
+                # Sin excluded_keys: Kazuhira cubre todo quiebre del universo,
+                # venga o no de Fountain9.
                 excluded_keys=set(),
                 duration_mode_by_store=kazuhira_duration_by_store,
                 lead_time_mode_by_store=kazuhira_lead_time_by_store,
@@ -7269,13 +6991,8 @@ def execute_planning(
             / "outputs"
             / run_date.strftime("%d-%m-%Y")
         )
-        # Barrido de universo completo de CATALOGO: solo cuando al menos
-        # un engine de cobertura está activo (confirmado con negocio).
-        # Reusa el catálogo ya cargado si algún engine lo necesitó, sin
-        # cargarlo de nuevo. Se hace ANTES del enriquecimiento de abajo,
-        # para que estas filas también reciban PRODUCT_NAME/CATEGORY_NAME/
-        # SWA, y ANTES de status_counts/status_swa, para que el universo
-        # completo cuente ahí también.
+        # Barrido de universo: solo con algún engine de cobertura activo; reusa
+        # el catálogo ya cargado.
         sweep_healthy_count = 0
         sweep_healthy_path: Path | None = None
         if (
@@ -7290,12 +7007,8 @@ def execute_planning(
                 (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"])
                 for row in result.base_rows
             }
-            # Los HUECOS (quiebres sin cubrir) entran a base_rows: son lo
-            # que hay que atender y deben verse en breakdown/Excel. Las
-            # filas SANAS (cientos de miles en un catálogo grande) NO se
-            # acumulan en memoria ni van al Excel — se cuentan y se
-            # escriben directo a un CSV, así el universo completo sigue
-            # siendo visible y descargable sin tumbar la sesión.
+            # Los huecos (quiebres sin cubrir) van a base_rows; las filas
+            # sanas, a un CSV en streaming (no a memoria ni al Excel).
             output_dir.mkdir(parents=True, exist_ok=True)
             sweep_healthy_path = output_dir / (
                 f"Universo_Catalogo_Sin_Necesidad_{run_date:%d-%m-%Y}.csv"
@@ -7337,10 +7050,8 @@ def execute_planning(
             result.base_rows.extend(sweep_gap_rows)
             del sweep_gap_rows
 
-        # Nombre + categoría del producto en todos los entregables (hoja
-        # DATA, por SYNC_ID). Se hace UNA sola vez, sobre las dos listas
-        # que alimentan todo lo demás (CSVs, Excel), antes de escribir
-        # nada — así no hay que repetir el lookup en cada punto de salida.
+        # PRODUCT_NAME, CATEGORY_NAME y SWA en todos los entregables: una sola
+        # pasada antes de escribir archivos.
         engine.enrich_rows_with_product_info(result.base_rows, catalogs)
         engine.enrich_rows_with_product_info(result.allocation_rows, catalogs)
         local_files = engine.create_output_files(
@@ -7403,10 +7114,8 @@ def execute_planning(
         fountain9_comparison = build_fountain9_comparison_report(
             result, catalogs, consolidated_input
         )
-        # SWA necesita el universo COMPLETO del catálogo, sin importar si
-        # algún engine de cobertura está activo — reusa el catálogo si ya
-        # se cargó para otro propósito en esta corrida, si no, lo carga
-        # aparte solo para esto.
+        # SWA necesita el catálogo completo aunque ningún engine de cobertura
+        # esté activo.
         swa_catalog_rows = ensure_catalog_rows()
         swa_report = build_swa_report(
             swa_catalog_rows, catalogs, result, insumos_summary
@@ -7542,9 +7251,8 @@ def execute_planning(
     )
     if simulation_mode:
         # Modo simulación: se corrió todo el pipeline real (para que los
-        # números sean exactos), pero no debe quedar ningún archivo
-        # persistido como si fuera una entrega real. Se limpia todo lo que
-        # se acaba de escribir a disco antes de regresar.
+        # números sean exactos), pero no debe quedar ningún archivo persistido
+        # como si fuera una entrega real.
         for path in local_files:
             try:
                 Path(path).unlink(missing_ok=True)
@@ -7642,13 +7350,8 @@ def render_capped_dataframe(
     column_config: dict[str, Any] | None = None,
     max_display: int = MAX_DISPLAY_ROWS,
 ) -> None:
-    """Renderiza una tabla potencialmente grande sin arriesgar el navegador:
-    nunca manda más de ``max_display`` filas al frontend (antes solo se
-    limitaba la ALTURA del contenedor, no el volumen de datos real — con
-    tablas de miles de filas eso seguía mandando el dataset completo aunque
-    solo se vieran unas pocas). Si hay más filas de las mostradas, lo dice
-    explícitamente y, si ``offer_download`` está activo, ofrece el CSV
-    completo para no perder el detalle.
+    """Renderiza una tabla potencialmente grande sin arriesgar el navegador: nunca manda
+    más de ``max_display`` filas al frontend.
     """
     if not rows:
         st.info("No existen registros para mostrar en esta sección.")
@@ -7690,10 +7393,8 @@ def report_table(
         return
     total = len(rows)
     display_rows = rows[:MAX_DISPLAY_ROWS]
-    # Antes esto solo acotaba la ALTURA del contenedor; con tablas de miles
-    # de filas (posible en ciudad/tienda con redes grandes) el dataset
-    # completo igual viajaba al navegador. Ahora también se acota el
-    # volumen real de filas enviadas.
+    # Se limita el número de filas enviadas al navegador, no solo la altura del
+    # contenedor.
     height = min(max(150, 36 * (len(display_rows) + 1)), max_height)
     st.dataframe(
         display_rows,
@@ -7718,11 +7419,7 @@ def render_source_analysis(analytics: dict[str, Any]) -> None:
     st.markdown(
         """
         <div class="report-note">
-            Cada bloque corresponde a un warehouse origen seleccionado. TAREAS son
-            líneas operativas del Bulk; UNIDADES son la suma de QUANTITY; PRODUCTOS son
-            SKUs distintos. Este análisis considera únicamente abasto normal y excluye
-            insumos para mantener comparables los orígenes. Mantén el cursor un segundo
-            sobre cualquier tarjeta para consultar su definición.
+            Un bloque por origen seleccionado. TAREAS = líneas del Bulk; UNIDADES = suma de QUANTITY; PRODUCTOS = SKUs distintos. Solo abasto normal (sin insumos). Definiciones en el tooltip de cada tarjeta.
         </div>
         """,
         unsafe_allow_html=True,
@@ -7911,12 +7608,7 @@ def render_golden_report(analytics: dict[str, Any]) -> None:
     st.markdown(
         """
         <div class="report-note">
-            Este bloque considera casos clasificados por tienda–SKU. La prioridad es
-            INFALTABLE primero, GOLDEN después y ANCHOR al final. Cuando una combinación
-            tiene más de una bandera, se reporta bajo su clasificación de mayor jerarquía.
-            COMPLIANCE DE CASOS exige cubrir el objetivo completo de cada tienda-SKU;
-            COMPLIANCE DE UNIDADES compara las unidades asignadas contra las unidades
-            objetivo. Las tarjetas distinguen casos, unidades, tiendas y productos.
+            Casos por tienda–SKU. Prioridad de clasificación: INFALTABLE, GOLDEN, ANCHOR (una combinación se reporta bajo su mayor jerarquía). COMPLIANCE DE CASOS exige el objetivo completo; COMPLIANCE DE UNIDADES compara asignado vs objetivo.
         </div>
         """,
         unsafe_allow_html=True,
@@ -8095,9 +7787,7 @@ def render_planning_analytics(analytics: dict[str, Any], run: dict[str, Any]) ->
     st.markdown(
         """
         <div class="report-note">
-            PRODUCTOS = SKUs distintos con al menos una unidad asignada · M³/PALLETS =
-            mismo dato, volumen realmente planeado · TAREAS = líneas generadas
-            considerando cada origen · UNIDADES = CANTIDAD_ASIGNADA total.
+            PRODUCTOS = SKUs distintos con unidades asignadas · M³/PALLETS = volumen planeado · TAREAS = líneas por origen · UNIDADES = CANTIDAD_ASIGNADA.
         </div>
         """,
         unsafe_allow_html=True,
@@ -8202,12 +7892,7 @@ def render_planning_analytics(analytics: dict[str, Any], run: dict[str, Any]) ->
     st.markdown(
         """
         <div class="report-note">
-            Un caso representa una combinación tienda–SKU. COMPLIANCE DE CASOS mide
-            cuántos casos se cubrieron al 100%; COMPLIANCE DE UNIDADES compara lo
-            asignado contra el objetivo final del modelo. El incremento por hardcode se
-            presenta separado del ROQ original para no inflar artificialmente el
-            cumplimiento. Mantén el cursor un segundo sobre cualquier tarjeta para ver
-            exactamente qué mide y cuál es su denominador.
+            Un caso = una tienda–SKU. COMPLIANCE DE CASOS = casos cubiertos al 100%; COMPLIANCE DE UNIDADES = asignado vs objetivo final. El incremento por hardcode se muestra aparte del ROQ original. Definiciones en el tooltip de cada tarjeta.
         </div>
         """,
         unsafe_allow_html=True,
@@ -8513,11 +8198,8 @@ CATEGORIA_DISPLAY_LABELS = {
 }
 
 
-# Identidad visual de cada bucket en el reporte de universo — un color
-# fijo por bucket para reconocerlos de un vistazo, independiente del
-# significado semántico (verde/rojo/azul) que ya usan las tarjetas de
-# resultado de abajo. "purple" queda fuera a propósito: ya es la identidad
-# de la tarjeta de Venom en CODEC, no se reutiliza aquí.
+# Identidad visual de cada bucket en el reporte de universo — un color fijo por
+# bucket para reconocerlos de un vistazo.
 UNIVERSE_BUCKET_BADGE_COLORS = {
     "GOLDEN": "#FFF000",
     "INFALTABLE": "#BD00FF",
@@ -8546,10 +8228,7 @@ def render_bucket_universe_report(bucket_label: str, report: dict[str, Any]) -> 
     st.markdown(
         f"""
         <div class="report-note">
-            Las {report['universe_size']:,} combinaciones tienda-SKU marcadas
-            {bucket_label} en GOLDEN_INFALTABLES_ANCHOR, evaluadas completas —
-            sin importar si algún engine las tocó hoy. Objetivo de riesgo:
-            {report['target_doh']:g} DOH.
+            {report['universe_size']:,} combinaciones tienda-SKU {bucket_label} en GOLDEN_INFALTABLES_ANCHOR, evaluadas completas aunque ningún engine las tocara hoy. Objetivo: {report['target_doh']:g} DOH.
         </div>
         """,
         unsafe_allow_html=True,
@@ -8667,11 +8346,7 @@ def render_results(run: dict[str, Any]) -> None:
     st.markdown(
         """
         <div class="report-note">
-            REQUERIDO = solo la necesidad original de Naked/Solidus (Fountain9 + reglas
-            de mínimo/hardcode), sin la cobertura que agregan AVL, Shalashaska, Liquid o
-            Venom · PLANEACIÓN FINAL = todo lo realmente asignado, con todos los
-            engines. PALLETS usa el mismo dato que M³ (columna PALLETS de VOLUMETRIA),
-            solo se muestra con esta etiqueta.
+            REQUERIDO = necesidad original de Naked/Solidus (sin la cobertura de AVL, Shalashaska, Liquid o Venom) · PLANEACIÓN FINAL = todo lo asignado, con todos los engines · PALLETS = mismo dato que M³ (VOLUMETRIA).
         </div>
         """,
         unsafe_allow_html=True,
@@ -8684,13 +8359,9 @@ def render_results(run: dict[str, Any]) -> None:
             unsafe_allow_html=True,
         )
         st.caption(
-            "Sobre TODO el universo de quiebres del catálogo (stock=0), "
-            "no solo lo que algún engine intentó cubrir. 'Ganado' es "
-            "binario: cualquier envío que saque a la tienda-SKU del "
-            "quiebre captura el SWA_POTENTIAL_GAIN_COUNTRY completo de "
-            "esa fila (hoja SWA, actualizada cada hora) — no es "
-            "proporcional a la cantidad enviada. Ausente de la hoja SWA "
-            "= 0 por descarte."
+            "Universo: todo quiebre del catálogo (stock = 0). 'Ganado' es binario: "
+            "cualquier envío que saque la tienda-SKU del quiebre captura su SWA "
+            "completo. Sin dato en la hoja SWA = 0."
         )
         render_kpi_cards(
             [
@@ -8743,15 +8414,10 @@ def render_results(run: dict[str, Any]) -> None:
         )
     elif "swa_report" in run:
         st.caption(
-            "ℹ️ La hoja SWA no está cargada en este archivo de "
-            "DATA_TRANSFERS — no hay con qué calcular SWA ganado/perdido "
-            "esta corrida."
+            "ℹ️ La hoja SWA no está en este DATA_TRANSFERS: sin SWA ganado/perdido."
         )
 
-    # Disponible para cada sección de engine más abajo (REPORTE POR
-    # ENGINE), para mostrar cuánto SWA capturó específicamente ese engine
-    # — reusa lo ya calculado en planned_by_engine_rows, no recorre
-    # base_rows otra vez por cada sección.
+    # Lookup de SWA por engine para las secciones de REPORTE POR ENGINE.
     swa_by_engine = swa_ganado_by_engine(run.get("planned_by_engine_rows", []))
     swa_enabled = bool(swa_report.get("enabled"))
 
@@ -8966,9 +8632,8 @@ def render_results(run: dict[str, Any]) -> None:
             '<span class="section-label">DESCARGAR TODO</span>', unsafe_allow_html=True
         )
         st.info(
-            "MODO SIMULACIÓN: esta corrida no generó archivos descargables. "
-            "Vuelve a correrla con el modo simulación apagado para obtener "
-            "los CSV, el Excel, el PDF y el ZIP reales."
+            "MODO SIMULACIÓN: no se generaron archivos descargables. Corre sin "
+            "simulación para obtener CSV, Excel, PDF y ZIP."
         )
     else:
         st.markdown('<span class="section-label">DESCARGAR TODO</span>', unsafe_allow_html=True)
@@ -8983,10 +8648,8 @@ def render_results(run: dict[str, Any]) -> None:
 
         with st.expander("¿Por qué no salió este SKU en esta tienda? · consulta puntual"):
             st.caption(
-                "Busca la tienda-SKU en lo que ya quedó en el zip de esta "
-                "corrida: líneas enviadas, filas declaradas (con su motivo) "
-                "y universo sano. Si no aparece en ninguno, te lo dice — "
-                "eso sería un hueco sin declarar."
+                "Busca la tienda-SKU en el zip de esta corrida: enviada, declarada "
+                "(con motivo), sana o sin rastro."
             )
             query_store_col, query_sku_col = st.columns(2)
             with query_store_col:
@@ -9126,13 +8789,7 @@ def render_results(run: dict[str, Any]) -> None:
     st.markdown(
         """
         <div class="report-note">
-            EFECTIVAMENTE PLANEADO = casos que sí recibieron al menos una unidad,
-            agrupados por engine y su causal · CORTES = todo lo que se quedó sin
-            enviar, con el motivo específico (incluye COPÉRNICO desglosado por
-            LOST/CANCELADOS/ZONA 856/etc.) · SIN RECOMENDACIÓN = por qué
-            Fountain9 no pidió nada, usando solo sus propias columnas (aparte de
-            CORTES porque no es un corte: no había nada que cubrir) · OVERVIEW =
-            planeado + cortes combinados en una sola vista general.
+            PLANEADO = casos con al menos una unidad, por engine y causal · CORTES = lo no enviado, con motivo (COPÉRNICO desglosado) · SIN RECOMENDACIÓN = por qué Fountain9 no pidió nada (no es un corte) · OVERVIEW = planeado + cortes.
         </div>
         """,
         unsafe_allow_html=True,
@@ -9158,15 +8815,10 @@ def render_results(run: dict[str, Any]) -> None:
 
     st.markdown("##### Sin recomendación — por qué Fountain9 no pidió nada")
     st.caption(
-        "Solo Naked (Fountain9 nunca recomendó nada para esta tienda-SKU). "
-        "Usa únicamente Demanda, Opening y Net Inter-Store Transfers — las "
-        "columnas propias del Bulk de Fountain9, sin mezclar datos de "
-        "CATALOGO/STOCK ni de otros engines. SWA_INFORMATIVO es justamente "
-        "eso — informativo, no 'perdido': estas filas tienen opening ≥ "
-        "demanda por definición, así que normalmente no son rupturas "
-        "reales contra nuestro propio stock. Si aparece algo aquí, suele "
-        "ser un desfase entre el opening predicho de Fountain9 y nuestro "
-        "stock actual."
+        "Solo Naked: Fountain9 no pidió nada para estas tienda-SKU. Los motivos usan "
+        "solo columnas del Bulk (demanda, opening, net transfer). SWA_INFORMATIVO no "
+        "es 'perdido': suele ser un desfase entre el opening predicho y el stock "
+        "real."
     )
     no_recommendation_rows = run.get("no_recommendation_rows", [])
     render_capped_dataframe(
@@ -9194,11 +8846,8 @@ def render_results(run: dict[str, Any]) -> None:
             unsafe_allow_html=True,
         )
         st.caption(
-            "No es una comparación en igualdad de condiciones — el punto es "
-            "mostrar cuánto más desbloquea Mother Base de lo que Fountain9 "
-            "siquiera alcanza a evaluar. 'Allocation (Store Based)' es la "
-            "decisión final de Fountain9 (confirmado por análisis de "
-            "archivos reales), no el ROQ/MOV que recomienda."
+            "Cuánto más cubre Mother Base de lo que Fountain9 evalúa. 'Allocation "
+            "(Store Based)' es la decisión final de Fountain9, no su ROQ/MOV."
         )
         f9 = fountain9_comparison["fountain9"]
         mb_mismo = fountain9_comparison["mother_base_mismo_alcance"]
@@ -9288,10 +8937,8 @@ def render_results(run: dict[str, Any]) -> None:
 
         st.markdown("###### Lo que desbloqueamos — fuera del alcance de Fountain9")
         st.caption(
-            "Tienda-SKU que Fountain9 nunca evaluó en absoluto (ni una fila "
-            "en su Bulk) — incluye, entre otras cosas, lo que cubre "
-            "'Cobertura sin Fountain9' (§17). Esto es lo que Mother Base "
-            "ve y Fountain9 ni siquiera alcanza a mirar."
+            "Tienda-SKU sin ninguna fila en el Bulk de Fountain9: lo que Mother Base "
+            "ve y Fountain9 no."
         )
         render_kpi_cards(
             [
@@ -9378,10 +9025,8 @@ def render_results(run: dict[str, Any]) -> None:
 
         st.markdown("###### Cobertura de rupturas de stock (stock = 0 en destino)")
         st.caption(
-            "'Cubrió' = esa fuente asignó algo > 0 a una tienda-SKU que "
-            "tenía stock en cero. Usa nuestro propio stock (catalogs."
-            "stock_base) como única fuente de verdad para decidir qué es "
-            "una ruptura, para no comparar con dos criterios distintos."
+            "'Cubrió' = asignó algo > 0 a una tienda-SKU con stock 0 (stock propio, "
+            "catalogs.stock_base, para ambos lados)."
         )
         render_kpi_cards(
             [
@@ -9425,10 +9070,8 @@ def render_results(run: dict[str, Any]) -> None:
         )
     elif run.get("fountain9_comparison") is not None:
         st.caption(
-            "ℹ️ El Bulk de Fountain9 de esta corrida no trae la columna "
-            "'Allocation (Store Based)' — no hay con qué comparar. No es "
-            "un error, solo significa que este archivo no incluye el "
-            "módulo de asignación propio de Fountain9."
+            "ℹ️ El Bulk de esta corrida no trae 'Allocation (Store Based)': no hay "
+            "con qué comparar."
         )
 
     if run.get("analytics"):
@@ -9443,11 +9086,7 @@ def render_results(run: dict[str, Any]) -> None:
         st.markdown(
             """
             <div class="report-note">
-                Comparación final, después de TODOS los engines (incluidos
-                Shalashaska, Liquid y Venom), entre el DOH real de cada
-                tienda-SKU Golden/Infaltable/Anchor y el objetivo del
-                Refuerzo. No mueve nada — solo avisa si algo quedó por debajo
-                del objetivo, revisa antes de entregar.
+                Verificación final tras todos los engines: DOH real de cada Golden/Infaltable/Anchor vs el objetivo del Refuerzo. No mueve nada; revisa antes de entregar.
             </div>
             """,
             unsafe_allow_html=True,
@@ -9494,9 +9133,7 @@ def render_results(run: dict[str, Any]) -> None:
     st.markdown(
         """
         <div class="report-note">
-            Un bloque por cada engine que corrió esta planeación. Naked es la base
-            (demanda natural de Fountain9); el resto son coberturas opcionales que
-            se apilan encima, en el orden en que se ejecutaron.
+            Un bloque por engine que corrió. Naked es la base (demanda de Fountain9); el resto son coberturas opcionales, en orden de ejecución.
         </div>
         """,
         unsafe_allow_html=True,
@@ -9735,13 +9372,9 @@ def render_results(run: dict[str, Any]) -> None:
             unsafe_allow_html=True,
         )
         st.caption(
-            "SKUs de catálogo con stock en cero sin recomendación positiva "
-            "de Fountain9 — ya sea porque el SKU no tiene ninguna fila en "
-            "su Bulk, o porque sí la tiene pero con 'sin recomendación' "
-            "(Fountain9 confió en su propio Predicted Opening Inventory, "
-            "que puede diferir de nuestro stock real). Usa la moda de "
-            "Duration y Lead Time por tienda del propio Bulk en vez del DOH "
-            "fijo de CODEC, y resta STOCK.INCOMING si está disponible."
+            "Quiebres de catálogo (stock 0) sin recomendación positiva de Fountain9 "
+            "(sin fila o con 'sin recomendación'). Usa la moda de Duration/Lead Time "
+            "por tienda y resta STOCK.INCOMING."
         )
         render_kpi_cards(
             [
@@ -9943,10 +9576,8 @@ def render_results(run: dict[str, Any]) -> None:
             unsafe_allow_html=True,
         )
         st.caption(
-            "Corrió al final, sobre los remanentes post-allocation. Sus líneas "
-            "nunca se consolidan con lo ya planeado: aparecen separadas en "
-            "DETALLE_ASIGNACION y en los CSV, marcadas con "
-            f"'{VENOM_CUT}'."
+            "Corre al final, sobre los remanentes. Sus líneas no se consolidan con lo "
+            f"ya planeado; van separadas y marcadas con '{VENOM_CUT}'."
         )
         render_kpi_cards(
             [
@@ -10028,17 +9659,12 @@ def render_results(run: dict[str, Any]) -> None:
             unsafe_allow_html=True,
         )
         st.caption(
-            "Última pasada de todo el pipeline (después de Venom). Universo: "
-            f"{kazuhira.get('universe_stores', 0):,} tiendas que se planean "
-            f"hoy ({kazuhira.get('universe_from_fountain9', 0):,} del Bulk de "
-            f"Fountain9 + {kazuhira.get('universe_schedule_only', 0):,} que "
-            "solo aparecen en SCHEDULE con día válido). Cubre toda "
-            "tienda-SKU cuya posición (stock + incoming + lo ya asignado) "
-            "sea < 1 DOH; una combinación sin fila en STOCK cuenta como 0 "
-            f"({kazuhira.get('missing_stock_treated_as_zero', 0):,} en esta "
-            "corrida). Misma fórmula que Cobertura sin Fountain9, con "
-            "promedio país de Duration/Lead Time cuando la tienda no tiene "
-            "dato propio. Lo que no se cubrió se explica abajo."
+            f"Universo: {kazuhira.get('universe_stores', 0):,} tiendas que se planean "
+            f"hoy ({kazuhira.get('universe_from_fountain9', 0):,} del Bulk + "
+            f"{kazuhira.get('universe_schedule_only', 0):,} solo por SCHEDULE). Cubre "
+            "toda tienda-SKU con posición (stock + incoming + asignado) < 1 DOH; sin "
+            f"fila en STOCK = 0 ({kazuhira.get('missing_stock_treated_as_zero', 0):,} "
+            "esta corrida). Lo no cubierto se explica abajo."
         )
         render_kpi_cards(
             [
@@ -10142,9 +9768,8 @@ def render_results(run: dict[str, Any]) -> None:
             unsafe_allow_html=True,
         )
         st.caption(
-            "Corre aparte de los demás engines: se anexa directo al "
-            "BulkCD_444.csv ya escrito, sin consumir el presupuesto "
-            "compartido de tareas."
+            "Se anexa a BulkCD_444.csv sin consumir tareas del presupuesto "
+            "compartido."
         )
         render_kpi_cards(
             [
@@ -10237,23 +9862,21 @@ def render_results(run: dict[str, Any]) -> None:
         ) + schedule_block.get("requirements_partial_cut", 0)
         if total_cases > 0:
             st.warning(
-                "Bloqueo por frecuencia de envío aplicado (hoy es "
-                f"{schedule_block.get('weekday', '')}): "
-                f"{schedule_block.get('requirements_full_cut', 0):,} casos "
-                "cortados por completo y "
-                f"{schedule_block.get('requirements_partial_cut', 0):,} parciales "
-                f"por origen fuera de frecuencia; "
-                f"{schedule_block.get('units_missing', 0):,} unidades sin cubrir "
-                f"en {schedule_block.get('stores', 0):,} tiendas y "
-                f"{schedule_block.get('products', 0):,} SKUs distintos "
-                f"({schedule_block.get('pairs_configured', 0):,} combinaciones "
-                "destino-origen configuradas en SCHEDULE)."
+                f"Bloqueo por frecuencia (hoy es {schedule_block.get('weekday', '')}): "
+                f"{schedule_block.get('requirements_full_cut', 0):,} casos cortados y "
+                f"{schedule_block.get('requirements_partial_cut', 0):,} parciales por "
+                "origen fuera de frecuencia; "
+                f"{schedule_block.get('units_missing', 0):,} unidades sin cubrir en "
+                f"{schedule_block.get('stores', 0):,} tiendas y "
+                f"{schedule_block.get('products', 0):,} SKUs "
+                f"({schedule_block.get('pairs_configured', 0):,} combinaciones en "
+                "SCHEDULE)."
             )
         else:
             st.caption(
-                "Bloqueo por frecuencia de envío activo (hoy es "
-                f"{schedule_block.get('weekday', '')}), pero ningún envío quedó "
-                "fuera de los días configurados en SCHEDULE en esta corrida."
+                "Bloqueo por frecuencia activo (hoy es "
+                f"{schedule_block.get('weekday', '')}), pero ningún envío quedó fuera "
+                "de los días de SCHEDULE."
             )
 
     copernico_cuts = run.get("copernico_cuts", {})
@@ -10263,14 +9886,12 @@ def render_results(run: dict[str, Any]) -> None:
     if copernico_cut_total > 0:
         st.warning(
             "COPÉRNICO como motivo de corte: "
-            f"{copernico_cuts.get('requirements_full_cut', 0):,} requerimientos "
-            "sin ninguna unidad y "
-            f"{copernico_cuts.get('requirements_partial_cut', 0):,} parciales por "
-            "ubicaciones excluidas (LOST, no usable, etc.) — "
+            f"{copernico_cuts.get('requirements_full_cut', 0):,} requerimientos sin "
+            f"ninguna unidad y {copernico_cuts.get('requirements_partial_cut', 0):,} "
+            "parciales por ubicaciones excluidas (LOST, no usable, etc.) — "
             f"{copernico_cuts.get('units_missing', 0):,} unidades sin cubrir en "
             f"{copernico_cuts.get('stores', 0):,} tiendas y "
-            f"{copernico_cuts.get('products', 0):,} SKUs distintos. Sin esa "
-            "exclusión, esas líneas habrían tenido stock elegible."
+            f"{copernico_cuts.get('products', 0):,} SKUs."
         )
 
     insumos = run.get("insumos", {})
@@ -10647,9 +10268,7 @@ def render() -> None:
                 )
             )
 
-        # Detección de outliers Fountain9 eliminada a pedido de negocio — ya
-        # no hay toggle ni UI para esto. Se deja la variable en False para no
-        # tener que tocar cada punto interno que todavía la recibe.
+        # Detección de outliers de Fountain9 eliminada (sin toggle ni UI).
         exclude_fountain9_outlier_stores = False
 
         excluded_skus_raw = st.text_area(
@@ -10697,8 +10316,8 @@ def render() -> None:
         # Soporte legado conservado en backend para una futura reactivación.
         apply_origin_storage_override = False
         st.caption(
-            "El máximo de tareas es un solo presupuesto compartido: Naked + "
-            "Solidus + Shalashaska + Liquid nunca podrán excederlo."
+            "Presupuesto de tareas compartido: Naked, Solidus, Shalashaska y Liquid "
+            "nunca lo exceden."
         )
 
     st.session_state.setdefault("mb_engine_naked_enabled", True)
@@ -10801,13 +10420,9 @@ def render() -> None:
             )
         elif include_solidus_engine:
             st.caption(
-                "⚠️ Activar cualquiera de estos 4 también activa el barrido "
-                "de universo completo de CATALOGO: toda tienda-SKU que "
-                "ningún engine toque queda declarada: los huecos (quiebres "
-                "sin cubrir, con su motivo) van al reporte y al Excel; las "
-                "tiendas-SKU sanas se cuentan en el Overview y se listan en "
-                "un CSV aparte (Universo_Catalogo_Sin_Necesidad), sin "
-                "consumir stock/tareas ni saturar la memoria."
+                "⚠️ Activar cualquiera de estos 4 activa el barrido de universo de "
+                "CATALOGO: los huecos van al reporte y al Excel; lo sano, a un CSV "
+                "aparte."
             )
             avl_left, preventive_mid, special_right, no_f9_right = st.columns(4)
             with avl_left:
@@ -10938,10 +10553,9 @@ def render() -> None:
                 )
             with shala_right:
                 st.info(
-                    "Shalashaska usa únicamente tiendas que ya tienen una "
-                    "transferencia desde el mismo origen en esta corrida. Primero "
-                    "nivela todas al DOH objetivo; si queda inventario, lo reparte "
-                    "por SHARE_VENTAS. POR_MERMAR nunca sustituye al stock final."
+                    "Usa solo tiendas que ya reciben una transferencia del mismo "
+                    "origen en esta corrida. Nivela al DOH objetivo y reparte el "
+                    "resto por SHARE_VENTAS. POR_MERMAR no sustituye al stock final."
                 )
         else:
             st.caption(
@@ -11043,10 +10657,8 @@ def render() -> None:
                     ),
                 )
                 st.info(
-                    "Liquid solo considera tiendas que ya recibieron unidades "
-                    "reales de otro engine en esta misma corrida (Naked, Solidus, "
-                    "AVL, Preventivo o Shalashaska) — nunca introduce tiendas "
-                    "nuevas. No exige que el SKU esté en CATALOGO."
+                    "Solo considera tiendas que ya recibieron unidades de otro engine "
+                    "en esta corrida; no exige el SKU en CATALOGO."
                 )
 
             st.markdown("#### SKUs MANUALES A AGOTAR POR ORIGEN")
@@ -11071,8 +10683,7 @@ def render() -> None:
                 )
         else:
             st.caption(
-                "Liquid Engine está apagado. Sus reglas de liquidación y captura "
-                "de SKUs no están disponibles para esta corrida."
+                "Liquid Engine apagado."
             )
 
     with st.container(border=True, key="engine_venom_module"):
@@ -11235,9 +10846,9 @@ def render() -> None:
             kazuhira_swa_priority = False
         elif include_kazuhira_engine:
             st.warning(
-                "⚠️ Kazuhira busca cubrir TODO el universo de catálogo en "
-                "quiebre, no solo lo que Fountain9 pidió. Puede generar "
-                "muchas tareas nuevas si el catálogo es grande."
+                "⚠️ Kazuhira cubre todo el universo de catálogo en quiebre, no solo "
+                "lo de Fountain9. Puede generar muchas tareas si el catálogo es "
+                "grande."
             )
             kaz_left, kaz_right = st.columns(2)
             with kaz_left:
@@ -11291,8 +10902,7 @@ def render() -> None:
             kazuhira_ignore_store_capacity = False
             kazuhira_swa_priority = False
             st.caption(
-                "Kazuhira Engine está apagado. Ningún quiebre adicional se "
-                "cubrirá más allá de lo que ya hagan los demás engines."
+                "Kazuhira Engine apagado."
             )
 
     simulation_mode = False
@@ -11310,8 +10920,8 @@ def render() -> None:
         )
         if simulation_mode:
             st.info(
-                "MODO SIMULACIÓN ACTIVO: esta corrida no va a generar "
-                "archivos descargables. Apaga el toggle para una entrega real."
+                "MODO SIMULACIÓN ACTIVO: no se generarán archivos. Apágalo para una "
+                "entrega real."
             )
 
     submitted_click = st.button(

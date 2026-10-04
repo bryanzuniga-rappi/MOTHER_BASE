@@ -1,8 +1,4 @@
-"""Prueba de punta a punta de execute_planning con Kazuhira activo.
-
-Existe porque compilar y probar piezas sueltas no detecta errores de
-tiempo de ejecución en la orquestación (variables fuera de alcance, un
-archivo que no llega al zip, etc.)."""
+"""Prueba de punta a punta de execute_planning con Kazuhira activo."""
 
 from datetime import date
 
@@ -59,7 +55,6 @@ def test_kazuhira_end_to_end_covers_catalog_gaps_and_schedule_only_store():
     assert k["universe_schedule_only"] == 1
     lines = _bulk_lines(run)
     # La tienda 300 NO viene en Fountain9, solo en SCHEDULE: recibe sus 3 SKUs.
-    # Duration/Lead Time heredados de la ciudad (5 + 3) con ADU 1 => 8.
     assert {sku: lines[(300, sku)] for sku in SKUS} == {10: 8, 11: 8, 12: 8}
     # SKUs que Fountain9 no pidió en tiendas que sí planea:
     assert lines[(100, 11)] == 8 and lines[(100, 12)] == 8 and lines[(101, 11)] == 8
@@ -156,8 +151,7 @@ def test_missing_incoming_column_means_no_incoming(tmp_path):
 
 
 def test_incoming_suppresses_kazuhira_end_to_end():
-    """(100, 11) tiene 3 de incoming con ADU 1 => 3 DOH: no hace falta
-    enviar. Antes de leer INCOMING_TR se enviaban 8 unidades de más."""
+    """(100, 11) tiene 3 de incoming con ADU 1 => 3 DOH: no hace falta enviar."""
     run = _run(
         database_bytes=build_workbook_bytes(
             STORES, SKUS, schedule_only_stores={300},
@@ -172,8 +166,7 @@ def test_incoming_suppresses_kazuhira_end_to_end():
 # --- sin fila en STOCK => stock 0 e incoming 0, en todos los engines -----------------
 
 def test_avl_alone_covers_catalog_combination_missing_from_stock_sheet():
-    """Sin Kazuhira: antes AVL saltaba una combinación de CATALOGO sin fila
-    en STOCK. Ahora la toma con stock 0 y la cubre."""
+    """Sin Kazuhira: antes AVL saltaba una combinación de CATALOGO sin fila en STOCK."""
     workbook = build_workbook_bytes(
         STORES, SKUS, omit_stock_rows={(100, 12)},
     )

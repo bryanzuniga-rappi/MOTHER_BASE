@@ -1,65 +1,25 @@
 """Venom Engine — llenado DDMRP posterior a toda la planeación.
 
-Venom se ejecuta al final de la secuencia (después de Naked, Solidus, AVL,
-Preventivo, Shalashaska, Liquid e Insumos, y antes de la partición por
-OWNER). Toma los remanentes de stock post-allocation y lo ya incoming de
-esta misma corrida, y aplica un modelo DDMRP (Demand Driven MRP) simplificado
-para decidir si hace falta un envío adicional de "llenado de buffer".
+Posición: después de Liquid; antes de Kazuhira y de la partición por OWNER.
+Entrada: stock remanente, lo ya asignado en la corrida y CATALOGO (ADU, LIST_TYPE).
+Salida: filas NUEVAS en allocation_rows y base_rows; nunca consolida con
+líneas existentes del mismo origen-destino-SKU (el reporte separa lo de Venom).
 
-A diferencia de Liquid/Shalashaska, Venom **nunca consolida** con líneas ya
-existentes del mismo trío origen-destino-SKU: siempre agrega una fila nueva a
-``allocation_rows`` y a ``base_rows``, aunque el trío ya tuviera cantidad
-asignada por otro engine. Esto es intencional: el reporte debe mostrar por
-separado cuánto mandó la planeación original y cuánto Venom encima de eso.
+Modelo DDMRP simplificado, por tienda-SKU elegible:
+    Red Zone      = ADU x LT x LTF x (1 + VF)
+    Yellow Zone   = ADU x LT
+    Green Zone    = max(ADU x LT x LTF, mínimo operativo)
+    Top of Yellow = Red Zone + Yellow Zone
+    Top of Green  = Top of Yellow + Green Zone
+    NFP           = On-Hand + On-Order - ADU x LT
+Si NFP < Top of Yellow se ordena ceil(Top of Green - NFP). LTF = VF = 0.5
+(perfil medio; LTF_MEDIUM / VF_MEDIUM). On-Order = lo ya asignado en la corrida
+si "considerar planeación actual" está activo; si no, 0.
 
-## Modelo DDMRP simplificado
-
-Para cada combinación tienda-SKU elegible (según TIPO DE SECCIÓN):
-
-    ADU          = CATALOGO.ADU de esa tienda-SKU
-    Red Base     = ADU x Lead Time x LTF
-    Red Safety   = Red Base x VF
-    Red Zone     = Red Base + Red Safety
-    Yellow Zone  = ADU x Lead Time
-    Green Zone   = max(ADU x Lead Time x LTF, mínimo operativo)
-    Top of Red   = Red Zone
-    Top of Yellow= Red Zone + Yellow Zone
-    Top of Green = Top of Yellow + Green Zone
-
-    On-Hand      = STOCK_DISPONIBLE_FINAL remanente en la tienda destino
-    On-Order     = unidades ya asignadas a esa tienda-SKU en esta misma
-                   corrida (Naked+Solidus+AVL+Preventivo+Shalashaska+Liquid+
-                   Insumos), solo si "considerar planeación actual" está
-                   activo; si no, On-Order = 0.
-    Demanda Calif.= ADU x Lead Time
-    NFP          = On-Hand + On-Order - Demanda Calificada
-
-Si NFP >= Top of Yellow, el buffer está sano y no se genera envío. Si NFP <
-Top of Yellow, Venom ordena hasta el techo de la zona verde:
-
-    Cantidad = ceil(Top of Green - NFP)
-
-LTF (Factor de Lead Time) y VF (Factor de Variabilidad) usan el perfil medio
-estándar de DDMRP (0.5 cada uno) — ver ``LTF_MEDIUM``/``VF_MEDIUM``.
-
-## Ontop manual: sin restricción de CAP_RECIBO
-
-Venom es, en la práctica, un "ontop manual" sobre la planeación normal: sí
-respeta el stock remanente por origen y el presupuesto compartido de tareas
-(``MAX_TASKS``), pero **no** se limita por la capacidad de recibo de la
-tienda (``CAP_RECIBO``). Sus unidades nunca se descuentan de
-``result.capacity_rows`` ni cuentan para "capacidad cerrada"; los campos
-informativos ``M3_CAPACIDAD_ANTES``/``M3_CAPACIDAD_DESPUES`` del reporte
-reflejan lo que otros engines ya usaron, no lo que Venom decide agregar.
-
-## OOWL — sin pronóstico
-
-"OOWL" no es una clasificación estática: son combinaciones tienda-SKU con
-stock disponible en alguno de los orígenes de Venom, CERO stock/incoming en
-la tienda destino, y sin ADU en CATALOGO (por lo que no se puede construir un
-buffer DDMRP real). En ese caso Venom no calcula zonas: manda directamente
-``config.minimum_positive_quantity`` unidades (el mismo mínimo operativo de
-3 que usa el resto del proyecto), sujeto a stock, capacidad y tareas.
+Sin CAP_RECIBO: respeta stock por origen y MAX_TASKS, pero no usa ni cierra la
+capacidad de tienda (es un "ontop manual").
+OOWL: tienda-SKU sin ADU, con stock en origen y cero stock/incoming en destino.
+Bloqueado a nivel motor: no se envía mínimo operativo sin pronóstico.
 """
 
 from __future__ import annotations
@@ -75,7 +35,7 @@ VENOM_REASON = "ENVIADO POR VENOM ENGINE"
 VENOM_CUT = "ENVIADOS POR VENOM ENGINE"
 
 # Perfil medio estándar de DDMRP: ni corto/largo lead time, ni baja/alta
-# variabilidad. Ver README §17 para la justificación de este default.
+# variabilidad.
 LTF_MEDIUM = 0.5
 VF_MEDIUM = 0.5
 
@@ -122,12 +82,7 @@ def compute_ddmrp_zones(
     vf: float = VF_MEDIUM,
     minimum_green_units: float = 3.0,
 ) -> dict[str, float]:
-    """Calcula las zonas roja/amarilla/verde de un buffer DDMRP.
-
-    ``minimum_green_units`` evita zonas verdes en cero cuando ADU x Lead Time
-    x LTF es muy pequeño, siguiendo el mismo mínimo operativo (3 unidades)
-    que ya usa el resto del proyecto (MOV_MINIMO_3, OOWL, etc.).
-    """
+    """Calcula las zonas roja/amarilla/verde de un buffer DDMRP."""
     adu = max(float(adu), 0.0)
     lead_time_days = max(float(lead_time_days), 0.0)
     red_base = adu * lead_time_days * ltf
@@ -185,16 +140,7 @@ def _allocate_across_origins(
     consumed_by_origin_sku: Counter,
     summary: dict[str, Any],
 ) -> list[tuple[int, int]]:
-    """Reparte ``quantity_needed`` entre ``source_candidates`` en orden.
-
-    No valida bloqueos de tienda/ciudad/ruta/regional/frecuencia: eso ya se
-    resolvió antes de llamar esta función (por SKU-tienda, no por origen).
-    Venom es un "ontop manual": respeta el stock remanente por origen y el
-    presupuesto compartido de tareas, pero **no** se limita por CAP_RECIBO —
-    a propósito no cuenta contra la capacidad de recibo de la tienda.
-    Devuelve la lista de (origen, cantidad) realmente asignada; puede ser
-    menor a lo pedido o vacía.
-    """
+    """Reparte ``quantity_needed`` entre ``source_candidates`` en orden."""
     remaining = quantity_needed
     picks: list[tuple[int, int]] = []
     tentative_tasks_used = result.tasks_used
@@ -283,17 +229,9 @@ def apply_venom_engine(
     blocked_cities: tuple[str, ...],
     reason_column: str = "PLANNING_REASON",
 ) -> dict[str, Any]:
-    """Corre el llenado DDMRP de Venom al final de toda la planeación.
-
-    ``catalog_lookup`` es ``(destino, sku) -> {"adu": float, "list_type": str}``
-    y debe incluir TODAS las filas de CATALOGO (sin filtrar por ADU > 0), a
-    diferencia del loader que usan AVL/Preventivo/Shalashaska.
-    """
-    # OOWL bloqueado a nivel motor, a pedido de negocio: no se calcula ningún
-    # envío de mínimo operativo sin pronóstico, sin importar lo que llegue en
-    # section_types. Es la tercera capa de defensa (la UI ya no lo ofrece y
-    # el llamador en les_enfants_terribles.py ya lo filtra antes de llegar
-    # aquí), para que ninguna ruta de código pueda reactivarlo por accidente.
+    """Corre el llenado DDMRP de Venom al final de toda la planeación."""
+    # OOWL bloqueado a nivel motor: no se envía mínimo operativo sin
+    # pronóstico, sin importar section_types.
     section_types = set(section_types) - {"OOWL"}
 
     summary = empty_venom_summary(True)
@@ -735,16 +673,7 @@ def _append_allocations(
     catalogs: engine.Catalogs,
     reason_column: str,
 ) -> None:
-    """Agrega una fila NUEVA de allocation por cada origen usado.
-
-    A propósito nunca busca ni reutiliza una fila existente del mismo trío
-    origen-destino-SKU: Venom siempre queda como una línea separada y
-    adicional, nunca consolidada con lo que ya había planeado.
-
-    A propósito tampoco toca ``result.capacity_rows``/CAP_RECIBO: Venom es
-    un "ontop manual" que no cuenta contra la capacidad de recibo de la
-    tienda, aunque sí cuenta contra el presupuesto compartido de tareas.
-    """
+    """Agrega una fila NUEVA de allocation por cada origen usado."""
     for source, quantity in picks:
         result.allocation_rows.append(
             {

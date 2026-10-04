@@ -198,8 +198,9 @@ def test_invalid_candidate_mode_still_raises():
 # --- Rediseño: universo desde GOLDEN_INFALTABLES_ANCHOR, on-top y cascada --
 
 def test_special_doh_candidate_exists_without_catalogo_row():
-    """Un SKU Golden en una tienda que NO tiene fila en CATALOGO para esa
-    tienda debe seguir evaluándose (antes era invisible por completo)."""
+    """Un SKU Golden en una tienda que NO tiene fila en CATALOGO para esa tienda debe
+    seguir evaluándose.
+    """
     catalogs = make_catalogs(
         stock_base={(444, 30): 100.0, (100, 30): 2.0},
         golden_products={(100, 30)},
@@ -451,7 +452,7 @@ def test_health_check_disabled_when_no_golden_infaltable_anchor_universe():
     assert check["checked"] == 0
 
 
-# --- Mínimo de unidades a enviar, ahora configurable (punto de esta sesión) -
+# --- Mínimo de unidades a enviar (configurable) ---
 
 def test_avl_stockout_respects_custom_minimum_quantity():
     """Con minimum_positive_quantity=6 (más alto que el ADU*DOH natural),
@@ -503,8 +504,9 @@ def test_special_doh_no_adu_respects_custom_minimum_quantity():
 
 
 def test_calculate_target_quantity_hardcodes_use_configured_minimum():
-    """Los dos hardcodes de Naked (antes fijos en 4 y 3) ahora deben
-    reflejar exactamente minimum_positive_quantity, sin importar su valor."""
+    """Los dos hardcodes de Naked ahora deben reflejar exactamente
+    minimum_positive_quantity, sin importar su valor.
+    """
     config = engine.Config(
         origin_warehouses=(444,), max_tasks=100, minimum_positive_quantity=5
     )
@@ -562,8 +564,8 @@ def test_preventive_eligibility_threshold_stays_fixed_at_3():
         origin_warehouses=(444,), max_tasks=100, minimum_positive_quantity=10
     )
     result = make_result()
-    # destination_stock=4 (>= 3) y current_doh alto -> NO debe calificar
-    # como preventivo, sin importar que minimum_positive_quantity sea 10.
+    # Destination_stock=4 (>= 3) y current_doh alto -> NO debe calificar como
+    # preventivo, sin importar que minimum_positive_quantity sea 10.
     m.apply_avl_fill(
         result, catalog_rows(adu_10=1.0), catalogs, config, set(), (), 2.0,
         candidate_mode="preventive",

@@ -1,6 +1,4 @@
-"""Pruebas de Kazuhira Engine (apply_avl_fill con candidate_mode="kazuhira"):
-garantía total de cobertura de quiebres, con fallback de Duration/Lead Time
-y dos toggles de bypass (presupuesto de tareas y capacidad de tienda)."""
+"""Pruebas de Kazuhira Engine (apply_avl_fill con candidate_mode="kazuhira")."""
 
 from types import SimpleNamespace
 
@@ -87,8 +85,9 @@ def test_labels_are_kazuhira_specific():
 
 
 def test_covers_regardless_of_fountain9_history():
-    """Punto central: excluded_keys vacío => cubre aunque Fountain9 haya
-    tenido (y recomendado) la tienda-SKU, mientras siga en quiebre."""
+    """Excluded_keys vacío => cubre aunque Fountain9 haya tenido (y recomendado) la
+    tienda-SKU, mientras siga en quiebre.
+    """
     result = make_result()
     summary = run_kazuhira(
         result, catalog_rows(100), make_catalogs(), excluded_keys=set()
@@ -322,9 +321,9 @@ def test_missing_stock_row_is_treated_as_zero():
 
 
 def test_missing_stock_row_is_treated_as_zero_in_every_coverage_mode():
-    """Decisión de negocio: en CATALOGO y sin fila en STOCK => stock 0 e
-    incoming 0, en TODOS los modos de cobertura (antes solo Kazuhira).
-    (Preventivo no aplica: por definición exige stock > 0.)"""
+    """En CATALOGO y sin fila en STOCK => stock 0 e incoming 0, en TODOS los modos de
+    cobertura.
+    """
     for mode in ("stockout", "no_fountain9_coverage", "kazuhira"):
         catalogs = make_catalogs(stock_base={(444, 10): 1000.0})   # sin (100, 10)
         summary = run_kazuhira(

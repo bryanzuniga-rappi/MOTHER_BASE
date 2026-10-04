@@ -401,10 +401,9 @@ def test_venom_after_real_plan_transfers_keeps_lines_separate():
 
 
 def test_venom_base_row_has_same_schema_as_naked_solidus():
-    """Regresión: build_planning_analytics lee TAREAS_GENERADAS (y otras
-    columnas) con corchetes directos, sin .get(), en todas las filas
-    asignadas. Si el esquema de Venom se queda corto, esto revienta con
-    KeyError en producción apenas Venom asigna algo — justo lo que pasó."""
+    """Regresión: build_planning_analytics lee TAREAS_GENERADAS (y otras columnas) con
+    corchetes directos, sin .get(), en todas las filas asignadas.
+    """
     catalogs = make_catalogs()
     config = engine.Config(origin_warehouses=(444,), max_tasks=1000)
     naked_rows = [{
@@ -426,9 +425,8 @@ def test_venom_base_row_has_same_schema_as_naked_solidus():
     naked_row = next(r for r in result.base_rows if r["TIPO_DE_CORTE"] != VENOM_CUT)
     missing = set(naked_row) - set(venom_row)
     # STORAGE/VALUE se normalizan aparte (normalize_result_storage) y
-    # STOCK_ANTES_*/STOCK_REMANENTE_* nunca se leen con corchetes en otra
-    # parte del código; el resto de columnas de Naked/Solidus SÍ deben
-    # existir en la fila de Venom.
+    # STOCK_ANTES_*/STOCK_REMANENTE_* nunca se leen con corchetes en otra parte
+    # del código.
     allowed_missing = {"STORAGE", "VALUE", "STOCK_ANTES_444", "STOCK_REMANENTE_444"}
     assert missing <= allowed_missing, (
         "Venom no tiene columnas de Naked/Solidus que no están en la lista "

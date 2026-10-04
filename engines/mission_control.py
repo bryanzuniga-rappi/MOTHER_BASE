@@ -1,3 +1,10 @@
+"""Mission Control — cola secuencial de requerimientos.
+
+Posición: antes de la asignación; decide qué filas entran a Naked y Solidus.
+Entrada: filas consolidadas del Bulk.
+Salida: cola ordenada y conteos por engine.
+"""
+
 from __future__ import annotations
 
 from typing import Any
@@ -15,14 +22,9 @@ def select_engine_rows(
     include_naked: bool,
     include_hardcodes: bool,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    """Prepara la cola secuencial que consumirá el ledger global.
-
-    ``include_hardcodes`` controla los hardcodes HARDCODE_4_CERO_TOTAL /
-    HARDCODE_3_INVENTARIO_MENOR_DEMANDA (MOV<=0 pero el modelo igual arma un
-    objetivo). Conceptualmente viven bajo Naked (es la forma en que tomamos
-    la necesidad cuando Fountain9 no dio un ROQ positivo), con su propio
-    toggle "Cubrir a Fountain9" — independiente de Solidus Engine, que hoy
-    solo cubre AVL, Preventivo y Refuerzo Golden/Infaltable/Anchor.
+    """Arma la cola secuencial de requerimientos. include_hardcodes activa
+    HARDCODE_4_CERO_TOTAL y HARDCODE_3_INVENTARIO_MENOR_DEMANDA (MOV <= 0 con
+    objetivo armado por el modelo).
     """
     selected: list[dict[str, Any]] = []
     summary = {

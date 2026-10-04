@@ -1,6 +1,6 @@
-"""Fixture de punta a punta: arma un DATA_TRANSFERS.xlsx y un Bulk de
-Fountain9 sintéticos y ejecuta execute_planning completo. Sirve para el test
-de regresión (datos mínimos) y para medir escala (muchas tiendas/SKUs)."""
+"""Fixture de punta a punta: arma un DATA_TRANSFERS.xlsx y un Bulk de Fountain9
+sintéticos y ejecuta execute_planning completo.
+"""
 
 import io
 import zipfile
@@ -108,7 +108,7 @@ def build_workbook_bytes(
 
 
 def build_plan_csv_bytes(rows: list[tuple]) -> bytes:
-    """rows: (store, sku, mov)."""
+    """Rows: (store, sku, mov)."""
     lines = [",".join(PLAN_HEADERS)]
     for store, sku, mov in rows:
         lines.append(f"{store},{sku},0,{mov},0,{mov},0,5,3")

@@ -1,10 +1,8 @@
-"""Chequeo de instalación: detecta archivos desordenados o desactualizados
-que hacen que la app ejecute código viejo sin avisar.
+"""Chequeo de instalación: avisa si hay archivos sueltos o desactualizados.
 
-Origen: al subir el proyecto a GitHub arrastrando archivos sueltos, las
-carpetas se aplanaron: la versión nueva de modules/les_enfants_terribles.py
-quedó en la RAÍZ (donde nadie la importa) y la app siguió ejecutando la
-vieja. Este chequeo lo hace visible en la propia app."""
+Evita que la app ejecute código viejo sin avisar (p. ej. un
+modules/les_enfants_terribles.py anterior).
+"""
 
 from __future__ import annotations
 

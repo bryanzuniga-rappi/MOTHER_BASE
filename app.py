@@ -1,3 +1,10 @@
+"""Mother Base — punto de entrada de Streamlit.
+
+Flujo: login (auth.py) → inicio → módulo elegido (Les Enfants Terribles o
+Militaires Sans Frontières). Avisa si la instalación está desordenada
+(modules/install_check.py).
+"""
+
 from __future__ import annotations
 
 import streamlit as st

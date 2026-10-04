@@ -227,27 +227,15 @@ La hoja `SCHEDULE` define días permitidos para una pareja origen–destino. Su 
 
 ### SWA
 
-Hoja Aleph con `SWA_POTENTIAL_GAIN_COUNTRY` por tienda–SKU (Sales Weighted Availability — métrica clave de negocio), actualizada cada hora. Nunca participa en ninguna regla de asignación, solo en reportería — pero esa reportería ahora cubre todos los entregables principales.
+Hoja Aleph (cada hora) con `SWA_POTENTIAL_GAIN_COUNTRY` por tienda–SKU: el SWA país que se gana si esa combinación sale del quiebre. Solo se usa en reportería, nunca en reglas de asignación.
 
-**Ganado es binario, no proporcional.** Basta con sacar a una tienda-SKU del quiebre (cualquier unidad > 0 asignada) para capturar el `SWA_POTENTIAL_GAIN_COUNTRY` completo de esa fila — así es como se calcula el dato en origen (la condición de Aleph es `STOCK_UNITS > 0`, no una proporción). Ausente de la hoja SWA = 0 por descarte; nunca bloquea ningún reporte.
-
-**Universo: todo quiebre del catálogo**, no solo lo que algún engine intentó cubrir — incluye tienda-SKU donde ni siquiera había stock en ningún origen para intentarlo. `build_swa_report()` en `modules/les_enfants_terribles.py` es el cálculo autoritativo: itera CATALOGO completo, identifica quiebres (`stock_base` = 0) y compara contra `build_assigned_totals_by_key()` (suma por destino-SKU a través de todos los engines, para no contar doble si dos engines tocan la misma combinación).
-
-**Insumos es un caso especial.** Sus filas no viven en `result.allocation_rows` (corre aparte, anexado directo al CSV sin consumir tareas), así que `build_assigned_totals_by_key()` recibe sus llaves cubiertas por separado (`insumos_summary["assigned_keys"]`) para que el reporte central no las marque como "perdidas" por error. Su propio "SWA ganado" también se calcula aparte, directo desde sus filas ya enriquecidas — no está perfectamente reconciliado contra el reporte central si la misma tienda-SKU también recibió algo por la vía regular, pero ambos números son correctos por separado.
-
-**Dónde aparece — cobertura completa de los entregables principales:**
-
-- Sección dedicada al inicio de resultados (SWA ganado, SWA perdido/en riesgo, universo total, quiebres sin SWA registrado).
-- `SWA_POTENTIAL_GAIN_COUNTRY` como columna en los CSV operativos, `BASE_TRANSFERS` y `DETALLE_ASIGNACION` (vía `enrich_rows_with_product_info`, mismo punto de enriquecimiento que `PRODUCT_NAME`/`CATEGORY_NAME`). Es informativo por fila — si la misma tienda-SKU recibe varias líneas, el valor se repite; no debe sumarse a través de filas sin deduplicar primero.
-- `SWA_GANADO` por engine/causal en "Efectivamente planeado", `SWA_PERDIDO` por motivo en "Cortes", columna `SWA` en el Overview general (`ordered_breakdown_rows`), `SWA_INFORMATIVO` en "Sin recomendación" (ver nota abajo).
-- Reporte de universo Golden/Infaltable/Anchor (detalle completo y micro-detalle de no cubiertos).
-- **Cada una de las 9 secciones de REPORTE POR ENGINE** (Naked, AVL, Preventivo, Refuerzo, Cobertura sin Fountain9, Shalashaska, Liquid, Venom, Insumos) trae su propia tarjeta "SWA GANADO" — `swa_ganado_by_engine()` reusa lo ya calculado en `planned_by_engine_rows`, salvo Insumos que usa su cálculo propio.
-- **Fountain9 vs Mother Base**: los tres bloques (cara a cara, adicional, total) ahora incluyen SWA — permite ver cuánto SWA capturamos que Fountain9 ni siquiera evalúa.
-- **PDF ejecutivo**: tabla de breakdown con columna SWA, más un bloque resumen (ganado/perdido/universo) junto a la tabla ejecutiva principal.
-
-**"Sin recomendación" es informativo, no "perdido".** Estas filas tienen `opening ≥ demanda` por definición (así decide Fountain9 no recomendar nada), así que normalmente no son rupturas reales contra nuestro propio `stock_base` — el campo se llama `SWA_INFORMATIVO` a propósito, para no confundirlo con una pérdida real. Si aparece algo distinto de cero, suele ser un desfase entre el opening predicho de Fountain9 y el stock actual.
+- **Ganado es binario:** cualquier envío que saque la tienda-SKU del quiebre captura su valor completo. Ausente de la hoja = 0.
+- **Universo:** todo quiebre del catálogo (`stock_base` = 0), lo haya intentado cubrir un engine o no. Cálculo autoritativo: `build_swa_report()`, que suma lo asignado por destino-SKU de todos los engines. Insumos corre aparte: se pasan sus llaves cubiertas y su SWA se calcula desde sus propias filas.
+- **Dónde aparece:** sección inicial de resultados; columna `SWA_POTENTIAL_GAIN_COUNTRY` en CSV, `BASE_TRANSFERS` y `DETALLE_ASIGNACION` (informativa por fila: no sumar sin deduplicar por destino-SKU); `SWA_GANADO` y `SWA_PERDIDO` por engine y por corte; columna `SWA` en Overview y PDF; una tarjeta "SWA GANADO" por engine; reporte Golden/Infaltable/Anchor; y Fountain9 vs Mother Base.
+- **"Sin recomendación"** usa `SWA_INFORMATIVO`, no "perdido": esas filas tienen opening ≥ demanda, así que normalmente no son quiebres reales.
 
 ---
+
 
 ## Contrato mínimo de datos
 
@@ -362,48 +350,31 @@ El Refuerzo Golden / Infaltable / Anchor usa el universo definido en la hoja cor
 
 ### Kazuhira Engine (garantía total de cobertura)
 
-Engine independiente (solo Big Boss, apagado por defecto) que corre **al final de todo el pipeline**, después de Venom y antes de la partición por OWNER. Su mandato es distinto al de los demás: ninguna tienda-SKU del catálogo debe quedar en quiebre (`stock_base` = 0) si hay stock disponible en CEDIS, **venga o no de un requerimiento de Fountain9**.
+Última pasada del pipeline (Shalashaska → Liquid → Venom → **Kazuhira** → partición OWNER → Insumos). Solo Big Boss; apagado por defecto. Mandato: ninguna tienda-SKU del catálogo queda en quiebre si hay stock en CEDIS, venga o no de Fountain9. Corre al final y no dentro de Solidus porque necesita el stock final; tiene prioridad sobre Insumos en el stock del 444.
 
-Por qué no es un toggle más de Solidus: Solidus corre a mitad del pipeline, después de Shalashaska y antes de Liquid/Venom; cada una de sus coberturas es quirúrgica a propósito. Kazuhira necesita ver el estado final de stock y no tiene condición propia más allá de "sigue en cero".
+| Tema | Regla |
+|---|---|
+| Universo de tiendas | Tiendas con filas en el Bulk de Fountain9 **más** las que SCHEDULE marca con día válido hoy para un origen seleccionado (independiente del toggle de bloqueo por SCHEDULE). Cerradas, ciudades bloqueadas y excluidas siguen fuera. |
+| Disparador | (stock + incoming + ya asignado) / ADU < 1 DOH. |
+| Cantidad | `ADU × (Duration + Lead Time) − stock − incoming − asignado`, con el mínimo de CODEC. ADU: propio → ciudad → 0.14. |
+| Duration / Lead Time | Moda propia de la tienda → promedio de su ciudad → promedio país. `DETALLE_MOTIVO` indica el escalón. |
+| Stock e incoming | Sin fila en STOCK = 0 (en todos los engines de cobertura). Incoming de `INCOMING_TR` (alias `INCOMING`), completo y sin fecha. |
+| Toggles (apagados) | *Ignorar presupuesto de tareas* (puede exceder `MAX_TASKS`); *Ignorar capacidad de tienda* (el uso se sigue registrando); *Priorizar por SWA* (ante escasez atiende primero el mayor `SWA_POTENTIAL_GAIN_COUNTRY`). |
+| Nunca se salta | Stock real de CEDIS, bloqueos regional/schedule/ruta de costos, tiendas cerradas y ciudades bloqueadas. |
 
-- **Fórmula:** idéntica a Cobertura sin Fountain9 — ADU (propio → ciudad → ficticio 0.14) × (Duration + Lead Time) − stock − incoming, con el mínimo de unidades de CODEC. Implementado como `candidate_mode="kazuhira"` de `apply_avl_fill`, reutilizando las mismas ramas ya probadas.
-- **Universo de tiendas:** las que se planean hoy = tiendas con filas en el Bulk de Fountain9 **más** las que SCHEDULE marca con día válido hoy para algún origen seleccionado, aunque Fountain9 no las haya arrojado (`build_planned_store_universe`). Esto es independiente del toggle de bloqueo por SCHEDULE: aquí SCHEDULE decide qué tiendas toca planear, no bloquea. Cerradas, ciudades bloqueadas y excluidas manualmente siguen fuera. El barrido de universo usa este mismo conjunto de tiendas.
-- **Disparador:** (stock + incoming + unidades ya asignadas esta corrida) / ADU efectivo **< 1 DOH** — no solo stock = 0. Una unidad enviada por otro engine no da por cubierta la combinación si deja menos de 1 DOH.
-- **Sin dato de stock = 0:** una combinación sin fila en STOCK se trata como stock 0 (contador `missing_stock_treated_as_zero`), no se salta. Esto aplica solo a Kazuhira; AVL, Preventivo, Refuerzo y Cobertura sin Fountain9 siguen saltándola.
-- **Cantidad:** el disparador es 1 DOH, pero la cantidad enviada es `ADU × (Duration + Lead Time) − stock − incoming − ya asignado`, con el mínimo de unidades de CODEC.
-- **Cascada de Duration/Lead Time:** moda propia de la tienda (Bulk de Fountain9) → promedio de las tiendas de la **misma ciudad** que sí tienen dato propio (`resolve_duration_lead_time_with_city_fallback`; solo promedia tiendas con ambos valores) → promedio país sobre modas propias (`compute_fallback_duration_and_lead_time`). Aplica, por ejemplo, a una tienda que solo aparece en SCHEDULE. El `DETALLE_MOTIVO` de cada fila dice qué escalón se usó. Cobertura sin Fountain9 no tiene cascada: sigue saltándose tiendas sin dato propio.
-- **Dos toggles de bypass, independientes y apagados por defecto:** *Ignorar presupuesto de tareas* (puede exceder `MAX_TASKS`) e *Ignorar capacidad de tienda* (no recorta el objetivo por m³; el uso de capacidad se sigue registrando para que el reporte muestre la excepción).
-- **Lo que ningún toggle puede saltarse:** el stock real de CEDIS y los bloqueos regionales, de schedule, de ruta de costos, tiendas cerradas y ciudades bloqueadas — son restricciones de negocio, no preferencias de optimización.
-- **Nada queda sin declarar, con motivo por fila.** Kazuhira registra por qué no cubrió cada tienda-SKU que evaluó (`skip_reasons` de `apply_avl_fill`) y ese motivo aparece como `TIPO_DE_CORTE` propio en el breakdown, en la columna `MOTIVO_KAZUHIRA` de `BASE_TRANSFERS` y en una tabla de su sección de reporte. Motivos: sin stock en CEDIS elegible; bloqueo regional/schedule con stock en CEDIS; capacidad de tienda; sin presupuesto de tareas (todo lo pendiente cuando se agota, aun si ya estaba agotado al arrancar); ruta de costos bloqueada; incoming que cubre la necesidad; sin Duration/Lead Time en todo el Bulk. "Sano" (posición ≥ 1 DOH) no es un hueco.
-- **El barrido ya no decide "sano" por stock > 0** cuando Kazuhira está activo: manda el criterio de Kazuhira (un SKU con 0.2 DOH que no se pudo cubrir ya no sale como "OK SIN NECESIDAD"). El barrido tampoco incluye tiendas cerradas, ciudades bloqueadas ni productos excluidos, que ya se reportan por sus propios resúmenes.
-- **Incoming:** se lee de la columna `INCOMING_TR` de la hoja STOCK (`INCOMING` se acepta como alias) y se cuenta completo, sin fecha de llegada; ya viene filtrado en DATA_TRANSFERS. **Ojo:** hasta la v6 solo se buscaba una columna llamada `INCOMING`, así que con `INCOMING_TR` el incoming de todo el sistema (Kazuhira y Cobertura sin Fountain9) se tomaba como 0 sin avisar.
-- **Prioridad por SWA (toggle, apagado por defecto):** cuando la capacidad de la tienda o el presupuesto de tareas no alcanzan para todos los quiebres, atiende primero los de mayor `SWA_POTENTIAL_GAIN_COUNTRY` en vez del orden por prioridad de producto/tienda. Medido con DATA_TRANSFERS real, tienda 89 (capacidad 7 m³): 130 SKUs y SWA 0.0515 con el orden actual contra 197 SKUs y SWA 0.0875 por SWA.
-- **Sin fila en STOCK = stock 0 e incoming 0 (decisión de negocio, todos los engines de cobertura):** una tienda-SKU que está en CATALOGO pero no aparece en STOCK se toma sin inventario ni incoming, no como "sin dato". Aplica a AVL, Preventivo, Refuerzo, Cobertura sin Fountain9 y Kazuhira (`missing_stock_treated_as_zero` en cada resumen y una advertencia consolidada por corrida; `skipped_missing_stock` queda siempre en 0). Motivo: en un DATA_TRANSFERS real, 101,794 de 295,090 combinaciones de CATALOGO (34 %) no tenían fila en STOCK y el 96 % de ellas tiene ADU > 0; solo 5,745 tenían una fila explícita con stock 0, así que antes casi todos los quiebres reales eran invisibles para los engines distintos de Kazuhira. Medido con ese archivo, tienda 89: AVL pasó de saltar 1,424 SKUs a cubrir 459 SKUs (4.6 m³), incluido el 12905.
-- **Sello de versión:** cada corrida lleva `APP_BUILD` (en la pantalla de resultados, como primera advertencia y en `run["build"]`). Si la corrida se generó con otro código, los resultados muestran un aviso con la versión real. Existe porque un despliegue desactualizado produce filas que parecen bugs del código nuevo (p. ej. la etiqueta genérica `EVALUADO POR KAZUHIRA` y la ausencia de la columna `MOTIVO_KAZUHIRA` son de antes de la v4). Hay que subir `APP_BUILD` en cada entrega.
-- **Chequeo de instalación (`modules/install_check.py`, llamado desde `app.py`):** al abrir la app avisa en rojo si `modules/les_enfants_terribles.py` es una versión sin sello, si hay archivos sueltos en la raíz que deben vivir en `modules/`, `engines/` o `tests/` (o borrarse), o si el `.gitignore` quedó guardado como `download`. Existe porque al subir archivos sueltos a GitHub se aplanaron las carpetas y la app siguió ejecutando una versión vieja de `les_enfants_terribles.py` sin avisar.
-- **Orden del pipeline (decisión confirmada):** Shalashaska → Liquid → Venom → Kazuhira → partición OWNER → Insumos. Kazuhira recibe lo que dejan los engines anteriores (incluido Venom) y tiene prioridad sobre Insumos en el stock del 444.
-- **Nada queda sin declarar (resumen):**
+Implementación: `candidate_mode="kazuhira"` de `apply_avl_fill`, con la misma fórmula que Cobertura sin Fountain9 (esa no tiene cascada y salta las tiendas sin dato propio).
 
-### Barrido de universo completo de CATALOGO
+**Todo queda declarado.** Cada tienda-SKU evaluada y no cubierta lleva su motivo (`TIPO_DE_CORTE`, columna `MOTIVO_KAZUHIRA` de `BASE_TRANSFERS` y tabla de su sección): sin stock en CEDIS; bloqueo regional/schedule con stock; capacidad de tienda; sin presupuesto de tareas; ruta de costos; incoming que cubre; sin Duration/Lead Time. El barrido declara además producto excluido y tienda sin registro en TIENDA. "Sano" (≥ 1 DOH) no es un hueco. La consulta puntual (`explain_store_sku`) responde por una tienda-SKU: enviada, declarada, sana o sin rastro.
 
-`plan_transfers` (la pasada base de Naked) solo procesa lo que viene del Bulk de Fountain9 — nunca toca CATALOGO directamente. Sin este barrido, cualquier tienda-SKU de CATALOGO ausente de Fountain9 **y** que ningún engine de cobertura toque queda completamente invisible: ni en el reporte, ni en ningún Excel, ni evaluada en absoluto.
+### Barrido de universo de CATALOGO
 
-Cuando al menos una cobertura de Solidus o Kazuhira está activa, `build_catalog_universe_sweep_rows()` agrega una fila de **solo visibilidad** por cada tienda-SKU de CATALOGO que nadie tocó — nunca consume stock, tareas ni capacidad, solo garantiza que el universo completo se vea:
+`plan_transfers` solo procesa lo que trae el Bulk de Fountain9. Con al menos un engine de cobertura activo (AVL, Preventivo, Refuerzo, Cobertura sin Fountain9 o Kazuhira), `iter_catalog_universe_sweep_rows()` recorre CATALOGO para las tiendas que se planean hoy y declara cada tienda-SKU que ningún engine tocó. Son filas de solo visibilidad: no consumen stock, tareas ni capacidad.
 
-- Con stock > 0 (sano, nada que cubrir): `OK SIN NECESIDAD · FUERA DEL BULK DE FOUNTAIN9` — excluido de la tabla de Cortes (igual que "SIN RECOMENDACIÓN"), porque no es un corte real.
-- Con stock = 0 (quiebre que nadie evaluó): `QUIEBRE SIN EVALUAR · FUERA DE COBERTURA ACTIVA` — sí aparece en Cortes, con su propio `SWA_PERDIDO`, porque genuinamente es un hueco sin cubrir.
+- **Huecos** (quiebres sin cubrir, con motivo: `QUIEBRE NO CUBIERTO · …`): van a `base_rows`, es decir, breakdown, Excel y SWA.
+- **Sanas** (`OK SIN NECESIDAD · FUERA DEL BULK DE FOUNTAIN9`): no van a memoria ni al Excel; se cuentan en el Overview y se escriben en streaming a `Universo_Catalogo_Sin_Necesidad_<fecha>.csv` (dentro del zip). Con Kazuhira decide su criterio (posición ≥ 1 DOH); sin él, stock > 0.
+- Tiendas cerradas y ciudades bloqueadas quedan fuera (ya se reportan aparte). Con todos los engines de cobertura apagados, el barrido no corre.
 
-**Dónde vive cada cosa (decisión de memoria).** Los *huecos* (quiebres sin cubrir, con su motivo) entran a `base_rows`: aparecen en el breakdown, en el Excel y en el SWA. Las filas *sanas* **no** se acumulan en memoria ni van al Excel: se cuentan en el Overview (`OK SIN NECESIDAD · FUERA DEL BULK DE FOUNTAIN9`) y se escriben en streaming a `Universo_Catalogo_Sin_Necesidad_<fecha>.csv`, dentro del zip. El barrido es un generador (`iter_catalog_universe_sweep_rows`); `build_catalog_universe_sweep_rows` es solo su versión en lista, para pruebas.
-
-**CATALOGO se carga una sola vez por corrida** (`ensure_catalog_rows` en `execute_planning`) y se reutiliza en AVL/Preventivo/Refuerzo, Kazuhira, el barrido, el chequeo de salud y SWA. Antes cada uno cargaba su propia copia completa, todas vivas hasta el final.
-
-Medición con datos sintéticos (85 % de las combinaciones con stock; Kazuhira activo; presupuesto de 5,000 tareas): a 500 mil combinaciones tienda-SKU, **206 s y 1,207 MB de pico antes; 66 s y 549 MB ahora**. A 1.2 millones: 159 s y 1,155 MB. Streamlit Community Cloud limita la memoria a aproximadamente 1 GB.
-
-**Consulta puntual ("¿por qué no salió el SKU X en la tienda Y?").** En los resultados, `explain_store_sku` busca la tienda-SKU en lo que ya quedó en el zip (líneas de `BulkCD_*.csv`, `BASE_TRANSFERS` y el CSV de universo sano) y responde: se envió (con unidades y motivo), no se envió y está declarado (con `TIPO_DE_CORTE`, `DETALLE_MOTIVO` y `MOTIVO_KAZUHIRA`), es sano, o **sin rastro** — un hueco sin declarar, con la lista de verificación. Una prueba de punta a punta confirma que, con presupuesto corto, ninguna combinación queda sin rastro.
-
-**Quiebres que ninguna regla de cobertura puede cubrir se declaran, no se omiten:** `PRODUCTO EXCLUIDO (BLOQUEOS O CODEC)` (antes se saltaban en silencio) y `TIENDA SIN REGISTRO EN TIENDA`. Tiendas cerradas y ciudades bloqueadas siguen fuera del barrido porque ya se reportan por sus propios resúmenes.
-
-Con todas las coberturas y Kazuhira apagados (el estado por defecto), este barrido no corre — el reporte sigue reflejando únicamente lo que Fountain9 trajo, como siempre. Activar cualquiera de estas coberturas puede aumentar mucho el total de filas si el catálogo es grande (hay una advertencia visible en CODEC para esto).
+**Memoria.** CATALOGO se carga una vez por corrida (`ensure_catalog_rows`). Referencia con datos sintéticos (85 % con stock, 5,000 tareas): 500 mil combinaciones tardan 66 s y llegan a 549 MB; Streamlit Community Cloud limita a ~1 GB.
 
 ### Shalashaska Engine
 
@@ -581,6 +552,11 @@ DATA_DASHBOARD_SPREADSHEET_ID = "id-del-dashboard"
 
 > **Seguridad:** `.streamlit/secrets.toml` debe estar en `.gitignore`. Si un secreto llegó al repositorio, elimínelo del historial y rótelo antes de desplegar.
 
+### Versión e instalación
+
+- **Sello de versión:** `APP_BUILD` aparece en resultados, advertencias, `run["build"]` y la hoja RESUMEN del Excel. Súbelo en cada entrega (formato `kazuhira-vN`).
+- **Chequeo de instalación** (`modules/install_check.py`): al abrir la app avisa si `modules/les_enfants_terribles.py` es una versión sin sello, si hay archivos sueltos en la raíz o si el `.gitignore` quedó guardado como `download`.
+
 ### Streamlit Community Cloud
 
 1. Suba el proyecto a GitHub sin archivos secretos.
@@ -628,6 +604,16 @@ Los engines deben conservar la trazabilidad de cada decisión: motivo, cantidad 
 - Las pruebas deben declarar la regla con un caso de entrada y resultado esperado, no solo validar que una función no falle.
 - No modifique las etiquetas de salida sin actualizar el breakdown, los exports y pruebas relacionadas.
 - No fusionar líneas de Venom con líneas del resto de engines.
+
+### Estilo de comentarios y documentación
+
+Se asume que quien mantiene el proyecto conoce el negocio; se documenta lo que el código no dice.
+
+- **Encabezado de módulo** (todos los archivos): título con una frase, y las líneas `Posición`, `Entrada`, `Salida` y, si aplica, `Regla clave`.
+- **Docstring de función:** una línea con lo que hace. Más solo si hay un parámetro u invariante no obvio, en una o dos líneas.
+- **Comentario en línea:** el *porqué* de lo no obvio (restricción, orden obligatorio, trampa), en una o dos líneas. No narra lo que hace el código.
+- **No incluir historia** ("antes…", "ahora…", "se decidió en…"): eso vive en el control de versiones. Tampoco repetir lo que ya dice este README.
+- **Texto de pantalla:** los avisos con cifras (resultados de la corrida) se conservan; las notas descriptivas fijas, una línea. Las definiciones de cada KPI van en su tooltip.
 
 ---
 

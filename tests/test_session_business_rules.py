@@ -1,11 +1,4 @@
-"""Pruebas de los ajustes de negocio de esta sesión:
-
-- SKUs excluidos permanentemente a nivel backend.
-- Restricciones exclusivas del perfil Raiden (orígenes default, ciudades
-  protegidas, bloqueo de Solidus/Liquid).
-- Validación de COPÉRNICO por warehouse antes de ejecutar.
-- MOQ especial del SKU 86195 en INSUMOS.
-"""
+"""Pruebas de los ajustes de negocio."""
 
 import io
 from types import SimpleNamespace
@@ -144,8 +137,9 @@ def test_product_catalog_loads_name_and_category_from_data_sheet(tmp_path):
 
 
 def test_product_catalog_uses_sync_id_not_catalog_id(tmp_path):
-    """El punto central de esta sesión: SYNC_ID es la llave de match, NO
-    CATALOG_ID — aunque ambos existan en la fila con valores distintos."""
+    """SYNC_ID es la llave de match, NO CATALOG_ID — aunque ambos existan en la fila con
+    valores distintos.
+    """
     xlsx_path = _minimal_workbook_with_extra_sheet(
         tmp_path,
         "DATA",
@@ -211,10 +205,8 @@ def test_health_cards_grouped_importrange_and_backend_before_aleph():
     primer_aleph = tipos.index("ALEPH")
     # Ningún IMPORTRANGE/BACKEND debe aparecer después del primer ALEPH.
     assert all(t == "ALEPH" for t in tipos[primer_aleph:])
-    # Orden estable dentro del grupo IMPORTRANGE/BACKEND: se conserva el
-    # orden relativo original (VOLUMETRIA, TIENDAS_CERRADAS, SCHEDULE),
-    # sin importar que STOCK (ALEPH) estuviera entre ellas en la lista de
-    # entrada.
+    # Orden estable dentro del grupo IMPORTRANGE/BACKEND: se conserva el orden
+    # relativo original (VOLUMETRIA, TIENDAS_CERRADAS, SCHEDULE).
     hojas_antes_de_aleph = [row["HOJA"] for row in ordered[:primer_aleph]]
     assert hojas_antes_de_aleph == ["VOLUMETRIA", "TIENDAS_CERRADAS", "SCHEDULE"]
 

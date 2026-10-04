@@ -126,9 +126,10 @@ def test_only_stockouts_count_toward_coverage_not_full_universe():
 
 
 def test_mother_base_adicional_captures_what_fountain9_never_saw():
-    """El punto central de esta sesión: Mother Base cubre tienda-SKU que
-    Fountain9 nunca evaluó en absoluto (ausentes de 'consolidated') — eso
-    debe aparecer en 'mother_base_adicional', separado del cara a cara."""
+    """Mother Base cubre tienda-SKU que Fountain9 nunca evaluó en absoluto (ausentes de
+    'consolidated') — eso debe aparecer en 'mother_base_adicional', separado del cara
+    a cara.
+    """
     consolidated = dict(
         [
             _consolidated_record(100, 10, 5.0),  # Fountain9 SÍ evaluó esto

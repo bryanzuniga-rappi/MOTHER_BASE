@@ -1,3 +1,8 @@
+"""Tema visual brutalista de Mother Base.
+
+CSS global y componentes compartidos (tarjeta de acción, sello del sistema).
+"""
+
 from __future__ import annotations
 
 import streamlit as st

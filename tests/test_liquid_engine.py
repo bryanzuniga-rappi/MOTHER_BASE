@@ -161,9 +161,9 @@ def _make_catalogs(stock_444=6.0, store_capacity=20.0, **overrides):
 
 
 def _make_result(funded_destinations=(100,), **overrides):
-    """``funded_destinations``: tiendas que ya recibieron unidades reales de
-    un engine anterior (Naked/Solidus/etc.), simulando el nuevo universo
-    restringido de Liquid. Pasa () para probar una tienda SIN fondear."""
+    """``funded_destinations``: tiendas que ya recibieron unidades reales de un engine
+    anterior (Naked/Solidus/etc.), simulando el nuevo universo restringido de Liquid.
+    """
     seed_rows = [
         {
             "WAREHOUSE_DESTINATION": destination,
@@ -305,9 +305,10 @@ def test_skip_reasons_are_mutually_exclusive_categories():
 
 
 def test_liquid_ignores_store_with_only_a_requirement_row_no_real_shipment():
-    """Una tienda con renglón en Fountain9 pero SIN asignación real de Naked/
-    Solidus (p. ej. quedó en SIN RECOMENDACIÓN o CORTE POR STOCK) NO debe
-    poder recibir liquidación: no está 'fondeada' de verdad ese día."""
+    """Una tienda con renglón en Fountain9 pero SIN asignación real de Naked/Solidus (p.
+    ej. quedó en SIN RECOMENDACIÓN o CORTE POR STOCK) NO debe poder recibir
+    liquidación.
+    """
     catalogs = _make_catalogs(stock_444=6.0)
     config = engine.Config(origin_warehouses=(444,), max_tasks=10)
     # Sin seed: la tienda 100 nunca recibió una unidad real todavía.

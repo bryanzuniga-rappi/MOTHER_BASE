@@ -1,10 +1,4 @@
-"""Pruebas de las métricas 'Requerido · Naked' en build_planning_analytics.
-
-'Requerido' en Planeación Lista debe reflejar SOLO la necesidad original de
-Naked/Solidus (Fountain9 + reglas de mínimo/hardcode), nunca lo que los
-engines de cobertura (AVL, Preventivo, Refuerzo especial, Shalashaska,
-Liquid, Venom) agregan como su propio objetivo.
-"""
+"""Pruebas de las métricas 'Requerido · Naked' en build_planning_analytics."""
 
 from types import SimpleNamespace
 

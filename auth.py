@@ -1,3 +1,9 @@
+"""Autenticación por perfil.
+
+BIG BOSS entra con código de acceso (Streamlit Secrets, con fallback);
+RAIDEN tiene acceso reducido (p. ej. sin Solidus ni Kazuhira).
+"""
+
 from __future__ import annotations
 
 import hmac

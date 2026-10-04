@@ -1,3 +1,10 @@
+"""Naked Engine — necesidad natural de Fountain9.
+
+Posición: base de la planeación (primer engine).
+Entrada: fila consolidada del Bulk (ROQ_INPUT / MOV_ORIGINAL).
+Salida: predicados que clasifican la fila (recomendación positiva o no).
+"""
+
 from __future__ import annotations
 
 from typing import Any

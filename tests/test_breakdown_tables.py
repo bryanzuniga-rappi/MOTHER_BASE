@@ -1,11 +1,4 @@
-"""Pruebas del breakdown de 3 tablas:
-
-1. build_planned_by_engine_rows — lo efectivamente planeado, por engine y
-   causal.
-2. build_cuts_detail_rows — todo lo que no se mandó, con motivo específico
-   (incluye los sub-motivos de COPÉRNICO).
-3. ordered_breakdown_rows — el overview general (ya existía, sin cambios).
-"""
+"""Pruebas del breakdown de 3 tablas."""
 
 from collections import Counter
 from types import SimpleNamespace
@@ -37,9 +30,9 @@ def test_attribute_engine_naked_default():
 
 
 def test_hardcode_cases_get_their_own_distinct_tipo_de_corte():
-    """Los 3 motivos reales de hardcode (antes todos caían juntos bajo "OK
-    MANUAL POR FORECAST 0") deben quedar separados, cada uno con su propia
-    etiqueta precisa."""
+    """Los 3 motivos reales de hardcode deben quedar separados, cada uno con su propia
+    etiqueta precisa.
+    """
     expectations = {
         "HARDCODE_4_CERO_TOTAL": "OK MANUAL POR FORECAST Y STOCK EN CERO",
         "HARDCODE_3_INVENTARIO_MENOR_DEMANDA": (
@@ -134,10 +127,9 @@ def test_swa_ganado_by_engine_empty_when_no_rows():
 
 
 def test_no_fountain9_coverage_sorted_before_shalashaska():
-    """Regresión: otro gap de la sesión anterior — 'Cobertura sin
-    Fountain9' faltaba en el orden de despliegue de esta tabla, lo que la
-    mandaba al final en vez de a su lugar real en la secuencia del
-    pipeline (justo después de Refuerzo, antes de Shalashaska)."""
+    """Regresión: otro gap de la sesión anterior — 'Cobertura sin Fountain9' faltaba en
+    el orden de despliegue de esta tabla.
+    """
     result = SimpleNamespace(
         base_rows=[
             {
@@ -379,8 +371,7 @@ def test_no_recommendation_breakdown_includes_swa_informativo():
 
 
 def test_cuts_detail_no_longer_includes_sin_recomendacion():
-    """Punto central de esta sesión: SIN RECOMENDACIÓN debe salir por
-    completo de la tabla de cortes general."""
+    """SIN RECOMENDACIÓN debe salir por completo de la tabla de cortes general."""
     result = SimpleNamespace(
         base_rows=[
             _no_rec_row(100, 10, demand=0, opening=5),
@@ -422,11 +413,9 @@ def test_catalog_universe_uncovered_included_in_cuts_detail():
 
 
 def test_ordered_breakdown_rows_handles_status_missing_from_swa():
-    """Regresión del bug real en producción: status_counts recibe llaves
-    extra después de construirse (CORTE POR TIENDA CERRADA, CORTE POR
-    CIUDAD BLOQUEADA, INSUMOS) que status_swa nunca tiene, porque esas
-    requisiciones no llegan a result.base_rows. Antes esto tronaba con
-    KeyError; ahora debe tratarse como SWA=0 sin problema."""
+    """Regresión del bug real en producción: status_counts recibe llaves extra después
+    de construirse (CORTE POR TIENDA CERRADA, CORTE POR CIUDAD BLOQUEADA, INSUMOS).
+    """
     status_counts = Counter(
         {"OK COMPLETO POR FOUNTAIN9": 5, "CORTE POR TIENDA CERRADA": 3}
     )

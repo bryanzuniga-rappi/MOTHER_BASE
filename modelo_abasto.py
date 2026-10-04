@@ -1,15 +1,10 @@
-"""
-Motor de planeación de abasto y transferencias entre warehouses.
+"""Motor de planeación de abasto (sin UI).
 
-Este módulo es el motor puro (sin UI): recibe DATA_TRANSFERS.xlsx y el plan
-diario de Fountain9 ya en disco, calcula demanda, prioridades, stock
-ajustado, capacidad y tareas, y genera las filas de asignación y los
-reportes. Lo importa y orquesta la app de Streamlit en
-``modules/les_enfants_terribles.py`` — no se ejecuta como script
-independiente.
-
-El motor es deliberadamente secuencial en la fase de asignación: el stock,
-la capacidad y el número de tareas cambian después de cada requerimiento.
+Posición: núcleo que orquesta modules/les_enfants_terribles.py.
+Entrada: DATA_TRANSFERS.xlsx, plan de Fountain9 y COPÉRNICO ya en disco.
+Salida: filas de asignación, bloqueos y reportes (CSV/Excel).
+Regla clave: la asignación es secuencial; stock, capacidad y tareas cambian
+tras cada requerimiento.
 """
 
 from __future__ import annotations
@@ -135,11 +130,7 @@ def normalize_city(value: Any) -> str:
 
 
 def normalize_weekday(value: Any) -> str:
-    """Normaliza un token de día (con o sin acentos, puntos o espacios sueltos).
-
-    Tolera variantes como ``" .Miércoles "`` o ``"lunes"`` y siempre devuelve la
-    forma canónica en mayúsculas sin acentos, p. ej. ``"MIERCOLES"``.
-    """
+    """Normaliza un token de día (con o sin acentos, puntos o espacios sueltos)."""
     raw = clean_text(value)
     folded = "".join(
         char
@@ -237,23 +228,12 @@ def iter_sheet_records(
 
 
 def _squash_header(value: Any) -> str:
-    """Colapsa un encabezado a solo letras/números para comparar alias.
-
-    Permite que ``WAREHOUSE_ID`` y ``WAREHOUSE ID`` (o cualquier combinación de
-    espacios/guiones bajos) se reconozcan como el mismo campo.
-    """
+    """Colapsa un encabezado a solo letras/números para comparar alias."""
     return re.sub(r"[^A-Z0-9]", "", normalize_header(value))
 
 
 def iter_schedule_records(workbook) -> Iterator[dict[str, Any]]:
-    """Lee la hoja SCHEDULE tolerando alias de encabezado.
-
-    Acepta ``WAREHOUSE_ID`` o ``WAREHOUSE ID`` para el destino, y requiere
-    ``ORIGEN`` y ``DAYS``. SCHEDULE es parte del contrato obligatorio (se
-    valida en el panel de salud), pero este loader es defensivo: si la hoja
-    no está presente no interrumpe la carga, simplemente no produce filas y
-    ningún par destino-origen queda restringido por frecuencia.
-    """
+    """Lee la hoja SCHEDULE tolerando alias de encabezado."""
     if "SCHEDULE" not in workbook.sheetnames:
         return
     ws = workbook["SCHEDULE"]
@@ -298,15 +278,8 @@ def iter_schedule_records(workbook) -> Iterator[dict[str, Any]]:
 
 
 def iter_product_catalog_records(workbook) -> Iterator[dict[str, Any]]:
-    """Lee la hoja DATA (catálogo maestro de producto): nombre, categoría y
-    jerarquía por SYNC_ID — la misma llave de SKU que usa todo el resto del
-    sistema (RETAIL_ID de Fountain9, PRODUCT_ID de CATALOGO).
-
-    DATA es parte del contrato obligatorio (se valida en el panel de
-    salud), pero este loader es defensivo igual que SCHEDULE: si la hoja no
-    está presente, no interrumpe la carga — simplemente no hay nombre ni
-    categoría disponibles para enriquecer reportes, sin afectar ninguna
-    regla de negocio (esta hoja nunca participa en la asignación).
+    """Lee la hoja DATA (catálogo maestro) por SYNC_ID: nombre y categoría para
+    reportes.
     """
     if "DATA" not in workbook.sheetnames:
         return
@@ -325,15 +298,7 @@ def iter_product_catalog_records(workbook) -> Iterator[dict[str, Any]]:
 
 
 def iter_swa_records(workbook) -> Iterator[dict[str, Any]]:
-    """Lee la hoja SWA (Sales Weighted Availability): cuánto SWA país se
-    ganaría si esta tienda-SKU saliera del quiebre
-    (SWA_POTENTIAL_GAIN_COUNTRY), por WAREHOUSE_ID/PRODUCT_ID — la misma
-    llave destino-SKU que usa el resto del sistema.
-
-    Igual que DATA: opcional, defensivo. Si la hoja no está, simplemente no
-    hay SWA disponible para ningún reporte — nunca participa en ninguna
-    regla de asignación, solo en reportería.
-    """
+    """Lee la hoja SWA: SWA país que se gana si la tienda-SKU sale del quiebre."""
     if "SWA" not in workbook.sheetnames:
         return
     yield from iter_sheet_records(
@@ -370,22 +335,7 @@ def put_unique(
 
 
 def copernico_is_usable(location: Any, warehouse: int | None = None) -> bool:
-    """Replica las fórmulas históricas de ubicación y USABLE?.
-
-    Cualquier ubicación de recibo — ``RECIBO_444``, ``RECIBO_831``,
-    ``RECIBO_852``, ``RECIBO_856`` o la que sea, para cualquier bodega — ya
-    NO se excluye (a pedido de negocio): ese saldo se considera usable sin
-    importar el destino. El chequeo es explícito por prefijo
-    (``RECIBO_<lo que sea>``), no por longitud de texto — antes solo se
-    comparaba contra el string literal ``"RECIBO_444"``, así que
-    ``RECIBO_831``/``852``/``856`` nunca coincidían con esa condición y
-    terminaban clasificándose como usables por pura coincidencia (caían al
-    chequeo genérico de longitud, que también las dejaba pasar). Ahora es
-    una regla a propósito, no un efecto colateral.
-
-    El parámetro ``warehouse`` se conserva en la firma por compatibilidad
-    con los llamadores existentes, aunque ya no cambia el resultado.
-    """
+    """Replica las fórmulas históricas de ubicación y USABLE?."""
     value = clean_text(location).upper()
     if value.startswith("Z"):
         return True
@@ -404,15 +354,7 @@ def load_copernico_unusable_csv(
     dict[tuple[int, int], str],
     dict[str, Any],
 ]:
-    """Resuelve saldo no usable y storage por Bodega + producto.
-
-    Acepta una sola ruta o una lista de rutas: si se cargan varios CSV de
-    COPÉRNICO en la misma corrida, sus filas se combinan exactamente como si
-    fueran un solo archivo. Cada archivo puede tener su propio delimitador y
-    no necesita traer las mismas columnas opcionales (p. ej. ZonaPiso); el
-    contrato de columnas obligatorias (Bodega, EAN, Ubicacion, Saldo) se
-    valida por separado en cada uno.
-    """
+    """Resuelve saldo no usable y storage por Bodega + producto."""
     path_list = [paths] if isinstance(paths, Path) else list(paths)
     if not path_list:
         raise ValueError("COPÉRNICO: no se proporcionó ningún archivo CSV")
@@ -500,8 +442,7 @@ def load_copernico_unusable_csv(
                     + ", ".join(missing)
                 )
             # ZonaPiso es opcional para bodegas distintas de 856 (se exige más
-            # abajo, por fila, solo cuando la bodega es 856). Si la columna
-            # existe, se usa en todas las bodegas para excluir saldo LOST.
+            # abajo, por fila, solo cuando la bodega es 856).
             zone_field = field_lookup.get("ZonaPiso")
 
             for row_number, row in enumerate(reader, start=2):
@@ -527,9 +468,8 @@ def load_copernico_unusable_csv(
                     clean_text(row.get(zone_field)).upper() if zone_field else ""
                 )
 
-                # ZonaPiso = LOST excluye el saldo sin importar la bodega, igual
-                # que CANCELADOS en Ubicacion. Se evalúa antes que cualquier
-                # otra regla para que nunca se cuente como usable.
+                # ZonaPiso = LOST excluye el saldo sin importar la bodega,
+                # igual que CANCELADOS en Ubicacion.
                 if floor_zone == "LOST":
                     lost_zone_rows += 1
                     lost_zone_units += balance
@@ -672,7 +612,6 @@ class Catalogs:
     anchor_products: set[tuple[int, int]] = field(default_factory=set)
     owner_stock: dict[tuple[int, int, str], int] = field(default_factory=dict)
     # SCHEDULE: (WAREHOUSE_ID destino, ORIGEN) -> días permitidos normalizados.
-    # Un par ausente de este diccionario no tiene restricción de frecuencia.
     schedule_days: dict[tuple[int, int], frozenset[str]] = field(
         default_factory=dict
     )
@@ -680,16 +619,12 @@ class Catalogs:
     # default para no alterar corridas existentes.
     schedule_block_enabled: bool = False
     # Toggle de CODEC para el bloqueo regional explícito (hoja
-    # BLOQUEOS_FORANEAS, CDMX→GDL/MTY). Activo por default, igual que
-    # siempre ha funcionado.
+    # BLOQUEOS_FORANEAS, CDMX→GDL/MTY).
     regional_block_enabled: bool = True
-    # Día de hoy (fecha real del sistema al momento de la corrida), normalizado
-    # igual que los tokens de SCHEDULE.DAYS, p. ej. "MIERCOLES".
+    # Día de hoy normalizado igual que SCHEDULE.DAYS (p. ej. LUNES).
     run_weekday_norm: str = ""
-    # Saldo no usable de COPÉRNICO por motivo específico: "LOST",
-    # "CANCELADOS", "ZONA_856", "OTRO_NO_USABLE" -> {(warehouse, sku):
-    # unidades}. Para el breakdown detallado de cortes. RECIBO_* ya no es
-    # motivo de exclusión, así que no aparece aquí.
+    # Saldo no usable de COPÉRNICO por motivo específico: "LOST", "CANCELADOS",
+    # "ZONA_856", "OTRO_NO_USABLE" -> {(warehouse, sku): unidades}.
     copernico_unusable_by_reason: dict[str, dict[tuple[int, int], float]] = field(
         default_factory=dict
     )
@@ -697,17 +632,13 @@ class Catalogs:
     # ningún lugar, mantenidos directamente por negocio en DATA_TRANSFERS.
     globally_blocked_skus: set[int] = field(default_factory=set)
     # Catálogo maestro de producto (hoja DATA), por SYNC_ID -> nombre y
-    # categoría. Solo para enriquecer reportes/entregables con texto
-    # legible; nunca participa en ninguna regla de asignación.
+    # categoría.
     product_catalog: dict[int, dict[str, str]] = field(default_factory=dict)
-    # STOCK.INCOMING (opcional, antes reservado sin usar): unidades ya en
-    # tránsito hacia (warehouse, sku), por cualquier motivo previo a esta
-    # corrida. Se resta al calcular cuánto falta cubrir en el mecanismo de
-    # cobertura sin Fountain9, para no sobre-enviar.
+    # STOCK.INCOMING_TR (opcional): unidades en tránsito hacia (warehouse,
+    # sku).
     incoming_stock: dict[tuple[int, int], float] = field(default_factory=dict)
     # Sales Weighted Availability: cuánto SWA país se ganaría si esta
     # tienda-SKU sale del quiebre (hoja SWA, SWA_POTENTIAL_GAIN_COUNTRY).
-    # Ausente de la hoja = 0 por descarte, nunca bloquea ningún reporte.
     swa_potential_gain: dict[tuple[int, int], float] = field(default_factory=dict)
 
 
@@ -747,8 +678,8 @@ def load_catalogs(
         }
 
         # Lista de exclusión global mantenida directamente por negocio en
-        # DATA_TRANSFERS: cualquier SKU aquí nunca se envía a ningún lugar,
-        # en ningún engine. Una sola columna (PRODUCT_ID), un SKU por fila.
+        # DATA_TRANSFERS: cualquier SKU aquí nunca se envía a ningún lugar, en
+        # ningún engine.
         globally_blocked_skus = {
             to_id(row["PRODUCT_ID"], "BLOQUEOS.PRODUCT_ID", True)
             for row in iter_sheet_records(workbook, "BLOQUEOS", ["PRODUCT_ID"])
@@ -937,16 +868,10 @@ def load_catalogs(
             if warehouse is not None and sku is not None:
                 unavailable_stock[(warehouse, sku)] += max(to_float(row["STOCK"]), 0.0)
 
-        # INCOMING es opcional (reservado desde hace tiempo, nunca exigido):
-        # se detecta si está presente en el encabezado real ANTES de
-        # pedirlo, para no romper cargas de negocio que todavía no lo
-        # traen en su STOCK.
         stock_required = ["WAREHOUSE_ID", "PRODUCT_ID", "STOCK_DISPONIBLE_FINAL"]
         _, stock_header_positions = find_header_row(workbook["STOCK"], stock_required)
         # El nombre real en DATA_TRANSFERS es INCOMING_TR (transferencias en
-        # camino); INCOMING se conserva como alias por compatibilidad. Antes
-        # solo se buscaba "INCOMING", así que con INCOMING_TR en la hoja el
-        # incoming de TODO el sistema quedaba silenciosamente en 0.
+        # camino); INCOMING se conserva como alias por compatibilidad.
         incoming_column = next(
             (
                 alias
@@ -1118,9 +1043,7 @@ def load_catalogs(
                 schedule_days[key] = days_set
 
         # Catálogo maestro de producto (hoja DATA): nombre y categoría por
-        # SYNC_ID, solo para reportes — nunca participa en asignación. La
-        # hoja es opcional en tiempo de carga (ver iter_product_catalog_records);
-        # si un SYNC_ID se repite, se conserva la primera fila y se avisa.
+        # SYNC_ID, solo para reportes — nunca participa en asignación.
         product_catalog: dict[int, dict[str, str]] = {}
         for row in iter_product_catalog_records(workbook):
             sku = to_id(row["SYNC_ID"], "DATA.SYNC_ID", True)
@@ -1302,10 +1225,7 @@ def detect_fountain9_store_outliers(
     consolidated: dict[tuple[int, int], dict[str, Any]],
     catalogs: Catalogs,
 ) -> dict[str, Any]:
-    """Deprecado: la detección de tiendas con cobertura F9 anómalamente baja
-    se eliminó a pedido de negocio. Se conserva como stub inerte (siempre
-    deshabilitado, cero tiendas excluidas) por si algún llamador viejo la
-    invoca todavía; no hace ningún cálculo real."""
+    """Deprecado: detección de tiendas con cobertura F9 anómala (eliminada); stub inerte."""
     return {
         "enabled": False,
         "stores_evaluated": 0,
@@ -1631,8 +1551,7 @@ def apply_owner_inventory_partition(
             ] += int(allocation["QUANTITY"])
 
         # Puede haber más de un renglón de reporte para el mismo tienda–SKU
-        # (por ejemplo Naked + Shalashaska). Se reconcilia en orden, sin duplicar
-        # la asignación final en cada renglón.
+        # (por ejemplo Naked + Shalashaska).
         for row in result.base_rows:
             destination = int(row["WAREHOUSE_DESTINATION"])
             sku = int(row["RETAIL_ID"])
@@ -1719,13 +1638,7 @@ def is_regional_block(
     destination_city_norm: str,
     is_golden_infaltable: bool,
 ) -> bool:
-    """Aplica únicamente los bloqueos explícitos de la hoja BLOQUEOS.
-
-    ``is_golden_infaltable`` se conserva en la firma por compatibilidad con los
-    distintos engines, pero Golden Infaltables ya no genera una restricción de
-    origen o ciudad. Su clasificación sigue disponible para prioridad y
-    reporting.
-    """
+    """Aplica únicamente los bloqueos explícitos de la hoja BLOQUEOS."""
     if source == destination:
         return True
     if not catalogs.regional_block_enabled:
@@ -1740,13 +1653,7 @@ def is_regional_block(
 
 
 def is_schedule_blocked(catalogs: Catalogs, source: int, destination: int) -> bool:
-    """Bloquea un origen-destino si hoy no es un día permitido en SCHEDULE.
-
-    Controlado por el toggle de CODEC ``schedule_block_enabled``. Si el toggle
-    está apagado, o si el par (destination, source) no aparece en la hoja
-    SCHEDULE, no aplica ninguna restricción de frecuencia (ver contrato de la
-    hoja SCHEDULE en el README).
-    """
+    """Bloquea un origen-destino si hoy no es un día permitido en SCHEDULE."""
     if not catalogs.schedule_block_enabled:
         return False
     allowed_days = catalogs.schedule_days.get((destination, source))
@@ -1768,17 +1675,8 @@ COPERNICO_REASON_LABELS: dict[str, str] = {
 def dominant_copernico_reason(
     catalogs: Catalogs, sku: int, sources: Iterable[int]
 ) -> str | None:
-    """Motivo de COPÉRNICO que explica la mayor parte del saldo no usable de
-    ``sku`` sumando los orígenes dados (ignora los que ya están bloqueados
-    por otra regla, para no atribuir el corte a COPÉRNICO si el verdadero
-    motivo es otro). Devuelve la etiqueta corta ("LOST", "CANCELADOS",
-    "ZONA 856", "OTRO") o ``None`` si no hay saldo excluido por COPÉRNICO
-    en esos orígenes.
-
-    ``sources`` se materializa a una tupla de entrada: el cálculo itera sobre
-    ella una vez por cada motivo posible, así que un generador de un solo
-    uso se agotaría después del primer motivo y arrojaría un resultado
-    incorrecto (silencioso) para el resto.
+    """Motivo de COPÉRNICO que explica la mayor parte del saldo no usable de un SKU en
+    los orígenes dados.
     """
     source_list = tuple(sources)
     totals: dict[str, float] = {}
@@ -1975,9 +1873,7 @@ def plan_transfers(
                     break
 
             # Una necesidad que no puede cubrirse completa con el stock
-            # elegible remanente no debe consumir inventario. Se omite esta
-            # tienda y se conserva el saldo para requerimientos posteriores
-            # que sí puedan atenderse al 100%.
+            # elegible remanente no debe consumir inventario.
             stock_insufficient = remaining_candidate > 0
             if stock_insufficient:
                 candidate_allocations = []
@@ -2018,9 +1914,7 @@ def plan_transfers(
                 if schedule_blocks[source] and not regional_blocks[source]
             )
             # Unidades excluidas por COPÉRNICO (ubicación no usable, LOST,
-            # etc.) en orígenes que de otra forma serían elegibles — para
-            # separar "no se planificó por COPÉRNICO" de un corte genérico
-            # por falta de stock.
+            # etc.) en orígenes que de otra forma serían elegibles.
             copernico_unusable_stock = sum(
                 origin_info[source].get("copernico_unusable", 0)
                 for source in config.origin_warehouses
@@ -2235,8 +2129,7 @@ def plan_transfers(
 
     # Segunda pasada: una vez atendidas todas las necesidades que cabían
     # completas, el stock todavía remanente vuelve a las tiendas diferidas en
-    # su orden original de prioridad. En esta etapa sí se permite una atención
-    # parcial para aprovechar el saldo sin bloquear tiendas posteriores.
+    # su orden original de prioridad.
     for row, report_row in deferred_stock_rows:
         destination = row["WAREHOUSE_DESTINATION"]
         sku = row["RETAIL_ID"]
@@ -2481,22 +2374,8 @@ def enrich_rows_with_product_info(
     sku_field: str = "RETAIL_ID",
     destination_field: str = "WAREHOUSE_DESTINATION",
 ) -> None:
-    """Le pega PRODUCT_NAME, CATEGORY_NAME y SWA_POTENTIAL_GAIN_COUNTRY a
-    cada fila. PRODUCT_NAME/CATEGORY_NAME buscan por SKU en
-    catalogs.product_catalog (hoja DATA, indexado por SYNC_ID); SWA busca
-    por (destino, SKU) en catalogs.swa_potential_gain (hoja SWA). Muta las
-    filas en el lugar — se llama UNA vez sobre cada lista de filas
-    (base_rows, allocation_rows, o cualquier lista de Insumos/Refuerzo)
-    antes de que esa lista se escriba a cualquier CSV/Excel, para que todo
-    lo que lea de ahí después ya lo tenga sin tener que repetir el lookup.
-
-    Si las hojas DATA/SWA están vacías o la llave no aparece ahí, deja las
-    columnas en cadena vacía / 0 — nunca truena, nunca inventa un valor.
-    Nota: SWA_POTENTIAL_GAIN_COUNTRY aquí es puramente informativo por
-    fila — si la misma tienda-SKU recibe varias líneas (de distintos
-    engines), el valor se repite en cada una; no debe sumarse a través de
-    filas sin deduplicar por (destino, SKU) primero (ver build_swa_report
-    para el cálculo agregado correcto).
+    """Agrega PRODUCT_NAME, CATEGORY_NAME y SWA_POTENTIAL_GAIN_COUNTRY a cada fila; el
+    SWA es informativo por fila (no sumar sin deduplicar por destino-SKU).
     """
     for row in rows:
         sku = row.get(sku_field)

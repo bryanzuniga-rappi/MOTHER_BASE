@@ -1,3 +1,12 @@
+"""Liquid Engine — agota el stock remanente de origen.
+
+Posición: después de Shalashaska, antes de Venom.
+Entrada: remanente por origen-SKU (cola automática por umbral o SKUs manuales)
+y SHARE_VENTAS.
+Salida: filas de asignación solo a tiendas que ya recibieron unidades en la corrida.
+Regla clave: no rebasa stock, capacidad ni tareas globales.
+"""
+
 from __future__ import annotations
 
 from collections import Counter
@@ -32,7 +41,7 @@ def empty_liquid_summary(enabled: bool) -> dict[str, Any]:
         "stock_exhausted_cases": 0,
         # Un candidato (origen-SKU dentro del umbral) puede no enviarse por
         # tres motivos distintos y mutuamente excluyentes; se cuentan por
-        # separado para poder diagnosticar sin releer todo BASE_TRANSFERS:
+        # separado para poder diagnosticar sin releer todo BASE_TRANSFERS.
         "skipped_no_destination_eligible": 0,  # todo destino bloqueado
         "skipped_capacity_full": 0,  # había destino, pero sin m3 disponible
         "skipped_task_limit": 0,  # se acabó el presupuesto de tareas
@@ -284,11 +293,9 @@ def apply_liquid_engine(
     tail_threshold: int = 10,
     reason_column: str = "PLANNING_REASON",
 ) -> dict[str, Any]:
-    """Agota stock remanente sin rebasar stock, capacidad o tareas globales.
-
-    ``tail_threshold`` es el umbral de la cola automática: un origen-SKU
-    entra como candidato cuando su remanente cumple
-    ``0 < remaining < tail_threshold`` (antes fijo en 10 unidades).
+    """Agota stock remanente sin rebasar stock, capacidad ni tareas globales.
+    tail_threshold: un origen-SKU entra a la cola automática si 0 < remanente <
+    tail_threshold.
     """
     summary = empty_liquid_summary(True)
     if tail_threshold <= 0:
@@ -327,14 +334,8 @@ def apply_liquid_engine(
         (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"]): row
         for row in plan_rows
     }
-    # Universo de destinos elegibles para Liquid: SOLO tiendas que ya
-    # recibieron unidades reales de algún engine anterior en esta misma
-    # corrida (Naked, Solidus, AVL, Preventivo, Shalashaska), tomado como una
-    # foto fija antes de que Liquid agregue nada. A propósito NO se usa
-    # "cualquier tienda con un renglón de requerimiento ese día" (que podía
-    # incluir tiendas con corte total o SIN RECOMENDACIÓN): dado que la
-    # planeación es secuencial, Liquid no debe introducir tiendas nuevas que
-    # la planeación normal no haya tocado de verdad.
+    # Destinos de Liquid: solo tiendas que ya recibieron unidades reales de un
+    # engine anterior en esta corrida.
     funded_destinations = {
         int(allocation["WAREHOUSE_DESTINATION"])
         for allocation in result.allocation_rows

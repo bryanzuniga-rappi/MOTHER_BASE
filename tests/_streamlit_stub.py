@@ -1,7 +1,5 @@
-"""Stub mínimo de streamlit para poder importar les_enfants_terribles.py en
-tests sin depender del paquete real. Solo cubre lo que se usa a nivel de
-módulo (decoradores) y las llamadas que las funciones bajo prueba podrían
-disparar; no reemplaza pruebas de interfaz.
+"""Stub mínimo de streamlit para poder importar les_enfants_terribles.py en tests sin
+depender del paquete real.
 """
 
 import sys

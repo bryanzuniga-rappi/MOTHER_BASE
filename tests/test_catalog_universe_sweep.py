@@ -77,8 +77,9 @@ def test_duplicate_catalog_rows_produce_one_sweep_row():
 
 
 def test_never_assigns_quantity_regardless_of_stock():
-    """Punto central: estas filas NUNCA consumen stock/tareas, incluso si
-    hay stock de sobra en el destino — son puramente informativas."""
+    """Estas filas NUNCA consumen stock/tareas, incluso si hay stock de sobra en el
+    destino — son puramente informativas.
+    """
     catalogs = make_catalogs(stock_base={(100, 10): 99999})
     rows = m.build_catalog_universe_sweep_rows(
         [_catalog_row(100, 10)], catalogs, existing_keys=set()

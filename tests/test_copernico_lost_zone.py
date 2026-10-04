@@ -1,11 +1,4 @@
-"""Pruebas de la exclusión universal ZonaPiso = LOST en el CSV de COPÉRNICO.
-
-Antes de este cambio, ZonaPiso solo se evaluaba para la bodega 856 (para
-clasificar E/RCC/RR/MRM). El resto de las bodegas únicamente miraban la
-columna Ubicacion. Ahora, sin importar la bodega, una fila con
-ZonaPiso = LOST siempre excluye ese saldo, igual que CANCELADOS/RECIBO_444
-en Ubicacion.
-"""
+"""Pruebas de la exclusión universal ZonaPiso = LOST en el CSV de COPÉRNICO."""
 
 import csv
 
@@ -49,12 +42,9 @@ def test_lost_takes_priority_over_usable_ubicacion():
 
 
 def test_recibo_444_is_usable_everywhere(tmp_path):
-    """A pedido de negocio: RECIBO_444 ya no se excluye en ninguna bodega
-    que use la clasificación general por Ubicacion — ni siquiera
-    parcialmente (antes solo 444/831 eran la excepción). La bodega 856
-    queda fuera de este test a propósito: usa ZonaPiso en vez de Ubicacion,
-    es una clasificación estructuralmente distinta y RECIBO_444 no aplica
-    ahí en absoluto."""
+    """A pedido de negocio: RECIBO_444 ya no se excluye en ninguna bodega que use la
+    clasificación general por Ubicacion — ni siquiera parcialmente.
+    """
     path = tmp_path / "copernico.csv"
     _write_copernico_csv(
         path,
@@ -77,10 +67,9 @@ def test_recibo_444_is_usable_everywhere(tmp_path):
 
 
 def test_copernico_is_usable_recibo_is_a_concept_not_just_444():
-    """RECIBO_444, RECIBO_831, RECIBO_852 y RECIBO_856 son todas variantes
-    del mismo concepto (ubicación de recibo), no solo la de la bodega 444
-    — copernico_is_usable debe reconocerlas todas por igual, de forma
-    explícita (no por casualidad de que el string mida 8+ caracteres)."""
+    """RECIBO_444, RECIBO_831, RECIBO_852 y RECIBO_856 son todas variantes del mismo
+    concepto (ubicación de recibo), no solo la de la bodega 444.
+    """
     for variant in ("RECIBO_444", "RECIBO_831", "RECIBO_852", "RECIBO_856"):
         assert engine.copernico_is_usable(variant) is True, variant
         assert engine.copernico_is_usable(variant.lower()) is True, variant
@@ -89,13 +78,10 @@ def test_copernico_is_usable_recibo_is_a_concept_not_just_444():
 
 
 def test_recibo_variants_not_dependent_on_string_length_coincidence():
-    """Antes de este fix, RECIBO_831/852/856 pasaban como usables por
-    casualidad (el chequeo genérico de longitud >= 8 los dejaba pasar sin
-    que nadie lo haya decidido a propósito). Esta prueba fija que ahora es
-    una regla explícita: incluso si alguna variante futura de la bodega
-    fuera de un solo dígito (por ejemplo "RECIBO_9", 8 caracteres exactos,
-    o algo aún más corto si cambiara el formato), debe seguir siendo
-    usable porque el chequeo es por PREFIJO, no por longitud total."""
+    """Antes de este fix, RECIBO_831/852/856 pasaban como usables por casualidad (el
+    chequeo genérico de longitud >= 8 los dejaba pasar sin que nadie lo haya decidido
+    a propósito).
+    """
     assert engine.copernico_is_usable("RECIBO_9") is True
     assert engine.copernico_is_usable("RECIBO_") is True  # prefijo solo, caso límite
 
@@ -405,10 +391,10 @@ def test_load_catalogs_accepts_multiple_copernico_files(tmp_path):
 
 
 def test_sku_absent_from_copernico_has_no_restriction():
-    """Si un SKU tiene stock en DATA_TRANSFERS pero nunca aparece en
-    COPÉRNICO para ese origen (ni como usable ni como no-usable), debe
-    tratarse como sin ninguna restricción — no como bloqueado por
-    precaución."""
+    """Si un SKU tiene stock en DATA_TRANSFERS pero nunca aparece en COPÉRNICO para ese
+    origen (ni como usable ni como no-usable), debe tratarse como sin ninguna
+    restricción.
+    """
     catalogs = engine.Catalogs(
         volume_m3={}, blocked_products=set(), route_cost_blocks=set(),
         store_priority={}, high_value={}, rackeados_444=set(),
@@ -423,11 +409,9 @@ def test_sku_absent_from_copernico_has_no_restriction():
 
 
 def test_sku_absent_from_copernico_no_restriction_for_any_warehouse():
-    """Mismo caso, pero confirmando que no depende de que el origen sea
-    444 — cualquier bodega debe comportarse igual. 425/856 quedan fuera:
-    tienen su propia partición por OWNER (ajena a COPÉRNICO) que también
-    acota 'adjusted', así que probarlas aquí mezclaría dos mecanismos
-    distintos sin poblar owner_stock."""
+    """Mismo caso, pero confirmando que no depende de que el origen sea 444 — cualquier
+    bodega debe comportarse igual.
+    """
     for warehouse in (444, 831, 9999):
         catalogs = engine.Catalogs(
             volume_m3={}, blocked_products=set(), route_cost_blocks=set(),

@@ -1,3 +1,12 @@
+"""Shalashaska Engine — evacuación de inventario próximo a caducar.
+
+Posición: después de Naked/Solidus, antes de Liquid.
+Entrada: POR_MERMAR (origen-SKU con vencimiento próximo), SHARE_VENTAS y ADU de CATALOGO.
+Salida: filas de asignación del remanente a tiendas, repartido por SHARE_VENTAS.
+Regla clave: respeta stock, capacidad y tareas globales; POR_MERMAR no se usa
+como stock mandante.
+"""
+
 from __future__ import annotations
 
 from collections import Counter
@@ -415,10 +424,8 @@ def apply_shalashaska_engine(
             if capacity_units <= 0:
                 continue
 
-            # La ausencia de CATALOGO/ADU no invalida una ruta que ya sale del
-            # origen. Estas tiendas no participan en el nivelado por DOH, pero
-            # sí pueden recibir inventario por mermar en la segunda pasada,
-            # distribuida mediante SHARE_VENTAS.
+            # Una ruta que ya sale del origen no se invalida por falta de
+            # CATALOGO/ADU.
             adu = max(float(catalog_adu.get((destination, sku), 0.0)), 0.0)
             current_inventory = max(
                 float(catalogs.stock_base.get((destination, sku), 0.0)), 0.0
@@ -469,8 +476,8 @@ def apply_shalashaska_engine(
         )
         assigned_by_demand = sum(demand_allocations.values())
 
-        # El remanente se evacúa por SHARE_VENTAS incluso si sólo existe una
-        # ruta elegible. En ese caso la tienda representa el 100% del share.
+        # El remanente se evacúa por SHARE_VENTAS aun con una sola ruta
+        # elegible.
         share_allocations = _share_distribution(
             available - assigned_by_demand, selected_options, capacity_left
         )

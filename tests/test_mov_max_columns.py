@@ -1,6 +1,6 @@
-"""Pruebas del nuevo cálculo de MOV efectivo: máximo entre la columna (MOV)
-y hasta 11 columnas relacionadas opcionales de Fountain9, y máximo (no
-suma) entre filas/archivos duplicados de la misma tienda-SKU."""
+"""Pruebas del nuevo cálculo de MOV efectivo: máximo entre la columna (MOV) y hasta 11
+columnas relacionadas opcionales de Fountain9.
+"""
 
 import csv
 from pathlib import Path
@@ -91,8 +91,9 @@ def test_mov_max_works_with_only_required_mov_column(tmp_path):
 
 
 def test_mov_max_duplicate_rows_take_max_not_sum(tmp_path):
-    """Punto central de esta sesión: la misma tienda-SKU en dos filas
-    (o archivos) distintos debe quedarse con el MÁXIMO, nunca la suma."""
+    """La misma tienda-SKU en dos filas (o archivos) distintos debe quedarse con el
+    MÁXIMO, nunca la suma.
+    """
     plan_path = tmp_path / "plan.csv"
     _write_plan_csv(
         plan_path,

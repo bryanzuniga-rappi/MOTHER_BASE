@@ -1,11 +1,4 @@
-"""Pruebas del bucket dedicado 'CORTE POR COPÉRNICO' en TIPO_DE_CORTE.
-
-Antes de este cambio, un requerimiento sin cubrir por exclusiones de
-COPÉRNICO (ubicación no usable, LOST, etc.) caía en el bucket genérico
-"CORTE POR STOCK", con COPERNICO_NO_USABLE mencionado solo como texto
-suelto dentro de DETALLE_MOTIVO — sin forma de cuantificarlo por separado
-en el breakdown. Ahora tiene su propio TIPO_DE_CORTE.
-"""
+"""Pruebas del bucket dedicado 'CORTE POR COPÉRNICO' en TIPO_DE_CORTE."""
 
 import modelo_abasto as engine
 from tests._streamlit_stub import install as _install_streamlit_stub
@@ -121,8 +114,9 @@ def test_regional_block_unaffected_by_new_copernico_bucket():
 
 
 def test_regional_block_priority_over_copernico_with_two_origins():
-    """444 tiene stock real bloqueado por regla regional; 831 tiene stock
-    excluido por COPÉRNICO. El bloqueo regional manda en la etiqueta."""
+    """444 tiene stock real bloqueado por regla regional; 831 tiene stock excluido por
+    COPÉRNICO.
+    """
     catalogs = make_catalogs(
         stock_base={(444, 10): 5.0, (831, 10): 5.0},
         copernico_unusable_by_warehouse={(831, 10): 5.0},
