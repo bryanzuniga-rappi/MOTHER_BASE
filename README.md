@@ -319,6 +319,20 @@ flowchart TD
     F --> G["OWNER, Insumos y entregables"]
 ```
 
+### Cómo leer el pipeline en 30 segundos
+
+| Etapa | Qué hace | Pregunta que responde |
+|---|---|---|
+| **Naked** | Ejecuta la necesidad natural de Fountain9 y sus mínimos operativos cuando Fountain9 no generó un ROQ positivo. | “¿Qué pidió el forecast para hoy?” |
+| **Shalashaska** | Evacúa inventario próximo a caducar por las rutas que ya saldrán: primero por ADU/DOH y luego por share de ventas. | “¿Cómo evitamos que este producto merme?” |
+| **Solidus** | Agrega coberturas tácticas: AVL, prevención, refuerzo Golden/Infaltable/Anchor y quiebres sin recomendación útil. | “¿Qué riesgo importante no cubrió la recomendación natural?” |
+| **Liquid** | Distribuye remanente disponible después de las prioridades anteriores. | “¿Dónde todavía podemos aprovechar este saldo?” |
+| **Venom** | Recompone buffers DDMRP hacia Top of Green; sus líneas quedan separadas para auditar su impacto. | “¿Qué buffer necesita recuperación estructural?” |
+| **Kazuhira** | Última red de seguridad: revisa quiebres del universo planificable y cubre los que aún sean posibles. | “¿Quedó algún quiebre real que todavía podamos resolver?” |
+| **OWNER e Insumos** | Separa 425/856 por propietario y agrega insumos elegibles al bulk correspondiente. | “¿Cómo debe quedar el archivo listo para ejecutar?” |
+
+**Regla común:** ningún engine puede saltarse stock, bloqueos o restricciones de ruta. Naked, Shalashaska, Solidus y Liquid también comparten el límite operativo de tareas; Kazuhira solo puede ignorarlo si Big Boss activa explícitamente ese bypass.
+
 ### Naked Engine
 
 Atiende la recomendación natural con ROQ positivo. Incluye un toggle independiente, **Cubrir a Fountain9**, para hardcodes en los que Fountain9 no produce ROQ positivo pero el negocio determina que debe haber una cobertura mínima:
@@ -350,7 +364,7 @@ El Refuerzo Golden / Infaltable / Anchor usa el universo definido en la hoja cor
 
 Engine independiente (solo Big Boss, apagado por defecto) que corre **al final de todo el pipeline**, después de Venom y antes de la partición por OWNER. Su mandato es distinto al de los demás: ninguna tienda-SKU del catálogo debe quedar en quiebre (`stock_base` = 0) si hay stock disponible en CEDIS, **venga o no de un requerimiento de Fountain9**.
 
-Por qué no es un toggle más de Solidus: Solidus corre a mitad del pipeline (antes de Shalashaska/Liquid/Venom) y cada uno de sus engines es quirúrgico a propósito. Kazuhira necesita ver el estado final de stock y no tiene condición propia más allá de "sigue en cero".
+Por qué no es un toggle más de Solidus: Solidus corre a mitad del pipeline, después de Shalashaska y antes de Liquid/Venom; cada una de sus coberturas es quirúrgica a propósito. Kazuhira necesita ver el estado final de stock y no tiene condición propia más allá de "sigue en cero".
 
 - **Fórmula:** idéntica a Cobertura sin Fountain9 — ADU (propio → ciudad → ficticio 0.14) × (Duration + Lead Time) − stock − incoming, con el mínimo de unidades de CODEC. Implementado como `candidate_mode="kazuhira"` de `apply_avl_fill`, reutilizando las mismas ramas ya probadas.
 - **Universo de tiendas:** las que se planean hoy = tiendas con filas en el Bulk de Fountain9 **más** las que SCHEDULE marca con día válido hoy para algún origen seleccionado, aunque Fountain9 no las haya arrojado (`build_planned_store_universe`). Esto es independiente del toggle de bloqueo por SCHEDULE: aquí SCHEDULE decide qué tiendas toca planear, no bloquea. Cerradas, ciudades bloqueadas y excluidas manualmente siguen fuera. El barrido de universo usa este mismo conjunto de tiendas.
