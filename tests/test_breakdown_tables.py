@@ -393,6 +393,34 @@ def test_cuts_detail_no_longer_includes_sin_recomendacion():
     assert "CORTE POR STOCK" in causales
 
 
+def test_catalog_universe_healthy_excluded_from_cuts_detail():
+    """OK SIN NECESIDAD no es un corte real — no había nada que cubrir.
+    Igual tratamiento que SIN RECOMENDACIÓN."""
+    result = SimpleNamespace(
+        base_rows=[
+            _row(100, 10, 0, 0, m.CATALOG_UNIVERSE_HEALTHY_CUT, "CATALOGO_SIN_NECESIDAD"),
+            _row(100, 11, 5, 0, "CORTE POR STOCK"),
+        ],
+    )
+    cuts = m.build_cuts_detail_rows(result)
+    causales = {row["CAUSAL"] for row in cuts}
+    assert m.CATALOG_UNIVERSE_HEALTHY_CUT not in causales
+    assert "CORTE POR STOCK" in causales
+
+
+def test_catalog_universe_uncovered_included_in_cuts_detail():
+    """QUIEBRE SIN EVALUAR sí es un corte real — nadie lo cubrió, debe
+    aparecer con visibilidad plena en Cortes."""
+    result = SimpleNamespace(
+        base_rows=[
+            _row(100, 10, 0, 0, m.CATALOG_UNIVERSE_UNCOVERED_CUT, "CATALOGO_QUIEBRE_SIN_EVALUAR"),
+        ],
+    )
+    cuts = m.build_cuts_detail_rows(result)
+    causales = {row["CAUSAL"] for row in cuts}
+    assert m.CATALOG_UNIVERSE_UNCOVERED_CUT in causales
+
+
 def test_ordered_breakdown_rows_handles_status_missing_from_swa():
     """Regresión del bug real en producción: status_counts recibe llaves
     extra después de construirse (CORTE POR TIENDA CERRADA, CORTE POR

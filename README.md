@@ -310,6 +310,30 @@ Para resolver ADU, las coberturas usan esta cascada:
 
 El Refuerzo Golden / Infaltable / Anchor usa el universo definido en la hoja correspondiente, no solamente las filas existentes de catálogo. Nunca modifica una recomendación que Fountain9 ya solicitó.
 
+### Kazuhira Engine (garantía total de cobertura)
+
+Engine independiente (solo Big Boss, apagado por defecto) que corre **al final de todo el pipeline**, después de Venom y antes de la partición por OWNER. Su mandato es distinto al de los demás: ninguna tienda-SKU del catálogo debe quedar en quiebre (`stock_base` = 0) si hay stock disponible en CEDIS, **venga o no de un requerimiento de Fountain9**.
+
+Por qué no es un toggle más de Solidus: Solidus corre a mitad del pipeline (antes de Shalashaska/Liquid/Venom) y cada uno de sus engines es quirúrgico a propósito. Kazuhira necesita ver el estado final de stock y no tiene condición propia más allá de "sigue en cero".
+
+- **Fórmula:** idéntica a Cobertura sin Fountain9 — ADU (propio → ciudad → ficticio 0.14) × (Duration + Lead Time) − stock − incoming, con el mínimo de unidades de CODEC. Implementado como `candidate_mode="kazuhira"` de `apply_avl_fill`, reutilizando las mismas ramas ya probadas.
+- **Alcance:** sin `excluded_keys`; solo se salta lo que ya recibió asignación positiva en esta corrida.
+- **Fallback propio:** si la tienda nunca tuvo fila en el Bulk (sin moda de Duration/Lead Time), usa el promedio país (`compute_fallback_duration_and_lead_time`) en vez de saltarse el quiebre como hace Cobertura sin Fountain9.
+- **Dos toggles de bypass, independientes y apagados por defecto:** *Ignorar presupuesto de tareas* (puede exceder `MAX_TASKS`) e *Ignorar capacidad de tienda* (no recorta el objetivo por m³; el uso de capacidad se sigue registrando para que el reporte muestre la excepción).
+- **Lo que ningún toggle puede saltarse:** el stock real de CEDIS y los bloqueos regionales, de schedule, de ruta de costos, tiendas cerradas y ciudades bloqueadas — son restricciones de negocio, no preferencias de optimización.
+- **Nada queda sin declarar:** con Kazuhira activo, un quiebre que sigue en cero aparece como `QUIEBRE NO CUBIERTO · EVALUADO POR KAZUHIRA` (motivos posibles: sin stock en CEDIS elegible, bloqueo, tienda cerrada/ciudad bloqueada, incoming que lo cubre, o sin Duration/Lead Time en todo el Bulk). Activar Kazuhira también activa el barrido de universo completo.
+
+### Barrido de universo completo de CATALOGO
+
+`plan_transfers` (la pasada base de Naked) solo procesa lo que viene del Bulk de Fountain9 — nunca toca CATALOGO directamente. Sin este barrido, cualquier tienda-SKU de CATALOGO ausente de Fountain9 **y** que ningún engine de cobertura toque queda completamente invisible: ni en el reporte, ni en ningún Excel, ni evaluada en absoluto.
+
+Cuando al menos uno de los 4 toggles de cobertura de Solidus está activo (AVL, Prevención, Refuerzo o Cobertura sin Fountain9), `build_catalog_universe_sweep_rows()` agrega una fila de **solo visibilidad** por cada tienda-SKU de CATALOGO que nadie tocó — nunca consume stock, tareas ni capacidad, solo garantiza que el universo completo se vea:
+
+- Con stock > 0 (sano, nada que cubrir): `OK SIN NECESIDAD · FUERA DEL BULK DE FOUNTAIN9` — excluido de la tabla de Cortes (igual que "SIN RECOMENDACIÓN"), porque no es un corte real.
+- Con stock = 0 (quiebre que nadie evaluó): `QUIEBRE SIN EVALUAR · FUERA DE COBERTURA ACTIVA` — sí aparece en Cortes, con su propio `SWA_PERDIDO`, porque genuinamente es un hueco sin cubrir.
+
+Con los 4 toggles apagados (el estado por defecto), este barrido no corre — el reporte sigue reflejando únicamente lo que Fountain9 trajo, como siempre. Activar cualquiera de los 4 puede aumentar mucho el total de filas si el catálogo es grande (hay una advertencia visible en CODEC para esto).
+
 ### Shalashaska Engine
 
 Propone evacuar inventario marcado como **por mermar**, respetando los bloqueos, la capacidad de las tiendas y el presupuesto compartido de tareas.

@@ -300,6 +300,44 @@ HARDCODE_CUT_LABELS: dict[str, str] = {
     "HARDCODE_3_NET_TRANSFER_BAJO": "OK MANUAL POR NET TRANSFER BAJO",
 }
 
+# Barrido de universo completo de CATALOGO (sesión "ver el universo entero
+# en todo momento"): cuando al menos un engine de cobertura está activo,
+# toda combinación tienda-SKU de CATALOGO que ningún engine tocó (ni
+# Fountain9, ni AVL/Preventivo/Refuerzo/Cobertura sin Fountain9) recibe
+# una fila de SOLO VISIBILIDAD — nunca consume stock/tareas/capacidad, es
+# puramente informativa para que nada quede invisible en el reporte.
+# Definidas ANTES de BREAKDOWN_ORDER a propósito: ese tuple se evalúa al
+# importar el módulo, así que cualquier constante que referencie ahí debe
+# existir antes, no solo más abajo en el archivo.
+CATALOG_UNIVERSE_HEALTHY_CUT = "OK SIN NECESIDAD · FUERA DEL BULK DE FOUNTAIN9"
+CATALOG_UNIVERSE_HEALTHY_REGLA = "CATALOGO_SIN_NECESIDAD"
+CATALOG_UNIVERSE_UNCOVERED_CUT = "QUIEBRE SIN EVALUAR · FUERA DE COBERTURA ACTIVA"
+CATALOG_UNIVERSE_UNCOVERED_REGLA = "CATALOGO_QUIEBRE_SIN_EVALUAR"
+# Con Kazuhira activo, un quiebre que sigue en cero YA fue evaluado: no se
+# pudo cubrir por un motivo legítimo (sin stock en CEDIS elegible, bloqueo
+# regional/schedule/ruta de costos, tienda cerrada o ciudad bloqueada,
+# incoming que lo cubre, o sin Duration/Lead Time en todo el Bulk). Se
+# declara aparte de "sin evaluar" para que nada quede ambiguo.
+CATALOG_UNIVERSE_POST_KAZUHIRA_CUT = "QUIEBRE NO CUBIERTO · EVALUADO POR KAZUHIRA"
+CATALOG_UNIVERSE_POST_KAZUHIRA_REGLA = "CATALOGO_QUIEBRE_POST_KAZUHIRA"
+
+# Kazuhira: última pasada del pipeline completo (después de Venom), no un
+# toggle más de Solidus. Mandato distinto por diseño — "ni una sola
+# combinación tienda-SKU del universo de catálogo debe quedar en quiebre
+# si hay stock disponible en CEDIS", sin importar si Fountain9 la
+# evaluó o no. Reusa la MISMA fórmula que Cobertura sin Fountain9 (ADU ×
+# (Duration+LeadTime) − stock − incoming, cascada de ADU) — lo que cambia
+# es el alcance: exclusión mínima (solo lo ya asignado esta corrida, no
+# "fountain_recommended_keys"), fallback de Duration/LeadTime cuando la
+# tienda no tiene dato propio (para nunca saltarse un quiebre por falta
+# de ese dato), y dos toggles independientes para ignorar presupuesto de
+# tareas y capacidad de tienda.
+PLANNING_REASON_KAZUHIRA = "COBERTURA TOTAL · KAZUHIRA ENGINE"
+KAZUHIRA_CUT = "ENVIADOS PARA GARANTIZAR COBERTURA TOTAL · KAZUHIRA"
+KAZUHIRA_REGLA_DEMANDA = "KAZUHIRA_COBERTURA_TOTAL"
+# (Definidas antes de BREAKDOWN_ORDER a propósito: ese tuple se evalúa al
+# importar el módulo y referencia KAZUHIRA_CUT.)
+
 BREAKDOWN_ORDER = (
     "CORTE POR CIUDAD BLOQUEADA",
     "CORTE POR PRODUCTO RACKEADO 444",
@@ -317,7 +355,11 @@ BREAKDOWN_ORDER = (
     "ENVIADOS PARA CUBRIR QUIEBRE SIN FOUNTAIN9",
     SHALASHASKA_CUT,
     LIQUID_CUT,
+    KAZUHIRA_CUT,
     "SIN RECOMENDACIÓN",
+    CATALOG_UNIVERSE_POST_KAZUHIRA_CUT,
+    CATALOG_UNIVERSE_UNCOVERED_CUT,
+    CATALOG_UNIVERSE_HEALTHY_CUT,
     "CORTE POR RUTA DE COSTOS",
     "CORTE POR TIENDA CERRADA",
     "INSUMOS",
@@ -2714,6 +2756,7 @@ ENGINE_CUT_ATTRIBUTION: dict[str, str] = {
     "ENVIADOS PARA PREVENIR QUIEBRE": "Preventivo",
     SPECIAL_DOH_CUT: "Refuerzo Golden/Infaltable/Anchor",
     NO_FOUNTAIN9_CUT: "Cobertura sin Fountain9",
+    KAZUHIRA_CUT: "Kazuhira",
     SHALASHASKA_CUT: "Shalashaska",
     LIQUID_CUT: "Liquid",
     VENOM_CUT: "Venom",
@@ -2758,7 +2801,7 @@ def build_planned_by_engine_rows(
     engine_order = ["Naked", "AVL", "Preventivo",
                      "Refuerzo Golden/Infaltable/Anchor",
                      "Cobertura sin Fountain9", "Shalashaska",
-                     "Liquid", "Venom", "Insumos"]
+                     "Liquid", "Venom", "Insumos", "Kazuhira"]
     cut_order = {label: index for index, label in enumerate(BREAKDOWN_ORDER)}
 
     def sort_key(item: tuple[tuple[str, str], int]) -> tuple[int, int, str]:
@@ -2832,8 +2875,8 @@ def build_cuts_detail_rows(
         if int(row.get("CANTIDAD_ASIGNADA", 0) or 0) > 0:
             continue
         tipo = str(row.get("TIPO_DE_CORTE", ""))
-        if tipo == "SIN RECOMENDACIÓN":
-            continue
+        if tipo in ("SIN RECOMENDACIÓN", CATALOG_UNIVERSE_HEALTHY_CUT):
+            continue  # ninguno de los dos es un corte real: no había nada que cubrir
         counts[tipo] += 1
         units_missing[tipo] += int(row.get("CANTIDAD_OBJETIVO", 0) or 0)
         swa_perdido[tipo] += float(row.get("SWA_POTENTIAL_GAIN_COUNTRY", 0.0) or 0.0)
@@ -2959,6 +3002,27 @@ def _coverage_stats(keys_with_qty: list[tuple[tuple[int, int], float]]) -> dict[
     }
 
 
+def compute_fallback_duration_and_lead_time(
+    duration_mode_by_store: dict[int, float],
+    lead_time_mode_by_store: dict[int, float],
+) -> tuple[float | None, float | None]:
+    """Promedio país de Duration y Lead Time entre las tiendas que sí
+    tienen su propia moda — el respaldo de Kazuhira para tiendas que nunca
+    tuvieron ni una fila en el Bulk de Fountain9 (por eso no tienen moda
+    propia). None si no hay ninguna tienda con dato (nada de qué
+    promediar) — en ese caso Kazuhira simplemente no puede cubrir esas
+    tiendas, no hay información alguna para intentarlo."""
+    duration_values = [v for v in duration_mode_by_store.values() if v is not None]
+    lead_time_values = [v for v in lead_time_mode_by_store.values() if v is not None]
+    fallback_duration = (
+        sum(duration_values) / len(duration_values) if duration_values else None
+    )
+    fallback_lead_time = (
+        sum(lead_time_values) / len(lead_time_values) if lead_time_values else None
+    )
+    return fallback_duration, fallback_lead_time
+
+
 def build_assigned_totals_by_key(
     result,
     extra_assigned_keys: set[tuple[int, int]] | None = None,
@@ -2991,6 +3055,72 @@ def get_swa_potential_gain(catalogs, destination: int, sku: int) -> float:
     no aparece en la hoja SWA — nunca bloquea nada, es puramente
     informativo."""
     return catalogs.swa_potential_gain.get((destination, sku), 0.0)
+
+
+def build_catalog_universe_sweep_rows(
+    catalog_rows: list[dict[str, Any]],
+    catalogs,
+    existing_keys: set[tuple[int, int]],
+    kazuhira_active: bool = False,
+) -> list[dict[str, Any]]:
+    """Barrido de visibilidad: una fila por cada tienda-SKU de CATALOGO que
+    NINGÚN engine tocó esta corrida (ni Fountain9, ni AVL/Preventivo/
+    Refuerzo/Cobertura sin Fountain9) — para que el universo completo
+    quede visible en el reporte, sin importar qué toggles de cobertura
+    estén activos.
+
+    Nunca consume stock, tareas ni capacidad — son filas de SOLO
+    VISIBILIDAD (CANTIDAD_OBJETIVO=0, CANTIDAD_ASIGNADA=0 siempre). No
+    intentan cubrir nada; eso lo deciden los engines de cobertura con sus
+    propios toggles. Esto solo garantiza que lo que nadie tocó no
+    desaparezca del reporte.
+
+    Dos motivos, distinguidos por si hay stock real (catalogs.stock_base)
+    o no:
+    - Con stock > 0: sano, no había nada que cubrir.
+    - Con stock = 0: quiebre real que ningún engine activo alcanzó a
+      evaluar — a diferencia de "sin recomendación" (que sí tuvo una fila
+      de Fountain9), aquí puede que ni eso haya habido.
+    """
+    rows: list[dict[str, Any]] = []
+    seen_in_sweep: set[tuple[int, int]] = set()
+    for row in catalog_rows:
+        destination = row["WAREHOUSE_DESTINATION"]
+        sku = row["RETAIL_ID"]
+        key = (destination, sku)
+        if key in existing_keys or key in seen_in_sweep:
+            continue
+        seen_in_sweep.add(key)
+
+        destination_stock = max(catalogs.stock_base.get(key, 0.0), 0.0)
+        store = catalogs.stores.get(destination, {})
+        if destination_stock > 0:
+            tipo_de_corte = CATALOG_UNIVERSE_HEALTHY_CUT
+            regla_demanda = CATALOG_UNIVERSE_HEALTHY_REGLA
+        elif kazuhira_active:
+            tipo_de_corte = CATALOG_UNIVERSE_POST_KAZUHIRA_CUT
+            regla_demanda = CATALOG_UNIVERSE_POST_KAZUHIRA_REGLA
+        else:
+            tipo_de_corte = CATALOG_UNIVERSE_UNCOVERED_CUT
+            regla_demanda = CATALOG_UNIVERSE_UNCOVERED_REGLA
+
+        rows.append(
+            {
+                "WAREHOUSE_DESTINATION": destination,
+                "RETAIL_ID": sku,
+                "CITY": store.get("city", ""),
+                "CITY_NORMALIZED": store.get("city_norm", ""),
+                "WAREHOUSE_NAME": store.get("warehouse_name", ""),
+                "CANTIDAD_OBJETIVO": 0,
+                "CANTIDAD_ASIGNADA": 0,
+                "TIPO_DE_CORTE": tipo_de_corte,
+                "REGLA_DEMANDA": regla_demanda,
+                "PREDICTED_DEMAND": 0.0,
+                "PREDICTED_OPENING_INVENTORY": destination_stock,
+                "NET_INTER_STORE_TRANSFERS": 0.0,
+            }
+        )
+    return rows
 
 
 def build_swa_report(
@@ -4498,17 +4628,31 @@ def apply_avl_fill(
     excluded_keys: set[tuple[int, int]] | None = None,
     duration_mode_by_store: dict[int, float] | None = None,
     lead_time_mode_by_store: dict[int, float] | None = None,
+    fallback_duration: float | None = None,
+    fallback_lead_time: float | None = None,
+    ignore_task_budget: bool = False,
+    ignore_store_capacity: bool = False,
 ) -> dict[str, Any]:
     """Usa tareas remanentes para stockouts, inventario preventivo, refuerzo
-    de Golden/Infaltable/Anchor del catálogo, o cobertura de quiebres sin
-    fila de Fountain9 (candidate_mode="no_fountain9_coverage").
+    de Golden/Infaltable/Anchor del catálogo, cobertura de quiebres sin
+    fila de Fountain9 (candidate_mode="no_fountain9_coverage"), o la
+    garantía total de Kazuhira (candidate_mode="kazuhira" — misma fórmula
+    que "no_fountain9_coverage", alcance más amplio).
 
-    ``duration_mode_by_store``/``lead_time_mode_by_store`` solo aplican al
-    modo "no_fountain9_coverage" — la moda de Duration/Lead Time del Bulk
-    de Fountain9, una por tienda (ver consolidate_plan_files).
+    ``duration_mode_by_store``/``lead_time_mode_by_store`` aplican a
+    "no_fountain9_coverage" y "kazuhira" — la moda de Duration/Lead Time
+    del Bulk de Fountain9, una por tienda (ver consolidate_plan_files).
+    ``fallback_duration``/``fallback_lead_time`` solo aplican a
+    "kazuhira": si la tienda no tiene su propia moda (nunca tuvo fila en
+    el Bulk), se usa este valor en vez de saltarse el quiebre — "Cobertura
+    sin Fountain9" en cambio sí se salta ese caso (``skipped_no_duration_
+    data``), porque no tiene mandato de garantía absoluta.
+    ``ignore_task_budget``/``ignore_store_capacity``: solo relevantes para
+    Kazuhira (el resto de los modos siempre respeta ambos límites).
     """
     if candidate_mode not in {
         "stockout", "preventive", "special_doh", "no_fountain9_coverage",
+        "kazuhira",
     }:
         raise ValueError(f"Modo de cobertura de catálogo inválido: {candidate_mode}")
     duration_mode_by_store = duration_mode_by_store or {}
@@ -4520,7 +4664,9 @@ def apply_avl_fill(
     for base_row in result.base_rows:
         base_row.setdefault("ADU_CATALOGO", "")
         base_row.setdefault("DOH_AVL", "")
-    if doh <= 0 or summary["task_slots_before"] <= 0:
+    if doh <= 0 or (
+        not ignore_task_budget and summary["task_slots_before"] <= 0
+    ):
         summary["task_slots_after"] = summary["task_slots_before"]
         return summary
 
@@ -4645,20 +4791,33 @@ def apply_avl_fill(
                 config.minimum_positive_quantity,
             )
             summary["preventive_candidates"] += 1
-        elif candidate_mode == "no_fountain9_coverage":
+        elif candidate_mode in ("no_fountain9_coverage", "kazuhira"):
             # Quebrado (stock=0) Y esta tienda-SKU no está en excluded_keys
-            # — quien llama decide qué cuenta como "ya cubierto por
-            # Fountain9": hoy es fountain_recommended_keys (solo
-            # recomendación positiva), así que un "sin recomendación" con
-            # quiebre real también es candidato aquí, no solo los SKUs
-            # ausentes del archivo por completo. Duration/Lead Time moda
-            # por TIENDA sustituyen el DOH fijo de CODEC; sin esos dos
-            # datos para esta tienda, no hay base para calcular.
+            # — quien llama decide qué cuenta como "ya cubierto": para
+            # "no_fountain9_coverage" hoy es fountain_recommended_keys
+            # (solo recomendación positiva); para "kazuhira" normalmente
+            # es solo lo ya asignado esta corrida (garantía total, sin
+            # importar el origen del quiebre). Duration/Lead Time moda por
+            # TIENDA sustituyen el DOH fijo de CODEC.
             if destination_stock > 0:
                 summary["skipped_not_stockout"] += 1
                 continue
             duration_mode = duration_mode_by_store.get(destination)
             lead_time_mode = lead_time_mode_by_store.get(destination)
+            used_fallback_duration = False
+            if (
+                (duration_mode is None or lead_time_mode is None)
+                and candidate_mode == "kazuhira"
+                and fallback_duration is not None
+                and fallback_lead_time is not None
+            ):
+                # Garantía total: esta tienda nunca tuvo fila en el Bulk de
+                # Fountain9 (por eso no tiene moda propia) — en vez de
+                # saltarse el quiebre como haría "Cobertura sin Fountain9",
+                # se usa el fallback global para no dejarlo sin cubrir.
+                duration_mode = fallback_duration
+                lead_time_mode = fallback_lead_time
+                used_fallback_duration = True
             if duration_mode is None or lead_time_mode is None:
                 summary["skipped_no_duration_data"] = (
                     summary.get("skipped_no_duration_data", 0) + 1
@@ -4744,22 +4903,26 @@ def apply_avl_fill(
                 "PRODUCT_PRIORITY_RANK": priority_profile["rank"],
                 "PRIORITY": catalogs.store_priority.get(destination, 100),
                 "DURATION_MODE": (
-                    duration_mode_by_store.get(destination)
-                    if candidate_mode == "no_fountain9_coverage"
+                    duration_mode
+                    if candidate_mode in ("no_fountain9_coverage", "kazuhira")
                     else None
                 ),
                 "LEAD_TIME_MODE": (
-                    lead_time_mode_by_store.get(destination)
-                    if candidate_mode == "no_fountain9_coverage"
+                    lead_time_mode
+                    if candidate_mode in ("no_fountain9_coverage", "kazuhira")
                     else None
                 ),
                 "INCOMING": (
                     max(catalogs.incoming_stock.get(key, 0.0), 0.0)
-                    if candidate_mode == "no_fountain9_coverage"
+                    if candidate_mode in ("no_fountain9_coverage", "kazuhira")
                     else 0.0
                 ),
                 "USED_FICTITIOUS_ADU": (
-                    candidate_mode == "no_fountain9_coverage" and adu <= 0
+                    candidate_mode in ("no_fountain9_coverage", "kazuhira")
+                    and adu <= 0
+                ),
+                "USED_FALLBACK_DURATION": (
+                    candidate_mode == "kazuhira" and used_fallback_duration
                 ),
             }
         )
@@ -4779,7 +4942,7 @@ def apply_avl_fill(
     products_sent: set[int] = set()
     next_order = len(result.base_rows) + 1
     for candidate in candidates:
-        if result.tasks_used >= config.max_tasks:
+        if not ignore_task_budget and result.tasks_used >= config.max_tasks:
             break
 
         destination = candidate["WAREHOUSE_DESTINATION"]
@@ -4815,18 +4978,25 @@ def apply_avl_fill(
             capacity_by_store[destination] = capacity_row
 
         cap_before = float(capacity_row["M3_CONTABILIZADO_CAPACIDAD"])
-        if bool(capacity_row["CAPACIDAD_CERRADA"]):
+        if not ignore_store_capacity and bool(capacity_row["CAPACIDAD_CERRADA"]):
             summary["skipped_capacity"] += 1
             continue
 
         original_target = int(candidate["TARGET"])
-        remaining_capacity_m3 = max(capacity - cap_before, 0.0)
-        capacity_units = (
-            int(math.floor((remaining_capacity_m3 / m3_per_unit) + 1e-9))
-            if m3_per_unit > 0
-            else original_target
-        )
-        target = min(original_target, max(capacity_units, 0))
+        if ignore_store_capacity:
+            # Garantía total de Kazuhira: el objetivo no se recorta por
+            # espacio disponible — se sigue REGISTRANDO el uso de
+            # capacidad para que el reporte muestre la excepción, pero no
+            # limita la cantidad enviada.
+            target = original_target
+        else:
+            remaining_capacity_m3 = max(capacity - cap_before, 0.0)
+            capacity_units = (
+                int(math.floor((remaining_capacity_m3 / m3_per_unit) + 1e-9))
+                if m3_per_unit > 0
+                else original_target
+            )
+            target = min(original_target, max(capacity_units, 0))
         if target <= 0:
             summary["skipped_capacity"] += 1
             continue
@@ -4878,7 +5048,11 @@ def apply_avl_fill(
                 catalogs, source, destination
             )
 
-        available_task_slots = max(config.max_tasks - result.tasks_used, 0)
+        available_task_slots = (
+            len(candidate_allocations)
+            if ignore_task_budget
+            else max(config.max_tasks - result.tasks_used, 0)
+        )
         allocations = candidate_allocations[:available_task_slots]
         assigned = sum(quantity for _, quantity in allocations)
         if assigned <= 0:
@@ -4914,7 +5088,11 @@ def apply_avl_fill(
                             else (
                                 PLANNING_REASON_NO_FOUNTAIN9
                                 if candidate_mode == "no_fountain9_coverage"
-                                else PLANNING_REASON_SPECIAL_DOH
+                                else (
+                                    PLANNING_REASON_KAZUHIRA
+                                    if candidate_mode == "kazuhira"
+                                    else PLANNING_REASON_SPECIAL_DOH
+                                )
                             )
                         )
                     ),
@@ -4970,7 +5148,11 @@ def apply_avl_fill(
                     else (
                         "COBERTURA_SIN_FOUNTAIN9"
                         if candidate_mode == "no_fountain9_coverage"
-                        else "REFUERZO_ESPECIALES_DOH"
+                        else (
+                            KAZUHIRA_REGLA_DEMANDA
+                            if candidate_mode == "kazuhira"
+                            else "REFUERZO_ESPECIALES_DOH"
+                        )
                     )
                 )
             ),
@@ -4981,7 +5163,7 @@ def apply_avl_fill(
             ),
             "DOH_AVL": (
                 (candidate["DURATION_MODE"] or 0) + (candidate["LEAD_TIME_MODE"] or 0)
-                if candidate_mode == "no_fountain9_coverage"
+                if candidate_mode in ("no_fountain9_coverage", "kazuhira")
                 else doh
             ),
             "DOH_DESTINO_ANTES": (
@@ -5034,7 +5216,11 @@ def apply_avl_fill(
                     else (
                         NO_FOUNTAIN9_CUT
                         if candidate_mode == "no_fountain9_coverage"
-                        else SPECIAL_DOH_CUT
+                        else (
+                            KAZUHIRA_CUT
+                            if candidate_mode == "kazuhira"
+                            else SPECIAL_DOH_CUT
+                        )
                     )
                 )
             ),
@@ -5048,14 +5234,15 @@ def apply_avl_fill(
                         if candidate_mode == "preventive"
                         else (
                             (
-                                f"Quebrado sin fila de Fountain9: ADU "
+                                f"{'Kazuhira · garantía total: quebrado' if candidate_mode == 'kazuhira' else 'Quebrado sin fila de Fountain9'}: ADU "
                                 f"{'ficticio ' if candidate['USED_FICTITIOUS_ADU'] else ''}"
                                 f"{(FICTITIOUS_ADU_NO_FOUNTAIN9 if candidate['USED_FICTITIOUS_ADU'] else candidate['ADU']):.4f} "
                                 f"× (Duration {candidate['DURATION_MODE']:g} + Lead "
-                                f"Time {candidate['LEAD_TIME_MODE']:g} moda de la "
-                                f"tienda) − {candidate['INCOMING']:g} incoming"
+                                f"Time {candidate['LEAD_TIME_MODE']:g} "
+                                f"{'moda país, sin dato propio de tienda' if candidate.get('USED_FALLBACK_DURATION') else 'moda de la tienda'}"
+                                f") − {candidate['INCOMING']:g} incoming"
                             )
-                            if candidate_mode == "no_fountain9_coverage"
+                            if candidate_mode in ("no_fountain9_coverage", "kazuhira")
                             else (
                                 (
                                     "Refuerzo Golden/Infaltable/Anchor SIN ADU "
@@ -5077,7 +5264,7 @@ def apply_avl_fill(
                 )
                 + (
                     "; "
-                    if candidate_mode == "no_fountain9_coverage"
+                    if candidate_mode in ("no_fountain9_coverage", "kazuhira")
                     else (
                         f"; objetivo de cobertura {doh:g} DOH con ADU "
                         f"{candidate['ADU']:.4f}. "
@@ -5088,7 +5275,16 @@ def apply_avl_fill(
                         else "; "
                     )
                 )
-                + f"Asignadas {assigned} de {original_target} sin exceder capacidad."
+                + (
+                    f"Asignadas {assigned} de {original_target}"
+                    + (
+                        " (presupuesto de tareas y/o capacidad de tienda "
+                        "ignorados por configuración de Kazuhira)."
+                        if candidate_mode == "kazuhira"
+                        and (ignore_task_budget or ignore_store_capacity)
+                        else " sin exceder capacidad."
+                    )
+                )
             ),
         }
         for source in config.origin_warehouses:
@@ -5843,6 +6039,9 @@ def execute_planning(
     apply_origin_storage_override: bool = False,
     exclude_fountain9_outlier_stores: bool = True,
     include_venom_engine: bool = False,
+    include_kazuhira_engine: bool = False,
+    kazuhira_ignore_task_budget: bool = False,
+    kazuhira_ignore_store_capacity: bool = False,
     venom_origins: tuple[int, ...] = (),
     venom_destinations: tuple[int, ...] = (),
     venom_section_types: frozenset[str] = frozenset(),
@@ -6421,6 +6620,73 @@ def execute_planning(
                     f"{venom_summary['tasks_added']:,} tareas nuevas del "
                     "presupuesto compartido."
                 )
+
+        kazuhira_summary = empty_avl_summary(include_kazuhira_engine, 1.0)
+        kazuhira_summary["mode"] = "kazuhira"
+        if include_kazuhira_engine:
+            # Independiente de los 4 toggles de Solidus: puede estar
+            # activo aunque todos ellos estén apagados, así que el
+            # catálogo puede no estar cargado todavía en esta corrida.
+            if catalog_fill_rows_cache is None:
+                kazuhira_catalog_rows, kazuhira_catalog_warnings = (
+                    load_avl_catalog_rows(data_path)
+                )
+                result.warnings.extend(kazuhira_catalog_warnings)
+            else:
+                kazuhira_catalog_rows = catalog_fill_rows_cache
+            kazuhira_duration_by_store = consolidation_summary.get(
+                "duration_mode_by_store", {}
+            )
+            kazuhira_lead_time_by_store = consolidation_summary.get(
+                "lead_time_mode_by_store", {}
+            )
+            kazuhira_fallback_duration, kazuhira_fallback_lead_time = (
+                compute_fallback_duration_and_lead_time(
+                    kazuhira_duration_by_store, kazuhira_lead_time_by_store
+                )
+            )
+            kazuhira_summary = apply_avl_fill(
+                result,
+                kazuhira_catalog_rows,
+                catalogs,
+                config,
+                engine_blocked_store_ids,
+                blocked_cities,
+                1.0,  # dummy: este modo no usa un DOH fijo de CODEC
+                candidate_mode="kazuhira",
+                # Sin exclusión más allá de lo ya asignado esta corrida
+                # (que apply_avl_fill calcula internamente) — a propósito:
+                # la garantía de Kazuhira es "cubrir TODO lo que siga en
+                # quiebre", sin importar si vino o no de un requerimiento
+                # de Fountain9.
+                excluded_keys=set(),
+                duration_mode_by_store=kazuhira_duration_by_store,
+                lead_time_mode_by_store=kazuhira_lead_time_by_store,
+                fallback_duration=kazuhira_fallback_duration,
+                fallback_lead_time=kazuhira_fallback_lead_time,
+                ignore_task_budget=kazuhira_ignore_task_budget,
+                ignore_store_capacity=kazuhira_ignore_store_capacity,
+            )
+            result.warnings.append(
+                "Kazuhira Engine (garantía total): se agregaron "
+                f"{kazuhira_summary['cases_sent']:,} casos, "
+                f"{kazuhira_summary['tasks_added']:,} tareas y "
+                f"{kazuhira_summary['units_added']:,} unidades para cerrar "
+                "quiebres del catálogo sin importar origen de la "
+                "recomendación"
+                + (
+                    " (presupuesto de tareas ignorado)"
+                    if kazuhira_ignore_task_budget
+                    else ""
+                )
+                + (
+                    " (capacidad de tienda ignorada)"
+                    if kazuhira_ignore_store_capacity
+                    else ""
+                )
+                + "."
+            )
+
         owner_summary = engine.apply_owner_inventory_partition(
             result,
             catalogs,
@@ -6542,6 +6808,39 @@ def execute_planning(
             / "outputs"
             / run_date.strftime("%d-%m-%Y")
         )
+        # Barrido de universo completo de CATALOGO: solo cuando al menos
+        # un engine de cobertura está activo (confirmado con negocio).
+        # Reusa el catálogo ya cargado si algún engine lo necesitó, sin
+        # cargarlo de nuevo. Se hace ANTES del enriquecimiento de abajo,
+        # para que estas filas también reciban PRODUCT_NAME/CATEGORY_NAME/
+        # SWA, y ANTES de status_counts/status_swa, para que el universo
+        # completo cuente ahí también.
+        if (
+            include_avl_fill
+            or include_preventive_fill
+            or include_special_doh_fill
+            or include_no_fountain9_coverage
+            or include_kazuhira_engine
+        ):
+            if catalog_fill_rows_cache is None:
+                sweep_catalog_rows, sweep_warnings = load_avl_catalog_rows(
+                    data_path
+                )
+                result.warnings.extend(sweep_warnings)
+            else:
+                sweep_catalog_rows = catalog_fill_rows_cache
+            existing_keys = {
+                (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"])
+                for row in result.base_rows
+            }
+            sweep_rows = build_catalog_universe_sweep_rows(
+                sweep_catalog_rows,
+                catalogs,
+                existing_keys,
+                kazuhira_active=include_kazuhira_engine,
+            )
+            result.base_rows.extend(sweep_rows)
+
         # Nombre + categoría del producto en todos los entregables (hoja
         # DATA, por SYNC_ID). Se hace UNA sola vez, sobre las dos listas
         # que alimentan todo lo demás (CSVs, Excel), antes de escribir
@@ -6807,6 +7106,7 @@ def execute_planning(
         "anchor_universe_report": anchor_universe_report,
         "copernico_cuts": copernico_cuts,
         "venom": venom_summary,
+        "kazuhira": kazuhira_summary,
         "input_consolidation": consolidation_summary,
         "engine_selection": engine_selection,
         "excluded_skus": sorted(excluded_sku_set),
@@ -9180,6 +9480,103 @@ def render_results(run: dict[str, Any]) -> None:
                 "(ver advertencias para el detalle)."
             )
 
+    kazuhira = run.get("kazuhira", {})
+    if kazuhira.get("enabled"):
+        st.markdown(
+            '<span class="section-label">KAZUHIRA ENGINE · GARANTÍA TOTAL</span>',
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            "Última pasada de todo el pipeline (después de Venom): cualquier "
+            "tienda-SKU del catálogo que siga con stock en cero, sin "
+            "importar si Fountain9 la recomendó. Misma fórmula que Cobertura "
+            "sin Fountain9, con promedio país de Duration/Lead Time cuando "
+            "la tienda no tiene dato propio. Lo que no se cubrió se explica "
+            "abajo — no hay quiebres 'olvidados', cada uno queda con motivo."
+        )
+        render_kpi_cards(
+            [
+                {
+                    "category": "CASOS · KAZUHIRA",
+                    "label": "TIENDA-SKU CUBIERTOS",
+                    "value": f"{kazuhira.get('cases_sent', 0):,}",
+                    "description": (
+                        "Quiebres que ningún engine anterior cerró y que "
+                        "Kazuhira cubrió con stock disponible en CEDIS."
+                    ),
+                    "tone": "acid",
+                },
+                {
+                    "category": "TAREAS · KAZUHIRA",
+                    "label": "TAREAS GENERADAS",
+                    "value": f"{kazuhira.get('tasks_added', 0):,}",
+                    "description": (
+                        "Líneas operativas adicionales. Pueden exceder el "
+                        "presupuesto compartido solo si activaste 'Ignorar "
+                        "presupuesto de tareas'."
+                    ),
+                    "tone": "blue",
+                },
+                {
+                    "category": "UNIDADES · KAZUHIRA",
+                    "label": "UNIDADES AGREGADAS",
+                    "value": f"{kazuhira.get('units_added', 0):,}",
+                    "description": (
+                        "ADU (propio, de ciudad o ficticio) × (Duration + "
+                        "Lead Time), menos stock e incoming, con el mínimo "
+                        "de unidades a enviar aplicado."
+                    ),
+                    "tone": "acid",
+                },
+                {
+                    "category": "SIN STOCK · KAZUHIRA",
+                    "label": "SIN STOCK EN NINGÚN ORIGEN",
+                    "value": f"{kazuhira.get('skipped_no_source_stock', 0):,}",
+                    "description": (
+                        "Quiebres que Kazuhira intentó cubrir pero ningún "
+                        "CEDI elegible tenía stock (o estaba bloqueado por "
+                        "ruta/schedule). Único motivo legítimo para que "
+                        "quede un quiebre sin cubrir con los bypass activos."
+                    ),
+                    "tone": "coral",
+                },
+                {
+                    "category": "CAPACIDAD · KAZUHIRA",
+                    "label": "OMITIDOS POR CAPACIDAD",
+                    "value": f"{kazuhira.get('skipped_capacity', 0):,}",
+                    "description": (
+                        "Quiebres no cubiertos porque la tienda no tenía "
+                        "espacio. Debe ser 0 si activaste 'Ignorar "
+                        "capacidad de tienda'."
+                    ),
+                    "tone": "coral",
+                },
+                {
+                    "category": "SIN DATO · KAZUHIRA",
+                    "label": "SIN DURATION/LEAD TIME",
+                    "value": f"{kazuhira.get('skipped_no_duration_data', 0):,}",
+                    "description": (
+                        "Solo ocurre si NINGUNA tienda del Bulk tiene "
+                        "Duration/Lead Time (no hay ni promedio país para "
+                        "usar de respaldo)."
+                    ),
+                    "tone": "coral",
+                },
+                *(
+                    [swa_card("Kazuhira", swa_by_engine)]
+                    if swa_enabled
+                    else []
+                ),
+            ],
+            columns_count=4,
+        )
+        st.success(
+            "Kazuhira: "
+            f"{kazuhira.get('cases_sent', 0):,} casos, "
+            f"{kazuhira.get('tasks_added', 0):,} tareas y "
+            f"{kazuhira.get('units_added', 0):,} unidades adicionales."
+        )
+
     insumos = run.get("insumos", {})
     if insumos.get("enabled"):
         st.markdown(
@@ -9751,6 +10148,9 @@ def render() -> None:
     st.session_state.setdefault("mb_engine_shalashaska_enabled", False)
     st.session_state.setdefault("mb_engine_liquid_enabled", False)
     st.session_state.setdefault("mb_engine_venom_enabled", False)
+    st.session_state.setdefault("mb_engine_kazuhira_enabled", False)
+    st.session_state.setdefault("mb_kazuhira_ignore_task_budget", False)
+    st.session_state.setdefault("mb_kazuhira_ignore_store_capacity", False)
 
     with st.container(border=True, key="engine_naked_module"):
         include_naked_engine = bool(
@@ -9841,6 +10241,14 @@ def render() -> None:
                 "sesión como Big Boss para usarlo."
             )
         elif include_solidus_engine:
+            st.caption(
+                "⚠️ Activar cualquiera de estos 4 también activa el barrido "
+                "de universo completo de CATALOGO: toda tienda-SKU que "
+                "ningún engine toque (sana o en quiebre sin cubrir) "
+                "aparecerá como fila de solo visibilidad en el reporte, "
+                "sin consumir stock/tareas. Puede aumentar mucho el total "
+                "de filas si el catálogo es grande."
+            )
             avl_left, preventive_mid, special_right, no_f9_right = st.columns(4)
             with avl_left:
                 include_avl_fill = st.toggle(
@@ -10214,6 +10622,104 @@ def render() -> None:
                 "DDMRP posterior a la planeación."
             )
 
+    with st.container(border=True, key="engine_kazuhira_module"):
+        if is_raiden:
+            st.session_state["mb_engine_kazuhira_enabled"] = False
+        include_kazuhira_engine = bool(
+            st.session_state["mb_engine_kazuhira_enabled"]
+        )
+        if render_action_card(
+            key="engine_kazuhira_card",
+            eyebrow="ENGINE / 06 · GARANTÍA TOTAL",
+            title="KAZUHIRA ENGINE",
+            description=(
+                "Corre al final de todo, después de Venom. Cubre CUALQUIER "
+                "tienda-SKU del catálogo que siga en quiebre (stock=0), sin "
+                "importar si Fountain9 la recomendó o no — misma fórmula que "
+                "Cobertura sin Fountain9 (ADU × Duration+LeadTime), con "
+                "respaldo propio si la tienda nunca tuvo fila en el Bulk."
+                if not is_raiden
+                else "Bloqueado para el perfil Raiden."
+            ),
+            active=include_kazuhira_engine,
+            tone="coral",
+            status=(
+                "BLOQUEADO · SOLO BIG BOSS"
+                if is_raiden
+                else (
+                    "ACTIVO"
+                    if include_kazuhira_engine
+                    else "INACTIVO · CLIC PARA ACTIVAR"
+                )
+            ),
+            min_height=150,
+            help_text=(
+                "El perfil Raiden no puede activar Kazuhira Engine."
+                if is_raiden
+                else "Haz clic en la tarjeta para activar o desactivar Kazuhira Engine."
+            ),
+        ):
+            if not is_raiden:
+                st.session_state["mb_engine_kazuhira_enabled"] = (
+                    not include_kazuhira_engine
+                )
+                st.rerun()
+        if is_raiden:
+            st.caption(
+                "Kazuhira Engine está bloqueado para el perfil Raiden. Inicia "
+                "sesión como Big Boss para usarlo."
+            )
+            kazuhira_ignore_task_budget = False
+            kazuhira_ignore_store_capacity = False
+        elif include_kazuhira_engine:
+            st.warning(
+                "⚠️ Kazuhira busca cubrir TODO el universo de catálogo en "
+                "quiebre, no solo lo que Fountain9 pidió. Puede generar "
+                "muchas tareas nuevas si el catálogo es grande."
+            )
+            kaz_left, kaz_right = st.columns(2)
+            with kaz_left:
+                kazuhira_ignore_task_budget = st.toggle(
+                    "Ignorar presupuesto de tareas",
+                    value=bool(
+                        st.session_state["mb_kazuhira_ignore_task_budget"]
+                    ),
+                    help=(
+                        "Si se activa, Kazuhira no se detiene aunque el "
+                        "presupuesto compartido de tareas (MAX_TASKS) ya se "
+                        "haya agotado por Naked/Solidus/Shalashaska/Liquid/"
+                        "Venom — la garantía de cobertura total se vuelve "
+                        "absoluta en vez de 'mejor esfuerzo dentro del "
+                        "límite'."
+                    ),
+                )
+                st.session_state["mb_kazuhira_ignore_task_budget"] = (
+                    kazuhira_ignore_task_budget
+                )
+            with kaz_right:
+                kazuhira_ignore_store_capacity = st.toggle(
+                    "Ignorar capacidad de tienda (m³)",
+                    value=bool(
+                        st.session_state["mb_kazuhira_ignore_store_capacity"]
+                    ),
+                    help=(
+                        "Si se activa, Kazuhira puede exceder la capacidad "
+                        "física registrada de la tienda con tal de "
+                        "garantizar cobertura. El reporte sigue mostrando "
+                        "cuánto se excedió, no lo esconde."
+                    ),
+                )
+                st.session_state["mb_kazuhira_ignore_store_capacity"] = (
+                    kazuhira_ignore_store_capacity
+                )
+        else:
+            kazuhira_ignore_task_budget = False
+            kazuhira_ignore_store_capacity = False
+            st.caption(
+                "Kazuhira Engine está apagado. Ningún quiebre adicional se "
+                "cubrirá más allá de lo que ya hagan los demás engines."
+            )
+
     simulation_mode = False
     if not is_raiden:
         simulation_mode = st.toggle(
@@ -10437,6 +10943,9 @@ def render() -> None:
                         exclude_fountain9_outlier_stores
                     ),
                     include_venom_engine=include_venom_engine,
+                    include_kazuhira_engine=include_kazuhira_engine,
+                    kazuhira_ignore_task_budget=kazuhira_ignore_task_budget,
+                    kazuhira_ignore_store_capacity=kazuhira_ignore_store_capacity,
                     venom_origins=tuple(venom_origins),
                     venom_destinations=tuple(venom_destinations),
                     venom_section_types=frozenset(venom_section_types) - {"OOWL"},
