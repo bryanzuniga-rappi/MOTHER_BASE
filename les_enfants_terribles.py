@@ -471,7 +471,7 @@ PLANNING_REASON_COLUMN = "PLANNING_REASON"
 # de la corrida y en run["build"], para saber con QUÉ código se generó cada
 # resultado (un despliegue desactualizado produce resultados que parecen
 # bugs del código nuevo). Súbelo en cada entrega.
-APP_BUILD = "2026-10-05 · kazuhira-v9"
+APP_BUILD = "2026-10-05 · kazuhira-v10"
 
 # REGLA_DEMANDA que solo generan los engines de cobertura (AVL, Preventivo,
 # Refuerzo Golden/Infaltable/Anchor, Shalashaska, Liquid, Venom) — nunca la

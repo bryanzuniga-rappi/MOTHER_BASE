@@ -136,12 +136,31 @@ def render_home() -> None:
             st.rerun()
 
 
+def render_installation_warnings() -> None:
+    """Avisa (sin detener la app) si hay archivos desordenados o viejos."""
+    try:
+        from pathlib import Path
+
+        from modules.install_check import installation_problems
+
+        problems = installation_problems(Path(__file__).resolve().parent)
+    except Exception:  # el chequeo nunca debe tumbar la app
+        return
+    if problems:
+        st.error(
+            "⚠️ Instalación incompleta o desordenada — la app puede estar "
+            "ejecutando código viejo:\n\n"
+            + "\n".join(f"- {problem}" for problem in problems)
+        )
+
+
 def main() -> None:
     inject_mother_base_theme()
     initialize_auth_state()
     if not st.session_state["mb_authenticated"]:
         render_gateway()
         return
+    render_installation_warnings()
 
     selected_module = st.session_state.get("mb_module", MODULE_HOME)
     if selected_module == MODULE_PLANNING:
