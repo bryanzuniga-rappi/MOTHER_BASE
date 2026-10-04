@@ -167,3 +167,29 @@ def test_incoming_suppresses_kazuhira_end_to_end():
     lines = _bulk_lines(run)
     assert (100, 11) not in lines
     assert lines[(100, 12)] == 8        # sin incoming sigue cubriéndose
+
+
+# --- sin fila en STOCK => stock 0 e incoming 0, en todos los engines -----------------
+
+def test_avl_alone_covers_catalog_combination_missing_from_stock_sheet():
+    """Sin Kazuhira: antes AVL saltaba una combinación de CATALOGO sin fila
+    en STOCK. Ahora la toma con stock 0 y la cubre."""
+    workbook = build_workbook_bytes(
+        STORES, SKUS, omit_stock_rows={(100, 12)},
+    )
+    run = _run(
+        database_bytes=workbook, include_kazuhira_engine=False,
+        include_avl_fill=True, avl_doh=3.0,
+    )
+    lines = _bulk_lines(run)
+    assert (100, 12) in lines and lines[(100, 12)] > 0
+    assert any(
+        "sin fila en STOCK" in w and "AVL" in w for w in run["warnings"]
+    ), run["warnings"][-6:]
+
+
+def test_missing_stock_row_is_not_reported_as_skipped_anywhere():
+    workbook = build_workbook_bytes(STORES, SKUS, omit_stock_rows={(100, 12)})
+    run = _run(database_bytes=workbook)
+    assert run["kazuhira"]["skipped_missing_stock"] == 0
+    assert run["kazuhira"]["missing_stock_treated_as_zero"] == 1

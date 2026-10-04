@@ -321,14 +321,36 @@ def test_missing_stock_row_is_treated_as_zero():
     assert summary["missing_stock_treated_as_zero"] == 1
 
 
-def test_missing_stock_row_still_skipped_by_no_fountain9_mode():
-    catalogs = make_catalogs(stock_base={(444, 10): 1000.0})
-    summary = run_kazuhira(
-        make_result(), catalog_rows(100), catalogs,
-        candidate_mode="no_fountain9_coverage",
+def test_missing_stock_row_is_treated_as_zero_in_every_coverage_mode():
+    """Decisión de negocio: en CATALOGO y sin fila en STOCK => stock 0 e
+    incoming 0, en TODOS los modos de cobertura (antes solo Kazuhira).
+    (Preventivo no aplica: por definición exige stock > 0.)"""
+    for mode in ("stockout", "no_fountain9_coverage", "kazuhira"):
+        catalogs = make_catalogs(stock_base={(444, 10): 1000.0})   # sin (100, 10)
+        summary = run_kazuhira(
+            make_result(), catalog_rows(100), catalogs, candidate_mode=mode
+        )
+        assert summary["cases_sent"] == 1, mode
+        assert summary["missing_stock_treated_as_zero"] == 1, mode
+        assert summary["skipped_missing_stock"] == 0, mode
+
+
+def test_missing_stock_row_special_doh_mode_covers_golden_without_stock_row():
+    catalogs = make_catalogs(
+        stock_base={(444, 10): 1000.0}, golden_infaltables={(100, 10)},
     )
-    assert summary["cases_sent"] == 0
-    assert summary["skipped_missing_stock"] == 1
+    catalogs.golden_products = {(100, 10)}
+    summary = run_kazuhira(
+        make_result(), catalog_rows(100), catalogs, candidate_mode="special_doh",
+    )
+    assert summary["missing_stock_treated_as_zero"] >= 1
+
+
+def test_missing_stock_incoming_is_also_zero():
+    catalogs = make_catalogs(stock_base={(444, 10): 1000.0})
+    assert catalogs.incoming_stock.get((100, 10), 0.0) == 0.0
+    summary = run_kazuhira(make_result(), catalog_rows(100, adu=1.0), catalogs)
+    assert summary["units_added"] == 8        # 1.0 x (5+3) - 0 - 0
 
 
 # --- universo de tiendas: Fountain9 + SCHEDULE de hoy -------------------------

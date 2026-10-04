@@ -4872,7 +4872,7 @@ def empty_avl_summary(enabled: bool, doh: float) -> dict[str, Any]:
         "task_slots_after": 0,
         "skipped_closed_store": 0,
         "skipped_blocked_city": 0,
-        "skipped_missing_stock": 0,
+        "skipped_missing_stock": 0,  # obsoleto: se conserva en 0 por compatibilidad
         "skipped_not_stockout": 0,
         "skipped_not_special": 0,
         "skipped_doh_sufficient": 0,
@@ -5070,10 +5070,12 @@ def apply_avl_fill(
             summary["skipped_blocked_city"] += 1
             continue
         if key not in catalogs.stock_base:
-            if candidate_mode != "kazuhira":
-                summary["skipped_missing_stock"] += 1
-                continue
-            # Garantía total: sin fila en STOCK = 0 unidades, no "sin dato".
+            # Decisión de negocio, para TODOS los modos de cobertura: una
+            # tienda-SKU que está en CATALOGO pero no aparece en STOCK se
+            # toma con stock 0 e incoming 0 (no hay inventario registrado),
+            # no como "sin dato". Antes AVL/Preventivo/Refuerzo/Cobertura
+            # sin Fountain9 la saltaban: en un DATA_TRANSFERS real eso era
+            # el 34 % del catálogo, con 96 % de esas filas con demanda.
             summary["missing_stock_treated_as_zero"] = (
                 summary.get("missing_stock_treated_as_zero", 0) + 1
             )
@@ -7117,6 +7119,28 @@ def execute_planning(
                     else ""
                 )
                 + "."
+            )
+
+        missing_stock_by_engine = {
+            label: summary_item.get("missing_stock_treated_as_zero", 0)
+            for label, summary_item in (
+                ("AVL", avl_summary),
+                ("Preventivo", preventive_summary),
+                ("Refuerzo", special_doh_summary),
+                ("Cobertura sin Fountain9", no_fountain9_summary),
+                ("Kazuhira", kazuhira_summary),
+            )
+            if summary_item.get("missing_stock_treated_as_zero", 0)
+        }
+        if missing_stock_by_engine:
+            result.warnings.append(
+                "Tienda-SKU de CATALOGO sin fila en STOCK: se tomaron con "
+                "stock 0 e incoming 0 ("
+                + ", ".join(
+                    f"{label}: {count:,}"
+                    for label, count in missing_stock_by_engine.items()
+                )
+                + ")."
             )
 
         owner_summary = engine.apply_owner_inventory_partition(

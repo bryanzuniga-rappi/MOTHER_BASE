@@ -57,6 +57,7 @@ def build_workbook_bytes(
     adu: float = 1.0,
     incoming: dict[tuple[int, int], float] | None = None,
     incoming_column: str | None = "INCOMING_TR",
+    omit_stock_rows: set[tuple[int, int]] = frozenset(),
 ) -> bytes:
     destination_stock = destination_stock or {}
     wb = openpyxl.Workbook(write_only=True)
@@ -83,6 +84,7 @@ def build_workbook_bytes(
     stock_rows += (
         (store, sku, destination_stock.get((store, sku), 0.0))
         for store in stores for sku in skus
+        if (store, sku) not in omit_stock_rows
     )
     stock_headers = ["WAREHOUSE_ID", "PRODUCT_ID", "STOCK_DISPONIBLE_FINAL"]
     if incoming_column:
