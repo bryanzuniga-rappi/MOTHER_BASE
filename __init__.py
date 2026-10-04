@@ -1,2 +1,2 @@
-"""Módulos visibles de Mother Base."""
+"""Motores adicionales de Les Enfants Terribles."""
 

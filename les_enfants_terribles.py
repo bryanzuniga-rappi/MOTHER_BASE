@@ -339,6 +339,20 @@ KAZUHIRA_REGLA_DEMANDA = "KAZUHIRA_COBERTURA_TOTAL"
 # (Definidas antes de BREAKDOWN_ORDER a propósito: ese tuple se evalúa al
 # importar el módulo y referencia KAZUHIRA_CUT.)
 
+# Motivos por los que Kazuhira NO pudo cubrir una tienda-SKU que evaluó,
+# registrados por apply_avl_fill (parámetro skip_reasons). "SANO" no es un
+# hueco: la posición (stock + incoming + asignado) ya alcanza 1 DOH.
+KAZUHIRA_REASON_HEALTHY = "SANO"
+KAZUHIRA_UNCOVERED_LABELS: dict[str, str] = {
+    "SIN_STOCK_ORIGEN": "QUIEBRE NO CUBIERTO · SIN STOCK EN CEDIS",
+    "BLOQUEO_ORIGEN": "QUIEBRE NO CUBIERTO · BLOQUEO REGIONAL/SCHEDULE CON STOCK EN CEDIS",
+    "CAPACIDAD": "QUIEBRE NO CUBIERTO · CAPACIDAD DE TIENDA",
+    "SIN_TAREAS": "QUIEBRE NO CUBIERTO · SIN PRESUPUESTO DE TAREAS",
+    "RUTA_COSTOS": "QUIEBRE NO CUBIERTO · RUTA DE COSTOS BLOQUEADA",
+    "INCOMING": "QUIEBRE NO CUBIERTO · INCOMING CUBRE LA NECESIDAD",
+    "SIN_DURATION": "QUIEBRE NO CUBIERTO · SIN DURATION/LEAD TIME",
+}
+
 BREAKDOWN_ORDER = (
     "CORTE POR CIUDAD BLOQUEADA",
     "CORTE POR PRODUCTO RACKEADO 444",
@@ -358,6 +372,7 @@ BREAKDOWN_ORDER = (
     LIQUID_CUT,
     KAZUHIRA_CUT,
     "SIN RECOMENDACIÓN",
+    *KAZUHIRA_UNCOVERED_LABELS.values(),
     CATALOG_UNIVERSE_POST_KAZUHIRA_CUT,
     CATALOG_UNIVERSE_UNCOVERED_CUT,
     CATALOG_UNIVERSE_HEALTHY_CUT,
@@ -3036,6 +3051,29 @@ def build_planned_store_universe(
     }
 
 
+def kazuhira_reason_text(reason: str | None) -> str:
+    """Texto corto del motivo por el que Kazuhira no cubrió una tienda-SKU
+    (vacío si no aplica o si era SANO — no es un hueco)."""
+    label = KAZUHIRA_UNCOVERED_LABELS.get(reason or "")
+    return label.split(" · ", 1)[1] if label else ""
+
+
+def annotate_base_rows_with_kazuhira_reasons(
+    base_rows: list[dict[str, Any]],
+    skip_reasons: dict[tuple[int, int], str],
+) -> None:
+    """Agrega MOTIVO_KAZUHIRA a TODAS las filas de base_rows (vacío si no
+    aplica) — todas, no solo las afectadas, porque el Excel toma sus
+    columnas de la primera fila."""
+    for row in base_rows:
+        reason = skip_reasons.get(
+            (row.get("WAREHOUSE_DESTINATION"), row.get("RETAIL_ID"))
+        )
+        row["MOTIVO_KAZUHIRA"] = row.get("MOTIVO_KAZUHIRA") or kazuhira_reason_text(
+            reason
+        )
+
+
 def resolve_duration_lead_time_with_city_fallback(
     catalogs,
     duration_mode_by_store: dict[int, float],
@@ -3139,6 +3177,9 @@ def build_catalog_universe_sweep_rows(
     existing_keys: set[tuple[int, int]],
     kazuhira_active: bool = False,
     allowed_destinations: set[int] | None = None,
+    skip_reasons: dict[tuple[int, int], str] | None = None,
+    closed_store_ids: set[int] | None = None,
+    blocked_cities: tuple[str, ...] = (),
 ) -> list[dict[str, Any]]:
     """Barrido de visibilidad: una fila por cada tienda-SKU de CATALOGO que
     NINGÚN engine tocó esta corrida (ni Fountain9, ni AVL/Preventivo/
@@ -3161,11 +3202,23 @@ def build_catalog_universe_sweep_rows(
     """
     rows: list[dict[str, Any]] = []
     seen_in_sweep: set[tuple[int, int]] = set()
+    blocked_city_set = set(blocked_cities)
     for row in catalog_rows:
         destination = row["WAREHOUSE_DESTINATION"]
         sku = row["RETAIL_ID"]
         key = (destination, sku)
         if allowed_destinations is not None and destination not in allowed_destinations:
+            continue
+        # Tiendas cerradas, ciudades bloqueadas y productos excluidos ya se
+        # reportan por sus propios resúmenes: no son huecos de cobertura.
+        if closed_store_ids and destination in closed_store_ids:
+            continue
+        if sku in catalogs.excluded_products:
+            continue
+        if blocked_city_set and (
+            catalogs.stores.get(destination, {}).get("city_norm", "")
+            in blocked_city_set
+        ):
             continue
         if key in existing_keys or key in seen_in_sweep:
             continue
@@ -3173,7 +3226,21 @@ def build_catalog_universe_sweep_rows(
 
         destination_stock = max(catalogs.stock_base.get(key, 0.0), 0.0)
         store = catalogs.stores.get(destination, {})
-        if destination_stock > 0:
+        # Con Kazuhira activo, él decide qué es "sano" (posición >= 1 DOH) y
+        # por qué no cubrió cada hueco; el criterio de stock > 0 solo aplica
+        # cuando no hay un motivo registrado.
+        kazuhira_reason = (
+            skip_reasons.get(key) if (kazuhira_active and skip_reasons) else None
+        )
+        if kazuhira_reason == KAZUHIRA_REASON_HEALTHY:
+            tipo_de_corte = CATALOG_UNIVERSE_HEALTHY_CUT
+            regla_demanda = CATALOG_UNIVERSE_HEALTHY_REGLA
+        elif kazuhira_reason is not None:
+            tipo_de_corte = KAZUHIRA_UNCOVERED_LABELS.get(
+                kazuhira_reason, CATALOG_UNIVERSE_POST_KAZUHIRA_CUT
+            )
+            regla_demanda = f"KAZUHIRA_{kazuhira_reason}"
+        elif destination_stock > 0:
             tipo_de_corte = CATALOG_UNIVERSE_HEALTHY_CUT
             regla_demanda = CATALOG_UNIVERSE_HEALTHY_REGLA
         elif kazuhira_active:
@@ -3194,6 +3261,7 @@ def build_catalog_universe_sweep_rows(
                 "CANTIDAD_ASIGNADA": 0,
                 "TIPO_DE_CORTE": tipo_de_corte,
                 "REGLA_DEMANDA": regla_demanda,
+                "MOTIVO_KAZUHIRA": kazuhira_reason_text(kazuhira_reason),
                 "PREDICTED_DEMAND": 0.0,
                 "PREDICTED_OPENING_INVENTORY": destination_stock,
                 "NET_INTER_STORE_TRANSFERS": 0.0,
@@ -4713,6 +4781,7 @@ def apply_avl_fill(
     ignore_store_capacity: bool = False,
     allowed_destinations: set[int] | None = None,
     duration_source_by_store: dict[int, str] | None = None,
+    skip_reasons: dict[tuple[int, int], str] | None = None,
 ) -> dict[str, Any]:
     """Usa tareas remanentes para stockouts, inventario preventivo, refuerzo
     de Golden/Infaltable/Anchor del catálogo, cobertura de quiebres sin
@@ -4734,6 +4803,11 @@ def apply_avl_fill(
     (Kazuhira: las del Bulk de Fountain9 de esta corrida + las que SCHEDULE
     marca con día válido hoy). None = todas las del catálogo.
 
+    ``skip_reasons``: si se pasa un dict, se llena con el motivo por el que
+    cada tienda-SKU evaluada NO se cubrió (llaves de KAZUHIRA_UNCOVERED_
+    LABELS, o KAZUHIRA_REASON_HEALTHY si ya tenía 1 DOH) — para declarar
+    cada quiebre abierto en vez de solo contarlo.
+
     Kazuhira dispara cuando (stock + incoming + lo ya asignado en esta
     corrida) / ADU efectivo < 1 DOH, no solo con stock = 0; una
     combinación sin fila en STOCK cuenta como stock 0 (no se salta).
@@ -4747,14 +4821,24 @@ def apply_avl_fill(
     lead_time_mode_by_store = lead_time_mode_by_store or {}
     duration_source_by_store = duration_source_by_store or {}
     summary = empty_avl_summary(True, doh)
+
+    def log_skip(skip_key: tuple[int, int], reason: str) -> None:
+        if skip_reasons is not None:
+            skip_reasons[skip_key] = reason
+
     summary["mode"] = candidate_mode
     summary["catalog_rows"] = len(catalog_rows)
     summary["task_slots_before"] = max(config.max_tasks - result.tasks_used, 0)
     for base_row in result.base_rows:
         base_row.setdefault("ADU_CATALOGO", "")
         base_row.setdefault("DOH_AVL", "")
+    # Con skip_reasons activo (Kazuhira) NO se corta aquí aunque el
+    # presupuesto ya esté agotado: hay que evaluar los candidatos para
+    # distinguir lo sano de lo que queda sin cubrir por falta de tareas.
     if doh <= 0 or (
-        not ignore_task_budget and summary["task_slots_before"] <= 0
+        not ignore_task_budget
+        and summary["task_slots_before"] <= 0
+        and skip_reasons is None
     ):
         summary["task_slots_after"] = summary["task_slots_before"]
         return summary
@@ -4911,6 +4995,7 @@ def apply_avl_fill(
                 ) / effective_adu
                 if current_doh >= 1.0:
                     summary["skipped_doh_sufficient"] += 1
+                    log_skip(key, KAZUHIRA_REASON_HEALTHY)
                     continue
             elif destination_stock > 0:
                 summary["skipped_not_stockout"] += 1
@@ -4937,6 +5022,7 @@ def apply_avl_fill(
                 summary["skipped_no_duration_data"] = (
                     summary.get("skipped_no_duration_data", 0) + 1
                 )
+                log_skip(key, "SIN_DURATION")
                 continue
             raw_target = (
                 effective_adu * (duration_mode + lead_time_mode)
@@ -4949,6 +5035,7 @@ def apply_avl_fill(
                 summary["skipped_covered_by_incoming"] = (
                     summary.get("skipped_covered_by_incoming", 0) + 1
                 )
+                log_skip(key, "INCOMING")
                 continue
             target = max(
                 int(math.ceil(raw_target)), config.minimum_positive_quantity
@@ -5002,6 +5089,7 @@ def apply_avl_fill(
             continue
         if key in catalogs.route_cost_blocks:
             summary["skipped_route_cost"] += 1
+            log_skip(key, "RUTA_COSTOS")
             continue
 
         candidates.append(
@@ -5066,8 +5154,15 @@ def apply_avl_fill(
     stores_sent: set[int] = set()
     products_sent: set[int] = set()
     next_order = len(result.base_rows) + 1
-    for candidate in candidates:
+    for candidate_position, candidate in enumerate(candidates):
         if not ignore_task_budget and result.tasks_used >= config.max_tasks:
+            # El presupuesto se agotó: todo lo que quedaba sin procesar
+            # queda declarado, no solo cortado en silencio.
+            for pending in candidates[candidate_position:]:
+                log_skip(
+                    (pending["WAREHOUSE_DESTINATION"], pending["RETAIL_ID"]),
+                    "SIN_TAREAS",
+                )
             break
 
         destination = candidate["WAREHOUSE_DESTINATION"]
@@ -5105,6 +5200,7 @@ def apply_avl_fill(
         cap_before = float(capacity_row["M3_CONTABILIZADO_CAPACIDAD"])
         if not ignore_store_capacity and bool(capacity_row["CAPACIDAD_CERRADA"]):
             summary["skipped_capacity"] += 1
+            log_skip((destination, sku), "CAPACIDAD")
             continue
 
         original_target = int(candidate["TARGET"])
@@ -5124,6 +5220,7 @@ def apply_avl_fill(
             target = min(original_target, max(capacity_units, 0))
         if target <= 0:
             summary["skipped_capacity"] += 1
+            log_skip((destination, sku), "CAPACIDAD")
             continue
         origin_info: dict[int, dict[str, Any]] = {}
         origin_before: dict[int, int] = {}
@@ -5182,6 +5279,17 @@ def apply_avl_fill(
         assigned = sum(quantity for _, quantity in allocations)
         if assigned <= 0:
             summary["skipped_no_source_stock"] += 1
+            # ¿Había stock en algún CEDI pero bloqueado por ruta/schedule, o
+            # de plano no había stock elegible?
+            blocked_with_stock = any(
+                origin_before.get(source, 0) > 0
+                and (regional_blocks.get(source) or schedule_blocks.get(source))
+                for source in config.origin_warehouses
+            )
+            log_skip(
+                (destination, sku),
+                "BLOQUEO_ORIGEN" if blocked_with_stock else "SIN_STOCK_ORIGEN",
+            )
             continue
 
         task_before = result.tasks_used
@@ -6752,6 +6860,7 @@ def execute_planning(
             consolidated_input.keys(), catalogs, config.origin_warehouses
         )
 
+        kazuhira_skip_reasons: dict[tuple[int, int], str] = {}
         kazuhira_summary = empty_avl_summary(include_kazuhira_engine, 1.0)
         kazuhira_summary["mode"] = "kazuhira"
         if include_kazuhira_engine:
@@ -6817,7 +6926,20 @@ def execute_planning(
                 ignore_store_capacity=kazuhira_ignore_store_capacity,
                 allowed_destinations=planned_store_universe["stores"],
                 duration_source_by_store=kazuhira_duration_source,
+                skip_reasons=kazuhira_skip_reasons,
             )
+            annotate_base_rows_with_kazuhira_reasons(
+                result.base_rows, kazuhira_skip_reasons
+            )
+            reason_counts = Counter(
+                reason
+                for reason in kazuhira_skip_reasons.values()
+                if reason != KAZUHIRA_REASON_HEALTHY
+            )
+            kazuhira_summary["skip_reason_counts"] = {
+                kazuhira_reason_text(reason): count
+                for reason, count in reason_counts.most_common()
+            }
             kazuhira_summary["universe_stores"] = len(
                 planned_store_universe["stores"]
             )
@@ -6999,6 +7121,9 @@ def execute_planning(
                 existing_keys,
                 kazuhira_active=include_kazuhira_engine,
                 allowed_destinations=planned_store_universe["stores"],
+                skip_reasons=kazuhira_skip_reasons,
+                closed_store_ids=engine_blocked_store_ids,
+                blocked_cities=blocked_cities,
             )
             result.base_rows.extend(sweep_rows)
 
@@ -9736,6 +9861,18 @@ def render_results(run: dict[str, Any]) -> None:
             ],
             columns_count=4,
         )
+        reason_counts_ui = kazuhira.get("skip_reason_counts", {})
+        if reason_counts_ui:
+            st.markdown("###### Quiebres que Kazuhira evaluó y no pudo cubrir — por motivo")
+            render_capped_dataframe(
+                [
+                    {"MOTIVO": reason, "TIENDA-SKU": count}
+                    for reason, count in reason_counts_ui.items()
+                ],
+                key="kazuhira_skip_reasons",
+                offer_download=True,
+                file_label="kazuhira_motivos_no_cubierto",
+            )
         st.success(
             "Kazuhira: "
             f"{kazuhira.get('cases_sent', 0):,} casos, "

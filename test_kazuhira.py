@@ -446,3 +446,146 @@ def test_kazuhira_detail_names_country_source_when_fallback_used():
         fallback_duration=6.0, fallback_lead_time=4.0,
     )
     assert "promedio país" in result.base_rows[-1]["DETALLE_MOTIVO"]
+
+
+# --- motivos por tienda-SKU (skip_reasons) ---------------------------------------
+
+def _reasons(rows, catalogs, config=CONFIG, **kwargs):
+    log: dict = {}
+    result = kwargs.pop("result", None) or make_result()
+    run_kazuhira(result, rows, catalogs, config, skip_reasons=log, **kwargs)
+    return log
+
+
+def test_reason_healthy_when_position_reaches_one_doh():
+    log = _reasons(catalog_rows(100, adu=1.0), _stock(5.0))
+    assert log[(100, 10)] == m.KAZUHIRA_REASON_HEALTHY
+
+
+def test_reason_no_origin_stock():
+    catalogs = make_catalogs(stock_base={(444, 10): 0.0, (100, 10): 0.0})
+    assert _reasons(catalog_rows(100), catalogs)[(100, 10)] == "SIN_STOCK_ORIGEN"
+
+
+def test_reason_origin_blocked_by_schedule_with_stock_available():
+    catalogs = make_catalogs(
+        schedule_block_enabled=True,
+        schedule_days={(100, 444): frozenset({"MARTES"})},
+        run_weekday_norm="LUNES",
+    )
+    assert _reasons(catalog_rows(100), catalogs)[(100, 10)] == "BLOQUEO_ORIGEN"
+
+
+def test_reason_store_capacity():
+    catalogs = make_catalogs(store_capacity={100: 0.5, 200: 1000.0})
+    assert _reasons(catalog_rows(100), catalogs)[(100, 10)] == "CAPACIDAD"
+
+
+def test_reason_route_cost_block():
+    catalogs = make_catalogs(route_cost_blocks={(100, 10)})
+    assert _reasons(catalog_rows(100), catalogs)[(100, 10)] == "RUTA_COSTOS"
+
+
+def test_reason_missing_duration_data():
+    log = _reasons(
+        catalog_rows(100), make_catalogs(),
+        duration_mode_by_store={}, lead_time_mode_by_store={},
+    )
+    assert log[(100, 10)] == "SIN_DURATION"
+
+
+def test_reason_task_budget_exhausted_declares_every_pending_candidate():
+    """El corte por presupuesto ya no es silencioso: cada pendiente queda
+    con motivo."""
+    config = engine.Config(origin_warehouses=(444,), max_tasks=1)
+    log = _reasons(
+        catalog_rows(100, 200), make_catalogs(), config,
+        result=make_result(tasks_used=1),
+    )
+    assert log == {(100, 10): "SIN_TAREAS", (200, 10): "SIN_TAREAS"}
+
+
+def test_covered_keys_have_no_skip_reason():
+    log = _reasons(catalog_rows(100), make_catalogs())
+    assert (100, 10) not in log
+
+
+# --- barrido con motivos (corrige la inconsistencia "sano = stock > 0") ----------
+
+def test_sweep_low_doh_not_covered_is_not_labeled_healthy():
+    """Antes: stock 0.2 => 'OK SIN NECESIDAD'. Ahora el motivo de Kazuhira
+    manda: quedó sin cubrir por falta de stock en CEDIS."""
+    catalogs = make_catalogs(stock_base={(444, 10): 0.0, (100, 10): 0.2})
+    rows = m.build_catalog_universe_sweep_rows(
+        catalog_rows(100), catalogs, set(), kazuhira_active=True,
+        skip_reasons={(100, 10): "SIN_STOCK_ORIGEN"},
+    )
+    assert rows[0]["TIPO_DE_CORTE"] == m.KAZUHIRA_UNCOVERED_LABELS["SIN_STOCK_ORIGEN"]
+    assert rows[0]["MOTIVO_KAZUHIRA"] == "SIN STOCK EN CEDIS"
+
+
+def test_sweep_healthy_per_kazuhira_even_if_stock_is_zero():
+    """Incoming/asignado ya dan 1 DOH: sano según Kazuhira."""
+    catalogs = make_catalogs(stock_base={(444, 10): 0.0, (100, 10): 0.0})
+    rows = m.build_catalog_universe_sweep_rows(
+        catalog_rows(100), catalogs, set(), kazuhira_active=True,
+        skip_reasons={(100, 10): m.KAZUHIRA_REASON_HEALTHY},
+    )
+    assert rows[0]["TIPO_DE_CORTE"] == m.CATALOG_UNIVERSE_HEALTHY_CUT
+
+
+def test_sweep_every_reason_has_a_distinct_registered_label():
+    labels = list(m.KAZUHIRA_UNCOVERED_LABELS.values())
+    assert len(set(labels)) == len(labels)
+    for label in labels:
+        assert label in m.BREAKDOWN_ORDER
+
+
+def test_sweep_skips_closed_stores_blocked_cities_and_excluded_products():
+    catalogs = make_catalogs(
+        stock_base={(100, 10): 0.0, (200, 10): 0.0, (100, 99): 0.0},
+        excluded_products={99},
+    )
+    rows = m.build_catalog_universe_sweep_rows(
+        catalog_rows(100, 200) + [
+            {"WAREHOUSE_DESTINATION": 100, "RETAIL_ID": 99, "ADU": 1.0}
+        ],
+        catalogs, set(), closed_store_ids={200},
+    )
+    assert [(r["WAREHOUSE_DESTINATION"], r["RETAIL_ID"]) for r in rows] == [(100, 10)]
+
+
+def test_sweep_skips_blocked_city():
+    catalogs = make_catalogs(stock_base={(100, 10): 0.0})
+    rows = m.build_catalog_universe_sweep_rows(
+        catalog_rows(100), catalogs, set(), blocked_cities=("CDMX",)
+    )
+    assert rows == []
+
+
+def test_annotate_base_rows_sets_column_on_every_row():
+    rows = [
+        {"WAREHOUSE_DESTINATION": 100, "RETAIL_ID": 10},
+        {"WAREHOUSE_DESTINATION": 200, "RETAIL_ID": 10},
+        {"WAREHOUSE_DESTINATION": 300, "RETAIL_ID": 10},
+    ]
+    m.annotate_base_rows_with_kazuhira_reasons(
+        rows,
+        {(100, 10): "CAPACIDAD", (200, 10): m.KAZUHIRA_REASON_HEALTHY},
+    )
+    assert [r["MOTIVO_KAZUHIRA"] for r in rows] == ["CAPACIDAD DE TIENDA", "", ""]
+
+
+def test_budget_exhausted_at_start_still_separates_healthy_from_pending():
+    """Caso más común en producción: Kazuhira arranca con 0 tareas libres.
+    Lo sano debe seguir sano; solo lo que de verdad es un hueco queda como
+    SIN_TAREAS."""
+    config = engine.Config(origin_warehouses=(444,), max_tasks=1)
+    catalogs = make_catalogs(
+        stock_base={(444, 10): 1000.0, (100, 10): 50.0, (200, 10): 0.0}
+    )
+    log = _reasons(
+        catalog_rows(100, 200), catalogs, config, result=make_result(tasks_used=1)
+    )
+    assert log[(100, 10)] == m.KAZUHIRA_REASON_HEALTHY
+    assert log[(200, 10)] == "SIN_TAREAS"
