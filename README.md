@@ -223,7 +223,7 @@ COPÉRNICO es opcional para la aplicación en general, pero es obligatorio cuand
 
 ### SCHEDULE
 
-La hoja `SCHEDULE` define días permitidos para una pareja origen–destino. Su bloqueo está apagado por defecto. Si se activa, la validación se hace contra la fecha real de la corrida en la zona horaria de Ciudad de México.
+La hoja `SCHEDULE` define días permitidos para una pareja origen–destino. Su bloqueo (toggle "Bloquear envíos fuera de frecuencia") está activo por defecto. Si está activo, la validación se hace contra la fecha real de la corrida en la zona horaria de Ciudad de México.
 
 ### SWA
 
@@ -338,7 +338,7 @@ Solidus utiliza stock, capacidad y tareas restantes en este orden:
 1. **AVL:** cobertura de catálogo con stock final cero y sin servicio positivo previo.
 2. **Prevención:** producto con poco inventario o menos de un DOH, sin recomendación positiva de Fountain9.
 3. **Refuerzo Golden / Infaltable / Anchor:** lleva el inventario hacia un DOH objetivo específico cuando Fountain9 no solicitó el caso.
-4. **Cobertura sin Fountain9:** opcional y apagada por defecto; cubre stockouts sin recomendación positiva de Fountain9 — ya sea porque el SKU no tiene fila en su bulk, o porque la tiene pero con "sin recomendación" (basada en su propio Predicted Opening Inventory, que puede no coincidir con el stock real).
+4. **Cobertura sin Fountain9:** opcional y apagada por defecto; cubre quiebres sin recomendación positiva de Fountain9 — ya sea porque el SKU no tiene fila en su bulk, o porque la tiene pero con "sin recomendación" (basada en su propio Predicted Opening Inventory, que puede no coincidir con el stock real).
 
 Para resolver ADU, las coberturas usan esta cascada:
 
@@ -421,8 +421,8 @@ Al terminar la corrida, Mother Base revisa el universo Golden / Infaltable / Anc
 | `RUTA_COSTOS` | Bloquea una pareja destino–SKU. Tiene toggle activo por defecto. |
 | `BLOQUEOS_FORANEAS` | Bloquea productos señalados desde CDMX hacia GDL/MTY. Tiene toggle activo por defecto. |
 | `RACKEADOS` | El stock rackeado no puede salir desde 444. Tiene toggle activo por defecto. |
-| `SCHEDULE` | Si está activado, bloquea origen–destino fuera de frecuencia. |
-| FRUVER 811 | Toggle que retira el stock 811 sin alterar otros orígenes. |
+| `SCHEDULE` | Bloquea origen–destino fuera de frecuencia. Tiene toggle, activo por defecto. |
+| FRUVER 811 | Toggle que retira el stock FRUVER del 811 sin alterar otros orígenes. Activo por defecto. |
 
 La implementación de los toggles de reglas maestras limpia las estructuras afectadas al cargar los catálogos. Esto evita que cada engine tenga que implementar el mismo `if` y garantiza una aplicación uniforme.
 
@@ -501,7 +501,7 @@ No se debe leer la comparación como una competencia de igualdad de condiciones:
 3. Agregue bloqueos temporales de tiendas, ciudades o SKUs cuando aplique.
 4. Configure INSUMOS, FRUVER y el calendario si corresponde.
 5. Active únicamente los engines requeridos para la corrida.
-6. Revise parámetros de objetivos y umbrales antes de confirmar.
+6. Revise parámetros de objetivos y umbrales antes de confirmar. Defaults: DOH de Golden / Infaltable / Anchor = 3 y lead time de Venom = 2 días.
 
 ### Después de ejecutar
 

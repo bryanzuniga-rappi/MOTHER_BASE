@@ -6126,8 +6126,8 @@ def execute_planning(
     include_insumos: bool = True,
     include_avl_fill: bool = False,
     avl_doh: float = 3.0,
-    block_fruver_811: bool = False,
-    block_off_schedule_shipments: bool = False,
+    block_fruver_811: bool = True,
+    block_off_schedule_shipments: bool = True,
     enable_rackeados_rule: bool = True,
     enable_closed_stores_rule: bool = True,
     enable_regional_block_rule: bool = True,
@@ -6137,7 +6137,7 @@ def execute_planning(
     include_preventive_fill: bool = False,
     include_special_doh_fill: bool = False,
     include_no_fountain9_coverage: bool = False,
-    special_doh_target: float = 21.0,
+    special_doh_target: float = 3.0,
     include_naked_engine: bool = True,
     cover_fountain9_hardcodes: bool = True,
     include_solidus_engine: bool = True,
@@ -6161,7 +6161,7 @@ def execute_planning(
     venom_origins: tuple[int, ...] = (),
     venom_destinations: tuple[int, ...] = (),
     venom_section_types: frozenset[str] = frozenset(),
-    venom_lead_time_days: float = 7.0,
+    venom_lead_time_days: float = 2.0,
     venom_consider_current_planning: bool = True,
 ) -> dict[str, Any]:
     clear_previous_workspace()
@@ -10295,7 +10295,7 @@ def render() -> None:
         with support_center:
             block_fruver_811 = st.toggle(
                 "Bloquear FRUVER desde el origen 811",
-                value=False,
+                value=True,
                 help=(
                     "El stock FRUVER del 811 queda fuera de los tres engines; los "
                     "demás orígenes permanecen disponibles."
@@ -10304,7 +10304,7 @@ def render() -> None:
         with support_right:
             block_off_schedule_shipments = st.toggle(
                 "Bloquear envíos fuera de frecuencia",
-                value=False,
+                value=True,
                 help=(
                     "Usa la hoja SCHEDULE (WAREHOUSE_ID + ORIGEN + DAYS) para "
                     "impedir que un origen envíe a una tienda en un día no "
@@ -10378,7 +10378,7 @@ def render() -> None:
     include_special_doh_fill = False
     include_no_fountain9_coverage = False
     avl_doh = 3.0
-    special_doh_target = 21.0
+    special_doh_target = 3.0
     with st.container(border=True, key="engine_solidus_module"):
         if is_raiden:
             st.session_state["mb_engine_solidus_enabled"] = False
@@ -10419,11 +10419,6 @@ def render() -> None:
                 "sesión como Big Boss para usarlo."
             )
         elif include_solidus_engine:
-            st.caption(
-                "⚠️ Activar cualquiera de estos 4 activa el barrido de universo de "
-                "CATALOGO: los huecos van al reporte y al Excel; lo sano, a un CSV "
-                "aparte."
-            )
             avl_left, preventive_mid, special_right, no_f9_right = st.columns(4)
             with avl_left:
                 include_avl_fill = st.toggle(
@@ -10491,7 +10486,7 @@ def render() -> None:
                     "DOH objetivo (Golden / Infaltable / Anchor)",
                     min_value=0.5,
                     max_value=90.0,
-                    value=21.0,
+                    value=3.0,
                     step=0.5,
                     disabled=not include_special_doh_fill,
                     help=(
@@ -10738,7 +10733,7 @@ def render() -> None:
                     "Lead time (días)",
                     min_value=0.1,
                     max_value=365.0,
-                    value=7.0,
+                    value=2.0,
                     step=0.5,
                     help=(
                         "Días de cobertura usados para construir las zonas "
@@ -10786,7 +10781,7 @@ def render() -> None:
             venom_origins = []
             venom_destinations = []
             venom_section_types = []
-            venom_lead_time_days = 7.0
+            venom_lead_time_days = 2.0
             venom_consider_current_planning = True
             st.caption(
                 "Venom Engine está apagado. No se ejecutará ningún llenado "
@@ -10845,11 +10840,6 @@ def render() -> None:
             kazuhira_ignore_store_capacity = False
             kazuhira_swa_priority = False
         elif include_kazuhira_engine:
-            st.warning(
-                "⚠️ Kazuhira cubre todo el universo de catálogo en quiebre, no solo "
-                "lo de Fountain9. Puede generar muchas tareas si el catálogo es "
-                "grande."
-            )
             kaz_left, kaz_right = st.columns(2)
             with kaz_left:
                 kazuhira_ignore_task_budget = st.toggle(
