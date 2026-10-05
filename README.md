@@ -21,7 +21,7 @@ Si es tu primera vez en Mother Base, lee estas cuatro ideas antes de entrar al d
 1. **Fountain9 propone; Mother Base decide si la propuesta es ejecutable.** Una recomendación no se envía si no hay stock, capacidad, ruta, calendario o tarea disponible.
 2. **El inventario no se puede inventar.** STOCK es el límite físico; COPÉRNICO, OWNER, rackeados y bloqueos únicamente pueden reducirlo.
 3. **Los engines compiten por recursos reales.** Una asignación consume stock, m³ de recibo y, salvo excepciones explícitas, una tarea operativa.
-4. **Cada salida debe poder explicarse.** Una tienda-SKU se envía, se corta por un motivo concreto o queda declarada como sana/sin necesidad; nunca debe quedar como un hueco silencioso.
+4. **Cada salida debe poder explicarse.** Una tienda–SKU se envía, se corta por un motivo concreto o queda declarada como sana/sin necesidad; nunca debe quedar como un hueco silencioso.
 
 La ruta normal para Supply es: validar fuentes → cargar Fountain9/COPÉRNICO → configurar CODEC → ejecutar → revisar cortes y alertas → descargar los archivos. La ruta normal para Desarrollo es: entender los contratos de datos → cambiar una regla en el motor → añadir prueba → conciliar una corrida histórica.
 
@@ -70,7 +70,6 @@ Mother Base reúne estas condiciones en una sola corrida. Primero atiende la nec
 |---|---|
 | ¿Qué transferencias se deben crear? | CSV por origen / owner y Excel consolidado |
 | ¿Qué se cubrió totalmente o parcialmente? | `DETALLE_ASIGNACION`, breakdown y KPIs |
-| ¿Qué engine y cobertura generó una línea? | Columnas `ENGINE` y `COBERTURA` de `BASE_TRANSFERS` |
 | ¿Por qué no se envió un caso? | `BASE_TRANSFERS` y tabla de cortes |
 | ¿Qué inventario del origen se utilizó? | Detalle de asignación y análisis por origen |
 | ¿Qué cambió frente a Fountain9? | Reporte comparativo Fountain9 vs Mother Base |
@@ -93,7 +92,7 @@ flowchart TD
 2. Se valida que las fuentes y hojas requeridas estén disponibles y con una frescura aceptable.
 3. Se cargan uno o varios CSV de Fountain9. Opcionalmente se agregan los archivos de COPÉRNICO.
 4. Supply define orígenes, máximo de tareas, bloqueos temporales y engines activos en el panel **CODEC**.
-5. El motor consolida las necesidades por tienda-SKU y asigna respetando todas las restricciones.
+5. El motor consolida las necesidades por tienda–SKU y asigna respetando todas las restricciones.
 6. Se generan diagnósticos, KPIs y archivos de salida.
 
 La aplicación pide una confirmación explícita antes de ejecutar. Esa confirmación es parte del control operativo: confirma que se validó la capacidad de recibo y que se consideraron tiendas en resguardo.
@@ -224,19 +223,31 @@ COPÉRNICO es opcional para la aplicación en general, pero es obligatorio cuand
 
 ### SCHEDULE
 
-La hoja `SCHEDULE` define días permitidos para una pareja origen–destino. Su bloqueo (toggle "Bloquear envíos fuera de frecuencia") está activo por defecto. Si está activo, la validación se hace contra la fecha real de la corrida en la zona horaria de Ciudad de México.
+La hoja `SCHEDULE` define días permitidos para una pareja origen–destino. Su bloqueo está apagado por defecto. Si se activa, la validación se hace contra la fecha real de la corrida en la zona horaria de Ciudad de México.
 
 ### SWA
 
-Hoja Aleph (cada hora) con `SWA_POTENTIAL_GAIN_COUNTRY` por tienda-SKU: el SWA país que se gana si esa combinación sale del quiebre. Solo se usa en reportería, nunca en reglas de asignación.
+Hoja Aleph con `SWA_POTENTIAL_GAIN_COUNTRY` por tienda–SKU (Sales Weighted Availability — métrica clave de negocio), actualizada cada hora. Nunca participa en ninguna regla de asignación, solo en reportería — pero esa reportería ahora cubre todos los entregables principales.
 
-- **Ganado es binario:** cualquier envío que saque la tienda-SKU del quiebre captura su valor completo. Ausente de la hoja = 0.
-- **Universo:** todo quiebre del catálogo (`stock_base` = 0), lo haya intentado cubrir un engine o no. Cálculo autoritativo: `build_swa_report()`, que suma lo asignado por destino-SKU de todos los engines. Insumos corre aparte: se pasan sus llaves cubiertas y su SWA se calcula desde sus propias filas.
-- **Dónde aparece:** sección inicial de resultados; columna `SWA_POTENTIAL_GAIN_COUNTRY` en CSV, `BASE_TRANSFERS` y `DETALLE_ASIGNACION` (informativa por fila: no sumar sin deduplicar por destino-SKU); `SWA_GANADO` y `SWA_PERDIDO` por engine y por corte; columna `SWA` en Overview y PDF; una tarjeta "SWA GANADO" por engine; reporte Golden/Infaltable/Anchor; y Fountain9 vs Mother Base.
-- **"Sin recomendación"** usa `SWA_INFORMATIVO`, no "perdido": esas filas tienen opening ≥ demanda, así que normalmente no son quiebres reales.
+**Ganado es binario, no proporcional.** Basta con sacar a una tienda-SKU del quiebre (cualquier unidad > 0 asignada) para capturar el `SWA_POTENTIAL_GAIN_COUNTRY` completo de esa fila — así es como se calcula el dato en origen (la condición de Aleph es `STOCK_UNITS > 0`, no una proporción). Ausente de la hoja SWA = 0 por descarte; nunca bloquea ningún reporte.
+
+**Universo: todo quiebre del catálogo**, no solo lo que algún engine intentó cubrir — incluye tienda-SKU donde ni siquiera había stock en ningún origen para intentarlo. `build_swa_report()` en `modules/les_enfants_terribles.py` es el cálculo autoritativo: itera CATALOGO completo, identifica quiebres (`stock_base` = 0) y compara contra `build_assigned_totals_by_key()` (suma por destino-SKU a través de todos los engines, para no contar doble si dos engines tocan la misma combinación).
+
+**Insumos es un caso especial.** Sus filas no viven en `result.allocation_rows` (corre aparte, anexado directo al CSV sin consumir tareas), así que `build_assigned_totals_by_key()` recibe sus llaves cubiertas por separado (`insumos_summary["assigned_keys"]`) para que el reporte central no las marque como "perdidas" por error. Su propio "SWA ganado" también se calcula aparte, directo desde sus filas ya enriquecidas — no está perfectamente reconciliado contra el reporte central si la misma tienda-SKU también recibió algo por la vía regular, pero ambos números son correctos por separado.
+
+**Dónde aparece — cobertura completa de los entregables principales:**
+
+- Sección dedicada al inicio de resultados (SWA ganado, SWA perdido/en riesgo, universo total, quiebres sin SWA registrado).
+- `SWA_POTENTIAL_GAIN_COUNTRY` como columna en los CSV operativos, `BASE_TRANSFERS` y `DETALLE_ASIGNACION` (vía `enrich_rows_with_product_info`, mismo punto de enriquecimiento que `PRODUCT_NAME`/`CATEGORY_NAME`). Es informativo por fila — si la misma tienda-SKU recibe varias líneas, el valor se repite; no debe sumarse a través de filas sin deduplicar primero.
+- `SWA_GANADO` por engine/causal en "Efectivamente planeado", `SWA_PERDIDO` por motivo en "Cortes", columna `SWA` en el Overview general (`ordered_breakdown_rows`), `SWA_INFORMATIVO` en "Sin recomendación" (ver nota abajo).
+- Reporte de universo Golden/Infaltable/Anchor (detalle completo y micro-detalle de no cubiertos).
+- **Cada una de las 9 secciones de REPORTE POR ENGINE** (Naked, AVL, Preventivo, Refuerzo, Cobertura sin Fountain9, Shalashaska, Liquid, Venom, Insumos) trae su propia tarjeta "SWA GANADO" — `swa_ganado_by_engine()` reusa lo ya calculado en `planned_by_engine_rows`, salvo Insumos que usa su cálculo propio.
+- **Fountain9 vs Mother Base**: los tres bloques (cara a cara, adicional, total) ahora incluyen SWA — permite ver cuánto SWA capturamos que Fountain9 ni siquiera evalúa.
+- **PDF ejecutivo**: tabla de breakdown con columna SWA, más un bloque resumen (ganado/perdido/universo) junto a la tabla ejecutiva principal.
+
+**"Sin recomendación" es informativo, no "perdido".** Estas filas tienen `opening ≥ demanda` por definición (así decide Fountain9 no recomendar nada), así que normalmente no son rupturas reales contra nuestro propio `stock_base` — el campo se llama `SWA_INFORMATIVO` a propósito, para no confundirlo con una pérdida real. Si aparece algo distinto de cero, suele ser un desfase entre el opening predicho de Fountain9 y el stock actual.
 
 ---
-
 
 ## Contrato mínimo de datos
 
@@ -244,16 +255,16 @@ Mother Base tolera columnas opcionales y varios alias, pero no puede inferir una
 
 | Fuente / hoja | Llave principal | Aporta | Si falta o es inconsistente |
 |---|---|---|---|
-| **Fountain9 CSV** | Tienda-SKU | Demanda, opening, MOV/ROQ, Duration y Lead Time cuando existan | La planeación natural no puede construirse; las coberturas de catálogo pueden seguir aplicando según su regla. |
-| **STOCK** | Origen–SKU / Tienda-SKU | Stock final, no disponible e incoming | Limita el envío desde origen; combinaciones de catálogo sin fila se tratan como inventario 0 en los engines de cobertura. |
+| **Fountain9 CSV** | Tienda–SKU | Demanda, opening, MOV/ROQ, Duration y Lead Time cuando existan | La planeación natural no puede construirse; las coberturas de catálogo pueden seguir aplicando según su regla. |
+| **STOCK** | Origen–SKU / Tienda–SKU | Stock final, no disponible e incoming | Limita el envío desde origen; combinaciones de catálogo sin fila se tratan como inventario 0 en los engines de cobertura. |
 | **TIENDA** | Warehouse | Ciudad, nombre y elegibilidad del destino | Sin tienda registrada no se puede enrutar ni calcular restricciones regionales. |
 | **CAP_RECIBO** | Tienda | Capacidad máxima de recibo en m³ | Se usa el default configurado si falta el dato; Supply debe revisar cualquier excepción. |
-| **CATALOGO** | Tienda-SKU | ADU, datos para cobertura y universo de visibilidad | Sin ADU se aplican fallbacks únicamente donde la regla los permite. |
+| **CATALOGO** | Tienda–SKU | ADU, datos para cobertura y universo de visibilidad | Sin ADU se aplican fallbacks únicamente donde la regla los permite. |
 | **POR_MERMAR** | Origen–SKU | Inventario próximo a caducar y fechas | Shalashaska no tiene candidato que evacuar. |
 | **COPÉRNICO** | Bodega–SKU | Inventario no pickeable y condición del 856 | Requerido para 444, 831 y 856 antes de ejecutar desde esos orígenes. |
 | **SCHEDULE** | Origen–destino | Días permitidos y universo operativo de Kazuhira | Si la pareja no existe, no se inventa una restricción de frecuencia. |
 | **OWNER** | Origen–SKU–owner | Inventario separable de 425/856 | Un owner insuficiente recorta o divide el bulk; no aumenta stock. |
-| **BLOQUEOS / RUTA_COSTOS / RACKEADOS** | SKU o tienda-SKU | Restricciones explícitas | Siempre ganan frente a una recomendación o engine. |
+| **BLOQUEOS / RUTA_COSTOS / RACKEADOS** | SKU o tienda–SKU | Restricciones explícitas | Siempre ganan frente a una recomendación o engine. |
 
 ---
 
@@ -322,14 +333,6 @@ flowchart TD
 
 **Regla común:** ningún engine puede saltarse stock, bloqueos o restricciones de ruta. Naked, Shalashaska, Solidus y Liquid también comparten el límite operativo de tareas; Kazuhira solo puede ignorarlo si Big Boss activa explícitamente ese bypass.
 
-### Visibilidad por engine
-
-Cada engine tiene un nombre, una cobertura y una etapa fijos en todos los reportes. `ENGINE_INFO` (en `modules/les_enfants_terribles.py`) es el registro único de qué hace, dónde corre y cómo funciona cada uno.
-
-- **Atribución:** `attribute_row()` asigna cada fila a un `ENGINE` y una `COBERTURA`. Naked = Fountain9 y Mínimos (hardcode). **Solidus = AVL, Preventivo, Refuerzo Golden / Infaltable / Anchor y Cobertura sin Fountain9.** Los demás engines no tienen cobertura (`—`).
-- **Dónde se ve:** tabla "Resumen por engine" (todos los engines en orden de ejecución, con estado, casos, tareas, unidades y SWA; Naked y Solidus también con su total); un panel con color propio y un expander "Cómo funciona" al inicio de cada engine; las columnas `ENGINE` y `COBERTURA` en `BASE_TRANSFERS`; la tabla "Efectivamente planeado" (ordenada por etapa) y el PDF ejecutivo.
-- **Tareas y unidades por engine** salen de las líneas reales de asignación (`PLANNING_REASON`), así que la suma de tareas de todos los engines coincide con las líneas del Bulk.
-
 ### Naked Engine
 
 Atiende la recomendación natural con ROQ positivo. Incluye un toggle independiente, **Cubrir a Fountain9**, para hardcodes en los que Fountain9 no produce ROQ positivo pero el negocio determina que debe haber una cobertura mínima:
@@ -338,9 +341,7 @@ Atiende la recomendación natural con ROQ positivo. Incluye un toggle independie
 - Inventario menor a demanda con ROQ no positivo: objetivo mínimo.
 - Net transfer bajo y poco inventario en destino: mínimo de 3 unidades.
 
-Estos casos pertenecen a Naked porque cubren una necesidad que Fountain9 no formuló como ROQ positivo; no deben confundirse con Solidus. Cada regla se apaga por separado y la de net transfer tiene umbrales editables (net transfer máximo y stock destino menor a; ambos en 3 por defecto).
-
-Otras variables de Naked: **Subir recomendaciones pequeñas al mínimo** (apagado, se envía el ROQ redondeado hacia arriba, sin piso) y **Usar columnas adicionales de MOV** (apagado, solo cuenta la columna MOV en vez del máximo con las columnas opcionales). En el Bulk llevan `PLANNING_REASON` = `MÍNIMO · NAKED ENGINE`; la recomendación natural, `FOUNTAIN9 · NAKED ENGINE`.
+Estos casos pertenecen a Naked porque cubren una necesidad que Fountain9 no formuló como ROQ positivo; no deben confundirse con Solidus.
 
 ### Solidus Engine
 
@@ -348,100 +349,93 @@ Solidus utiliza stock, capacidad y tareas restantes en este orden:
 
 1. **AVL:** cobertura de catálogo con stock final cero y sin servicio positivo previo.
 2. **Prevención:** producto con poco inventario o menos de un DOH, sin recomendación positiva de Fountain9.
-3. **Refuerzo (Infaltable, Golden, Anchor y KVI):** lleva el inventario hacia un DOH objetivo cuando Fountain9 no solicitó el caso. Cada bucket tiene su toggle y su DOH (3 por defecto); si una tienda-SKU está en varios buckets activos, gana el DOH más alto.
-4. **Cobertura sin Fountain9:** opcional y apagada por defecto; cubre quiebres sin recomendación positiva de Fountain9 — ya sea porque el SKU no tiene fila en su bulk, o porque la tiene pero con "sin recomendación" (basada en su propio Predicted Opening Inventory, que puede no coincidir con el stock real).
+3. **Refuerzo Golden / Infaltable / Anchor:** lleva el inventario hacia un DOH objetivo específico cuando Fountain9 no solicitó el caso.
+4. **Cobertura sin Fountain9:** opcional y apagada por defecto; cubre stockouts sin recomendación positiva de Fountain9 — ya sea porque el SKU no tiene fila en su bulk, o porque la tiene pero con "sin recomendación" (basada en su propio Predicted Opening Inventory, que puede no coincidir con el stock real).
 
 Para resolver ADU, las coberturas usan esta cascada:
 
-1. ADU de la tienda-SKU.
+1. ADU de la tienda–SKU.
 2. Promedio del mismo SKU en otras tiendas de la misma ciudad.
 3. Sin ADU disponible: se aplica el tratamiento propio de cada cobertura.
 
-El Refuerzo usa el universo de los buckets activos (hoja GOLDEN_INFALTABLES_ANCHOR y hoja KVI), no solamente las filas existentes de catálogo. Nunca modifica una recomendación que Fountain9 ya solicitó.
-
-**Prioridad por SWA:** si falta capacidad de tienda o presupuesto de tareas, las 4 coberturas atienden primero lo que más SWA país recupera (toggle activo por defecto; sin escasez no cambia nada).
+El Refuerzo Golden / Infaltable / Anchor usa el universo definido en la hoja correspondiente, no solamente las filas existentes de catálogo. Nunca modifica una recomendación que Fountain9 ya solicitó.
 
 ### Kazuhira Engine (garantía total de cobertura)
 
-Última pasada del pipeline (Naked → Shalashaska → Solidus → Liquid → Venom → **Kazuhira** → partición OWNER → Insumos). Solo Big Boss; apagado por defecto. Mandato: ninguna tienda-SKU del catálogo queda en quiebre si hay stock en CEDIS, venga o no de Fountain9. Corre al final y no dentro de Solidus porque necesita el stock final; tiene prioridad sobre Insumos en el stock del 444.
+Engine independiente (solo Big Boss, apagado por defecto) que corre **al final de todo el pipeline**, después de Venom y antes de la partición por OWNER. Su mandato es distinto al de los demás: ninguna tienda-SKU del catálogo debe quedar en quiebre (`stock_base` = 0) si hay stock disponible en CEDIS, **venga o no de un requerimiento de Fountain9**.
 
-| Tema | Regla |
-|---|---|
-| Universo de tiendas | Tiendas con filas en el Bulk de Fountain9 **más** las que SCHEDULE marca con día válido hoy para un origen seleccionado (independiente del toggle de bloqueo por SCHEDULE). Cerradas, ciudades bloqueadas y excluidas siguen fuera. |
-| Disparador | (stock + incoming + ya asignado) / ADU < 1 DOH. |
-| Cantidad | `ADU × (Duration + Lead Time) − stock − incoming − asignado`, con el mínimo de CODEC. ADU: propio → ciudad → 0.14. |
-| Duration / Lead Time | Moda propia de la tienda → promedio de su ciudad → promedio país. `DETALLE_MOTIVO` indica el escalón. |
-| Stock e incoming | Sin fila en STOCK = 0 (en todos los engines de cobertura). Incoming de `INCOMING_TR` (alias `INCOMING`), completo y sin fecha. |
-| Toggles (apagados) | *Ignorar presupuesto de tareas* (puede exceder `MAX_TASKS`); *Ignorar capacidad de tienda* (el uso se sigue registrando); *Priorizar por SWA* (ante escasez atiende primero el mayor `SWA_POTENTIAL_GAIN_COUNTRY`). |
-| Nunca se salta | Stock real de CEDIS, bloqueos regional/schedule/ruta de costos, tiendas cerradas y ciudades bloqueadas. |
+Por qué no es un toggle más de Solidus: Solidus corre a mitad del pipeline, después de Shalashaska y antes de Liquid/Venom; cada una de sus coberturas es quirúrgica a propósito. Kazuhira necesita ver el estado final de stock y no tiene condición propia más allá de "sigue en cero".
 
-Implementación: `candidate_mode="kazuhira"` de `apply_avl_fill`, con la misma fórmula que Cobertura sin Fountain9 (esa no tiene cascada y salta las tiendas sin dato propio).
+- **Fórmula:** idéntica a Cobertura sin Fountain9 — ADU (propio → ciudad → ficticio 0.14) × (Duration + Lead Time) − stock − incoming, con el mínimo de unidades de CODEC. Implementado como `candidate_mode="kazuhira"` de `apply_avl_fill`, reutilizando las mismas ramas ya probadas.
+- **Universo de tiendas:** las que se planean hoy = tiendas con filas en el Bulk de Fountain9 **más** las que SCHEDULE marca con día válido hoy para algún origen seleccionado, aunque Fountain9 no las haya arrojado (`build_planned_store_universe`). Esto es independiente del toggle de bloqueo por SCHEDULE: aquí SCHEDULE decide qué tiendas toca planear, no bloquea. Cerradas, ciudades bloqueadas y excluidas manualmente siguen fuera. El barrido de universo usa este mismo conjunto de tiendas.
+- **Disparador:** (stock + incoming + unidades ya asignadas esta corrida) / ADU efectivo **< 1 DOH** — no solo stock = 0. Una unidad enviada por otro engine no da por cubierta la combinación si deja menos de 1 DOH.
+- **Sin dato de stock = 0:** una combinación sin fila en STOCK se trata como stock 0 (contador `missing_stock_treated_as_zero`), no se salta. Esto aplica solo a Kazuhira; AVL, Preventivo, Refuerzo y Cobertura sin Fountain9 siguen saltándola.
+- **Cantidad:** el disparador es 1 DOH, pero la cantidad enviada es `ADU × (Duration + Lead Time) − stock − incoming − ya asignado`, con el mínimo de unidades de CODEC.
+- **Cascada de Duration/Lead Time:** moda propia de la tienda (Bulk de Fountain9) → promedio de las tiendas de la **misma ciudad** que sí tienen dato propio (`resolve_duration_lead_time_with_city_fallback`; solo promedia tiendas con ambos valores) → promedio país sobre modas propias (`compute_fallback_duration_and_lead_time`). Aplica, por ejemplo, a una tienda que solo aparece en SCHEDULE. El `DETALLE_MOTIVO` de cada fila dice qué escalón se usó. Cobertura sin Fountain9 no tiene cascada: sigue saltándose tiendas sin dato propio.
+- **Dos toggles de bypass, independientes y apagados por defecto:** *Ignorar presupuesto de tareas* (puede exceder `MAX_TASKS`) e *Ignorar capacidad de tienda* (no recorta el objetivo por m³; el uso de capacidad se sigue registrando para que el reporte muestre la excepción).
+- **Lo que ningún toggle puede saltarse:** el stock real de CEDIS y los bloqueos regionales, de schedule, de ruta de costos, tiendas cerradas y ciudades bloqueadas — son restricciones de negocio, no preferencias de optimización.
+- **Nada queda sin declarar, con motivo por fila.** Kazuhira registra por qué no cubrió cada tienda-SKU que evaluó (`skip_reasons` de `apply_avl_fill`) y ese motivo aparece como `TIPO_DE_CORTE` propio en el breakdown, en la columna `MOTIVO_KAZUHIRA` de `BASE_TRANSFERS` y en una tabla de su sección de reporte. Motivos: sin stock en CEDIS elegible; bloqueo regional/schedule con stock en CEDIS; capacidad de tienda; sin presupuesto de tareas (todo lo pendiente cuando se agota, aun si ya estaba agotado al arrancar); ruta de costos bloqueada; incoming que cubre la necesidad; sin Duration/Lead Time en todo el Bulk. "Sano" (posición ≥ 1 DOH) no es un hueco.
+- **El barrido ya no decide "sano" por stock > 0** cuando Kazuhira está activo: manda el criterio de Kazuhira (un SKU con 0.2 DOH que no se pudo cubrir ya no sale como "OK SIN NECESIDAD"). El barrido tampoco incluye tiendas cerradas, ciudades bloqueadas ni productos excluidos, que ya se reportan por sus propios resúmenes.
+- **Incoming:** se lee de la columna `INCOMING_TR` de la hoja STOCK (`INCOMING` se acepta como alias) y se cuenta completo, sin fecha de llegada; ya viene filtrado en DATA_TRANSFERS. **Ojo:** hasta la v6 solo se buscaba una columna llamada `INCOMING`, así que con `INCOMING_TR` el incoming de todo el sistema (Kazuhira y Cobertura sin Fountain9) se tomaba como 0 sin avisar.
+- **Prioridad por SWA (toggle, apagado por defecto):** cuando la capacidad de la tienda o el presupuesto de tareas no alcanzan para todos los quiebres, atiende primero los de mayor `SWA_POTENTIAL_GAIN_COUNTRY` en vez del orden por prioridad de producto/tienda. Medido con DATA_TRANSFERS real, tienda 89 (capacidad 7 m³): 130 SKUs y SWA 0.0515 con el orden actual contra 197 SKUs y SWA 0.0875 por SWA.
+- **Sin fila en STOCK = stock 0 e incoming 0 (decisión de negocio, todos los engines de cobertura):** una tienda-SKU que está en CATALOGO pero no aparece en STOCK se toma sin inventario ni incoming, no como "sin dato". Aplica a AVL, Preventivo, Refuerzo, Cobertura sin Fountain9 y Kazuhira (`missing_stock_treated_as_zero` en cada resumen y una advertencia consolidada por corrida; `skipped_missing_stock` queda siempre en 0). Motivo: en un DATA_TRANSFERS real, 101,794 de 295,090 combinaciones de CATALOGO (34 %) no tenían fila en STOCK y el 96 % de ellas tiene ADU > 0; solo 5,745 tenían una fila explícita con stock 0, así que antes casi todos los quiebres reales eran invisibles para los engines distintos de Kazuhira. Medido con ese archivo, tienda 89: AVL pasó de saltar 1,424 SKUs a cubrir 459 SKUs (4.6 m³), incluido el 12905.
+- **Sello de versión:** cada corrida lleva `APP_BUILD` (en la pantalla de resultados, como primera advertencia y en `run["build"]`). Si la corrida se generó con otro código, los resultados muestran un aviso con la versión real. Existe porque un despliegue desactualizado produce filas que parecen bugs del código nuevo (p. ej. la etiqueta genérica `EVALUADO POR KAZUHIRA` y la ausencia de la columna `MOTIVO_KAZUHIRA` son de antes de la v4). Hay que subir `APP_BUILD` en cada entrega.
+- **Chequeo de instalación (`modules/install_check.py`, llamado desde `app.py`):** al abrir la app avisa en rojo si `modules/les_enfants_terribles.py` es una versión sin sello, si hay archivos sueltos en la raíz que deben vivir en `modules/`, `engines/` o `tests/` (o borrarse), o si el `.gitignore` quedó guardado como `download`. Existe porque al subir archivos sueltos a GitHub se aplanaron las carpetas y la app siguió ejecutando una versión vieja de `les_enfants_terribles.py` sin avisar.
+- **Orden del pipeline (decisión confirmada):** Shalashaska → Liquid → Venom → Kazuhira → partición OWNER → Insumos. Kazuhira recibe lo que dejan los engines anteriores (incluido Venom) y tiene prioridad sobre Insumos en el stock del 444.
+- **Nada queda sin declarar (resumen):**
 
-**Todo queda declarado.** Cada tienda-SKU evaluada y no cubierta lleva su motivo (`TIPO_DE_CORTE`, columna `MOTIVO_KAZUHIRA` de `BASE_TRANSFERS` y tabla de su sección): sin stock en CEDIS; bloqueo regional/schedule con stock; capacidad de tienda; sin presupuesto de tareas; ruta de costos; incoming que cubre; sin Duration/Lead Time. El barrido declara además producto excluido y tienda sin registro en TIENDA. "Sano" (≥ 1 DOH) no es un hueco. La consulta puntual (`explain_store_sku`) responde por una tienda-SKU: enviada, declarada, sana o sin rastro.
+### Barrido de universo completo de CATALOGO
 
-### Barrido de universo de CATALOGO
+`plan_transfers` (la pasada base de Naked) solo procesa lo que viene del Bulk de Fountain9 — nunca toca CATALOGO directamente. Sin este barrido, cualquier tienda-SKU de CATALOGO ausente de Fountain9 **y** que ningún engine de cobertura toque queda completamente invisible: ni en el reporte, ni en ningún Excel, ni evaluada en absoluto.
 
-`plan_transfers` solo procesa lo que trae el Bulk de Fountain9. Con al menos un engine de cobertura activo (AVL, Preventivo, Refuerzo, Cobertura sin Fountain9 o Kazuhira), `iter_catalog_universe_sweep_rows()` recorre CATALOGO para las tiendas que se planean hoy y declara cada tienda-SKU que ningún engine tocó. Son filas de solo visibilidad: no consumen stock, tareas ni capacidad.
+Cuando al menos una cobertura de Solidus o Kazuhira está activa, `build_catalog_universe_sweep_rows()` agrega una fila de **solo visibilidad** por cada tienda-SKU de CATALOGO que nadie tocó — nunca consume stock, tareas ni capacidad, solo garantiza que el universo completo se vea:
 
-- **Huecos** (quiebres sin cubrir, con motivo: `QUIEBRE NO CUBIERTO · …`): van a `base_rows`, es decir, breakdown, Excel y SWA.
-- **Sanas** (`OK SIN NECESIDAD · FUERA DEL BULK DE FOUNTAIN9`): no van a memoria ni al Excel; se cuentan en el Overview y se escriben en streaming a `Universo_Catalogo_Sin_Necesidad_<fecha>.csv` (dentro del zip). Con Kazuhira decide su criterio (posición ≥ 1 DOH); sin él, stock > 0.
-- Tiendas cerradas y ciudades bloqueadas quedan fuera (ya se reportan aparte). Con todos los engines de cobertura apagados, el barrido no corre.
+- Con stock > 0 (sano, nada que cubrir): `OK SIN NECESIDAD · FUERA DEL BULK DE FOUNTAIN9` — excluido de la tabla de Cortes (igual que "SIN RECOMENDACIÓN"), porque no es un corte real.
+- Con stock = 0 (quiebre que nadie evaluó): `QUIEBRE SIN EVALUAR · FUERA DE COBERTURA ACTIVA` — sí aparece en Cortes, con su propio `SWA_PERDIDO`, porque genuinamente es un hueco sin cubrir.
 
-**Memoria.** CATALOGO se carga una vez por corrida (`ensure_catalog_rows`). Referencia con datos sintéticos (85 % con stock, 5,000 tareas): 500 mil combinaciones tardan 66 s y llegan a 549 MB; Streamlit Community Cloud limita a ~1 GB.
+**Dónde vive cada cosa (decisión de memoria).** Los *huecos* (quiebres sin cubrir, con su motivo) entran a `base_rows`: aparecen en el breakdown, en el Excel y en el SWA. Las filas *sanas* **no** se acumulan en memoria ni van al Excel: se cuentan en el Overview (`OK SIN NECESIDAD · FUERA DEL BULK DE FOUNTAIN9`) y se escriben en streaming a `Universo_Catalogo_Sin_Necesidad_<fecha>.csv`, dentro del zip. El barrido es un generador (`iter_catalog_universe_sweep_rows`); `build_catalog_universe_sweep_rows` es solo su versión en lista, para pruebas.
+
+**CATALOGO se carga una sola vez por corrida** (`ensure_catalog_rows` en `execute_planning`) y se reutiliza en AVL/Preventivo/Refuerzo, Kazuhira, el barrido, el chequeo de salud y SWA. Antes cada uno cargaba su propia copia completa, todas vivas hasta el final.
+
+Medición con datos sintéticos (85 % de las combinaciones con stock; Kazuhira activo; presupuesto de 5,000 tareas): a 500 mil combinaciones tienda-SKU, **206 s y 1,207 MB de pico antes; 66 s y 549 MB ahora**. A 1.2 millones: 159 s y 1,155 MB. Streamlit Community Cloud limita la memoria a aproximadamente 1 GB.
+
+**Consulta puntual ("¿por qué no salió el SKU X en la tienda Y?").** En los resultados, `explain_store_sku` busca la tienda-SKU en lo que ya quedó en el zip (líneas de `BulkCD_*.csv`, `BASE_TRANSFERS` y el CSV de universo sano) y responde: se envió (con unidades y motivo), no se envió y está declarado (con `TIPO_DE_CORTE`, `DETALLE_MOTIVO` y `MOTIVO_KAZUHIRA`), es sano, o **sin rastro** — un hueco sin declarar, con la lista de verificación. Una prueba de punta a punta confirma que, con presupuesto corto, ninguna combinación queda sin rastro.
+
+**Quiebres que ninguna regla de cobertura puede cubrir se declaran, no se omiten:** `PRODUCTO EXCLUIDO (BLOQUEOS O CODEC)` (antes se saltaban en silencio) y `TIENDA SIN REGISTRO EN TIENDA`. Tiendas cerradas y ciudades bloqueadas siguen fuera del barrido porque ya se reportan por sus propios resúmenes.
+
+Con todas las coberturas y Kazuhira apagados (el estado por defecto), este barrido no corre — el reporte sigue reflejando únicamente lo que Fountain9 trajo, como siempre. Activar cualquiera de estas coberturas puede aumentar mucho el total de filas si el catálogo es grande (hay una advertencia visible en CODEC para esto).
 
 ### Shalashaska Engine
 
-Evacúa inventario marcado como **POR_MERMAR**. No usa ese valor para inflar el stock disponible: primero confirma que las unidades siguen existiendo en el stock ajustado del origen. Después distribuye solo hacia tiendas elegibles, para aprovechar rutas operativas reales y no mandar producto próximo a caducar a ciudades lejanas.
+Evacúa inventario marcado como **POR_MERMAR**. No usa ese valor para inflar el stock disponible: primero confirma que las unidades siguen existiendo en el stock ajustado del origen. Después distribuye solo hacia tiendas que ya tienen una transferencia efectiva desde ese mismo origen durante la corrida; así aprovecha rutas operativas reales.
 
 ```mermaid
 flowchart TD
     A["POR_MERMAR origen-SKU"] --> B["Validar stock ajustado"]
-    B --> C["Filtrar categorías sensibles"]
-    C --> D["Tomar rutas: tienda con ROQ positivo, ciudad activa"]
-    D --> E["Nivelar por ADU y DOH interno"]
-    E --> F["Evacuar remanente por SHARE_VENTAS"]
-    F --> G["Registrar m³, tarea y motivo"]
+    B --> C["Tomar rutas efectivas desde el origen"]
+    C --> D["Nivelar por ADU y DOH seguro"]
+    D --> E["Evacuar remanente por SHARE_VENTAS"]
+    E --> F["Registrar m³, tarea y motivo"]
 ```
 
-| Regla | Efecto |
-|---|---|
-| **ROQ positivo (mandante)** | Una tienda solo es elegible si recibió del mismo origen al menos una línea con ROQ positivo de Fountain9. Los mínimos (hardcode) no cuentan. |
-| **Ciudades** | Siempre activas según los orígenes elegidos: 444, 811, 831 y 834 → CDMX; 425 → Guadalajara; 856 y 49 → Monterrey. Se pueden agregar más en CODEC. Con un origen sin regla no se restringe por ciudad. |
-| **Categorías sensibles** | Hoy, `CATEGORY_NAME` = Huevo (hoja DATA; coincide con el nombre completo, sin acentos ni mayúsculas, y su plural). Apagado el toggle "Permitir categorías sensibles", no se evacúan; un SKU sin categoría se reporta, no se asume. |
-| **Evacuar solo una parte** | Toggle con porcentaje (80 % por defecto): se envía ese porcentaje de las unidades en riesgo de cada SKU, redondeado hacia abajo; el resto queda disponible. |
-
-- La nivelación por DOH se conserva internamente (7 DOH) pero ya no es un campo de CODEC: con el tope de evacuación, decide qué tiendas reciben primero.
+- Si existe ADU tienda–SKU, primero nivela hacia el DOH seguro, limitado por los días que faltan para caducar.
 - Si el SKU no existe en CATALOGO o no tiene ADU para una tienda, esa ruta **no se descarta**: puede recibir el remanente mediante `SHARE_VENTAS`.
-- Lo que no se evacúa debe explicarse por stock mandante, restricción, capacidad, presupuesto de tareas o el tope de evacuación; nunca por la simple ausencia de ADU.
+- Si solo hay una ruta elegible, recibe el 100 % del share permitido por capacidad.
+- Lo que no se evacúa debe explicarse por stock mandante, restricción, capacidad o presupuesto de tareas; nunca por la simple ausencia de ADU.
 
 ### Liquid Engine
 
-Distribuye remanentes de inventario desde los orígenes seleccionados. Puede correr con SKUs indicados manualmente o detectar colas pequeñas según el umbral configurado. Solo envía a tiendas que ya recibieron unidades de otro engine en la corrida. Nivela con el **ADU de CATALOGO** hasta 14 DOH; solo si una tienda-SKU no tiene ADU, lo deriva de la demanda predicha del Bulk entre la Duration de la tienda (moda de su propio Bulk) o, sin ella, 7 días. Si no encuentra destino elegible, reporta el motivo: restricción, capacidad, falta de tarea o ausencia de demanda apta.
+Distribuye remanentes de inventario desde los orígenes seleccionados. Puede correr con SKUs indicados manualmente o detectar colas pequeñas según el umbral configurado. Si no encuentra destino elegible, reporta el motivo: restricción, capacidad, falta de tarea o ausencia de demanda apta.
 
 ### Venom Engine
 
 Ejecuta al final como cobertura DDMRP. Calcula zonas de buffer y propone llenado hacia el `Top of Green` cuando corresponde. Sus líneas se conservan separadas de otras asignaciones aun cuando compartan origen, destino y SKU.
 
-| Variable | Efecto | Default |
-|---|---|---|
-| Lead time (días) | Base de las zonas | 2 |
-| Factor de lead time (LTF) | Zona verde y base de la roja | 0.5 |
-| Factor de variabilidad (VF) | Zona roja de seguridad | 0.5 |
-| Mínimo de orden (unidades) | Piso de la zona verde | Mínimo de CODEC |
-| Ciclo de pedido (días) | Zona verde mínima = ADU × ciclo | 0 (sin ciclo) |
-| Disparador de reorden | Techo que dispara el pedido: amarillo (estándar), rojo o verde | Amarillo |
-| Múltiplo de envío | Redondea hacia arriba la cantidad | 1 |
-| Restar demanda calificada | NFP = on-hand + on-order − ADU × lead time; apagado, sin restar | Activo |
-| Considerar planeación actual / incoming en tránsito | Qué cuenta como on-order (`INCOMING_TR` en el segundo) | Ambos activos |
-| Tipo de sección | Infaltable, Golden, Anchor, KVI o BL (OOWL sigue bloqueado) | Ninguno |
-| SKUs específicos por origen | Se evalúan con DDMRP aunque no califiquen en ningún tipo; se surten solo desde ese origen. "Usar solo los SKUs específicos" ignora los tipos | Vacío |
-| Limitar a la capacidad de la tienda | Tope de m³ propio de Venom | Apagado |
-
-**Capacidad.** Venom no consume el ledger de capacidad de los engines anteriores ni se consolida con sus líneas. Con su tope activo usa la capacidad completa de la tienda como presupuesto propio: si otros engines ya usaron 9 de 10 pallets, Venom aún puede usar sus propios 10, que no se suman a esos 9. Kazuhira solo ve el remanente de lo que usaron los demás engines (en el ejemplo, 1 pallet), sin contar a Venom. Esto debe mantenerse para que su impacto sea auditable.
+Venom no consume el ledger de capacidad usado por los engines anteriores ni se consolida con sus líneas. Esto debe mantenerse para que su impacto sea auditable.
 
 ### Checks posteriores
 
-Al terminar la corrida, Mother Base revisa el universo de los buckets del Refuerzo (Infaltable, Golden, Anchor y KVI). El check de salud es informativo: identifica tienda-SKU que quedaron debajo del DOH objetivo de su bucket después de todos los engines; no replantea automáticamente.
+Al terminar la corrida, Mother Base revisa el universo Golden / Infaltable / Anchor. El check de salud es informativo: identifica tienda–SKU que quedaron debajo del objetivo de DOH después de todos los engines; no replantea automáticamente.
 
 ---
 
@@ -452,13 +446,12 @@ Al terminar la corrida, Mother Base revisa el universo de los buckets del Refuer
 | `TIENDAS_CERRADAS` | No permite envíos a destinos cerrados. Tiene toggle, activo por defecto. |
 | Tiendas excluidas en CODEC | Bloqueo temporal de destinos para la corrida. |
 | Ciudades bloqueadas | Bloqueo temporal de ciudades. Raiden no puede bloquear las ciudades protegidas. |
-| `BLOQUEOS` + SKUs de CODEC | Excluyen producto de engines e INSUMOS. La hoja `BLOQUEOS` tiene toggle ("Regla de bloqueos"), activo por defecto; la exclusión manual de SKUs siempre aplica. |
+| `BLOQUEOS` + SKUs de CODEC | Excluyen producto de engines e INSUMOS. |
 | `RUTA_COSTOS` | Bloquea una pareja destino–SKU. Tiene toggle activo por defecto. |
 | `BLOQUEOS_FORANEAS` | Bloquea productos señalados desde CDMX hacia GDL/MTY. Tiene toggle activo por defecto. |
 | `RACKEADOS` | El stock rackeado no puede salir desde 444. Tiene toggle activo por defecto. |
-| `SCHEDULE` | Bloquea origen–destino fuera de frecuencia. Tiene toggle, activo por defecto. |
-| FRUVER 811 | Toggle que retira el stock FRUVER del 811 sin alterar otros orígenes. Activo por defecto. |
-| Capacidad de tienda (`CAP_RECIBO`) | Limita lo que recibe cada tienda. El toggle "Ignorar capacidad de tienda" la desactiva en todos los engines (el uso de m³ se sigue registrando). Venom tiene su propio tope aparte. |
+| `SCHEDULE` | Si está activado, bloquea origen–destino fuera de frecuencia. |
+| FRUVER 811 | Toggle que retira el stock 811 sin alterar otros orígenes. |
 
 La implementación de los toggles de reglas maestras limpia las estructuras afectadas al cargar los catálogos. Esto evita que cada engine tenga que implementar el mismo `if` y garantiza una aplicación uniforme.
 
@@ -537,7 +530,7 @@ No se debe leer la comparación como una competencia de igualdad de condiciones:
 3. Agregue bloqueos temporales de tiendas, ciudades o SKUs cuando aplique.
 4. Configure INSUMOS, FRUVER y el calendario si corresponde.
 5. Active únicamente los engines requeridos para la corrida.
-6. Revise parámetros de objetivos y umbrales antes de confirmar. Defaults: DOH de Golden / Infaltable / Anchor = 3 y lead time de Venom = 2 días.
+6. Revise parámetros de objetivos y umbrales antes de confirmar.
 
 ### Después de ejecutar
 
@@ -588,11 +581,6 @@ DATA_DASHBOARD_SPREADSHEET_ID = "id-del-dashboard"
 
 > **Seguridad:** `.streamlit/secrets.toml` debe estar en `.gitignore`. Si un secreto llegó al repositorio, elimínelo del historial y rótelo antes de desplegar.
 
-### Versión e instalación
-
-- **Sello de versión:** `APP_BUILD` aparece en resultados, advertencias, `run["build"]` y la hoja RESUMEN del Excel. Súbelo en cada entrega (formato `kazuhira-vN`).
-- **Chequeo de instalación** (`modules/install_check.py`): al abrir la app avisa si `modules/les_enfants_terribles.py` es una versión sin sello, si hay archivos sueltos en la raíz o si el `.gitignore` quedó guardado como `download`.
-
 ### Streamlit Community Cloud
 
 1. Suba el proyecto a GitHub sin archivos secretos.
@@ -640,23 +628,6 @@ Los engines deben conservar la trazabilidad de cada decisión: motivo, cantidad 
 - Las pruebas deben declarar la regla con un caso de entrada y resultado esperado, no solo validar que una función no falle.
 - No modifique las etiquetas de salida sin actualizar el breakdown, los exports y pruebas relacionadas.
 - No fusionar líneas de Venom con líneas del resto de engines.
-
-### Estilo de comentarios y documentación
-
-Se asume que quien mantiene el proyecto conoce el negocio; se documenta lo que el código no dice.
-
-- **Encabezado de módulo** (todos los archivos): título con una frase, y las líneas `Posición`, `Entrada`, `Salida` y, si aplica, `Regla clave`.
-- **Docstring de función:** una línea con lo que hace. Más solo si hay un parámetro u invariante no obvio, en una o dos líneas.
-- **Comentario en línea:** el *porqué* de lo no obvio (restricción, orden obligatorio, trampa), en una o dos líneas. No narra lo que hace el código.
-- **No incluir historia** ("antes…", "ahora…", "se decidió en…"): eso vive en el control de versiones. Tampoco repetir lo que ya dice este README.
-- **Texto de pantalla:** los avisos con cifras (resultados de la corrida) se conservan; las notas descriptivas fijas, una línea. Las definiciones de cada KPI van en su tooltip.
-- **Etiquetas de controles** (toggles, campos, botones, expanders; las hace cumplir `tests/test_ui_labels.py`):
-  - Español en *sentence case*: solo la primera letra en mayúscula; siglas y nombres propios se respetan (SKU, DOH, SWA, AVL, Fountain9).
-  - Sin guiones bajos: los nombres técnicos de hojas y columnas van en el tooltip (`help`).
-  - Calificadores entre paréntesis, nunca con `—` ni `·`; "(opcional)" siempre al final.
-  - Toggles y botones con verbo en infinitivo ("Aplicar…", "Bloquear…", "Cubrir…").
-  - Un solo término por concepto: **quiebre** (no stockout ni ruptura) y **tienda-SKU** (con guion corto).
-  - Títulos de sección, eyebrows y tarjetas KPI van en MAYÚSCULAS por diseño; los encabezados Markdown, en *sentence case*.
 
 ---
 
