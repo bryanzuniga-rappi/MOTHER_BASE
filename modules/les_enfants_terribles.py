@@ -447,7 +447,7 @@ PLANNING_REASON_COLUMN = "PLANNING_REASON"
 
 # Sello de versión (resultados, advertencias y run['build']). Subir en cada
 # entrega.
-APP_BUILD = "2026-10-05 · kazuhira-v11"
+APP_BUILD = "2026-10-05 · kazuhira-v12"
 
 # REGLA_DEMANDA de filas de cobertura, nunca de la necesidad original de
 # Fountain9; 'Requerido' las excluye.
@@ -11100,99 +11100,6 @@ def render() -> None:
                 "recomendación natural de Fountain9."
             )
 
-    shalashaska_target_doh = 7.0       # nivelación interna; ya no se expone en CODEC
-    shalashaska_extra_cities: list[str] = []
-    shalashaska_allow_sensitive = False
-    shalashaska_evacuation_fraction = 1.0
-    with st.container(border=True, key="engine_shalashaska_module"):
-        include_shalashaska_engine = bool(
-            st.session_state["mb_engine_shalashaska_enabled"]
-        )
-        if render_action_card(
-            key="engine_shalashaska_card",
-            eyebrow="ENGINE / 02 · EXPIRATION EVACUATION",
-            title="SHALASHASKA ENGINE",
-            description=ENGINE_INFO["Shalashaska"]["card"],
-            active=include_shalashaska_engine,
-            tone="orange",
-            status=(
-                "ACTIVO"
-                if include_shalashaska_engine
-                else "INACTIVO · CLIC PARA ACTIVAR"
-            ),
-            min_height=150,
-            help_text=(
-                "Haz clic en la tarjeta para activar o desactivar Shalashaska Engine."
-            ),
-        ):
-            st.session_state["mb_engine_shalashaska_enabled"] = (
-                not include_shalashaska_engine
-            )
-            st.rerun()
-        if include_shalashaska_engine:
-            forced_cities = shalashaska_forced_cities(tuple(selected_origins))
-            city_names = {"CDMX": "Ciudad de México", "GDL": "Guadalajara", "MTY": "Monterrey"}
-            if forced_cities:
-                st.markdown(
-                    "**Ciudades siempre activas** (por los orígenes elegidos): "
-                    + ", ".join(city_names[c] for c in sorted(forced_cities))
-                    + ". 444, 811, 831 y 834 activan CDMX; 425, Guadalajara; "
-                    "856 y 49, Monterrey."
-                )
-            else:
-                st.caption("Con los orígenes elegidos no hay ciudad forzada: sin restricción por ciudad.")
-            shalashaska_extra_cities = st.multiselect(
-                "Ciudades adicionales (opcional)",
-                options=[
-                    city for city in city_labels
-                    if engine.normalize_city(city) not in forced_cities
-                ],
-                default=[],
-                format_func=lambda city: city_labels.get(city, city),
-                help=(
-                    "Por defecto la merma solo viaja a las ciudades forzadas por el "
-                    "origen: las lejanas tardan más en evacuarla."
-                ),
-            )
-            shala_left, shala_right = st.columns(2)
-            with shala_left:
-                shalashaska_allow_sensitive = st.toggle(
-                    "Permitir categorías sensibles (Huevo)",
-                    value=False,
-                    help=(
-                        "Apagado: los SKUs de categoría sensible (hoy Huevo, según "
-                        "CATEGORY_NAME de la hoja DATA) no se evacúan. Encendido: "
-                        "pueden enviarse."
-                    ),
-                )
-            with shala_right:
-                limit_evacuation = st.toggle(
-                    "Evacuar solo una parte de la merma",
-                    value=False,
-                    help=(
-                        "Envía solo el porcentaje indicado de las unidades en riesgo "
-                        "de cada SKU y deja el resto disponible para otros usos."
-                    ),
-                )
-                evacuation_percent = st.number_input(
-                    "Porcentaje de merma a evacuar (%)",
-                    min_value=10,
-                    max_value=100,
-                    value=80,
-                    step=5,
-                    disabled=not limit_evacuation,
-                )
-                if limit_evacuation:
-                    shalashaska_evacuation_fraction = float(evacuation_percent) / 100.0
-            st.caption(
-                "Solo recibe merma una tienda con ROQ positivo de Fountain9 que ya "
-                "recibe del mismo origen: los mínimos (hardcode) no cuentan."
-            )
-        else:
-            st.caption(
-                "Shalashaska Engine está apagado. No se procesará la hoja POR_MERMAR."
-            )
-
     include_avl_fill = False
     include_preventive_fill = False
     include_special_doh_fill = False
@@ -11209,7 +11116,7 @@ def render() -> None:
         )
         if render_action_card(
             key="engine_solidus_card",
-            eyebrow="ENGINE / 03 · CATALOG COVERAGE",
+            eyebrow="ENGINE / 02 · CATALOG COVERAGE",
             title="SOLIDUS ENGINE",
             description=(
                 ENGINE_INFO["Solidus"]["card"]
@@ -11336,6 +11243,99 @@ def render() -> None:
             st.caption(
                 "Solidus Engine está apagado. Sus protecciones y parámetros no "
                 "están disponibles para esta corrida."
+            )
+
+    shalashaska_target_doh = 7.0       # nivelación interna; ya no se expone en CODEC
+    shalashaska_extra_cities: list[str] = []
+    shalashaska_allow_sensitive = False
+    shalashaska_evacuation_fraction = 1.0
+    with st.container(border=True, key="engine_shalashaska_module"):
+        include_shalashaska_engine = bool(
+            st.session_state["mb_engine_shalashaska_enabled"]
+        )
+        if render_action_card(
+            key="engine_shalashaska_card",
+            eyebrow="ENGINE / 03 · EXPIRATION EVACUATION",
+            title="SHALASHASKA ENGINE",
+            description=ENGINE_INFO["Shalashaska"]["card"],
+            active=include_shalashaska_engine,
+            tone="orange",
+            status=(
+                "ACTIVO"
+                if include_shalashaska_engine
+                else "INACTIVO · CLIC PARA ACTIVAR"
+            ),
+            min_height=150,
+            help_text=(
+                "Haz clic en la tarjeta para activar o desactivar Shalashaska Engine."
+            ),
+        ):
+            st.session_state["mb_engine_shalashaska_enabled"] = (
+                not include_shalashaska_engine
+            )
+            st.rerun()
+        if include_shalashaska_engine:
+            forced_cities = shalashaska_forced_cities(tuple(selected_origins))
+            city_names = {"CDMX": "Ciudad de México", "GDL": "Guadalajara", "MTY": "Monterrey"}
+            if forced_cities:
+                st.markdown(
+                    "**Ciudades siempre activas** (por los orígenes elegidos): "
+                    + ", ".join(city_names[c] for c in sorted(forced_cities))
+                    + ". 444, 811, 831 y 834 activan CDMX; 425, Guadalajara; "
+                    "856 y 49, Monterrey."
+                )
+            else:
+                st.caption("Con los orígenes elegidos no hay ciudad forzada: sin restricción por ciudad.")
+            shalashaska_extra_cities = st.multiselect(
+                "Ciudades adicionales (opcional)",
+                options=[
+                    city for city in city_labels
+                    if engine.normalize_city(city) not in forced_cities
+                ],
+                default=[],
+                format_func=lambda city: city_labels.get(city, city),
+                help=(
+                    "Por defecto la merma solo viaja a las ciudades forzadas por el "
+                    "origen: las lejanas tardan más en evacuarla."
+                ),
+            )
+            shala_left, shala_right = st.columns(2)
+            with shala_left:
+                shalashaska_allow_sensitive = st.toggle(
+                    "Permitir categorías sensibles (Huevo)",
+                    value=False,
+                    help=(
+                        "Apagado: los SKUs de categoría sensible (hoy Huevo, según "
+                        "CATEGORY_NAME de la hoja DATA) no se evacúan. Encendido: "
+                        "pueden enviarse."
+                    ),
+                )
+            with shala_right:
+                limit_evacuation = st.toggle(
+                    "Evacuar solo una parte de la merma",
+                    value=False,
+                    help=(
+                        "Envía solo el porcentaje indicado de las unidades en riesgo "
+                        "de cada SKU y deja el resto disponible para otros usos."
+                    ),
+                )
+                evacuation_percent = st.number_input(
+                    "Porcentaje de merma a evacuar (%)",
+                    min_value=10,
+                    max_value=100,
+                    value=80,
+                    step=5,
+                    disabled=not limit_evacuation,
+                )
+                if limit_evacuation:
+                    shalashaska_evacuation_fraction = float(evacuation_percent) / 100.0
+            st.caption(
+                "Solo recibe merma una tienda con ROQ positivo de Fountain9 que ya "
+                "recibe del mismo origen: los mínimos (hardcode) no cuentan."
+            )
+        else:
+            st.caption(
+                "Shalashaska Engine está apagado. No se procesará la hoja POR_MERMAR."
             )
 
     liquid_manual_skus_by_origin_raw: dict[int, str] = {}

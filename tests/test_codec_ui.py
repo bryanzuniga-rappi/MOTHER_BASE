@@ -150,9 +150,9 @@ def test_everything_on_still_binds_to_the_engine_signature():
 
 # --- textos de las tarjetas de engine ------------------------------------------------------
 
-CARD_KEYS = {
-    "Naked": "engine_naked_card", "Shalashaska": "engine_shalashaska_card",
-    "Solidus": "engine_solidus_card", "Liquid": "engine_liquid_card",
+CARD_KEYS = {          # orden en que aparecen las tarjetas en CODEC
+    "Naked": "engine_naked_card", "Solidus": "engine_solidus_card",
+    "Shalashaska": "engine_shalashaska_card", "Liquid": "engine_liquid_card",
     "Venom": "engine_venom_card", "Kazuhira": "engine_kazuhira_card",
 }
 
@@ -170,11 +170,12 @@ def test_card_texts_are_short_and_name_the_engines_purpose():
         assert text.count(".") <= 4, engine            # sin párrafos largos
 
 
-def test_cards_are_numbered_in_execution_order():
+def test_cards_are_numbered_in_the_order_they_appear_with_solidus_second():
     _k, fake = run_codec()
-    eyebrows = [fake.cards[CARD_KEYS[e]]["eyebrow"] for e in CARD_KEYS]
+    ordered = sorted(CARD_KEYS, key=lambda e: list(fake.cards).index(CARD_KEYS[e]))
+    assert ordered == ["Naked", "Solidus", "Shalashaska", "Liquid", "Venom", "Kazuhira"]
+    eyebrows = [fake.cards[CARD_KEYS[e]]["eyebrow"] for e in ordered]
     assert [x.split("·")[0].strip() for x in eyebrows] == [f"ENGINE / 0{i}" for i in range(1, 7)]
-    assert list(CARD_KEYS) == list(m.ENGINE_ORDER[:6])
 
 
 def test_raiden_still_sees_the_locked_message_on_restricted_engines():
