@@ -1,11 +1,12 @@
-"""Solidus Engine — protección manual sin ROQ positivo.
+"""Clasificación de los mínimos (hardcode) de Naked.
 
-Posición: junto a Naked, sobre la misma fila consolidada del Bulk.
-Entrada: fila con ROQ <= 0 pero con objetivo > 0 por reglas de mínimo/hardcode.
-Salida: predicado is_solidus_requirement.
-Las coberturas de catálogo de Solidus (AVL, Preventivo, Refuerzo, Cobertura
-sin Fountain9) viven en modules/les_enfants_terribles.py (apply_avl_fill).
-"""
+Nombre histórico: no es el Solidus Engine. Los mínimos pertenecen a Naked
+(toggle "Cubrir a Fountain9"); el Solidus Engine real —AVL, Preventivo,
+Refuerzo y Cobertura sin Fountain9— vive en modules/les_enfants_terribles.py
+(apply_avl_fill).
+Entrada: fila consolidada con ROQ <= 0 pero con objetivo > 0 por reglas de
+mínimo/hardcode.
+Salida: predicado is_solidus_requirement (se conserva por compatibilidad)."""
 
 from __future__ import annotations
 

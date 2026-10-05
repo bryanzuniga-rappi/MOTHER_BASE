@@ -217,10 +217,11 @@ def test_no_fountain9_cut_registered_in_breakdown_order():
 
 
 def test_no_fountain9_cut_attributed_to_its_own_engine():
-    """Regresión: sin esto, los casos de este engine se atribuían a
-    'Naked/Solidus' en la tabla de planeado-por-engine en vez de a su
-    propio engine."""
-    assert m.attribute_engine(m.NO_FOUNTAIN9_CUT) == "Cobertura sin Fountain9"
+    """Sus casos se atribuyen a Solidus, con la cobertura propia."""
+    assert m.attribute_engine(m.NO_FOUNTAIN9_CUT) == "Solidus"
+    assert m.attribute_row({"TIPO_DE_CORTE": m.NO_FOUNTAIN9_CUT}) == (
+        "Solidus", "Cobertura sin Fountain9",
+    )
 
 
 def test_regla_demanda_and_tipo_de_corte_labels():

@@ -1,6 +1,6 @@
 """Shalashaska Engine — evacuación de inventario próximo a caducar.
 
-Posición: después de Naked/Solidus, antes de Liquid.
+Posición: después de Naked, antes de Solidus.
 Entrada: POR_MERMAR (origen-SKU con vencimiento próximo), SHARE_VENTAS y ADU de CATALOGO.
 Salida: filas de asignación del remanente a tiendas, repartido por SHARE_VENTAS.
 Regla clave: respeta stock, capacidad y tareas globales; POR_MERMAR no se usa

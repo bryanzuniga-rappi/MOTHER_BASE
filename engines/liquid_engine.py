@@ -1,6 +1,6 @@
 """Liquid Engine — agota el stock remanente de origen.
 
-Posición: después de Shalashaska, antes de Venom.
+Posición: después de Solidus, antes de Venom.
 Entrada: remanente por origen-SKU (cola automática por umbral o SKUs manuales)
 y SHARE_VENTAS.
 Salida: filas de asignación solo a tiendas que ya recibieron unidades en la corrida.

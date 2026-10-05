@@ -113,12 +113,13 @@ def test_cuts_detail_sums_swa_perdido():
 
 def test_swa_ganado_by_engine_sums_across_causales():
     planned_rows = [
-        {"ENGINE": "AVL", "CAUSAL": "ENVIADOS PARA CUBRIR AVL", "CASOS": 1, "UNIDADES": 5, "SWA_GANADO": 1.5},
+        {"ENGINE": "Solidus", "COBERTURA": "AVL", "CAUSAL": "ENVIADOS PARA CUBRIR AVL", "CASOS": 1, "UNIDADES": 5, "SWA_GANADO": 1.5},
         {"ENGINE": "Naked", "CAUSAL": "OK COMPLETO POR FOUNTAIN9", "CASOS": 2, "UNIDADES": 10, "SWA_GANADO": 2.0},
         {"ENGINE": "Naked", "CAUSAL": "OK MANUAL POR NET TRANSFER BAJO", "CASOS": 1, "UNIDADES": 3, "SWA_GANADO": 0.5},
     ]
     totals = m.swa_ganado_by_engine(planned_rows)
-    assert totals["AVL"] == 1.5
+    assert totals["AVL"] == 1.5          # por cobertura
+    assert totals["Solidus"] == 1.5      # y el total de Solidus
     assert totals["Naked"] == 2.5  # suma de sus dos causales
 
 
@@ -126,10 +127,8 @@ def test_swa_ganado_by_engine_empty_when_no_rows():
     assert m.swa_ganado_by_engine([]) == {}
 
 
-def test_no_fountain9_coverage_sorted_before_shalashaska():
-    """Regresión: otro gap de la sesión anterior — 'Cobertura sin Fountain9' faltaba en
-    el orden de despliegue de esta tabla.
-    """
+def test_engines_sorted_in_execution_order_shalashaska_before_solidus():
+    """El orden de la tabla es el de ejecución: Naked → Shalashaska → Solidus."""
     result = SimpleNamespace(
         base_rows=[
             {
@@ -146,15 +145,14 @@ def test_no_fountain9_coverage_sorted_before_shalashaska():
     )
     rows = m.build_planned_by_engine_rows(result)
     engines_in_order = [row["ENGINE"] for row in rows]
-    assert engines_in_order.index("Cobertura sin Fountain9") < engines_in_order.index(
-        "Shalashaska"
-    )
+    assert engines_in_order.index("Shalashaska") < engines_in_order.index("Solidus")
 
 
 def test_attribute_engine_known_add_on_engines():
-    assert m.attribute_engine("ENVIADOS PARA CUBRIR AVL") == "AVL"
-    assert m.attribute_engine("ENVIADOS PARA PREVENIR QUIEBRE") == "Preventivo"
-    assert m.attribute_engine(m.SPECIAL_DOH_CUT) == "Refuerzo Golden/Infaltable/Anchor"
+    # Las 4 coberturas pertenecen a Solidus; el detalle va en COBERTURA.
+    assert m.attribute_engine("ENVIADOS PARA CUBRIR AVL") == "Solidus"
+    assert m.attribute_engine("ENVIADOS PARA PREVENIR QUIEBRE") == "Solidus"
+    assert m.attribute_engine(m.SPECIAL_DOH_CUT) == "Solidus"
     assert m.attribute_engine(m.SHALASHASKA_CUT) == "Shalashaska"
     assert m.attribute_engine(m.LIQUID_CUT) == "Liquid"
     assert m.attribute_engine(m.VENOM_CUT) == "Venom"
@@ -173,11 +171,12 @@ def test_planned_by_engine_only_includes_assigned_rows():
     )
     rows = m.build_planned_by_engine_rows(result)
     engines = {row["ENGINE"] for row in rows}
-    assert engines == {"Naked", "AVL"}
+    assert engines == {"Naked", "Solidus"}
     naked_row = next(r for r in rows if r["ENGINE"] == "Naked")
     assert naked_row["CASOS"] == 1
     assert naked_row["UNIDADES"] == 10
-    avl_row = next(r for r in rows if r["ENGINE"] == "AVL")
+    avl_row = next(r for r in rows if r["COBERTURA"] == "AVL")
+    assert avl_row["ENGINE"] == "Solidus"
     assert avl_row["CASOS"] == 1
     assert avl_row["UNIDADES"] == 8
 

@@ -1,6 +1,7 @@
 """Mission Control — cola secuencial de requerimientos.
 
-Posición: antes de la asignación; decide qué filas entran a Naked y Solidus.
+Posición: antes de la asignación; decide qué filas entran a la pasada base de Naked
+(recomendación natural y mínimos).
 Entrada: filas consolidadas del Bulk.
 Salida: cola ordenada y conteos por engine.
 """

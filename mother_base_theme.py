@@ -180,7 +180,20 @@ def inject_mother_base_theme() -> None:
         .engine-panel.solidus { background: var(--blue); color: var(--white); }
         .engine-panel.liquid { background: var(--coral); }
         .engine-panel.shalashaska { background: var(--orange); }
+        .engine-panel.venom { background: #8a3ffc; color: var(--white); }
+        .engine-panel.kazuhira { background: var(--ink); color: var(--acid); }
+        .engine-panel.insumos { background: var(--yellow); }
         .engine-panel h4, .engine-panel p { color: inherit !important; }
+        .engine-panel .stage {
+            font-size: .7rem; font-weight: 900; letter-spacing: .14em;
+            margin-bottom: 4px;
+        }
+        .engine-panel h4 {
+            font-family: "Archivo Black", sans-serif;
+            font-size: clamp(1.5rem, 3.2vw, 2.4rem);
+            line-height: .95; margin: 0 0 8px; padding: 0;
+        }
+        .engine-panel p { font-weight: 700; margin: 0; }
 
         div.stButton > button,
         div.stDownloadButton > button,

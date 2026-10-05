@@ -213,3 +213,23 @@ def test_excel_carries_motivo_column_and_build_stamp():
         )
     assert "MOTIVO_KAZUHIRA" in header
     assert m.APP_BUILD in resumen
+
+
+def test_excel_and_run_carry_engine_attribution():
+    """BASE_TRANSFERS trae ENGINE y COBERTURA por fila; la corrida trae el resumen."""
+    import io, zipfile
+    import openpyxl
+    run = _run()
+    with zipfile.ZipFile(run["zip"]) as archive:
+        name = next(n for n in archive.namelist() if n.endswith(".xlsx"))
+        workbook = openpyxl.load_workbook(io.BytesIO(archive.read(name)), read_only=True, data_only=True)
+        rows = list(workbook["BASE_TRANSFERS"].iter_rows(values_only=True))
+    header = list(rows[0])
+    assert "ENGINE" in header and "COBERTURA" in header
+    engines = {r[header.index("ENGINE")] for r in rows[1:]}
+    assert "Kazuhira" in engines
+    summary = {(r["ENGINE"], r["COBERTURA"]): r for r in run["engine_summary_rows"]}
+    assert summary[("Kazuhira", "—")]["CASOS"] > 0 and summary[("Kazuhira", "—")]["TAREAS"] > 0
+    assert summary[("Kazuhira", "—")]["ESTADO"] == "ACTIVO"
+    assert summary[("Solidus", "Total")]["ESTADO"] == "APAGADO"      # sin coberturas prendidas
+    assert [r["ENGINE"] for r in run["engine_summary_rows"]][0] == "Naked"

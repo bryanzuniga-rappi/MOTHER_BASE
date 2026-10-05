@@ -70,6 +70,7 @@ Mother Base reúne estas condiciones en una sola corrida. Primero atiende la nec
 |---|---|
 | ¿Qué transferencias se deben crear? | CSV por origen / owner y Excel consolidado |
 | ¿Qué se cubrió totalmente o parcialmente? | `DETALLE_ASIGNACION`, breakdown y KPIs |
+| ¿Qué engine y cobertura generó una línea? | Columnas `ENGINE` y `COBERTURA` de `BASE_TRANSFERS` |
 | ¿Por qué no se envió un caso? | `BASE_TRANSFERS` y tabla de cortes |
 | ¿Qué inventario del origen se utilizó? | Detalle de asignación y análisis por origen |
 | ¿Qué cambió frente a Fountain9? | Reporte comparativo Fountain9 vs Mother Base |
@@ -321,6 +322,14 @@ flowchart TD
 
 **Regla común:** ningún engine puede saltarse stock, bloqueos o restricciones de ruta. Naked, Shalashaska, Solidus y Liquid también comparten el límite operativo de tareas; Kazuhira solo puede ignorarlo si Big Boss activa explícitamente ese bypass.
 
+### Visibilidad por engine
+
+Cada engine tiene un nombre, una cobertura y una etapa fijos en todos los reportes. `ENGINE_INFO` (en `modules/les_enfants_terribles.py`) es el registro único de qué hace, dónde corre y cómo funciona cada uno.
+
+- **Atribución:** `attribute_row()` asigna cada fila a un `ENGINE` y una `COBERTURA`. Naked = Fountain9 y Mínimos (hardcode). **Solidus = AVL, Preventivo, Refuerzo Golden / Infaltable / Anchor y Cobertura sin Fountain9.** Los demás engines no tienen cobertura (`—`).
+- **Dónde se ve:** tabla "Resumen por engine" (todos los engines en orden de ejecución, con estado, casos, tareas, unidades y SWA; Naked y Solidus también con su total); un panel con color propio y un expander "Cómo funciona" al inicio de cada engine; las columnas `ENGINE` y `COBERTURA` en `BASE_TRANSFERS`; la tabla "Efectivamente planeado" (ordenada por etapa) y el PDF ejecutivo.
+- **Tareas y unidades por engine** salen de las líneas reales de asignación (`PLANNING_REASON`), así que la suma de tareas de todos los engines coincide con las líneas del Bulk.
+
 ### Naked Engine
 
 Atiende la recomendación natural con ROQ positivo. Incluye un toggle independiente, **Cubrir a Fountain9**, para hardcodes en los que Fountain9 no produce ROQ positivo pero el negocio determina que debe haber una cobertura mínima:
@@ -329,7 +338,7 @@ Atiende la recomendación natural con ROQ positivo. Incluye un toggle independie
 - Inventario menor a demanda con ROQ no positivo: objetivo mínimo.
 - Net transfer bajo y poco inventario en destino: mínimo de 3 unidades.
 
-Estos casos pertenecen a Naked porque cubren una necesidad que Fountain9 no formuló como ROQ positivo; no deben confundirse con Solidus.
+Estos casos pertenecen a Naked porque cubren una necesidad que Fountain9 no formuló como ROQ positivo; no deben confundirse con Solidus. En el Bulk llevan `PLANNING_REASON` = `MÍNIMO · NAKED ENGINE`; la recomendación natural, `FOUNTAIN9 · NAKED ENGINE`.
 
 ### Solidus Engine
 
@@ -350,7 +359,7 @@ El Refuerzo Golden / Infaltable / Anchor usa el universo definido en la hoja cor
 
 ### Kazuhira Engine (garantía total de cobertura)
 
-Última pasada del pipeline (Shalashaska → Liquid → Venom → **Kazuhira** → partición OWNER → Insumos). Solo Big Boss; apagado por defecto. Mandato: ninguna tienda-SKU del catálogo queda en quiebre si hay stock en CEDIS, venga o no de Fountain9. Corre al final y no dentro de Solidus porque necesita el stock final; tiene prioridad sobre Insumos en el stock del 444.
+Última pasada del pipeline (Naked → Shalashaska → Solidus → Liquid → Venom → **Kazuhira** → partición OWNER → Insumos). Solo Big Boss; apagado por defecto. Mandato: ninguna tienda-SKU del catálogo queda en quiebre si hay stock en CEDIS, venga o no de Fountain9. Corre al final y no dentro de Solidus porque necesita el stock final; tiene prioridad sobre Insumos en el stock del 444.
 
 | Tema | Regla |
 |---|---|

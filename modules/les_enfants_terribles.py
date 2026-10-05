@@ -1,8 +1,9 @@
 """Les Enfants Terribles — módulo de planeación (UI y orquestación).
 
-Posición: ejecuta, en orden, Naked → Solidus (AVL, Preventivo, Refuerzo,
-Cobertura sin Fountain9) → Shalashaska → Liquid → Venom → Kazuhira →
-partición OWNER → Insumos, con un presupuesto de tareas compartido.
+Posición: ejecuta, en orden, Naked → Shalashaska → Solidus (AVL, Preventivo,
+Refuerzo, Cobertura sin Fountain9) → Liquid → Venom → Kazuhira → partición
+OWNER → Insumos, con un presupuesto de tareas compartido. ENGINE_INFO es el
+registro de qué hace cada engine (lo usan pantalla y PDF).
 Entrada: Bulk de Fountain9, DATA_TRANSFERS y COPÉRNICO.
 Salida: zip con CSV de carga, Excel y PDF ejecutivo, más reportes en pantalla.
 Reglas y engines: ver README.
@@ -50,6 +51,7 @@ from reportlab.platypus import (
 import modelo_abasto as engine
 from engines.liquid_engine import (
     LIQUID_CUT,
+    LIQUID_REASON,
     apply_liquid_engine,
     empty_liquid_summary,
     load_store_shares,
@@ -57,6 +59,7 @@ from engines.liquid_engine import (
 )
 from engines.shalashaska_engine import (
     SHALASHASKA_CUT,
+    SHALASHASKA_REASON,
     apply_shalashaska_engine,
     empty_shalashaska_summary,
     load_expiring_inventory,
@@ -64,6 +67,7 @@ from engines.shalashaska_engine import (
 from engines.venom_engine import (
     SECTION_TYPES as VENOM_SECTION_TYPES,
     VENOM_CUT,
+    VENOM_REASON,
     apply_venom_engine,
     empty_venom_summary,
 )
@@ -457,7 +461,7 @@ ENGINE_TOPUP_REGLA_DEMANDA: frozenset[str] = frozenset(
     }
 )
 PLANNING_REASON_FOUNTAIN9 = "FOUNTAIN9 · NAKED ENGINE"
-PLANNING_REASON_MANUAL_FORECAST_ZERO = "PROTECCIÓN · SOLIDUS ENGINE"
+PLANNING_REASON_MANUAL_FORECAST_ZERO = "MÍNIMO · NAKED ENGINE"
 PLANNING_REASON_AVL = "CUBRIR AVL · SOLIDUS ENGINE"
 PLANNING_REASON_PREVENTIVE = "EVITAR QUIEBRES · SOLIDUS ENGINE"
 PLANNING_REASON_SPECIAL_DOH = "REFUERZO GOLDEN/INFALTABLE/ANCHOR · SOLIDUS ENGINE"
@@ -2689,76 +2693,287 @@ def ordered_breakdown_rows(
 # TIPO_DE_CORTE que solo generan los engines de cobertura opcional. Cualquier
 # TIPO_DE_CORTE que NO aparezca aquí se le atribuye a la pasada base
 # Naked/Solidus (la cascada principal de plan_transfers).
-ENGINE_CUT_ATTRIBUTION: dict[str, str] = {
-    "ENVIADOS PARA CUBRIR AVL": "AVL",
-    "ENVIADOS PARA PREVENIR QUIEBRE": "Preventivo",
-    SPECIAL_DOH_CUT: "Refuerzo Golden/Infaltable/Anchor",
-    NO_FOUNTAIN9_CUT: "Cobertura sin Fountain9",
-    KAZUHIRA_CUT: "Kazuhira",
-    SHALASHASKA_CUT: "Shalashaska",
-    LIQUID_CUT: "Liquid",
-    VENOM_CUT: "Venom",
+# --- Registro de engines (orden real de ejecución) -------------------------
+# Naked → Shalashaska → Solidus → Liquid → Venom → Kazuhira → OWNER → Insumos.
+ENGINE_ORDER = (
+    "Naked", "Shalashaska", "Solidus", "Liquid", "Venom", "Kazuhira", "Insumos",
+)
+NO_COVERAGE = "—"
+COVERAGE_FOUNTAIN9 = "Fountain9"
+COVERAGE_MINIMUMS = "Mínimos (hardcode)"
+COVERAGE_AVL = "AVL"
+COVERAGE_PREVENTIVE = "Preventivo"
+COVERAGE_SPECIAL_DOH = "Refuerzo Golden/Infaltable/Anchor"
+COVERAGE_NO_FOUNTAIN9 = "Cobertura sin Fountain9"
+COVERAGE_ORDER: dict[str, tuple[str, ...]] = {
+    "Naked": (COVERAGE_FOUNTAIN9, COVERAGE_MINIMUMS),
+    "Solidus": (
+        COVERAGE_AVL, COVERAGE_PREVENTIVE, COVERAGE_SPECIAL_DOH,
+        COVERAGE_NO_FOUNTAIN9,
+    ),
+}
+ENGINE_COVERAGE_BY_CUT: dict[str, tuple[str, str]] = {
+    "ENVIADOS PARA CUBRIR AVL": ("Solidus", COVERAGE_AVL),
+    "ENVIADOS PARA PREVENIR QUIEBRE": ("Solidus", COVERAGE_PREVENTIVE),
+    SPECIAL_DOH_CUT: ("Solidus", COVERAGE_SPECIAL_DOH),
+    NO_FOUNTAIN9_CUT: ("Solidus", COVERAGE_NO_FOUNTAIN9),
+    SHALASHASKA_CUT: ("Shalashaska", NO_COVERAGE),
+    LIQUID_CUT: ("Liquid", NO_COVERAGE),
+    VENOM_CUT: ("Venom", NO_COVERAGE),
+    KAZUHIRA_CUT: ("Kazuhira", NO_COVERAGE),
+}
+ENGINE_COVERAGE_BY_REASON: dict[str, tuple[str, str]] = {
+    PLANNING_REASON_FOUNTAIN9: ("Naked", COVERAGE_FOUNTAIN9),
+    PLANNING_REASON_MANUAL_FORECAST_ZERO: ("Naked", COVERAGE_MINIMUMS),
+    PLANNING_REASON_AVL: ("Solidus", COVERAGE_AVL),
+    PLANNING_REASON_PREVENTIVE: ("Solidus", COVERAGE_PREVENTIVE),
+    PLANNING_REASON_SPECIAL_DOH: ("Solidus", COVERAGE_SPECIAL_DOH),
+    PLANNING_REASON_NO_FOUNTAIN9: ("Solidus", COVERAGE_NO_FOUNTAIN9),
+    SHALASHASKA_REASON: ("Shalashaska", NO_COVERAGE),
+    LIQUID_REASON: ("Liquid", NO_COVERAGE),
+    VENOM_REASON: ("Venom", NO_COVERAGE),
+    PLANNING_REASON_KAZUHIRA: ("Kazuhira", NO_COVERAGE),
+}
+SWEEP_ONLY_ENGINE = "Barrido de catálogo"
+
+ENGINE_INFO: dict[str, dict[str, Any]] = {
+    "Naked": {
+        "stage": "Etapa 1",
+        "role": "Cubre la recomendación natural de Fountain9 (ROQ positivo) y sus mínimos.",
+        "position": "Base de la planeación; primera prioridad sobre el presupuesto de tareas.",
+        "how": (
+            "Toma el MOV efectivo de Fountain9 por tienda-SKU y asigna desde los orígenes en el orden elegido.",
+            "Respeta stock ajustado, capacidad de la tienda, bloqueos y el presupuesto de tareas.",
+            "Con «Cubrir a Fountain9» arma además un mínimo (3–4 unidades) cuando Fountain9 no dio ROQ positivo.",
+        ),
+        "coverages": {
+            COVERAGE_FOUNTAIN9: "Necesidad con ROQ positivo.",
+            COVERAGE_MINIMUMS: "Mínimo cuando Fountain9 no dio ROQ positivo (reglas HARDCODE).",
+        },
+    },
+    "Shalashaska": {
+        "stage": "Etapa 2",
+        "role": "Evacúa inventario próximo a caducar (POR_MERMAR).",
+        "position": "Después de Naked, antes de Solidus.",
+        "how": (
+            "Solo usa tiendas que ya reciben una transferencia del mismo origen en la corrida.",
+            "Nivela al DOH objetivo y reparte el resto por SHARE_VENTAS.",
+            "POR_MERMAR no sustituye al stock final: respeta stock, capacidad y tareas.",
+        ),
+    },
+    "Solidus": {
+        "stage": "Etapa 3",
+        "role": "Coberturas tácticas de catálogo con el stock, la capacidad y las tareas que quedan.",
+        "position": "Después de Shalashaska. Sus coberturas corren en cadena: AVL → Preventivo → Refuerzo → Cobertura sin Fountain9.",
+        "how": (
+            "Cada cobertura actúa solo donde Fountain9 no pidió algo positivo; nunca modifica una recomendación de Fountain9.",
+            "ADU: de la tienda-SKU → promedio de la ciudad → tratamiento propio de la cobertura.",
+            "Comparten stock, capacidad y presupuesto de tareas con Naked, Shalashaska y Liquid.",
+        ),
+        "coverages": {
+            COVERAGE_AVL: "Quiebres (stock 0) del catálogo, hasta el DOH objetivo.",
+            COVERAGE_PREVENTIVE: "Inventario bajo (< 1 DOH o < 3 unidades) sin recomendación positiva.",
+            COVERAGE_SPECIAL_DOH: "Lleva Golden / Infaltable / Anchor a su DOH objetivo.",
+            COVERAGE_NO_FOUNTAIN9: "Quiebres sin recomendación positiva, con Duration y Lead Time por tienda.",
+        },
+    },
+    "Liquid": {
+        "stage": "Etapa 4",
+        "role": "Agota el stock remanente de origen.",
+        "position": "Después de Solidus, antes de Venom.",
+        "how": (
+            "Candidatos: SKUs manuales y remanentes bajo el umbral por origen.",
+            "Solo envía a tiendas que ya recibieron unidades de otro engine en la corrida; no exige el SKU en CATALOGO.",
+            "Reparte por SHARE_VENTAS sin rebasar stock, capacidad ni tareas.",
+        ),
+    },
+    "Venom": {
+        "stage": "Etapa 5",
+        "role": "Recompone buffers DDMRP sobre lo ya planeado.",
+        "position": "Después de Liquid, antes de Kazuhira.",
+        "how": (
+            "Calcula zonas roja, amarilla y verde (ADU × lead time) por tienda-SKU.",
+            "Si la posición neta queda bajo el techo amarillo, ordena hasta el techo verde.",
+            "Sus líneas quedan separadas de las de otros engines y no usan la capacidad de recibo.",
+        ),
+    },
+    "Kazuhira": {
+        "stage": "Etapa 6",
+        "role": "Garantía final: cubre todo quiebre que aún sea posible resolver.",
+        "position": "Última pasada, antes de la partición OWNER. Solo Big Boss.",
+        "how": (
+            "Universo: tiendas que se planean hoy (Bulk de Fountain9 + SCHEDULE).",
+            "Dispara con (stock + incoming + asignado) / ADU < 1 DOH; sin fila en STOCK cuenta como 0.",
+            "Lo que no cubre queda declarado con su motivo.",
+        ),
+    },
+    "Insumos": {
+        "stage": "Anexo",
+        "role": "Anexa insumos al BulkCD_444 sin consumir tareas.",
+        "position": "Después de la partición OWNER.",
+        "how": (
+            "Solo tiendas que ya reciben producto normal del 444.",
+            "Limitado por stock ajustado y MOQ por insumo.",
+            "No consume el presupuesto de tareas.",
+        ),
+    },
 }
 
 
+def attribute_row(row: dict[str, Any]) -> tuple[str, str]:
+    """(engine, cobertura) que generó esta fila de BASE_TRANSFERS."""
+    tipo = str(row.get("TIPO_DE_CORTE", ""))
+    hit = ENGINE_COVERAGE_BY_CUT.get(tipo)
+    if hit is not None:
+        return hit
+    rule = str(row.get("REGLA_DEMANDA", ""))
+    if rule.startswith("CATALOGO_"):
+        if tipo == CATALOG_UNIVERSE_POST_KAZUHIRA_CUT:
+            return ("Kazuhira", NO_COVERAGE)
+        return (SWEEP_ONLY_ENGINE, NO_COVERAGE)
+    if rule in MANUAL_FORECAST_ZERO_RULES:
+        return ("Naked", COVERAGE_MINIMUMS)
+    return ("Naked", COVERAGE_FOUNTAIN9)
+
+
 def attribute_engine(tipo_de_corte: str) -> str:
-    """Engine que generó esta línea de BASE_TRANSFERS. Todo lo que no sea de
-    un engine de cobertura opcional de Solidus (AVL/Preventivo/Refuerzo/
-    Cobertura sin Fountain9) u otro engine aparte viene de la pasada base
-    de Naked — nada genuinamente de Solidus cae en este fallback, porque
-    la salida de cada engine de Solidus ya tiene su propia atribución
-    explícita arriba en ENGINE_CUT_ATTRIBUTION."""
-    return ENGINE_CUT_ATTRIBUTION.get(tipo_de_corte, "Naked")
+    """Engine que generó una línea según su TIPO_DE_CORTE (Naked si no es de otro)."""
+    return ENGINE_COVERAGE_BY_CUT.get(tipo_de_corte, ("Naked", ""))[0]
+
+
+def annotate_base_rows_with_engine(base_rows: list[dict[str, Any]]) -> None:
+    """Agrega ENGINE y COBERTURA a cada fila de BASE_TRANSFERS."""
+    for row in base_rows:
+        row["ENGINE"], row["COBERTURA"] = attribute_row(row)
 
 
 def build_planned_by_engine_rows(
     result, insumos_summary: dict[str, Any] | None = None
 ) -> list[dict[str, Any]]:
-    """Tabla 1: lo efectivamente planeado (CANTIDAD_ASIGNADA > 0), por engine y causal."""
-    counts: Counter[tuple[str, str]] = Counter()
-    units: Counter[tuple[str, str]] = Counter()
-    swa_ganado: Counter[tuple[str, str]] = Counter()
+    """Tabla 1: lo efectivamente planeado (CANTIDAD_ASIGNADA > 0), por engine, cobertura y causal."""
+    keyed: dict[tuple[str, str, str], dict[str, float]] = {}
+
+    def bucket(engine_name: str, coverage: str, tipo: str) -> dict[str, float]:
+        return keyed.setdefault(
+            (engine_name, coverage, tipo), {"casos": 0, "unidades": 0, "swa": 0.0}
+        )
+
     for row in result.base_rows:
-        if int(row.get("CANTIDAD_ASIGNADA", 0) or 0) <= 0:
+        assigned = int(row.get("CANTIDAD_ASIGNADA", 0) or 0)
+        if assigned <= 0:
             continue
-        tipo = str(row.get("TIPO_DE_CORTE", ""))
-        engine_name = attribute_engine(tipo)
-        key = (engine_name, tipo)
-        counts[key] += 1
-        units[key] += int(row.get("CANTIDAD_ASIGNADA", 0) or 0)
-        swa_ganado[key] += float(row.get("SWA_POTENTIAL_GAIN_COUNTRY", 0.0) or 0.0)
+        engine_name, coverage = attribute_row(row)
+        item = bucket(engine_name, coverage, str(row.get("TIPO_DE_CORTE", "")))
+        item["casos"] += 1
+        item["unidades"] += assigned
+        item["swa"] += float(row.get("SWA_POTENTIAL_GAIN_COUNTRY", 0.0) or 0.0)
 
     if insumos_summary and insumos_summary.get("lines_added"):
-        key = ("Insumos", "INSUMOS")
-        counts[key] += int(insumos_summary["lines_added"])
-        units[key] += int(insumos_summary.get("units_added", 0))
+        item = bucket("Insumos", NO_COVERAGE, "INSUMOS")
+        item["casos"] += int(insumos_summary["lines_added"])
+        item["unidades"] += int(insumos_summary.get("units_added", 0))
 
-    engine_order = ["Naked", "AVL", "Preventivo",
-                     "Refuerzo Golden/Infaltable/Anchor",
-                     "Cobertura sin Fountain9", "Shalashaska",
-                     "Liquid", "Venom", "Insumos", "Kazuhira"]
     cut_order = {label: index for index, label in enumerate(BREAKDOWN_ORDER)}
 
-    def sort_key(item: tuple[tuple[str, str], int]) -> tuple[int, int, str]:
-        (engine_name, tipo), _count = item
+    def sort_key(key: tuple[str, str, str]) -> tuple[int, int, int, str]:
+        engine_name, coverage, tipo = key
         engine_index = (
-            engine_order.index(engine_name)
-            if engine_name in engine_order
-            else len(engine_order)
+            ENGINE_ORDER.index(engine_name)
+            if engine_name in ENGINE_ORDER
+            else len(ENGINE_ORDER)
         )
-        return (engine_index, cut_order.get(tipo, len(cut_order)), tipo)
+        coverages = COVERAGE_ORDER.get(engine_name, ())
+        coverage_index = (
+            coverages.index(coverage) if coverage in coverages else len(coverages)
+        )
+        return (engine_index, coverage_index, cut_order.get(tipo, len(cut_order)), tipo)
 
     return [
         {
             "ENGINE": engine_name,
+            "COBERTURA": coverage,
             "CAUSAL": tipo,
-            "CASOS": count,
-            "UNIDADES": units[(engine_name, tipo)],
-            "SWA_GANADO": round(swa_ganado[(engine_name, tipo)], 4),
+            "CASOS": int(item["casos"]),
+            "UNIDADES": int(item["unidades"]),
+            "SWA_GANADO": round(item["swa"], 4),
         }
-        for (engine_name, tipo), count in sorted(counts.items(), key=sort_key)
-        if count
+        for (engine_name, coverage, tipo), item in sorted(
+            keyed.items(), key=lambda kv: sort_key(kv[0])
+        )
+        if item["casos"]
     ]
+
+
+def build_engine_summary_rows(
+    result,
+    insumos_summary: dict[str, Any] | None = None,
+    enabled: dict[tuple[str, str], bool] | None = None,
+) -> list[dict[str, Any]]:
+    """Una fila por engine (Naked y Solidus también por cobertura, con su total).
+
+    Casos y SWA salen de base_rows; tareas y unidades, de las líneas reales
+    (allocation_rows) según su PLANNING_REASON. ``enabled`` marca el estado.
+    """
+    enabled = enabled or {}
+    cases: Counter[tuple[str, str]] = Counter()
+    swa: Counter[tuple[str, str]] = Counter()
+    tasks: Counter[tuple[str, str]] = Counter()
+    units: Counter[tuple[str, str]] = Counter()
+    for row in result.base_rows:
+        if int(row.get("CANTIDAD_ASIGNADA", 0) or 0) <= 0:
+            continue
+        key = attribute_row(row)
+        cases[key] += 1
+        swa[key] += float(row.get("SWA_POTENTIAL_GAIN_COUNTRY", 0.0) or 0.0)
+    for line in getattr(result, "allocation_rows", []):
+        key = ENGINE_COVERAGE_BY_REASON.get(
+            str(line.get(PLANNING_REASON_COLUMN, "")), ("Naked", COVERAGE_FOUNTAIN9)
+        )
+        tasks[key] += 1
+        units[key] += int(line.get("QUANTITY", 0) or 0)
+    insumos_key = ("Insumos", NO_COVERAGE)
+    if insumos_summary:
+        cases[insumos_key] += int(insumos_summary.get("lines_added", 0) or 0)
+        units[insumos_key] += int(insumos_summary.get("units_added", 0) or 0)
+
+    def status(key: tuple[str, str]) -> str:
+        return "ACTIVO" if enabled.get(key, True) else "APAGADO"
+
+    def make_row(engine_name: str, coverage: str, what: str, keys) -> dict[str, Any]:
+        info = ENGINE_INFO[engine_name]
+        return {
+            "ETAPA": info["stage"],
+            "ENGINE": engine_name,
+            "COBERTURA": coverage,
+            "QUÉ HACE": what,
+            "ESTADO": status(keys[0]) if len(keys) == 1 else (
+                "ACTIVO" if any(status(k) == "ACTIVO" for k in keys) else "APAGADO"
+            ),
+            "CASOS": sum(cases[k] for k in keys),
+            "TAREAS": sum(tasks[k] for k in keys),
+            "UNIDADES": sum(units[k] for k in keys),
+            "SWA_GANADO": round(sum(swa[k] for k in keys), 4),
+        }
+
+    rows: list[dict[str, Any]] = []
+    for engine_name in ENGINE_ORDER:
+        info = ENGINE_INFO[engine_name]
+        coverages = COVERAGE_ORDER.get(engine_name)
+        if coverages:
+            keys = [(engine_name, c) for c in coverages]
+            rows.append(make_row(engine_name, "Total", info["role"], keys))
+            for coverage in coverages:
+                rows.append(
+                    make_row(
+                        engine_name, coverage, info["coverages"][coverage],
+                        [(engine_name, coverage)],
+                    )
+                )
+        else:
+            rows.append(
+                make_row(engine_name, NO_COVERAGE, info["role"], [(engine_name, NO_COVERAGE)])
+            )
+    return rows
 
 
 def swa_card(engine_name: str, swa_by_engine: dict[str, float]) -> dict[str, Any]:
@@ -2779,12 +2994,15 @@ def swa_card(engine_name: str, swa_by_engine: dict[str, float]) -> dict[str, Any
 def swa_ganado_by_engine(
     planned_by_engine_rows: list[dict[str, Any]],
 ) -> dict[str, float]:
-    """SWA total ganado por cada engine, sumando sus causales — reusa lo
+    """SWA ganado por engine y por cobertura (Solidus = suma de sus 4) — reusa lo
     que ya calculó build_planned_by_engine_rows en vez de recorrer
     base_rows otra vez por cada sección de engine en la UI."""
     totals: dict[str, float] = defaultdict(float)
     for row in planned_by_engine_rows:
         totals[row["ENGINE"]] += row.get("SWA_GANADO", 0.0)
+        coverage = row.get("COBERTURA", NO_COVERAGE)
+        if coverage != NO_COVERAGE:
+            totals[coverage] += row.get("SWA_GANADO", 0.0)
     return dict(totals)
 
 
@@ -5459,6 +5677,7 @@ def write_executive_pdf(
     status_counts: dict[str, int] | Counter[str],
     status_swa: dict[str, float] | None = None,
     swa_report: dict[str, Any] | None = None,
+    engine_summary_rows: list[dict[str, Any]] | None = None,
     input_requirements: int,
     evaluated_requirements: int,
     tasks: int,
@@ -5846,10 +6065,31 @@ def write_executive_pdf(
                 [220 * mm, 45 * mm],
             ),
         ]
+    engine_summary_block: list[Any] = []
+    if engine_summary_rows:
+        swa_on = bool(swa_report and swa_report.get("enabled"))
+        engine_columns: list[tuple[str, str, Any]] = [
+            ("ETAPA", "ETAPA", str),
+            ("ENGINE", "ENGINE", str),
+            ("COBERTURA", "COBERTURA", str),
+            ("ESTADO", "ESTADO", str),
+            ("CASOS", "CASOS", fmt_int),
+            ("TAREAS", "TAREAS", fmt_int),
+            ("UNIDADES", "UNIDADES", fmt_int),
+        ]
+        engine_widths = [22 * mm, 34 * mm, 62 * mm, 24 * mm, 28 * mm, 28 * mm, 32 * mm]
+        if swa_on:
+            engine_columns.append(("SWA_GANADO", "SWA GANADO", fmt_float))
+            engine_widths.append(30 * mm)
+        engine_summary_block = [
+            Paragraph("RESUMEN POR ENGINE", section_style),
+            report_table_pdf(engine_summary_rows, engine_columns, engine_widths),
+        ]
     story.extend(
         [
             executive_table,
             *swa_summary_block,
+            *engine_summary_block,
             Paragraph("BREAKDOWN DE LA PLANEACIÓN", section_style),
             report_table_pdf(
                 ordered_breakdown_rows(status_counts, status_swa),
@@ -7052,6 +7292,7 @@ def execute_planning(
 
         # PRODUCT_NAME, CATEGORY_NAME y SWA en todos los entregables: una sola
         # pasada antes de escribir archivos.
+        annotate_base_rows_with_engine(result.base_rows)
         engine.enrich_rows_with_product_info(result.base_rows, catalogs)
         engine.enrich_rows_with_product_info(result.allocation_rows, catalogs)
         local_files = engine.create_output_files(
@@ -7107,6 +7348,22 @@ def execute_planning(
         planned_by_engine_rows = build_planned_by_engine_rows(
             result, insumos_summary
         )
+        engine_enabled = {
+            ("Naked", COVERAGE_FOUNTAIN9): include_naked_engine,
+            ("Naked", COVERAGE_MINIMUMS): include_naked_engine and cover_fountain9_hardcodes,
+            ("Shalashaska", NO_COVERAGE): include_shalashaska_engine,
+            ("Solidus", COVERAGE_AVL): include_solidus_engine and include_avl_fill,
+            ("Solidus", COVERAGE_PREVENTIVE): include_solidus_engine and include_preventive_fill,
+            ("Solidus", COVERAGE_SPECIAL_DOH): include_solidus_engine and include_special_doh_fill,
+            ("Solidus", COVERAGE_NO_FOUNTAIN9): include_solidus_engine and include_no_fountain9_coverage,
+            ("Liquid", NO_COVERAGE): include_liquid_engine,
+            ("Venom", NO_COVERAGE): include_venom_engine,
+            ("Kazuhira", NO_COVERAGE): include_kazuhira_engine,
+            ("Insumos", NO_COVERAGE): include_insumos,
+        }
+        engine_summary_rows = build_engine_summary_rows(
+            result, insumos_summary, engine_enabled
+        )
         cuts_detail_rows = build_cuts_detail_rows(
             result, closed_summary, block_summary
         )
@@ -7146,6 +7403,7 @@ def execute_planning(
             status_counts=status_counts,
             status_swa=status_swa,
             swa_report=swa_report,
+            engine_summary_rows=engine_summary_rows,
             input_requirements=consolidation_summary["unique_requirements"],
             evaluated_requirements=requirements,
             tasks=result.tasks_used,
@@ -7283,6 +7541,7 @@ def execute_planning(
         "status_counts": dict(status_counts),
         "status_swa": dict(status_swa),
         "planned_by_engine_rows": planned_by_engine_rows,
+        "engine_summary_rows": engine_summary_rows,
         "cuts_detail_rows": cuts_detail_rows,
         "no_recommendation_rows": no_recommendation_rows,
         "fountain9_comparison": fountain9_comparison,
@@ -8331,6 +8590,81 @@ def render_bucket_universe_report(bucket_label: str, report: dict[str, Any]) -> 
         )
 
 
+ENGINE_CSS_CLASS = {
+    "Naked": "naked", "Shalashaska": "shalashaska", "Solidus": "solidus",
+    "Liquid": "liquid", "Venom": "venom", "Kazuhira": "kazuhira",
+    "Insumos": "insumos",
+}
+
+
+def render_engine_header(
+    engine_name: str,
+    summary_rows: list[dict[str, Any]],
+    swa_enabled: bool = False,
+) -> None:
+    """Encabezado estándar de cada engine: etapa, qué hace y cómo funciona.
+
+    Naked y Solidus, que agrupan varias coberturas, muestran además sus totales.
+    """
+    info = ENGINE_INFO[engine_name]
+    st.markdown(
+        f'<div class="engine-panel {ENGINE_CSS_CLASS[engine_name]}">'
+        f'<div class="stage">{html.escape(info["stage"].upper())}</div>'
+        f"<h4>{html.escape(engine_name.upper())}</h4>"
+        f'<p>{html.escape(info["role"])}</p>'
+        "</div>",
+        unsafe_allow_html=True,
+    )
+    with st.expander(f"Cómo funciona {engine_name}"):
+        lines = [f"**Posición:** {info['position']}", "", "**Cómo funciona**"]
+        lines += [f"- {item}" for item in info["how"]]
+        if info.get("coverages"):
+            lines += ["", "**Coberturas**"]
+            lines += [f"- **{name}:** {text}" for name, text in info["coverages"].items()]
+        st.markdown("\n".join(lines))
+    if engine_name not in COVERAGE_ORDER:
+        return
+    totals = next(
+        (r for r in summary_rows if r["ENGINE"] == engine_name and r["COBERTURA"] == "Total"),
+        None,
+    )
+    if totals is None:
+        return
+    scope = "Fountain9 + mínimos" if engine_name == "Naked" else "sus 4 coberturas"
+    tone = "blue" if engine_name == "Solidus" else "acid"
+    category = f"{engine_name.upper()} · TOTAL"
+    cards = [
+        {"category": category, "label": "CASOS", "value": f"{totals['CASOS']:,}",
+         "description": f"Casos tienda-SKU con al menos una unidad ({scope}).", "tone": tone},
+        {"category": category, "label": "TAREAS", "value": f"{totals['TAREAS']:,}",
+         "description": f"Líneas de asignación generadas ({scope}).", "tone": tone},
+        {"category": category, "label": "UNIDADES", "value": f"{totals['UNIDADES']:,}",
+         "description": f"Unidades asignadas ({scope}).", "tone": tone},
+    ]
+    if swa_enabled:
+        cards.append(
+            {"category": category, "label": "SWA GANADO", "value": f"{totals['SWA_GANADO']:,.4f}",
+             "description": f"SWA país capturado ({scope}).", "tone": tone}
+        )
+    render_kpi_cards(cards, columns_count=4)
+
+
+def render_engine_summary_table(
+    summary_rows: list[dict[str, Any]], swa_enabled: bool
+) -> None:
+    """Tabla resumen: todos los engines en orden de ejecución, con su estado."""
+    columns = ["ETAPA", "ENGINE", "COBERTURA", "QUÉ HACE", "ESTADO",
+               "CASOS", "TAREAS", "UNIDADES"]
+    if swa_enabled:
+        columns.append("SWA_GANADO")
+    render_capped_dataframe(
+        [{column: row[column] for column in columns} for row in summary_rows],
+        key="engine_summary",
+        offer_download=True,
+        file_label="resumen_por_engine",
+    )
+
+
 def render_results(run: dict[str, Any]) -> None:
     planning_summary = run.get("analytics", {}).get("summary", {})
     st.markdown('<div class="result-title">PLANEACIÓN LISTA.</div>', unsafe_allow_html=True)
@@ -8346,7 +8680,7 @@ def render_results(run: dict[str, Any]) -> None:
     st.markdown(
         """
         <div class="report-note">
-            REQUERIDO = necesidad original de Naked/Solidus (sin la cobertura de AVL, Shalashaska, Liquid o Venom) · PLANEACIÓN FINAL = todo lo asignado, con todos los engines · PALLETS = mismo dato que M³ (VOLUMETRIA).
+            REQUERIDO = necesidad original de Naked (Fountain9 y mínimos), sin la cobertura de Shalashaska, Solidus, Liquid, Venom ni Kazuhira · PLANEACIÓN FINAL = todo lo asignado, con todos los engines · PALLETS = mismo dato que M³ (VOLUMETRIA).
         </div>
         """,
         unsafe_allow_html=True,
@@ -8419,6 +8753,7 @@ def render_results(run: dict[str, Any]) -> None:
 
     # Lookup de SWA por engine para las secciones de REPORTE POR ENGINE.
     swa_by_engine = swa_ganado_by_engine(run.get("planned_by_engine_rows", []))
+    engine_summary_rows = run.get("engine_summary_rows", [])
     swa_enabled = bool(swa_report.get("enabled"))
 
     render_kpi_cards(
@@ -8428,7 +8763,7 @@ def render_results(run: dict[str, Any]) -> None:
                 "label": "UNIDADES",
                 "value": f"{planning_summary.get('naked_target_units', 0):,}",
                 "description": (
-                    "Suma de CANTIDAD_OBJETIVO SOLO de la pasada base Naked/Solidus "
+                    "Suma de CANTIDAD_OBJETIVO SOLO de la pasada base de Naked "
                     "(necesidad original de Fountain9). No incluye lo que AVL, "
                     "Shalashaska, Liquid o Venom agregan como cobertura propia."
                 ),
@@ -8439,7 +8774,7 @@ def render_results(run: dict[str, Any]) -> None:
                 "label": "TAREAS",
                 "value": f"{planning_summary.get('naked_eligible_cases', 0):,}",
                 "description": (
-                    "Casos tienda-SKU evaluados solo por Naked/Solidus; el máximo de "
+                    "Casos tienda-SKU evaluados solo por Naked; el máximo de "
                     "tareas si cada caso se cubriera con una sola línea."
                 ),
                 "tone": "blue",
@@ -8449,7 +8784,7 @@ def render_results(run: dict[str, Any]) -> None:
                 "label": "PALLETS",
                 "value": f"{planning_summary.get('naked_target_m3', 0):,.2f}",
                 "description": (
-                    "Suma de M3_OBJETIVO SOLO de la pasada base Naked/Solidus."
+                    "Suma de M3_OBJETIVO SOLO de la pasada base de Naked."
                 ),
                 "tone": "blue",
             },
@@ -9133,14 +9468,18 @@ def render_results(run: dict[str, Any]) -> None:
     st.markdown(
         """
         <div class="report-note">
-            Un bloque por engine que corrió. Naked es la base (demanda de Fountain9); el resto son coberturas opcionales, en orden de ejecución.
+            Un bloque por engine, en orden de ejecución: Naked → Shalashaska → Solidus → Liquid → Venom → Kazuhira, más Insumos como anexo. Solidus agrupa 4 coberturas de catálogo (AVL, Preventivo, Refuerzo y Cobertura sin Fountain9); los mínimos (hardcode) son de Naked.
         </div>
         """,
         unsafe_allow_html=True,
     )
+    if engine_summary_rows:
+        st.markdown('<span class="section-label">RESUMEN POR ENGINE</span>', unsafe_allow_html=True)
+        render_engine_summary_table(engine_summary_rows, swa_enabled)
 
     naked = run.get("naked", {})
     if naked.get("enabled"):
+        render_engine_header("Naked", engine_summary_rows, swa_enabled)
         st.markdown(
             '<span class="section-label">REPORTE NAKED · DEMANDA NATURAL FOUNTAIN9</span>',
             unsafe_allow_html=True,
@@ -9152,9 +9491,9 @@ def render_results(run: dict[str, Any]) -> None:
                     "label": "TAREAS GENERADAS",
                     "value": f"{naked.get('tasks', 0):,}",
                     "description": (
-                        "Líneas de asignación con PLANNING_REASON = "
-                        "'FOUNTAIN9 · NAKED ENGINE': demanda natural, sin hardcodes "
-                        "de Solidus ni coberturas adicionales."
+                        "Líneas con PLANNING_REASON = 'FOUNTAIN9 · NAKED ENGINE': "
+                        "solo demanda natural, sin mínimos (hardcode) ni otros "
+                        "engines."
                     ),
                     "tone": "acid",
                 },
@@ -9182,10 +9521,79 @@ def render_results(run: dict[str, Any]) -> None:
             columns_count=4,
         )
 
+    shalashaska = run.get("shalashaska", {})
+    if shalashaska.get("enabled"):
+        render_engine_header("Shalashaska", engine_summary_rows, swa_enabled)
+        st.markdown(
+            '<span class="section-label">SHALASHASKA ENGINE · EVACUACIÓN</span>',
+            unsafe_allow_html=True,
+        )
+        render_kpi_cards(
+            [
+                {
+                    "category": "TAREAS · SHALASHASKA",
+                    "label": "TAREAS NUEVAS UTILIZADAS",
+                    "value": f"{shalashaska.get('tasks_added', 0):,}",
+                    "description": (
+                        "Nuevas combinaciones origen–destino–SKU creadas para "
+                        "evacuar inventario próximo a caducar. Comparten el mismo "
+                        "límite global con los demás engines."
+                    ),
+                    "tone": "blue",
+                },
+                {
+                    "category": "UNIDADES · RIESGO",
+                    "label": "UNIDADES POR MERMAR",
+                    "value": f"{shalashaska.get('units_at_risk', 0):,}",
+                    "description": (
+                        "Unidades informadas por POR_MERMAR para los orígenes "
+                        "seleccionados y sin SKUs excluidos, antes de aplicar el "
+                        "stock final mandante, bloqueos y capacidad."
+                    ),
+                    "tone": "coral",
+                },
+                {
+                    "category": "UNIDADES · EVACUADAS",
+                    "label": "UNIDADES REUBICADAS",
+                    "value": f"{shalashaska.get('units_evacuated', 0):,}",
+                    "description": (
+                        "Unidades próximas a caducar que sí fueron distribuidas. "
+                        "Primero se nivelan por necesidad y DOH; el sobrante se "
+                        "diversifica mediante share de ventas."
+                    ),
+                    "tone": "acid",
+                },
+                {
+                    "category": "VALOR · PROTEGIDO",
+                    "label": "VALOR REUBICADO",
+                    "value": f"${shalashaska.get('value_protected', 0):,.2f}",
+                    "description": (
+                        "Valor proporcional del inventario por mermar que fue "
+                        "reubicado en tiendas con oportunidad de venta. No representa "
+                        "venta garantizada ni ahorro contable realizado."
+                    ),
+                },
+                *([swa_card("Shalashaska", swa_by_engine)] if swa_enabled else []),
+            ],
+            columns_count=4,
+        )
+        if shalashaska.get("units_not_evacuated", 0) > 0:
+            st.warning(
+                f"Quedaron {shalashaska['units_not_evacuated']:,} unidades sin "
+                "evacuar por stock mandante, falta de ADU o ruta natural, "
+                "restricciones, capacidad o límite compartido de tareas."
+            )
+
+    if any(
+        run.get(key, {}).get("enabled")
+        for key in ("avl", "preventive", "special_doh", "no_fountain9_coverage")
+    ):
+        render_engine_header("Solidus", engine_summary_rows, swa_enabled)
+
     avl = run.get("avl", {})
     if avl.get("enabled"):
         st.markdown(
-            '<span class="section-label">COBERTURA AVL · ÚLTIMA PASADA</span>',
+            '<span class="section-label">SOLIDUS · COBERTURA AVL</span>',
             unsafe_allow_html=True,
         )
         render_kpi_cards(
@@ -9237,7 +9645,7 @@ def render_results(run: dict[str, Any]) -> None:
     preventive = run.get("preventive", {})
     if preventive.get("enabled"):
         st.markdown(
-            '<span class="section-label">BLINDAJE PREVENTIVO · ÚLTIMA PASADA</span>',
+            '<span class="section-label">SOLIDUS · BLINDAJE PREVENTIVO</span>',
             unsafe_allow_html=True,
         )
         render_kpi_cards(
@@ -9299,8 +9707,8 @@ def render_results(run: dict[str, Any]) -> None:
     special_doh = run.get("special_doh", {})
     if special_doh.get("enabled"):
         st.markdown(
-            '<span class="section-label">REFUERZO GOLDEN/INFALTABLE/ANCHOR · '
-            'ÚLTIMA PASADA</span>',
+            '<span class="section-label">SOLIDUS · REFUERZO GOLDEN / INFALTABLE / '
+            'ANCHOR</span>',
             unsafe_allow_html=True,
         )
         render_kpi_cards(
@@ -9367,8 +9775,7 @@ def render_results(run: dict[str, Any]) -> None:
     no_fountain9 = run.get("no_fountain9_coverage", {})
     if no_fountain9.get("enabled"):
         st.markdown(
-            '<span class="section-label">COBERTURA SIN FOUNTAIN9 · '
-            "ÚLTIMA PASADA DE SOLIDUS</span>",
+            '<span class="section-label">SOLIDUS · COBERTURA SIN FOUNTAIN9</span>',
             unsafe_allow_html=True,
         )
         st.caption(
@@ -9438,72 +9845,11 @@ def render_results(run: dict[str, Any]) -> None:
             f"{no_fountain9.get('units_added', 0):,} unidades adicionales."
         )
 
-    shalashaska = run.get("shalashaska", {})
-    if shalashaska.get("enabled"):
-        st.markdown(
-            '<span class="section-label">SHALASHASKA ENGINE · EVACUACIÓN</span>',
-            unsafe_allow_html=True,
-        )
-        render_kpi_cards(
-            [
-                {
-                    "category": "TAREAS · SHALASHASKA",
-                    "label": "TAREAS NUEVAS UTILIZADAS",
-                    "value": f"{shalashaska.get('tasks_added', 0):,}",
-                    "description": (
-                        "Nuevas combinaciones origen–destino–SKU creadas para "
-                        "evacuar inventario próximo a caducar. Comparten el mismo "
-                        "límite global con los demás engines."
-                    ),
-                    "tone": "blue",
-                },
-                {
-                    "category": "UNIDADES · RIESGO",
-                    "label": "UNIDADES POR MERMAR",
-                    "value": f"{shalashaska.get('units_at_risk', 0):,}",
-                    "description": (
-                        "Unidades informadas por POR_MERMAR para los orígenes "
-                        "seleccionados y sin SKUs excluidos, antes de aplicar el "
-                        "stock final mandante, bloqueos y capacidad."
-                    ),
-                    "tone": "coral",
-                },
-                {
-                    "category": "UNIDADES · EVACUADAS",
-                    "label": "UNIDADES REUBICADAS",
-                    "value": f"{shalashaska.get('units_evacuated', 0):,}",
-                    "description": (
-                        "Unidades próximas a caducar que sí fueron distribuidas. "
-                        "Primero se nivelan por necesidad y DOH; el sobrante se "
-                        "diversifica mediante share de ventas."
-                    ),
-                    "tone": "acid",
-                },
-                {
-                    "category": "VALOR · PROTEGIDO",
-                    "label": "VALOR REUBICADO",
-                    "value": f"${shalashaska.get('value_protected', 0):,.2f}",
-                    "description": (
-                        "Valor proporcional del inventario por mermar que fue "
-                        "reubicado en tiendas con oportunidad de venta. No representa "
-                        "venta garantizada ni ahorro contable realizado."
-                    ),
-                },
-                *([swa_card("Shalashaska", swa_by_engine)] if swa_enabled else []),
-            ],
-            columns_count=4,
-        )
-        if shalashaska.get("units_not_evacuated", 0) > 0:
-            st.warning(
-                f"Quedaron {shalashaska['units_not_evacuated']:,} unidades sin "
-                "evacuar por stock mandante, falta de ADU o ruta natural, "
-                "restricciones, capacidad o límite compartido de tareas."
-            )
-
     liquid = run.get("liquid", {})
     if liquid.get("enabled"):
+        render_engine_header("Liquid", engine_summary_rows, swa_enabled)
         st.markdown(
-            '<span class="section-label">LIQUID ENGINE · ÚLTIMA PASADA</span>',
+            '<span class="section-label">LIQUID ENGINE · AGOTAMIENTO</span>',
             unsafe_allow_html=True,
         )
         render_kpi_cards(
@@ -9570,6 +9916,7 @@ def render_results(run: dict[str, Any]) -> None:
 
     venom = run.get("venom", {})
     if venom.get("enabled"):
+        render_engine_header("Venom", engine_summary_rows, swa_enabled)
         st.markdown(
             '<span class="section-label">VENOM ENGINE · DDMRP POST-PLANEACIÓN'
             '</span>',
@@ -9654,6 +10001,7 @@ def render_results(run: dict[str, Any]) -> None:
 
     kazuhira = run.get("kazuhira", {})
     if kazuhira.get("enabled"):
+        render_engine_header("Kazuhira", engine_summary_rows, swa_enabled)
         st.markdown(
             '<span class="section-label">KAZUHIRA ENGINE · GARANTÍA TOTAL</span>',
             unsafe_allow_html=True,
@@ -9763,6 +10111,7 @@ def render_results(run: dict[str, Any]) -> None:
 
     insumos = run.get("insumos", {})
     if insumos.get("enabled"):
+        render_engine_header("Insumos", engine_summary_rows, swa_enabled)
         st.markdown(
             '<span class="section-label">INSUMOS · ANEXO SIN TAREAS</span>',
             unsafe_allow_html=True,
@@ -10373,6 +10722,62 @@ def render() -> None:
                 "recomendación natural de Fountain9."
             )
 
+    shalashaska_target_doh = 7.0
+    with st.container(border=True, key="engine_shalashaska_module"):
+        include_shalashaska_engine = bool(
+            st.session_state["mb_engine_shalashaska_enabled"]
+        )
+        if render_action_card(
+            key="engine_shalashaska_card",
+            eyebrow="ENGINE / 02 · EXPIRATION EVACUATION",
+            title="SHALASHASKA ENGINE",
+            description=(
+                "Evacúa inventario próximo a caducar hacia tiendas que ya salen "
+                "desde el mismo origen. Primero nivela DOH con ADU de CATALOGO; "
+                "después distribuye el remanente por share de ventas."
+            ),
+            active=include_shalashaska_engine,
+            tone="orange",
+            status=(
+                "ACTIVO"
+                if include_shalashaska_engine
+                else "INACTIVO · CLIC PARA ACTIVAR"
+            ),
+            min_height=150,
+            help_text=(
+                "Haz clic en la tarjeta para activar o desactivar Shalashaska Engine."
+            ),
+        ):
+            st.session_state["mb_engine_shalashaska_enabled"] = (
+                not include_shalashaska_engine
+            )
+            st.rerun()
+        if include_shalashaska_engine:
+            shala_left, shala_right = st.columns([1, 2])
+            with shala_left:
+                shalashaska_target_doh = st.number_input(
+                    "DOH objetivo (primera pasada)",
+                    min_value=1.0,
+                    max_value=30.0,
+                    value=7.0,
+                    step=0.5,
+                    help=(
+                        "La primera pasada intenta llevar de forma pareja a todas "
+                        "las tiendas elegibles hasta este DOH usando el ADU directo "
+                        "de CATALOGO."
+                    ),
+                )
+            with shala_right:
+                st.info(
+                    "Usa solo tiendas que ya reciben una transferencia del mismo "
+                    "origen en esta corrida. Nivela al DOH objetivo y reparte el "
+                    "resto por SHARE_VENTAS. POR_MERMAR no sustituye al stock final."
+                )
+        else:
+            st.caption(
+                "Shalashaska Engine está apagado. No se procesará la hoja POR_MERMAR."
+            )
+
     include_avl_fill = False
     include_preventive_fill = False
     include_special_doh_fill = False
@@ -10387,12 +10792,12 @@ def render() -> None:
         )
         if render_action_card(
             key="engine_solidus_card",
-            eyebrow="ENGINE / 02 · PROTECTION",
+            eyebrow="ENGINE / 03 · CATALOG COVERAGE",
             title="SOLIDUS ENGINE",
             description=(
-                "Cobertura AVL, prevención de posibles quiebres y refuerzo de "
-                "Golden/Infaltable/Anchor. Los hardcodes de Fountain9 ahora "
-                "viven en Naked."
+                "Coberturas tácticas de catálogo: AVL, Preventivo, Refuerzo "
+                "Golden / Infaltable / Anchor y Cobertura sin Fountain9. Los "
+                "mínimos (hardcode) viven en Naked."
                 if not is_raiden
                 else "Bloqueado para el perfil Raiden."
             ),
@@ -10499,62 +10904,6 @@ def render() -> None:
             st.caption(
                 "Solidus Engine está apagado. Sus protecciones y parámetros no "
                 "están disponibles para esta corrida."
-            )
-
-    shalashaska_target_doh = 7.0
-    with st.container(border=True, key="engine_shalashaska_module"):
-        include_shalashaska_engine = bool(
-            st.session_state["mb_engine_shalashaska_enabled"]
-        )
-        if render_action_card(
-            key="engine_shalashaska_card",
-            eyebrow="ENGINE / 03 · EXPIRATION EVACUATION",
-            title="SHALASHASKA ENGINE",
-            description=(
-                "Evacúa inventario próximo a caducar hacia tiendas que ya salen "
-                "desde el mismo origen. Primero nivela DOH con ADU de CATALOGO; "
-                "después distribuye el remanente por share de ventas."
-            ),
-            active=include_shalashaska_engine,
-            tone="orange",
-            status=(
-                "ACTIVO"
-                if include_shalashaska_engine
-                else "INACTIVO · CLIC PARA ACTIVAR"
-            ),
-            min_height=150,
-            help_text=(
-                "Haz clic en la tarjeta para activar o desactivar Shalashaska Engine."
-            ),
-        ):
-            st.session_state["mb_engine_shalashaska_enabled"] = (
-                not include_shalashaska_engine
-            )
-            st.rerun()
-        if include_shalashaska_engine:
-            shala_left, shala_right = st.columns([1, 2])
-            with shala_left:
-                shalashaska_target_doh = st.number_input(
-                    "DOH objetivo (primera pasada)",
-                    min_value=1.0,
-                    max_value=30.0,
-                    value=7.0,
-                    step=0.5,
-                    help=(
-                        "La primera pasada intenta llevar de forma pareja a todas "
-                        "las tiendas elegibles hasta este DOH usando el ADU directo "
-                        "de CATALOGO."
-                    ),
-                )
-            with shala_right:
-                st.info(
-                    "Usa solo tiendas que ya reciben una transferencia del mismo "
-                    "origen en esta corrida. Nivela al DOH objetivo y reparte el "
-                    "resto por SHARE_VENTAS. POR_MERMAR no sustituye al stock final."
-                )
-        else:
-            st.caption(
-                "Shalashaska Engine está apagado. No se procesará la hoja POR_MERMAR."
             )
 
     liquid_manual_skus_by_origin_raw: dict[int, str] = {}
