@@ -41,7 +41,7 @@ def test_every_engine_has_complete_documentation():
 
 def test_solidus_has_exactly_the_four_catalog_coverages():
     assert m.COVERAGE_ORDER["Solidus"] == (
-        "AVL", "Preventivo", "Refuerzo Golden/Infaltable/Anchor",
+        "AVL", "Preventivo", m.COVERAGE_SPECIAL_DOH,
         "Cobertura sin Fountain9",
     )
 
@@ -67,7 +67,7 @@ def test_attribute_row_each_solidus_coverage():
     for cut, coverage in (
         ("ENVIADOS PARA CUBRIR AVL", "AVL"),
         ("ENVIADOS PARA PREVENIR QUIEBRE", "Preventivo"),
-        (m.SPECIAL_DOH_CUT, "Refuerzo Golden/Infaltable/Anchor"),
+        (m.SPECIAL_DOH_CUT, m.COVERAGE_SPECIAL_DOH),
         (m.NO_FOUNTAIN9_CUT, "Cobertura sin Fountain9"),
     ):
         assert m.attribute_row({"TIPO_DE_CORTE": cut}) == ("Solidus", coverage)
@@ -167,7 +167,7 @@ def test_summary_tasks_match_total_allocation_lines_and_insumos_has_none():
 def test_summary_status_reflects_enabled_flags():
     result = SimpleNamespace(base_rows=[], allocation_rows=[])
     enabled = {("Solidus", "AVL"): True, ("Solidus", "Preventivo"): False,
-               ("Solidus", "Refuerzo Golden/Infaltable/Anchor"): False,
+               ("Solidus", m.COVERAGE_SPECIAL_DOH): False,
                ("Solidus", "Cobertura sin Fountain9"): False, ("Liquid", "—"): False}
     rows = {(r["ENGINE"], r["COBERTURA"]): r for r in m.build_engine_summary_rows(result, None, enabled)}
     assert rows[("Solidus", "Total")]["ESTADO"] == "ACTIVO"      # basta una cobertura

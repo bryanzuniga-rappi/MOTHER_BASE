@@ -40,6 +40,12 @@ class Config:
     default_store_capacity_m3: float = 10.0
     default_m3_per_unit: float = 0.002
     minimum_positive_quantity: int = 3
+    # Bypass global (CODEC): ningún engine corta por capacidad de tienda. El
+    # uso de m³ se sigue registrando para los reportes.
+    ignore_store_capacity: bool = False
+    # Naked: sube las recomendaciones positivas pequeñas de Fountain9 al mínimo
+    # de unidades. Apagado: se envía ceil(MOV) tal cual.
+    raise_small_roq_to_minimum: bool = True
 
     # Carpeta de trabajo local para outputs de una corrida (execute_planning
     # siempre pasa una ruta de workspace temporal propia; este default solo
@@ -48,6 +54,19 @@ class Config:
 
 
 CONFIG = Config()
+
+# Capacidad "infinita" finita: evita inf en floor() y sigue siendo comparable.
+UNLIMITED_CAPACITY_M3 = 1e15
+
+
+def store_capacity_limit_m3(
+    catalogs: "Catalogs", config: Config, destination: int
+) -> float:
+    """Capacidad que SÍ limita a una tienda: CAP_RECIBO (o el default), o
+    prácticamente ilimitada con el bypass global ``ignore_store_capacity``."""
+    if config.ignore_store_capacity:
+        return UNLIMITED_CAPACITY_M3
+    return catalogs.store_capacity.get(destination, config.default_store_capacity_m3)
 
 
 # Columnas aceptadas para el incoming de la hoja STOCK, en orden de preferencia.
@@ -1408,7 +1427,8 @@ def calculate_target_quantity(row: dict[str, Any], config: Config) -> tuple[int,
     demand = row["PREDICTED_DEMAND"]
     opening = row["PREDICTED_OPENING_INVENTORY"]
     if mov > 0:
-        return max(int(math.ceil(mov)), config.minimum_positive_quantity), "MOV_MINIMO_3"
+        floor = config.minimum_positive_quantity if config.raise_small_roq_to_minimum else 1
+        return max(int(math.ceil(mov)), floor), "MOV_MINIMO_3"
     if math.isclose(demand, 0.0, abs_tol=1e-9) and math.isclose(
         opening, 0.0, abs_tol=1e-9
     ):
@@ -1799,6 +1819,7 @@ def plan_transfers(
         capacity = catalogs.store_capacity.get(
             destination, config.default_store_capacity_m3
         )
+        capacity_limit = store_capacity_limit_m3(catalogs, config, destination)
         cap_before = cap_used_normal[destination]
         task_before = tasks_used
 
@@ -1851,7 +1872,7 @@ def plan_transfers(
             )
             passes_capacity = False
         else:
-            capacity_remaining_m3 = max(capacity - cap_before, 0.0)
+            capacity_remaining_m3 = max(capacity_limit - cap_before, 0.0)
             if m3_per_unit > 0:
                 capacity_units = int(
                     math.floor((capacity_remaining_m3 / m3_per_unit) + 1e-9)
@@ -1942,7 +1963,7 @@ def plan_transfers(
                 actual_m3 = assigned * m3_per_unit
                 actual_m3_by_store[destination] += actual_m3
                 cap_used_normal[destination] += actual_m3
-                if cap_used_normal[destination] >= capacity - 1e-9:
+                if cap_used_normal[destination] >= capacity_limit - 1e-9:
                     cap_closed[destination] = True
 
             if assigned >= target:
@@ -2135,9 +2156,7 @@ def plan_transfers(
         sku = row["RETAIL_ID"]
         target = row["CANTIDAD_OBJETIVO"]
         m3_per_unit = row["M3_POR_UNIDAD"]
-        capacity = catalogs.store_capacity.get(
-            destination, config.default_store_capacity_m3
-        )
+        capacity = store_capacity_limit_m3(catalogs, config, destination)
         capacity_before = cap_used_normal[destination]
         capacity_remaining_m3 = max(capacity - capacity_before, 0.0)
         if m3_per_unit > 0:

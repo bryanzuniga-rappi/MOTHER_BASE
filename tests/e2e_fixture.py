@@ -58,7 +58,13 @@ def build_workbook_bytes(
     incoming: dict[tuple[int, int], float] | None = None,
     incoming_column: str | None = "INCOMING_TR",
     omit_stock_rows: set[tuple[int, int]] = frozenset(),
+    extra_rows: dict[str, list[tuple]] | None = None,
+    categories: dict[int, str] | None = None,
+    catalog_adu: dict[tuple[int, int], float] | None = None,
+    swa_values: dict[tuple[int, int], float] | None = None,
 ) -> bytes:
+    """``extra_rows``: filas para hojas que por defecto van vacías (p. ej.
+    CAP_RECIBO, BLOQUEOS, KVI, POR_MERMAR). ``categories``: CATEGORY_NAME por SKU."""
     destination_stock = destination_stock or {}
     wb = openpyxl.Workbook(write_only=True)
 
@@ -68,8 +74,11 @@ def build_workbook_bytes(
         for row in rows:
             ws.append(list(row))
 
+    extra_rows = extra_rows or {}
+    categories = categories or {}
+    catalog_adu = catalog_adu or {}
     for name, headers in EMPTY_SHEETS.items():
-        sheet(name, headers)
+        sheet(name, headers, extra_rows.get(name, ()))
     all_stores = {origin: "CDMX", **stores}
     sheet(
         "TIENDA", ["CITY", "WAREHOUSE_ID", "WAREHOUSE_NAME"],
@@ -77,7 +86,7 @@ def build_workbook_bytes(
     )
     sheet(
         "CATALOGO", ["WAREHOUSE_ID", "PRODUCT_ID", "ADU"],
-        ((store, sku, adu) for store in stores for sku in skus),
+        ((store, sku, catalog_adu.get((store, sku), adu)) for store in stores for sku in skus),
     )
     incoming = incoming or {}
     stock_rows = [(origin, sku, origin_stock) for sku in skus]
@@ -99,19 +108,27 @@ def build_workbook_bytes(
     )
     sheet("DATA", ["SYNC_ID", "PRODUCT_NAME", "MACROCATEGORY_NAME",
                    "CATEGORY_NAME", "SUBCATEGORY_NAME"],
-          ((sku, f"PRODUCTO {sku}", "M", "C", "S") for sku in skus))
+          ((sku, f"PRODUCTO {sku}", "M", categories.get(sku, "C"), "S") for sku in skus))
     sheet("SWA", ["WAREHOUSE_ID", "PRODUCT_ID", "SWA_POTENTIAL_GAIN_COUNTRY"],
-          ((store, sku, 0.01) for store in stores for sku in skus[:1]))
+          (((store, sku, value) for (store, sku), value in swa_values.items())
+           if swa_values is not None
+           else ((store, sku, 0.01) for store in stores for sku in skus[:1])))
     buffer = io.BytesIO()
     wb.save(buffer)
     return buffer.getvalue()
 
 
-def build_plan_csv_bytes(rows: list[tuple]) -> bytes:
-    """Rows: (store, sku, mov)."""
-    lines = [",".join(PLAN_HEADERS)]
-    for store, sku, mov in rows:
-        lines.append(f"{store},{sku},0,{mov},0,{mov},0,5,3")
+def build_plan_csv_bytes(rows: list[tuple], extra_mov_column: str | None = None) -> bytes:
+    """Filas: (tienda, sku, mov) o (tienda, sku, mov, demanda, opening, net_transfer).
+    ``extra_mov_column``: nombre de una columna MOV opcional; su valor es el
+    séptimo elemento de la fila (o 0)."""
+    headers = list(PLAN_HEADERS) + ([extra_mov_column] if extra_mov_column else [])
+    lines = [",".join(headers)]
+    for row in rows:
+        store, sku, mov = row[:3]
+        demand, opening, net = (row[3:6] if len(row) >= 6 else (mov, 0, 0))
+        extra = f",{row[6] if len(row) > 6 else 0}" if extra_mov_column else ""
+        lines.append(f"{store},{sku},0,{demand},{opening},{mov},{net},5,3{extra}")
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
@@ -119,6 +136,7 @@ class FakeUpload(io.BytesIO):
     def __init__(self, name: str, data: bytes):
         super().__init__(data)
         self.name = name
+        self.size = len(data)          # st.file_uploader expone .size
 
 
 def read_zip_names(zip_path) -> list[str]:

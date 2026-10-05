@@ -23,6 +23,40 @@ import modelo_abasto as engine
 SHALASHASKA_REASON = "EVACUACIÓN · SHALASHASKA ENGINE"
 SHALASHASKA_CUT = "ENVIADOS POR SHALASHASKA ENGINE"
 
+# Categorías (CATEGORY_NAME de la hoja DATA) que Shalashaska no envía salvo que
+# CODEC las permita. Se compara el nombre completo, sin acentos ni mayúsculas;
+# acepta el plural.
+SENSITIVE_CATEGORIES: frozenset[str] = frozenset({"HUEVO"})
+
+# Origen -> ciudad (normalizada) que siempre queda activa si el origen está
+# seleccionado: evita mandar merma próxima a caducar a ciudades lejanas.
+FORCED_CITY_BY_ORIGIN: dict[int, str] = {
+    444: engine.CDMX, 811: engine.CDMX, 831: engine.CDMX, 834: engine.CDMX,
+    425: engine.GDL,
+    856: engine.MTY, 49: engine.MTY,
+}
+
+
+def shalashaska_forced_cities(origins: tuple[int, ...] | list[int]) -> set[str]:
+    """Ciudades (CDMX/GDL/MTY) que no pueden desactivarse según los orígenes."""
+    return {FORCED_CITY_BY_ORIGIN[o] for o in origins if o in FORCED_CITY_BY_ORIGIN}
+
+
+def fold_category(value: Any) -> str:
+    """Nombre de categoría sin acentos, en mayúsculas y sin espacios sobrantes."""
+    import unicodedata
+
+    raw = "" if value is None else str(value)
+    folded = "".join(
+        ch for ch in unicodedata.normalize("NFKD", raw) if not unicodedata.combining(ch)
+    )
+    return " ".join(folded.upper().split())
+
+
+def is_sensitive_category(category: Any, sensitive: frozenset[str]) -> bool:
+    name = fold_category(category)
+    return bool(name) and (name in sensitive or (name.endswith("S") and name[:-1] in sensitive))
+
 
 def empty_shalashaska_summary(enabled: bool) -> dict[str, Any]:
     return {
@@ -52,6 +86,14 @@ def empty_shalashaska_summary(enabled: bool) -> dict[str, Any]:
         "skipped_task_limit": 0,
         "skipped_regional_block": 0,
         "skipped_schedule_block": 0,
+        "skipped_city_not_allowed": 0,
+        "skipped_sensitive_category": 0,
+        "units_sensitive_excluded": 0,
+        "sensitive_unclassified": 0,
+        "units_held_back_by_fraction": 0,
+        "stores_without_positive_roq": 0,
+        "allowed_cities": [],
+        "evacuation_fraction": 1.0,
     }
 
 
@@ -262,12 +304,29 @@ def apply_shalashaska_engine(
     run_date: date,
     target_doh: float,
     reason_column: str = "PLANNING_REASON",
+    allowed_cities: set[str] | None = None,
+    non_natural_keys: set[tuple[int, int]] | None = None,
+    evacuation_fraction: float = 1.0,
+    excluded_categories: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
-    """Evacua inventario próximo a caducar sin rebasar restricciones globales."""
-    summary = empty_shalashaska_summary(True)
-    summary["tasks_before"] = result.tasks_used
+    """Evacúa inventario próximo a caducar sin rebasar restricciones globales.
+
+    allowed_cities: ciudades normalizadas a las que puede enviar (None = todas).
+    non_natural_keys: (destino, SKU) que NO nacieron de un ROQ positivo de
+    Fountain9 (mínimos/hardcode); una tienda solo es elegible si recibió al menos
+    una línea natural del mismo origen (None = cualquier línea cuenta).
+    evacuation_fraction: porción de la merma reportada que se envía (1.0 = toda).
+    excluded_categories: categorías sensibles que no se envían.
+    """
     if target_doh <= 0:
         raise ValueError("Shalashaska: el DOH objetivo debe ser mayor a cero.")
+    if not 0 < evacuation_fraction <= 1:
+        raise ValueError("Shalashaska: la fracción de evacuación debe estar en (0, 1].")
+    summary = empty_shalashaska_summary(True)
+    summary["tasks_before"] = result.tasks_used
+    summary["evacuation_fraction"] = float(evacuation_fraction)
+    summary["allowed_cities"] = sorted(allowed_cities) if allowed_cities is not None else []
+    non_natural_keys = non_natural_keys or set()
 
     blocked_city_set = set(blocked_cities)
 
@@ -285,11 +344,20 @@ def apply_shalashaska_engine(
         ] += int(allocation["QUANTITY"])
         source = int(allocation["WAREHOUSE_SOURCE"])
         destination = int(allocation["WAREHOUSE_DESTINATION"])
+        allocation_key = (destination, int(allocation["RETAIL_ID"]))
+        if allocation_key in non_natural_keys:
+            # Un mínimo (hardcode) no da derecho a recibir merma: la tienda debe
+            # tener un ROQ positivo de Fountain9.
+            summary["stores_without_positive_roq"] += 1
+            continue
+        city_norm = catalogs.stores.get(destination, {}).get("city_norm", "")
+        if allowed_cities is not None and city_norm not in allowed_cities:
+            summary["skipped_city_not_allowed"] += 1
+            continue
         if (
             source in natural_destinations_by_source
             and destination not in closed_store_ids
-            and catalogs.stores.get(destination, {}).get("city_norm", "")
-            not in blocked_city_set
+            and city_norm not in blocked_city_set
         ):
             natural_destinations_by_source[source].add(destination)
 
@@ -305,14 +373,24 @@ def apply_shalashaska_engine(
         if sku in catalogs.excluded_products:
             summary["skipped_excluded_sku"] += 1
             continue
+        if excluded_categories:
+            category = catalogs.product_catalog.get(sku, {}).get("CATEGORY_NAME", "")
+            if not fold_category(category):
+                summary["sensitive_unclassified"] += 1
+            elif is_sensitive_category(category, excluded_categories):
+                summary["skipped_sensitive_category"] += 1
+                summary["units_sensitive_excluded"] += risk_units
+                continue
         summary["units_at_risk"] += risk_units
         summary["value_at_risk"] += float(row["VALUE_STOCK"])
         stock_info = engine.source_stock_components(catalogs, source, sku)
         remaining_stock = max(
             int(stock_info["adjusted"]) - consumed_stock[(source, sku)], 0
         )
-        eligible_units = min(risk_units, remaining_stock)
-        summary["units_capped_by_stock"] += max(risk_units - eligible_units, 0)
+        sendable_units = int(math.floor(risk_units * evacuation_fraction + 1e-9))
+        summary["units_held_back_by_fraction"] += risk_units - sendable_units
+        eligible_units = min(sendable_units, remaining_stock)
+        summary["units_capped_by_stock"] += max(sendable_units - eligible_units, 0)
         if eligible_units <= 0:
             continue
         candidate = dict(row)
@@ -409,13 +487,14 @@ def apply_shalashaska_engine(
             capacity = catalogs.store_capacity.get(
                 destination, config.default_store_capacity_m3
             )
+            capacity_limit = engine.store_capacity_limit_m3(catalogs, config, destination)
             capacity_row = capacity_by_store.get(destination)
             used_m3 = (
                 float(capacity_row["M3_CONTABILIZADO_CAPACIDAD"])
                 if capacity_row
                 else 0.0
             )
-            remaining_m3 = max(capacity - used_m3, 0.0)
+            remaining_m3 = max(capacity_limit - used_m3, 0.0)
             capacity_units = (
                 int(math.floor((remaining_m3 / m3_per_unit) + 1e-9))
                 if m3_per_unit > 0

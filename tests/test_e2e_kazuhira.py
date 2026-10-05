@@ -40,6 +40,8 @@ def _run(**overrides):
 def _bulk_lines(run):
     import csv, io, zipfile
     with zipfile.ZipFile(run["zip"]) as archive:
+        if "BulkCD_444.csv" not in archive.namelist():
+            return {}                      # no se envió nada: no hay Bulk
         text = archive.read("BulkCD_444.csv").decode("utf-8-sig")
     return {
         (int(r["WAREHOUSE_DESTINATION"]), int(r["RETAIL_ID"])): int(r["QUANTITY"])

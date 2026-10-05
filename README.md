@@ -338,7 +338,9 @@ Atiende la recomendación natural con ROQ positivo. Incluye un toggle independie
 - Inventario menor a demanda con ROQ no positivo: objetivo mínimo.
 - Net transfer bajo y poco inventario en destino: mínimo de 3 unidades.
 
-Estos casos pertenecen a Naked porque cubren una necesidad que Fountain9 no formuló como ROQ positivo; no deben confundirse con Solidus. En el Bulk llevan `PLANNING_REASON` = `MÍNIMO · NAKED ENGINE`; la recomendación natural, `FOUNTAIN9 · NAKED ENGINE`.
+Estos casos pertenecen a Naked porque cubren una necesidad que Fountain9 no formuló como ROQ positivo; no deben confundirse con Solidus. Cada regla se apaga por separado y la de net transfer tiene umbrales editables (net transfer máximo y stock destino menor a; ambos en 3 por defecto).
+
+Otras variables de Naked: **Subir recomendaciones pequeñas al mínimo** (apagado, se envía el ROQ redondeado hacia arriba, sin piso) y **Usar columnas adicionales de MOV** (apagado, solo cuenta la columna MOV en vez del máximo con las columnas opcionales). En el Bulk llevan `PLANNING_REASON` = `MÍNIMO · NAKED ENGINE`; la recomendación natural, `FOUNTAIN9 · NAKED ENGINE`.
 
 ### Solidus Engine
 
@@ -346,7 +348,7 @@ Solidus utiliza stock, capacidad y tareas restantes en este orden:
 
 1. **AVL:** cobertura de catálogo con stock final cero y sin servicio positivo previo.
 2. **Prevención:** producto con poco inventario o menos de un DOH, sin recomendación positiva de Fountain9.
-3. **Refuerzo Golden / Infaltable / Anchor:** lleva el inventario hacia un DOH objetivo específico cuando Fountain9 no solicitó el caso.
+3. **Refuerzo (Infaltable, Golden, Anchor y KVI):** lleva el inventario hacia un DOH objetivo cuando Fountain9 no solicitó el caso. Cada bucket tiene su toggle y su DOH (3 por defecto); si una tienda-SKU está en varios buckets activos, gana el DOH más alto.
 4. **Cobertura sin Fountain9:** opcional y apagada por defecto; cubre quiebres sin recomendación positiva de Fountain9 — ya sea porque el SKU no tiene fila en su bulk, o porque la tiene pero con "sin recomendación" (basada en su propio Predicted Opening Inventory, que puede no coincidir con el stock real).
 
 Para resolver ADU, las coberturas usan esta cascada:
@@ -355,7 +357,9 @@ Para resolver ADU, las coberturas usan esta cascada:
 2. Promedio del mismo SKU en otras tiendas de la misma ciudad.
 3. Sin ADU disponible: se aplica el tratamiento propio de cada cobertura.
 
-El Refuerzo Golden / Infaltable / Anchor usa el universo definido en la hoja correspondiente, no solamente las filas existentes de catálogo. Nunca modifica una recomendación que Fountain9 ya solicitó.
+El Refuerzo usa el universo de los buckets activos (hoja GOLDEN_INFALTABLES_ANCHOR y hoja KVI), no solamente las filas existentes de catálogo. Nunca modifica una recomendación que Fountain9 ya solicitó.
+
+**Prioridad por SWA:** si falta capacidad de tienda o presupuesto de tareas, las 4 coberturas atienden primero lo que más SWA país recupera (toggle activo por defecto; sin escasez no cambia nada).
 
 ### Kazuhira Engine (garantía total de cobertura)
 
@@ -387,35 +391,57 @@ Implementación: `candidate_mode="kazuhira"` de `apply_avl_fill`, con la misma f
 
 ### Shalashaska Engine
 
-Evacúa inventario marcado como **POR_MERMAR**. No usa ese valor para inflar el stock disponible: primero confirma que las unidades siguen existiendo en el stock ajustado del origen. Después distribuye solo hacia tiendas que ya tienen una transferencia efectiva desde ese mismo origen durante la corrida; así aprovecha rutas operativas reales.
+Evacúa inventario marcado como **POR_MERMAR**. No usa ese valor para inflar el stock disponible: primero confirma que las unidades siguen existiendo en el stock ajustado del origen. Después distribuye solo hacia tiendas elegibles, para aprovechar rutas operativas reales y no mandar producto próximo a caducar a ciudades lejanas.
 
 ```mermaid
 flowchart TD
     A["POR_MERMAR origen-SKU"] --> B["Validar stock ajustado"]
-    B --> C["Tomar rutas efectivas desde el origen"]
-    C --> D["Nivelar por ADU y DOH seguro"]
-    D --> E["Evacuar remanente por SHARE_VENTAS"]
-    E --> F["Registrar m³, tarea y motivo"]
+    B --> C["Filtrar categorías sensibles"]
+    C --> D["Tomar rutas: tienda con ROQ positivo, ciudad activa"]
+    D --> E["Nivelar por ADU y DOH interno"]
+    E --> F["Evacuar remanente por SHARE_VENTAS"]
+    F --> G["Registrar m³, tarea y motivo"]
 ```
 
-- Si existe ADU tienda-SKU, primero nivela hacia el DOH seguro, limitado por los días que faltan para caducar.
+| Regla | Efecto |
+|---|---|
+| **ROQ positivo (mandante)** | Una tienda solo es elegible si recibió del mismo origen al menos una línea con ROQ positivo de Fountain9. Los mínimos (hardcode) no cuentan. |
+| **Ciudades** | Siempre activas según los orígenes elegidos: 444, 811, 831 y 834 → CDMX; 425 → Guadalajara; 856 y 49 → Monterrey. Se pueden agregar más en CODEC. Con un origen sin regla no se restringe por ciudad. |
+| **Categorías sensibles** | Hoy, `CATEGORY_NAME` = Huevo (hoja DATA; coincide con el nombre completo, sin acentos ni mayúsculas, y su plural). Apagado el toggle "Permitir categorías sensibles", no se evacúan; un SKU sin categoría se reporta, no se asume. |
+| **Evacuar solo una parte** | Toggle con porcentaje (80 % por defecto): se envía ese porcentaje de las unidades en riesgo de cada SKU, redondeado hacia abajo; el resto queda disponible. |
+
+- La nivelación por DOH se conserva internamente (7 DOH) pero ya no es un campo de CODEC: con el tope de evacuación, decide qué tiendas reciben primero.
 - Si el SKU no existe en CATALOGO o no tiene ADU para una tienda, esa ruta **no se descarta**: puede recibir el remanente mediante `SHARE_VENTAS`.
-- Si solo hay una ruta elegible, recibe el 100 % del share permitido por capacidad.
-- Lo que no se evacúa debe explicarse por stock mandante, restricción, capacidad o presupuesto de tareas; nunca por la simple ausencia de ADU.
+- Lo que no se evacúa debe explicarse por stock mandante, restricción, capacidad, presupuesto de tareas o el tope de evacuación; nunca por la simple ausencia de ADU.
 
 ### Liquid Engine
 
-Distribuye remanentes de inventario desde los orígenes seleccionados. Puede correr con SKUs indicados manualmente o detectar colas pequeñas según el umbral configurado. Si no encuentra destino elegible, reporta el motivo: restricción, capacidad, falta de tarea o ausencia de demanda apta.
+Distribuye remanentes de inventario desde los orígenes seleccionados. Puede correr con SKUs indicados manualmente o detectar colas pequeñas según el umbral configurado. Solo envía a tiendas que ya recibieron unidades de otro engine en la corrida. Nivela con el **ADU de CATALOGO** hasta 14 DOH; solo si una tienda-SKU no tiene ADU, lo deriva de la demanda predicha del Bulk entre la Duration de la tienda (moda de su propio Bulk) o, sin ella, 7 días. Si no encuentra destino elegible, reporta el motivo: restricción, capacidad, falta de tarea o ausencia de demanda apta.
 
 ### Venom Engine
 
 Ejecuta al final como cobertura DDMRP. Calcula zonas de buffer y propone llenado hacia el `Top of Green` cuando corresponde. Sus líneas se conservan separadas de otras asignaciones aun cuando compartan origen, destino y SKU.
 
-Venom no consume el ledger de capacidad usado por los engines anteriores ni se consolida con sus líneas. Esto debe mantenerse para que su impacto sea auditable.
+| Variable | Efecto | Default |
+|---|---|---|
+| Lead time (días) | Base de las zonas | 2 |
+| Factor de lead time (LTF) | Zona verde y base de la roja | 0.5 |
+| Factor de variabilidad (VF) | Zona roja de seguridad | 0.5 |
+| Mínimo de orden (unidades) | Piso de la zona verde | Mínimo de CODEC |
+| Ciclo de pedido (días) | Zona verde mínima = ADU × ciclo | 0 (sin ciclo) |
+| Disparador de reorden | Techo que dispara el pedido: amarillo (estándar), rojo o verde | Amarillo |
+| Múltiplo de envío | Redondea hacia arriba la cantidad | 1 |
+| Restar demanda calificada | NFP = on-hand + on-order − ADU × lead time; apagado, sin restar | Activo |
+| Considerar planeación actual / incoming en tránsito | Qué cuenta como on-order (`INCOMING_TR` en el segundo) | Ambos activos |
+| Tipo de sección | Infaltable, Golden, Anchor, KVI o BL (OOWL sigue bloqueado) | Ninguno |
+| SKUs específicos por origen | Se evalúan con DDMRP aunque no califiquen en ningún tipo; se surten solo desde ese origen. "Usar solo los SKUs específicos" ignora los tipos | Vacío |
+| Limitar a la capacidad de la tienda | Tope de m³ propio de Venom | Apagado |
+
+**Capacidad.** Venom no consume el ledger de capacidad de los engines anteriores ni se consolida con sus líneas. Con su tope activo usa la capacidad completa de la tienda como presupuesto propio: si otros engines ya usaron 9 de 10 pallets, Venom aún puede usar sus propios 10, que no se suman a esos 9. Kazuhira solo ve el remanente de lo que usaron los demás engines (en el ejemplo, 1 pallet), sin contar a Venom. Esto debe mantenerse para que su impacto sea auditable.
 
 ### Checks posteriores
 
-Al terminar la corrida, Mother Base revisa el universo Golden / Infaltable / Anchor. El check de salud es informativo: identifica tienda-SKU que quedaron debajo del objetivo de DOH después de todos los engines; no replantea automáticamente.
+Al terminar la corrida, Mother Base revisa el universo de los buckets del Refuerzo (Infaltable, Golden, Anchor y KVI). El check de salud es informativo: identifica tienda-SKU que quedaron debajo del DOH objetivo de su bucket después de todos los engines; no replantea automáticamente.
 
 ---
 
@@ -426,12 +452,13 @@ Al terminar la corrida, Mother Base revisa el universo Golden / Infaltable / Anc
 | `TIENDAS_CERRADAS` | No permite envíos a destinos cerrados. Tiene toggle, activo por defecto. |
 | Tiendas excluidas en CODEC | Bloqueo temporal de destinos para la corrida. |
 | Ciudades bloqueadas | Bloqueo temporal de ciudades. Raiden no puede bloquear las ciudades protegidas. |
-| `BLOQUEOS` + SKUs de CODEC | Excluyen producto de engines e INSUMOS. |
+| `BLOQUEOS` + SKUs de CODEC | Excluyen producto de engines e INSUMOS. La hoja `BLOQUEOS` tiene toggle ("Regla de bloqueos"), activo por defecto; la exclusión manual de SKUs siempre aplica. |
 | `RUTA_COSTOS` | Bloquea una pareja destino–SKU. Tiene toggle activo por defecto. |
 | `BLOQUEOS_FORANEAS` | Bloquea productos señalados desde CDMX hacia GDL/MTY. Tiene toggle activo por defecto. |
 | `RACKEADOS` | El stock rackeado no puede salir desde 444. Tiene toggle activo por defecto. |
 | `SCHEDULE` | Bloquea origen–destino fuera de frecuencia. Tiene toggle, activo por defecto. |
 | FRUVER 811 | Toggle que retira el stock FRUVER del 811 sin alterar otros orígenes. Activo por defecto. |
+| Capacidad de tienda (`CAP_RECIBO`) | Limita lo que recibe cada tienda. El toggle "Ignorar capacidad de tienda" la desactiva en todos los engines (el uso de m³ se sigue registrando). Venom tiene su propio tope aparte. |
 
 La implementación de los toggles de reglas maestras limpia las estructuras afectadas al cargar los catálogos. Esto evita que cada engine tenga que implementar el mismo `if` y garantiza una aplicación uniforme.
 

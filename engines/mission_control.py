@@ -22,10 +22,12 @@ def select_engine_rows(
     *,
     include_naked: bool,
     include_hardcodes: bool,
+    hardcode_rules: frozenset[str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    """Arma la cola secuencial de requerimientos. include_hardcodes activa
-    HARDCODE_4_CERO_TOTAL y HARDCODE_3_INVENTARIO_MENOR_DEMANDA (MOV <= 0 con
-    objetivo armado por el modelo).
+    """Arma la cola secuencial de requerimientos. include_hardcodes activa los
+    mínimos (MOV <= 0 con objetivo armado por el modelo); hardcode_rules limita
+    cuáles de HARDCODE_4_CERO_TOTAL / HARDCODE_3_INVENTARIO_MENOR_DEMANDA aplican
+    (None = todas).
     """
     selected: list[dict[str, Any]] = []
     summary = {
@@ -46,9 +48,19 @@ def select_engine_rows(
         elif no_recommendation:
             summary["no_recommendation_rows"] += 1
 
+        solidus_allowed = solidus and include_hardcodes
+        if solidus_allowed and hardcode_rules is not None:
+            # La regla de net transfer llega con MOV efectivo 3 (se marca en la
+            # consolidación); las otras dos salen de calculate_target_quantity.
+            rule = (
+                "HARDCODE_3_NET_TRANSFER_BAJO"
+                if row.get("NET_TRANSFER_HARDCODE_3")
+                else engine.calculate_target_quantity(row, config)[1]
+            )
+            solidus_allowed = rule in hardcode_rules
         accepted = (
             (naked and include_naked)
-            or (solidus and include_hardcodes)
+            or solidus_allowed
             or (no_recommendation and include_naked)
         )
         if accepted:

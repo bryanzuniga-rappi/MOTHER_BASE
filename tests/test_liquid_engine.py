@@ -337,3 +337,49 @@ def test_liquid_reaches_store_once_it_receives_a_real_shipment():
         automatic_tail=True, forecast_horizon_days=7, tail_threshold=10,
     )
     assert any(row["RETAIL_ID"] == 10 for row in result.allocation_rows)
+
+
+# --- ADU de CATALOGO en lugar de "días del horizonte" ----------------------------------
+
+def _liquid_report_demand(plan_demand, **kwargs):
+    catalogs = _make_catalogs(stock_444=6.0)
+    config = engine.Config(origin_warehouses=(444,), max_tasks=10)
+    result = _make_result()
+    apply_liquid_engine(
+        result, catalogs, config,
+        [{"WAREHOUSE_DESTINATION": 100, "RETAIL_ID": 10, "PREDICTED_DEMAND": plan_demand}],
+        set(), (), {100: 1.0}, {},
+        automatic_tail=True, tail_threshold=10, **kwargs,
+    )
+    row = next(r for r in result.base_rows if r.get("REGLA_DEMANDA") == "LIQUID_ENGINE")
+    return row["PREDICTED_DEMAND"]
+
+
+def test_liquid_prefers_the_catalog_adu_over_the_plan_demand():
+    # ADU 2/día con Duration 5 => 10; la demanda del plan (70/7 = 10/día) se ignora
+    demand = _liquid_report_demand(
+        70.0, catalog_adu={(100, 10): 2.0}, duration_by_store={100: 5.0},
+    )
+    assert demand == 10.0
+
+
+def test_liquid_falls_back_to_plan_demand_over_the_stores_duration_when_no_catalog_adu():
+    demand = _liquid_report_demand(14.0, catalog_adu={}, duration_by_store={100: 7.0})
+    assert demand == 14.0                      # ADU 2 x 7
+
+
+def test_liquid_uses_the_internal_horizon_only_as_last_resort():
+    default = _liquid_report_demand(14.0)                              # 14 / 7 x 7
+    assert default == 14.0
+    assert _liquid_report_demand(10.0, forecast_horizon_days=5) == 10.0
+
+
+def test_liquid_horizon_is_no_longer_a_codec_input():
+    import ast, pathlib
+    source = (pathlib.Path(__file__).resolve().parent.parent / "modules" / "les_enfants_terribles.py").read_text(encoding="utf-8")
+    labels = [
+        n.args[0].value for n in ast.walk(ast.parse(source))
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "number_input" and n.args and isinstance(n.args[0], ast.Constant)
+    ]
+    assert not [l for l in labels if "horizonte" in str(l).lower()]

@@ -58,7 +58,9 @@ from engines.liquid_engine import (
     parse_manual_skus,
 )
 from engines.shalashaska_engine import (
+    SENSITIVE_CATEGORIES,
     SHALASHASKA_CUT,
+    shalashaska_forced_cities,
     SHALASHASKA_REASON,
     apply_shalashaska_engine,
     empty_shalashaska_summary,
@@ -445,7 +447,7 @@ PLANNING_REASON_COLUMN = "PLANNING_REASON"
 
 # Sello de versión (resultados, advertencias y run['build']). Subir en cada
 # entrega.
-APP_BUILD = "2026-10-05 · kazuhira-v10"
+APP_BUILD = "2026-10-05 · kazuhira-v11"
 
 # REGLA_DEMANDA de filas de cobertura, nunca de la necesidad original de
 # Fountain9; 'Requerido' las excluye.
@@ -1335,6 +1337,11 @@ def consolidate_plan_files(
     catalogs,
     config: engine.Config,
     output_path: Path,
+    *,
+    use_extra_mov_columns: bool = True,
+    net_transfer_rule_enabled: bool = True,
+    net_transfer_max: float = 3.0,
+    destination_stock_below: float = 3.0,
 ) -> tuple[Path, dict[tuple[int, int], dict[str, Any]], dict[str, Any]]:
     """Suma archivos y produce el CSV canónico que consume el motor."""
     if not plan_paths:
@@ -1497,7 +1504,9 @@ def consolidate_plan_files(
                         )
                     )
                 ]
-                for column, field_name in optional_mov_lookup.items():
+                for column, field_name in (
+                    optional_mov_lookup.items() if use_extra_mov_columns else ()
+                ):
                     row_mov_candidates.append(
                         engine.to_float(raw.get(field_name, ""))
                     )
@@ -1542,9 +1551,10 @@ def consolidate_plan_files(
         )
         deficit_rule = opening < demand
         net_transfer_rule = (
-            roq_input <= 0
-            and net_transfer <= 3
-            and destination_stock < 3
+            net_transfer_rule_enabled
+            and roq_input <= 0
+            and net_transfer <= net_transfer_max
+            and destination_stock < destination_stock_below
             and not zero_total_rule
             and not deficit_rule
         )
@@ -1957,15 +1967,30 @@ def build_golden_infaltable_anchor_health_check(
     catalogs,
     target_doh: float,
     catalog_rows: list[dict[str, Any]],
+    targets_by_bucket: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """Verificación de salud al final del pipeline (después de Shalashaska, Liquid y
-    Venom).
+    Venom). Con ``targets_by_bucket`` cada bucket usa su DOH (el más alto si hay
+    traslape); sin él, ``target_doh`` aplica a Infaltable, Golden y Anchor.
     """
-    keys = (
-        catalogs.golden_products
-        | catalogs.infaltable_products
-        | catalogs.anchor_products
+    bucket_keys = {
+        "INFALTABLE": catalogs.infaltable_products,
+        "GOLDEN": catalogs.golden_products,
+        "ANCHOR": catalogs.anchor_products,
+        "KVI": catalogs.kvi_products,
+    }
+    targets = (
+        dict(targets_by_bucket)
+        if targets_by_bucket
+        else {bucket: target_doh for bucket in ("INFALTABLE", "GOLDEN", "ANCHOR")}
     )
+    target_by_key: dict[tuple[int, int], float] = {}
+    for bucket, bucket_target in targets.items():
+        for bucket_key in bucket_keys[bucket]:
+            target_by_key[bucket_key] = max(
+                target_by_key.get(bucket_key, 0.0), float(bucket_target)
+            )
+    keys = set(target_by_key)
     if not keys:
         return {"enabled": False, "checked": 0, "below_target": [], "no_adu": 0}
 
@@ -1989,7 +2014,8 @@ def build_golden_infaltable_anchor_health_check(
         initial_stock = max(float(catalogs.stock_base.get(key, 0.0)), 0.0)
         final_position = initial_stock + assigned_by_key.get(key, 0)
         final_doh = final_position / adu
-        if final_doh < target_doh - 1e-6:
+        key_target = target_by_key[key]
+        if final_doh < key_target - 1e-6:
             store = catalogs.stores.get(destination, {})
             priority_profile = engine.product_priority_profile(
                 catalogs, destination, sku
@@ -2004,9 +2030,9 @@ def build_golden_infaltable_anchor_health_check(
                     "CATEGORY_NAME": product_info.get("CATEGORY_NAME", ""),
                     "TIPO": priority_profile["type"],
                     "DOH_FINAL": round(final_doh, 3),
-                    "DOH_OBJETIVO": round(target_doh, 3),
+                    "DOH_OBJETIVO": round(key_target, 3),
                     "UNIDADES_FALTANTES": int(
-                        math.ceil(max((target_doh - final_doh) * adu, 0.0))
+                        math.ceil(max((key_target - final_doh) * adu, 0.0))
                     ),
                 }
             )
@@ -2703,7 +2729,7 @@ COVERAGE_FOUNTAIN9 = "Fountain9"
 COVERAGE_MINIMUMS = "Mínimos (hardcode)"
 COVERAGE_AVL = "AVL"
 COVERAGE_PREVENTIVE = "Preventivo"
-COVERAGE_SPECIAL_DOH = "Refuerzo Golden/Infaltable/Anchor"
+COVERAGE_SPECIAL_DOH = "Refuerzo (Infaltable/Golden/Anchor/KVI)"
 COVERAGE_NO_FOUNTAIN9 = "Cobertura sin Fountain9"
 COVERAGE_ORDER: dict[str, tuple[str, ...]] = {
     "Naked": (COVERAGE_FOUNTAIN9, COVERAGE_MINIMUMS),
@@ -2741,10 +2767,15 @@ ENGINE_INFO: dict[str, dict[str, Any]] = {
         "stage": "Etapa 1",
         "role": "Cubre la recomendación natural de Fountain9 (ROQ positivo) y sus mínimos.",
         "position": "Base de la planeación; primera prioridad sobre el presupuesto de tareas.",
+        "card": (
+            "Cubre la recomendación natural de Fountain9 (ROQ positivo) y, si lo "
+            "activas, un mínimo cuando no hubo ROQ. Corre primero y tiene prioridad "
+            "sobre las tareas. Aquí configuras las 3 reglas de mínimo y sus umbrales."
+        ),
         "how": (
-            "Toma el MOV efectivo de Fountain9 por tienda-SKU y asigna desde los orígenes en el orden elegido.",
+            "Toma el MOV efectivo de Fountain9 (máximo entre MOV y sus columnas adicionales) y asigna desde los orígenes en el orden elegido.",
             "Respeta stock ajustado, capacidad de la tienda, bloqueos y el presupuesto de tareas.",
-            "Con «Cubrir a Fountain9» arma además un mínimo (3–4 unidades) cuando Fountain9 no dio ROQ positivo.",
+            "Con «Cubrir a Fountain9» arma además un mínimo cuando Fountain9 no dio ROQ positivo, con 3 reglas que se apagan por separado.",
         ),
         "coverages": {
             COVERAGE_FOUNTAIN9: "Necesidad con ROQ positivo.",
@@ -2755,25 +2786,38 @@ ENGINE_INFO: dict[str, dict[str, Any]] = {
         "stage": "Etapa 2",
         "role": "Evacúa inventario próximo a caducar (POR_MERMAR).",
         "position": "Después de Naked, antes de Solidus.",
+        "card": (
+            "Evacúa inventario próximo a caducar (POR_MERMAR) hacia tiendas con ROQ "
+            "positivo que ya reciben del mismo origen. Solo viaja a las ciudades que "
+            "ese origen cubre (puedes sumar más) y puede enviar solo un % de la merma."
+        ),
         "how": (
-            "Solo usa tiendas que ya reciben una transferencia del mismo origen en la corrida.",
-            "Nivela al DOH objetivo y reparte el resto por SHARE_VENTAS.",
-            "POR_MERMAR no sustituye al stock final: respeta stock, capacidad y tareas.",
+            "Solo envía a tiendas con ROQ positivo de Fountain9 que ya reciben del mismo origen; los mínimos (hardcode) no cuentan.",
+            "Solo a las ciudades que cubre cada origen (444, 811, 831 y 834: CDMX; 425: Guadalajara; 856 y 49: Monterrey) más las que agregues.",
+            "Puede evacuar solo un porcentaje de la merma y excluir categorías sensibles (Huevo).",
+            "Reparte parejo por ADU y luego por SHARE_VENTAS; POR_MERMAR no sustituye al stock final.",
         ),
     },
     "Solidus": {
         "stage": "Etapa 3",
         "role": "Coberturas tácticas de catálogo con el stock, la capacidad y las tareas que quedan.",
         "position": "Después de Shalashaska. Sus coberturas corren en cadena: AVL → Preventivo → Refuerzo → Cobertura sin Fountain9.",
+        "card": (
+            "Cuatro coberturas de catálogo con lo que sobra: AVL (quiebres), Preventivo "
+            "(inventario bajo), Refuerzo por bucket (Infaltable, Golden, Anchor, KVI) y "
+            "Cobertura sin Fountain9. Nunca toca una recomendación de Fountain9; si "
+            "falta capacidad o tareas, prioriza por SWA."
+        ),
         "how": (
             "Cada cobertura actúa solo donde Fountain9 no pidió algo positivo; nunca modifica una recomendación de Fountain9.",
-            "ADU: de la tienda-SKU → promedio de la ciudad → tratamiento propio de la cobertura.",
+            "Refuerzo: Infaltable, Golden, Anchor y KVI con toggle y DOH propios; si un SKU está en varios buckets, gana el DOH más alto.",
+            "Con poca capacidad o tareas atiende primero el mayor SWA (toggle).",
             "Comparten stock, capacidad y presupuesto de tareas con Naked, Shalashaska y Liquid.",
         ),
         "coverages": {
             COVERAGE_AVL: "Quiebres (stock 0) del catálogo, hasta el DOH objetivo.",
             COVERAGE_PREVENTIVE: "Inventario bajo (< 1 DOH o < 3 unidades) sin recomendación positiva.",
-            COVERAGE_SPECIAL_DOH: "Lleva Golden / Infaltable / Anchor a su DOH objetivo.",
+            COVERAGE_SPECIAL_DOH: "Lleva Infaltable, Golden, Anchor y KVI a su DOH objetivo (toggle y DOH por bucket).",
             COVERAGE_NO_FOUNTAIN9: "Quiebres sin recomendación positiva, con Duration y Lead Time por tienda.",
         },
     },
@@ -2781,30 +2825,48 @@ ENGINE_INFO: dict[str, dict[str, Any]] = {
         "stage": "Etapa 4",
         "role": "Agota el stock remanente de origen.",
         "position": "Después de Solidus, antes de Venom.",
+        "card": (
+            "Agota el stock remanente de origen: SKUs que tú indicas y saldos bajo un "
+            "umbral. Solo envía a tiendas que ya recibieron producto de otro engine, "
+            "repartiendo por share de ventas hasta 14 DOH con el ADU de CATALOGO."
+        ),
         "how": (
-            "Candidatos: SKUs manuales y remanentes bajo el umbral por origen.",
+            "Candidatos: SKUs manuales por origen y remanentes bajo el umbral.",
             "Solo envía a tiendas que ya recibieron unidades de otro engine en la corrida; no exige el SKU en CATALOGO.",
-            "Reparte por SHARE_VENTAS sin rebasar stock, capacidad ni tareas.",
+            "Nivela con el ADU de CATALOGO hasta 14 DOH y reparte por SHARE_VENTAS sin rebasar stock, capacidad ni tareas.",
         ),
     },
     "Venom": {
         "stage": "Etapa 5",
         "role": "Recompone buffers DDMRP sobre lo ya planeado.",
         "position": "Después de Liquid, antes de Kazuhira.",
+        "card": (
+            "Recompone buffers DDMRP sobre lo ya planeado: si la posición neta cae bajo "
+            "el disparador, pide hasta el techo verde. Configuras LTF, VF, ciclo de "
+            "pedido, múltiplo y SKUs específicos; puede usar una capacidad propia, "
+            "aparte de la de los demás engines."
+        ),
         "how": (
-            "Calcula zonas roja, amarilla y verde (ADU × lead time) por tienda-SKU.",
-            "Si la posición neta queda bajo el techo amarillo, ordena hasta el techo verde.",
-            "Sus líneas quedan separadas de las de otros engines y no usan la capacidad de recibo.",
+            "Calcula zonas roja, amarilla y verde por tienda-SKU con ADU, lead time, LTF, VF, mínimo de orden y ciclo de pedido.",
+            "Si el NFP (on-hand + on-order, con incoming opcional) cae bajo el disparador, ordena hasta el techo verde, redondeado al múltiplo de envío.",
+            "Sus líneas quedan separadas de las de otros engines. Con su tope usa la capacidad completa de la tienda, sin sumarse a lo ya usado ni restarlo a Kazuhira.",
+            "Acepta SKUs específicos por origen, aunque no califiquen en ningún tipo de sección.",
         ),
     },
     "Kazuhira": {
         "stage": "Etapa 6",
         "role": "Garantía final: cubre todo quiebre que aún sea posible resolver.",
         "position": "Última pasada, antes de la partición OWNER. Solo Big Boss.",
+        "card": (
+            "Última red de seguridad: cubre todo quiebre posible de las tiendas que se "
+            "planean hoy, venga o no de Fountain9. Lo que no cubre queda declarado con "
+            "su motivo. Solo Big Boss; puede ignorar el presupuesto de tareas o la "
+            "capacidad."
+        ),
         "how": (
             "Universo: tiendas que se planean hoy (Bulk de Fountain9 + SCHEDULE).",
             "Dispara con (stock + incoming + asignado) / ADU < 1 DOH; sin fila en STOCK cuenta como 0.",
-            "Lo que no cubre queda declarado con su motivo.",
+            "Lo que no cubre queda declarado con su motivo. Opcionales: ignorar presupuesto de tareas, ignorar capacidad, priorizar por SWA.",
         ),
     },
     "Insumos": {
@@ -2974,6 +3036,43 @@ def build_engine_summary_rows(
                 make_row(engine_name, NO_COVERAGE, info["role"], [(engine_name, NO_COVERAGE)])
             )
     return rows
+
+
+BUCKET_DISPLAY = {"INFALTABLE": "Infaltable", "GOLDEN": "Golden", "ANCHOR": "Anchor", "KVI": "KVI"}
+
+
+def special_doh_text(summary: dict[str, Any]) -> str:
+    """"Infaltable 3 DOH, Golden 5 DOH" a partir del resumen del Refuerzo."""
+    buckets = summary.get("doh_by_bucket") or {}
+    if not buckets:
+        return f"{summary.get('doh', 0):g} DOH"
+    return ", ".join(
+        f"{BUCKET_DISPLAY[bucket]} {value:g} DOH" for bucket, value in buckets.items()
+    )
+
+
+def venom_parameters_text(summary: dict[str, Any]) -> str:
+    """Una línea con los parámetros DDMRP con los que corrió Venom."""
+    zone = {"yellow": "amarillo", "red": "rojo", "green": "verde"}.get(
+        summary.get("trigger_zone", "yellow"), "amarillo"
+    )
+    parts = [
+        f"Lead time {summary.get('lead_time_days', 0):g} d",
+        f"LTF {summary.get('ltf', 0):g}",
+        f"VF {summary.get('vf', 0):g}",
+        f"disparador techo {zone}",
+    ]
+    if summary.get("order_cycle_days"):
+        parts.append(f"ciclo de pedido {summary['order_cycle_days']:g} d")
+    if summary.get("shipping_multiple", 1) > 1:
+        parts.append(f"múltiplo {summary['shipping_multiple']}")
+    parts.append("con incoming" if summary.get("consider_incoming") else "sin incoming")
+    parts.append(
+        "tope de capacidad propio" if summary.get("cap_to_store_capacity") else "sin tope de capacidad"
+    )
+    if summary.get("manual_pairs"):
+        parts.append(f"{summary['manual_pairs']:,} tienda-SKU específicas")
+    return "Parámetros: " + " · ".join(parts) + "."
 
 
 def swa_card(engine_name: str, swa_by_engine: dict[str, float]) -> dict[str, Any]:
@@ -4904,12 +5003,16 @@ def apply_avl_fill(
     duration_source_by_store: dict[int, str] | None = None,
     skip_reasons: dict[tuple[int, int], str] | None = None,
     swa_priority: bool = False,
+    special_doh_targets: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """Cobertura de catálogo con las tareas remanentes. candidate_mode: stockout (AVL),
     preventive, special_doh (Refuerzo), no_fountain9_coverage o kazuhira. Solo
     Kazuhira usa fallback_duration, fallback_lead_time, ignore_task_budget,
-    ignore_store_capacity y swa_priority. skip_reasons recibe el motivo de cada
-    tienda-SKU no cubierta.
+    ignore_store_capacity. swa_priority sirve a todos los modos: ante escasez de
+    capacidad o tareas atiende primero el mayor SWA. special_doh_targets
+    ({bucket: DOH}, buckets INFALTABLE/GOLDEN/ANCHOR/KVI) define el universo y el
+    DOH de cada bucket del Refuerzo; si una tienda-SKU está en varios, gana el
+    DOH más alto. skip_reasons recibe el motivo de cada tienda-SKU no cubierta.
     """
     if candidate_mode not in {
         "stockout", "preventive", "special_doh", "no_fountain9_coverage",
@@ -4919,6 +5022,8 @@ def apply_avl_fill(
     duration_mode_by_store = duration_mode_by_store or {}
     lead_time_mode_by_store = lead_time_mode_by_store or {}
     duration_source_by_store = duration_source_by_store or {}
+    # El bypass global de CODEC aplica a todas las coberturas, no solo a Kazuhira.
+    ignore_store_capacity = ignore_store_capacity or bool(config.ignore_store_capacity)
     summary = empty_avl_summary(True, doh)
 
     def log_skip(skip_key: tuple[int, int], reason: str) -> None:
@@ -4934,6 +5039,9 @@ def apply_avl_fill(
     # Con skip_reasons activo (Kazuhira) NO se corta aquí aunque el
     # presupuesto ya esté agotado: hay que evaluar los candidatos para
     # distinguir lo sano de lo que queda sin cubrir por falta de tareas.
+    if candidate_mode == "special_doh" and special_doh_targets is not None:
+        doh = max(special_doh_targets.values(), default=0.0)
+        summary["doh"] = float(doh)
     if doh <= 0 or (
         not ignore_task_budget
         and summary["task_slots_before"] <= 0
@@ -4986,13 +5094,28 @@ def apply_avl_fill(
             (allocation["WAREHOUSE_DESTINATION"], allocation["RETAIL_ID"])
         ] += int(allocation.get("QUANTITY", 0) or 0)
 
+    special_target_by_key: dict[tuple[int, int], float] = {}
     if candidate_mode == "special_doh":
-        # Universo: GOLDEN_INFALTABLES_ANCHOR completo, no CATALOGO.
-        iteration_keys = (
-            catalogs.golden_products
-            | catalogs.infaltable_products
-            | catalogs.anchor_products
+        # Universo: los buckets activos de GOLDEN_INFALTABLES_ANCHOR (y KVI), no
+        # CATALOGO. Cada bucket trae su DOH; el más alto gana si hay traslape.
+        bucket_keys = {
+            "INFALTABLE": catalogs.infaltable_products,
+            "GOLDEN": catalogs.golden_products,
+            "ANCHOR": catalogs.anchor_products,
+            "KVI": catalogs.kvi_products,
+        }
+        targets = (
+            dict(special_doh_targets)
+            if special_doh_targets is not None
+            else {bucket: doh for bucket in ("INFALTABLE", "GOLDEN", "ANCHOR")}
         )
+        for bucket, bucket_doh in targets.items():
+            for bucket_key in bucket_keys[bucket]:
+                special_target_by_key[bucket_key] = max(
+                    special_target_by_key.get(bucket_key, 0.0), float(bucket_doh)
+                )
+        summary["doh_by_bucket"] = {b: float(v) for b, v in targets.items()}
+        iteration_keys = set(special_target_by_key)
         iteration_rows = [
             {"WAREHOUSE_DESTINATION": destination, "RETAIL_ID": sku}
             for destination, sku in iteration_keys
@@ -5012,6 +5135,7 @@ def apply_avl_fill(
         destination = catalog_row["WAREHOUSE_DESTINATION"]
         sku = catalog_row["RETAIL_ID"]
         key = (destination, sku)
+        key_doh = special_target_by_key.get(key, doh)
         if allowed_destinations is not None and destination not in allowed_destinations:
             summary["skipped_outside_universe"] = (
                 summary.get("skipped_outside_universe", 0) + 1
@@ -5147,10 +5271,10 @@ def apply_avl_fill(
             current_position = destination_stock + already_assigned
             if adu > 0:
                 current_doh = current_position / adu
-                if current_doh >= doh:
+                if current_doh >= key_doh:
                     summary["skipped_doh_sufficient"] += 1
                     continue
-                target_position = int(math.ceil(adu * doh))
+                target_position = int(math.ceil(adu * key_doh))
                 target = max(target_position - current_position, 0)
                 if target <= 0:
                     summary["skipped_doh_sufficient"] += 1
@@ -5194,6 +5318,7 @@ def apply_avl_fill(
                 "NO_ADU_ANYWHERE": no_adu_anywhere,
                 "DESTINATION_STOCK": destination_stock,
                 "CURRENT_DOH": current_doh,
+                "TARGET_DOH": key_doh,
                 "TARGET": target,
                 "STORE": store,
                 "IS_GOLDEN": is_golden,
@@ -5497,7 +5622,7 @@ def apply_avl_fill(
             "DOH_AVL": (
                 (candidate["DURATION_MODE"] or 0) + (candidate["LEAD_TIME_MODE"] or 0)
                 if candidate_mode in ("no_fountain9_coverage", "kazuhira")
-                else doh
+                else candidate["TARGET_DOH"]
             ),
             "DOH_DESTINO_ANTES": (
                 round(candidate["CURRENT_DOH"], 3)
@@ -5578,13 +5703,13 @@ def apply_avl_fill(
                             if candidate_mode in ("no_fountain9_coverage", "kazuhira")
                             else (
                                 (
-                                    "Refuerzo Golden/Infaltable/Anchor SIN ADU "
+                                    "Refuerzo SIN ADU "
                                     "(ni propio ni de la ciudad): mínimo operativo "
                                     "de 3 unidades, sin piso de DOH."
                                 )
                                 if candidate["NO_ADU_ANYWHERE"]
                                 else (
-                                    "Refuerzo Golden/Infaltable/Anchor: "
+                                    "Refuerzo: "
                                     f"{candidate['DESTINATION_STOCK']:g} unidades en "
                                     "stock + lo ya asignado por otros engines de "
                                     "cobertura en esta corrida = "
@@ -5599,7 +5724,7 @@ def apply_avl_fill(
                     "; "
                     if candidate_mode in ("no_fountain9_coverage", "kazuhira")
                     else (
-                        f"; objetivo de cobertura {doh:g} DOH con ADU "
+                        f"; objetivo de cobertura {candidate['TARGET_DOH']:g} DOH con ADU "
                         f"{candidate['ADU']:.4f}. "
                         if not (
                             candidate_mode == "special_doh"
@@ -5947,13 +6072,12 @@ def write_executive_pdf(
                 )
                 + (
                     (
-                        f" Refuerzo Golden/Infaltable/Anchor a "
-                        f"{special_doh.get('doh', 0):g} DOH: "
+                        f" Refuerzo ({special_doh_text(special_doh)}): "
                         f"{special_doh['cases_sent']:,} casos y "
                         f"{special_doh['units_added']:,} unidades."
                     )
                     if special_doh.get("enabled")
-                    else " Refuerzo Golden/Infaltable/Anchor desactivado."
+                    else " Refuerzo desactivado."
                 )
                 + (
                     (
@@ -6371,6 +6495,8 @@ def execute_planning(
     enable_rackeados_rule: bool = True,
     enable_closed_stores_rule: bool = True,
     enable_regional_block_rule: bool = True,
+    enable_global_blocks_rule: bool = True,
+    ignore_store_capacity: bool = False,
     enable_route_cost_block_rule: bool = True,
     simulation_mode: bool = False,
     minimum_positive_quantity: int = 3,
@@ -6378,10 +6504,22 @@ def execute_planning(
     include_special_doh_fill: bool = False,
     include_no_fountain9_coverage: bool = False,
     special_doh_target: float = 3.0,
+    special_doh_targets: dict[str, float] | None = None,
+    solidus_swa_priority: bool = True,
     include_naked_engine: bool = True,
     cover_fountain9_hardcodes: bool = True,
+    hardcode_zero_total: bool = True,
+    hardcode_inventory_below_demand: bool = True,
+    hardcode_low_net_transfer: bool = True,
+    net_transfer_max: float = 3.0,
+    destination_stock_below: float = 3.0,
+    raise_small_roq_to_minimum: bool = True,
+    use_extra_mov_columns: bool = True,
     include_solidus_engine: bool = True,
     include_shalashaska_engine: bool = False,
+    shalashaska_extra_cities: tuple[str, ...] = (),
+    shalashaska_allow_sensitive: bool = False,
+    shalashaska_evacuation_fraction: float = 1.0,
     shalashaska_target_doh: float = 7.0,
     include_liquid_engine: bool = False,
     liquid_automatic_tail: bool = True,
@@ -6403,6 +6541,17 @@ def execute_planning(
     venom_section_types: frozenset[str] = frozenset(),
     venom_lead_time_days: float = 2.0,
     venom_consider_current_planning: bool = True,
+    venom_ltf: float = 0.5,
+    venom_vf: float = 0.5,
+    venom_min_green_units: float | None = None,
+    venom_order_cycle_days: float = 0.0,
+    venom_trigger_zone: str = "yellow",
+    venom_subtract_lead_time_demand: bool = True,
+    venom_consider_incoming: bool = False,
+    venom_shipping_multiple: int = 1,
+    venom_cap_to_store_capacity: bool = False,
+    venom_manual_skus_by_origin: dict[int, set[int]] | None = None,
+    venom_only_manual_skus: bool = False,
 ) -> dict[str, Any]:
     clear_previous_workspace()
     workspace = Path(tempfile.mkdtemp(prefix="transfer_planner_"))
@@ -6455,6 +6604,8 @@ def execute_planning(
         default_store_capacity_m3=engine.CONFIG.default_store_capacity_m3,
         default_m3_per_unit=engine.CONFIG.default_m3_per_unit,
         minimum_positive_quantity=minimum_positive_quantity,
+        raise_small_roq_to_minimum=bool(raise_small_roq_to_minimum),
+        ignore_store_capacity=bool(ignore_store_capacity),
         local_work_dir=str(workspace / "engine"),
     )
 
@@ -6498,6 +6649,19 @@ def execute_planning(
                 f"{weekday_display}; se omitirán los envíos origen-destino "
                 f"fuera de los días definidos en SCHEDULE "
                 f"({len(catalogs.schedule_days):,} combinaciones configuradas)."
+            )
+        if not enable_global_blocks_rule:
+            catalogs.warnings.append(
+                "Regla BLOQUEOS desactivada para esta corrida desde CODEC: "
+                f"{len(catalogs.globally_blocked_skus):,} SKUs de la hoja dejaron "
+                "de bloquearse (la exclusión manual de SKUs sigue aplicando)."
+            )
+            catalogs.globally_blocked_skus = set()
+        if ignore_store_capacity:
+            catalogs.warnings.append(
+                "Capacidad de tienda ignorada en todos los engines desde CODEC: "
+                "el uso de m³ se sigue registrando en los reportes, pero ninguna "
+                "línea se corta por capacidad."
             )
         excluded_sku_set = set(excluded_skus or ()) | catalogs.globally_blocked_skus
         manually_excluded_store_ids = set(excluded_store_ids or ())
@@ -6550,6 +6714,12 @@ def execute_planning(
                 catalogs,
                 config,
                 canonical_plan_path,
+                use_extra_mov_columns=use_extra_mov_columns,
+                net_transfer_rule_enabled=(
+                    cover_fountain9_hardcodes and hardcode_low_net_transfer
+                ),
+                net_transfer_max=net_transfer_max,
+                destination_stock_below=destination_stock_below,
             )
         )
         plan_read = engine.read_plan_csv(plan_path, config)
@@ -6641,6 +6811,15 @@ def execute_planning(
             config,
             include_naked=include_naked_engine,
             include_hardcodes=cover_fountain9_hardcodes,
+            hardcode_rules=frozenset(
+                rule
+                for rule, enabled in (
+                    ("HARDCODE_4_CERO_TOTAL", hardcode_zero_total),
+                    ("HARDCODE_3_INVENTARIO_MENOR_DEMANDA", hardcode_inventory_below_demand),
+                    ("HARDCODE_3_NET_TRANSFER_BAJO", hardcode_low_net_transfer),
+                )
+                if enabled
+            ),
         )
 
         result = engine.plan_transfers(engine_plan_rows, catalogs, config)
@@ -6712,6 +6891,24 @@ def execute_planning(
             include_shalashaska_engine
         )
         if include_shalashaska_engine:
+            # Ciudades activas: las forzadas por los orígenes + las que agregó el
+            # usuario. Sin ninguna regla aplicable no se restringe por ciudad.
+            shalashaska_allowed_cities: set[str] | None = shalashaska_forced_cities(
+                origins
+            ) | {engine.normalize_city(city) for city in shalashaska_extra_cities}
+            if not shalashaska_allowed_cities:
+                shalashaska_allowed_cities = None
+            # Regla mandante: solo recibe merma una tienda con ROQ positivo de
+            # Fountain9; los mínimos (hardcode) no cuentan.
+            shalashaska_non_natural_keys = {
+                (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"])
+                for row in result.base_rows
+                if row.get("REGLA_DEMANDA") in MANUAL_FORECAST_ZERO_RULES
+            } | {
+                key
+                for key, record in consolidated_input.items()
+                if record.get("NET_TRANSFER_HARDCODE_3")
+            }
             expiring_rows = load_expiring_inventory(data_path)
             store_shares_cache = load_store_shares(data_path)
             catalog_fill_rows_cache, catalog_warnings = load_avl_catalog_rows(
@@ -6735,7 +6932,19 @@ def execute_planning(
                 run_date=run_date,
                 target_doh=shalashaska_target_doh,
                 reason_column=PLANNING_REASON_COLUMN,
+                allowed_cities=shalashaska_allowed_cities,
+                non_natural_keys=shalashaska_non_natural_keys,
+                evacuation_fraction=shalashaska_evacuation_fraction,
+                excluded_categories=(
+                    frozenset() if shalashaska_allow_sensitive else SENSITIVE_CATEGORIES
+                ),
             )
+            if shalashaska_summary["sensitive_unclassified"]:
+                result.warnings.append(
+                    f"Shalashaska: {shalashaska_summary['sensitive_unclassified']:,} "
+                    "SKUs en riesgo no tienen CATEGORY_NAME en la hoja DATA, así que "
+                    "no se pudo verificar si son categoría sensible."
+                )
             result.warnings.append(
                 "Shalashaska Engine: se evacuaron "
                 f"{shalashaska_summary['units_evacuated']:,} de "
@@ -6750,6 +6959,13 @@ def execute_planning(
         )
         include_special_doh_fill = (
             include_solidus_engine and include_special_doh_fill
+        )
+        # DOH por bucket del Refuerzo; sin dict se conserva el criterio anterior
+        # (un solo DOH para Infaltable, Golden y Anchor; sin KVI).
+        effective_special_targets = (
+            {b: float(v) for b, v in special_doh_targets.items()}
+            if special_doh_targets is not None
+            else {b: float(special_doh_target) for b in ("INFALTABLE", "GOLDEN", "ANCHOR")}
         )
         include_no_fountain9_coverage = (
             include_solidus_engine and include_no_fountain9_coverage
@@ -6777,6 +6993,7 @@ def execute_planning(
                 engine_blocked_store_ids,
                 blocked_cities,
                 avl_doh,
+                swa_priority=solidus_swa_priority,
             )
             result.warnings.append(
                 f"Cobertura AVL ({avl_doh:g} DOH): se agregaron "
@@ -6802,6 +7019,7 @@ def execute_planning(
                 avl_doh,
                 candidate_mode="preventive",
                 excluded_keys=fountain_recommended_keys,
+                swa_priority=solidus_swa_priority,
             )
             result.warnings.append(
                 f"Blindaje preventivo ({avl_doh:g} DOH): se agregaron "
@@ -6825,17 +7043,24 @@ def execute_planning(
                 config,
                 engine_blocked_store_ids,
                 blocked_cities,
-                special_doh_target,
+                max(effective_special_targets.values(), default=0.0),
                 candidate_mode="special_doh",
                 excluded_keys=fountain_recommended_keys,
+                swa_priority=solidus_swa_priority,
+                special_doh_targets=effective_special_targets,
             )
+            special_doh_summary["buckets"] = sorted(effective_special_targets)
             result.warnings.append(
-                f"Refuerzo Golden/Infaltable/Anchor ({special_doh_target:g} DOH): "
-                f"se agregaron {special_doh_summary['cases_sent']:,} casos, "
+                "Refuerzo ("
+                + ", ".join(
+                    f"{bucket.title()} {value:g} DOH"
+                    for bucket, value in effective_special_targets.items()
+                )
+                + f"): se agregaron {special_doh_summary['cases_sent']:,} casos, "
                 f"{special_doh_summary['tasks_added']:,} tareas y "
-                f"{special_doh_summary['units_added']:,} unidades para subir "
-                "productos Golden, Infaltable o Anchor por debajo del DOH "
-                "objetivo, sin recomendación positiva de Fountain9."
+                f"{special_doh_summary['units_added']:,} unidades para subir los "
+                "productos de esos buckets por debajo de su DOH objetivo, sin "
+                "recomendación positiva de Fountain9."
             )
 
         no_fountain9_summary = empty_avl_summary(include_no_fountain9_coverage, 1.0)
@@ -6859,6 +7084,7 @@ def execute_planning(
                 lead_time_mode_by_store=consolidation_summary.get(
                     "lead_time_mode_by_store", {}
                 ),
+                swa_priority=solidus_swa_priority,
             )
             result.warnings.append(
                 "Cobertura sin Fountain9: se agregaron "
@@ -6897,6 +7123,12 @@ def execute_planning(
                     else origins
                 ),
                 forecast_horizon_days=forecast_horizon_days,
+                catalog_adu={
+                    (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"]): row["ADU"]
+                    for row in ensure_catalog_rows()
+                    if row["RETAIL_ID"] not in excluded_sku_set
+                },
+                duration_by_store=consolidation_summary.get("duration_mode_by_store", {}),
                 max_doh=14.0,
                 tail_threshold=int(liquid_tail_threshold),
                 reason_column=PLANNING_REASON_COLUMN,
@@ -6952,10 +7184,12 @@ def execute_planning(
                     "seleccionada quedó disponible (revisa exclusiones y "
                     "ciudades bloqueadas). No se generaron líneas."
                 )
-            elif not venom_section_types:
+            elif not venom_section_types and not any(
+                (venom_manual_skus_by_origin or {}).values()
+            ):
                 result.warnings.append(
                     "Venom Engine: activo, pero no se seleccionó ningún tipo "
-                    "de sección. No se generaron líneas."
+                    "de sección ni SKUs específicos. No se generaron líneas."
                 )
             else:
                 venom_summary = apply_venom_engine(
@@ -6971,6 +7205,20 @@ def execute_planning(
                     closed_or_excluded_store_ids=engine_blocked_store_ids,
                     blocked_cities=blocked_cities,
                     reason_column=PLANNING_REASON_COLUMN,
+                    ltf=float(venom_ltf),
+                    vf=float(venom_vf),
+                    min_green_units=venom_min_green_units,
+                    order_cycle_days=float(venom_order_cycle_days),
+                    trigger_zone=venom_trigger_zone,
+                    subtract_lead_time_demand=venom_subtract_lead_time_demand,
+                    consider_incoming=venom_consider_incoming,
+                    shipping_multiple=int(venom_shipping_multiple),
+                    cap_to_store_capacity=venom_cap_to_store_capacity,
+                    manual_skus_by_origin={
+                        int(source): set(skus) - excluded_sku_set
+                        for source, skus in (venom_manual_skus_by_origin or {}).items()
+                    },
+                    only_manual_skus=venom_only_manual_skus,
                 )
                 result.warnings.append(
                     "Venom Engine (DDMRP post-planeación, lead time "
@@ -7123,13 +7371,14 @@ def execute_planning(
             catalogs,
             special_doh_target,
             health_check_catalog_rows,
+            targets_by_bucket=effective_special_targets or None,
         )
         if golden_health_check["below_target"]:
             affected = len(golden_health_check["below_target"])
             result.warnings.append(
-                "Check de salud Golden/Infaltable/Anchor: "
+                "Check de salud del Refuerzo (Infaltable/Golden/Anchor/KVI): "
                 f"{affected:,} tienda-SKU terminaron esta corrida por debajo "
-                f"de {special_doh_target:g} DOH (de {golden_health_check['checked']:,} "
+                f"de su DOH objetivo (de {golden_health_check['checked']:,} "
                 "evaluadas). Es probable que un engine posterior al Refuerzo "
                 "(Shalashaska, Liquid o Venom) haya consumido stock del mismo "
                 "origen después de que se les aseguró su cobertura. Revisa el "
@@ -7144,6 +7393,9 @@ def execute_planning(
             closed_store_ids,
             blocked_cities,
             health_check_catalog_rows,
+            target_doh=effective_special_targets.get(
+                "GOLDEN", GOLDEN_INFALTABLE_ANCHOR_RISK_DOH
+            ),
         )
         infaltable_universe_report = build_bucket_universe_report(
             catalogs.infaltable_products,
@@ -7153,6 +7405,9 @@ def execute_planning(
             closed_store_ids,
             blocked_cities,
             health_check_catalog_rows,
+            target_doh=effective_special_targets.get(
+                "INFALTABLE", GOLDEN_INFALTABLE_ANCHOR_RISK_DOH
+            ),
         )
         anchor_universe_report = build_bucket_universe_report(
             catalogs.anchor_products,
@@ -7162,8 +7417,22 @@ def execute_planning(
             closed_store_ids,
             blocked_cities,
             health_check_catalog_rows,
+            target_doh=effective_special_targets.get(
+                "ANCHOR", GOLDEN_INFALTABLE_ANCHOR_RISK_DOH
+            ),
+        )
+        kvi_universe_report = build_bucket_universe_report(
+            catalogs.kvi_products if "KVI" in effective_special_targets else set(),
+            result,
+            catalogs,
+            config,
+            closed_store_ids,
+            blocked_cities,
+            health_check_catalog_rows,
+            target_doh=effective_special_targets.get("KVI", GOLDEN_INFALTABLE_ANCHOR_RISK_DOH),
         )
         for bucket_label, bucket_report in (
+            ("KVI", kvi_universe_report),
             ("Golden", golden_universe_report),
             ("Infaltable", infaltable_universe_report),
             ("Anchor", anchor_universe_report),
@@ -7350,7 +7619,11 @@ def execute_planning(
         )
         engine_enabled = {
             ("Naked", COVERAGE_FOUNTAIN9): include_naked_engine,
-            ("Naked", COVERAGE_MINIMUMS): include_naked_engine and cover_fountain9_hardcodes,
+            ("Naked", COVERAGE_MINIMUMS): (
+                include_naked_engine
+                and cover_fountain9_hardcodes
+                and (hardcode_zero_total or hardcode_inventory_below_demand or hardcode_low_net_transfer)
+            ),
             ("Shalashaska", NO_COVERAGE): include_shalashaska_engine,
             ("Solidus", COVERAGE_AVL): include_solidus_engine and include_avl_fill,
             ("Solidus", COVERAGE_PREVENTIVE): include_solidus_engine and include_preventive_fill,
@@ -7567,6 +7840,7 @@ def execute_planning(
         "golden_universe_report": golden_universe_report,
         "infaltable_universe_report": infaltable_universe_report,
         "anchor_universe_report": anchor_universe_report,
+        "kvi_universe_report": kvi_universe_report,
         "copernico_cuts": copernico_cuts,
         "venom": venom_summary,
         "kazuhira": kazuhira_summary,
@@ -8463,6 +8737,7 @@ UNIVERSE_BUCKET_BADGE_COLORS = {
     "GOLDEN": "#FFF000",
     "INFALTABLE": "#BD00FF",
     "ANCHOR": "#FF007F",
+    "KVI": "#D9FF3F",
 }
 
 
@@ -9460,6 +9735,7 @@ def render_results(run: dict[str, Any]) -> None:
     render_bucket_universe_report(
         "ANCHOR", run.get("anchor_universe_report", {})
     )
+    render_bucket_universe_report("KVI", run.get("kvi_universe_report", {}))
 
     st.markdown(
         '<div class="report-title">REPORTE POR ENGINE.</div>',
@@ -9742,7 +10018,7 @@ def render_results(run: dict[str, Any]) -> None:
                     "value": f"{special_doh.get('units_added', 0):,}",
                     "description": (
                         f"Unidades adicionales para subir Golden/Infaltable/Anchor "
-                        f"hasta {special_doh.get('doh', 0):g} DOH, sin mínimo "
+                        f"hasta su DOH por bucket, sin mínimo "
                         "forzado de 3 unidades (a diferencia de AVL/preventivo)."
                     ),
                     "tone": "acid",
@@ -9758,7 +10034,7 @@ def render_results(run: dict[str, Any]) -> None:
                     ),
                 },
                 *(
-                    [swa_card("Refuerzo Golden/Infaltable/Anchor", swa_by_engine)]
+                    [swa_card(COVERAGE_SPECIAL_DOH, swa_by_engine)]
                     if swa_enabled
                     else []
                 ),
@@ -9766,7 +10042,7 @@ def render_results(run: dict[str, Any]) -> None:
             columns_count=4,
         )
         st.success(
-            f"Refuerzo Golden/Infaltable/Anchor a {special_doh.get('doh', 0):g} DOH: "
+            f"Refuerzo ({special_doh_text(special_doh)}): "
             f"{special_doh.get('cases_sent', 0):,} casos, "
             f"{special_doh.get('tasks_added', 0):,} tareas y "
             f"{special_doh.get('units_added', 0):,} unidades adicionales."
@@ -9926,6 +10202,13 @@ def render_results(run: dict[str, Any]) -> None:
             "Corre al final, sobre los remanentes. Sus líneas no se consolidan con lo "
             f"ya planeado; van separadas y marcadas con '{VENOM_CUT}'."
         )
+        st.caption(venom_parameters_text(venom))
+        if venom.get("units_cut_by_capacity"):
+            st.warning(
+                f"El tope de capacidad de Venom recortó {venom['units_cut_by_capacity']:,} "
+                f"unidades y dejó {venom.get('skipped_capacity_cap', 0):,} tienda-SKU sin "
+                "enviar por falta de espacio propio."
+            )
         render_kpi_cards(
             [
                 {
@@ -10557,7 +10840,7 @@ def render() -> None:
         )
 
         st.markdown("###### Reglas activas por default — desactivar es la excepción")
-        rules_col1, rules_col2, rules_col3, rules_col4 = st.columns(4)
+        rules_col1, rules_col2, rules_col3, rules_col4, rules_col5 = st.columns(5)
         with rules_col1:
             enable_rackeados_rule = st.toggle(
                 "Regla de rackeados",
@@ -10592,6 +10875,17 @@ def render() -> None:
                 help=(
                     "Si se apaga, ninguna combinación tienda-SKU se bloquea "
                     "por la hoja RUTA_COSTOS."
+                ),
+            )
+
+        with rules_col5:
+            enable_global_blocks_rule = st.toggle(
+                "Regla de bloqueos",
+                value=True,
+                help=(
+                    "Si se apaga, los SKUs de la hoja BLOQUEOS dejan de excluirse "
+                    "de todos los engines. La exclusión manual de SKUs sigue "
+                    "aplicando. No confundir con BLOQUEOS_FORANEAS (bloqueo regional)."
                 ),
             )
 
@@ -10631,7 +10925,17 @@ def render() -> None:
             ),
         )
 
-        support_left, support_center, support_right = st.columns(3)
+        support_left, support_center, support_right, support_capacity = st.columns(4)
+        with support_capacity:
+            ignore_store_capacity = st.toggle(
+                "Ignorar capacidad de tienda (m³)",
+                value=False,
+                help=(
+                    "Ningún engine corta por capacidad de recibo de la tienda "
+                    "(CAP_RECIBO). El uso de m³ se sigue registrando en los "
+                    "reportes. Venom tiene su propio tope de capacidad aparte."
+                ),
+            )
         with support_left:
             include_insumos = st.toggle(
                 "Agregar insumos al Bulk del 444",
@@ -10687,11 +10991,7 @@ def render() -> None:
             key="engine_naked_card",
             eyebrow="ENGINE / 01 · FOUNTAIN9",
             title="NAKED ENGINE",
-            description=(
-                "Recomendación natural de Fountain9, más los hardcodes de "
-                "cobertura cuando no dio un ROQ positivo. Tiene la primera "
-                "prioridad sobre el presupuesto compartido de tareas."
-            ),
+            description=ENGINE_INFO["Naked"]["card"],
             active=include_naked_engine,
             tone="acid",
             status="ACTIVO" if include_naked_engine else "INACTIVO · CLIC PARA ACTIVAR",
@@ -10701,28 +11001,109 @@ def render() -> None:
             st.session_state["mb_engine_naked_enabled"] = not include_naked_engine
             st.rerun()
         cover_fountain9_hardcodes = False
+        hardcode_zero_total = True
+        hardcode_inventory_below_demand = True
+        hardcode_low_net_transfer = True
+        net_transfer_max = 3.0
+        destination_stock_below = 3.0
+        raise_small_roq_to_minimum = True
+        use_extra_mov_columns = True
         if include_naked_engine:
-            st.caption("Procesa exclusivamente casos con ROQ natural positivo.")
+            naked_left, naked_right = st.columns(2)
+            with naked_left:
+                raise_small_roq_to_minimum = st.toggle(
+                    "Subir recomendaciones pequeñas al mínimo",
+                    value=True,
+                    help=(
+                        "Una recomendación positiva de Fountain9 menor al mínimo "
+                        "de unidades se sube a ese mínimo. Apagado: se envía el "
+                        "ROQ redondeado hacia arriba, sin piso."
+                    ),
+                )
+            with naked_right:
+                use_extra_mov_columns = st.toggle(
+                    "Usar columnas adicionales de MOV",
+                    value=True,
+                    help=(
+                        "El MOV efectivo es el máximo entre la columna MOV y las "
+                        "columnas opcionales del Bulk de Fountain9. Apagado: "
+                        "solo cuenta la columna MOV."
+                    ),
+                )
             cover_fountain9_hardcodes = st.toggle(
                 "Cubrir a Fountain9",
                 value=True,
                 help=(
                     "Cuando Fountain9 no dio un ROQ positivo (MOV ≤ 0), el "
-                    "modelo igual puede armar un objetivo de 3 o 4 unidades "
-                    "según inventario/demanda en destino "
-                    "(HARDCODE_4_CERO_TOTAL / HARDCODE_3_INVENTARIO_MENOR_"
-                    "DEMANDA). Apagar esto deja esos casos completamente sin "
-                    "cubrir por Naked — Solidus (AVL/Preventivo/Refuerzo) "
-                    "sigue pudiendo cubrirlos por su cuenta si aplica."
+                    "modelo igual puede armar un mínimo de unidades según "
+                    "inventario y demanda en destino. Apagar esto deja esos "
+                    "casos sin cubrir por Naked; Solidus puede cubrirlos por "
+                    "su cuenta si aplica."
                 ),
             )
+            if cover_fountain9_hardcodes:
+                rule_left, rule_center, rule_right = st.columns(3)
+                with rule_left:
+                    hardcode_zero_total = st.toggle(
+                        "Cubrir forecast y stock en cero",
+                        value=True,
+                        help=(
+                            "Regla HARDCODE_4_CERO_TOTAL: demanda y opening "
+                            "predichos en cero."
+                        ),
+                    )
+                with rule_center:
+                    hardcode_inventory_below_demand = st.toggle(
+                        "Cubrir inventario menor a la demanda",
+                        value=True,
+                        help=(
+                            "Regla HARDCODE_3_INVENTARIO_MENOR_DEMANDA: ROQ no "
+                            "positivo y opening predicho menor a la demanda."
+                        ),
+                    )
+                with rule_right:
+                    hardcode_low_net_transfer = st.toggle(
+                        "Cubrir net transfer bajo",
+                        value=True,
+                        help=(
+                            "Regla HARDCODE_3_NET_TRANSFER_BAJO: ROQ no positivo, "
+                            "net transfer bajo y poco stock en destino."
+                        ),
+                    )
+                if hardcode_low_net_transfer:
+                    net_left, net_right = st.columns(2)
+                    with net_left:
+                        net_transfer_max = float(
+                            st.number_input(
+                                "Net transfer máximo (unidades)",
+                                min_value=0.0,
+                                max_value=50.0,
+                                value=3.0,
+                                step=1.0,
+                                help="La regla aplica con net transfer menor o igual a este valor.",
+                            )
+                        )
+                    with net_right:
+                        destination_stock_below = float(
+                            st.number_input(
+                                "Stock destino menor a (unidades)",
+                                min_value=0.0,
+                                max_value=50.0,
+                                value=3.0,
+                                step=1.0,
+                                help="La regla aplica con stock en destino estrictamente menor a este valor.",
+                            )
+                        )
         else:
             st.caption(
                 "Naked Engine está apagado. Activa la tarjeta para incluir la "
                 "recomendación natural de Fountain9."
             )
 
-    shalashaska_target_doh = 7.0
+    shalashaska_target_doh = 7.0       # nivelación interna; ya no se expone en CODEC
+    shalashaska_extra_cities: list[str] = []
+    shalashaska_allow_sensitive = False
+    shalashaska_evacuation_fraction = 1.0
     with st.container(border=True, key="engine_shalashaska_module"):
         include_shalashaska_engine = bool(
             st.session_state["mb_engine_shalashaska_enabled"]
@@ -10731,11 +11112,7 @@ def render() -> None:
             key="engine_shalashaska_card",
             eyebrow="ENGINE / 02 · EXPIRATION EVACUATION",
             title="SHALASHASKA ENGINE",
-            description=(
-                "Evacúa inventario próximo a caducar hacia tiendas que ya salen "
-                "desde el mismo origen. Primero nivela DOH con ADU de CATALOGO; "
-                "después distribuye el remanente por share de ventas."
-            ),
+            description=ENGINE_INFO["Shalashaska"]["card"],
             active=include_shalashaska_engine,
             tone="orange",
             status=(
@@ -10753,26 +11130,64 @@ def render() -> None:
             )
             st.rerun()
         if include_shalashaska_engine:
-            shala_left, shala_right = st.columns([1, 2])
+            forced_cities = shalashaska_forced_cities(tuple(selected_origins))
+            city_names = {"CDMX": "Ciudad de México", "GDL": "Guadalajara", "MTY": "Monterrey"}
+            if forced_cities:
+                st.markdown(
+                    "**Ciudades siempre activas** (por los orígenes elegidos): "
+                    + ", ".join(city_names[c] for c in sorted(forced_cities))
+                    + ". 444, 811, 831 y 834 activan CDMX; 425, Guadalajara; "
+                    "856 y 49, Monterrey."
+                )
+            else:
+                st.caption("Con los orígenes elegidos no hay ciudad forzada: sin restricción por ciudad.")
+            shalashaska_extra_cities = st.multiselect(
+                "Ciudades adicionales (opcional)",
+                options=[
+                    city for city in city_labels
+                    if engine.normalize_city(city) not in forced_cities
+                ],
+                default=[],
+                format_func=lambda city: city_labels.get(city, city),
+                help=(
+                    "Por defecto la merma solo viaja a las ciudades forzadas por el "
+                    "origen: las lejanas tardan más en evacuarla."
+                ),
+            )
+            shala_left, shala_right = st.columns(2)
             with shala_left:
-                shalashaska_target_doh = st.number_input(
-                    "DOH objetivo (primera pasada)",
-                    min_value=1.0,
-                    max_value=30.0,
-                    value=7.0,
-                    step=0.5,
+                shalashaska_allow_sensitive = st.toggle(
+                    "Permitir categorías sensibles (Huevo)",
+                    value=False,
                     help=(
-                        "La primera pasada intenta llevar de forma pareja a todas "
-                        "las tiendas elegibles hasta este DOH usando el ADU directo "
-                        "de CATALOGO."
+                        "Apagado: los SKUs de categoría sensible (hoy Huevo, según "
+                        "CATEGORY_NAME de la hoja DATA) no se evacúan. Encendido: "
+                        "pueden enviarse."
                     ),
                 )
             with shala_right:
-                st.info(
-                    "Usa solo tiendas que ya reciben una transferencia del mismo "
-                    "origen en esta corrida. Nivela al DOH objetivo y reparte el "
-                    "resto por SHARE_VENTAS. POR_MERMAR no sustituye al stock final."
+                limit_evacuation = st.toggle(
+                    "Evacuar solo una parte de la merma",
+                    value=False,
+                    help=(
+                        "Envía solo el porcentaje indicado de las unidades en riesgo "
+                        "de cada SKU y deja el resto disponible para otros usos."
+                    ),
                 )
+                evacuation_percent = st.number_input(
+                    "Porcentaje de merma a evacuar (%)",
+                    min_value=10,
+                    max_value=100,
+                    value=80,
+                    step=5,
+                    disabled=not limit_evacuation,
+                )
+                if limit_evacuation:
+                    shalashaska_evacuation_fraction = float(evacuation_percent) / 100.0
+            st.caption(
+                "Solo recibe merma una tienda con ROQ positivo de Fountain9 que ya "
+                "recibe del mismo origen: los mínimos (hardcode) no cuentan."
+            )
         else:
             st.caption(
                 "Shalashaska Engine está apagado. No se procesará la hoja POR_MERMAR."
@@ -10784,6 +11199,8 @@ def render() -> None:
     include_no_fountain9_coverage = False
     avl_doh = 3.0
     special_doh_target = 3.0
+    special_doh_targets: dict[str, float] = {}
+    solidus_swa_priority = True
     with st.container(border=True, key="engine_solidus_module"):
         if is_raiden:
             st.session_state["mb_engine_solidus_enabled"] = False
@@ -10795,9 +11212,7 @@ def render() -> None:
             eyebrow="ENGINE / 03 · CATALOG COVERAGE",
             title="SOLIDUS ENGINE",
             description=(
-                "Coberturas tácticas de catálogo: AVL, Preventivo, Refuerzo "
-                "Golden / Infaltable / Anchor y Cobertura sin Fountain9. Los "
-                "mínimos (hardcode) viven en Naked."
+                ENGINE_INFO["Solidus"]["card"]
                 if not is_raiden
                 else "Bloqueado para el perfil Raiden."
             ),
@@ -10824,7 +11239,7 @@ def render() -> None:
                 "sesión como Big Boss para usarlo."
             )
         elif include_solidus_engine:
-            avl_left, preventive_mid, special_right, no_f9_right = st.columns(4)
+            avl_left, preventive_mid, no_f9_right = st.columns(3)
             with avl_left:
                 include_avl_fill = st.toggle(
                     "Cubrir quiebres del catálogo (AVL)",
@@ -10841,17 +11256,6 @@ def render() -> None:
                     help=(
                         "Busca inventarios positivos menores a 1 DOH o a 3 unidades, "
                         "sin recomendación positiva de Fountain9."
-                    ),
-                )
-            with special_right:
-                include_special_doh_fill = st.toggle(
-                    "Reforzar Golden / Infaltable / Anchor",
-                    value=False,
-                    help=(
-                        "Sube el DOH de productos Golden, Infaltable o Anchor que "
-                        "estén por debajo del objetivo, sin recomendación positiva "
-                        "de Fountain9. Usa su propio DOH objetivo, independiente "
-                        "del de AVL/preventivo."
                     ),
                 )
             with no_f9_right:
@@ -10872,34 +11276,62 @@ def render() -> None:
                         f"{FICTITIOUS_ADU_NO_FOUNTAIN9:g}/día."
                     ),
                 )
-            doh_left, doh_right = st.columns(2)
-            with doh_left:
-                avl_doh = st.number_input(
-                    "DOH objetivo (AVL y preventivo)",
-                    min_value=0.5,
-                    max_value=30.0,
-                    value=3.0,
-                    step=0.5,
-                    disabled=not (include_avl_fill or include_preventive_fill),
-                    help=(
-                        "Aplica a cobertura AVL y prevención. Se envían al menos 3 "
-                        "unidades salvo falta de stock o capacidad."
-                    ),
-                )
-            with doh_right:
-                special_doh_target = st.number_input(
-                    "DOH objetivo (Golden / Infaltable / Anchor)",
-                    min_value=0.5,
-                    max_value=90.0,
-                    value=3.0,
-                    step=0.5,
-                    disabled=not include_special_doh_fill,
-                    help=(
-                        "Solo aplica a productos marcados Golden, Infaltable o "
-                        "Anchor. Sin mínimo forzado de 3 unidades: si ya están "
-                        "cerca del objetivo, sube exactamente lo que falta."
-                    ),
-                )
+            avl_doh = st.number_input(
+                "DOH objetivo (AVL y preventivo)",
+                min_value=0.5,
+                max_value=30.0,
+                value=3.0,
+                step=0.5,
+                disabled=not (include_avl_fill or include_preventive_fill),
+                help=(
+                    "Aplica a cobertura AVL y prevención. Se envían al menos 3 "
+                    "unidades salvo falta de stock o capacidad."
+                ),
+            )
+            st.markdown("**Refuerzo por bucket** · cada uno con su DOH objetivo")
+            special_cols = st.columns(4)
+            special_buckets = (
+                ("INFALTABLE", "Reforzar Infaltables", "Infaltables"),
+                ("GOLDEN", "Reforzar Golden", "Golden"),
+                ("ANCHOR", "Reforzar Anchor", "Anchor"),
+                ("KVI", "Reforzar KVIs", "KVIs"),
+            )
+            special_doh_targets = {}
+            for column, (bucket, toggle_label, plural) in zip(special_cols, special_buckets):
+                with column:
+                    bucket_on = st.toggle(
+                        toggle_label,
+                        value=False,
+                        key=f"mb_special_{bucket.lower()}_on",
+                        help=(
+                            f"Sube el DOH de los {plural} que estén por debajo de su "
+                            "objetivo, sin recomendación positiva de Fountain9. "
+                            "Nunca modifica una recomendación de Fountain9."
+                        ),
+                    )
+                    bucket_doh = st.number_input(
+                        f"DOH objetivo ({plural})",
+                        min_value=0.5,
+                        max_value=90.0,
+                        value=3.0,
+                        step=0.5,
+                        key=f"mb_special_{bucket.lower()}_doh",
+                        disabled=not bucket_on,
+                        help="Sin mínimo forzado: si ya están cerca del objetivo, sube exactamente lo que falta.",
+                    )
+                    if bucket_on:
+                        special_doh_targets[bucket] = float(bucket_doh)
+            include_special_doh_fill = bool(special_doh_targets)
+            special_doh_target = max(special_doh_targets.values(), default=3.0)
+            solidus_swa_priority = st.toggle(
+                "Priorizar por SWA cuando falte capacidad o tareas",
+                value=True,
+                help=(
+                    "Si no alcanza la capacidad de la tienda o el presupuesto de "
+                    "tareas, las 4 coberturas atienden primero lo que más SWA país "
+                    "recupera (hoja SWA). Sin escasez no cambia nada."
+                ),
+            )
         else:
             st.caption(
                 "Solidus Engine está apagado. Sus protecciones y parámetros no "
@@ -10922,8 +11354,7 @@ def render() -> None:
             eyebrow="ENGINE / 04 · INVENTORY LIQUIDATION",
             title="LIQUID ENGINE",
             description=(
-                "Agota remanentes por origen. Primero nivela DOH y después utiliza "
-                "el share de ventas de las tiendas."
+                ENGINE_INFO["Liquid"]["card"]
                 if not is_raiden
                 else "Bloqueado para el perfil Raiden."
             ),
@@ -10989,20 +11420,10 @@ def render() -> None:
                     )
                 )
             with liquid_right:
-                forecast_horizon_days = st.number_input(
-                    "Días del horizonte de forecast",
-                    min_value=1,
-                    max_value=90,
-                    value=7,
-                    step=1,
-                    help=(
-                        "Convierte Predicted Demand for selected duration en ADU para "
-                        "nivelar las tiendas hasta un máximo de 14 DOH."
-                    ),
-                )
                 st.info(
                     "Solo considera tiendas que ya recibieron unidades de otro engine "
-                    "en esta corrida; no exige el SKU en CATALOGO."
+                    "en esta corrida; no exige el SKU en CATALOGO. Nivela con el ADU "
+                    "de CATALOGO hasta un máximo de 14 DOH."
                 )
 
             st.markdown("#### SKUs manuales a agotar por origen")
@@ -11030,18 +11451,24 @@ def render() -> None:
                 "Liquid Engine apagado."
             )
 
+    venom_manual_skus_by_origin_raw: dict[int, str] = {}
+    venom_ltf = 0.5
+    venom_vf = 0.5
+    venom_min_green_units = None
+    venom_order_cycle_days = 0.0
+    venom_trigger_zone = "yellow"
+    venom_shipping_multiple = 1
+    venom_subtract_lead_time_demand = True
+    venom_consider_incoming = False
+    venom_cap_to_store_capacity = False
+    venom_only_manual_skus = False
     with st.container(border=True, key="engine_venom_module"):
         include_venom_engine = bool(st.session_state["mb_engine_venom_enabled"])
         if render_action_card(
             key="engine_venom_card",
             eyebrow="ENGINE / 05 · DDMRP POST-PLANEACIÓN",
             title="VENOM ENGINE",
-            description=(
-                "Corre al final, sobre los remanentes post-allocation y lo ya "
-                "incoming de esta corrida. Aplica un modelo DDMRP simplificado "
-                "para llenar buffers; sus líneas nunca se consolidan con lo ya "
-                "planeado."
-            ),
+            description=ENGINE_INFO["Venom"]["card"],
             active=include_venom_engine,
             tone="purple",
             status="ACTIVO" if include_venom_engine else "INACTIVO · CLIC PARA ACTIVAR",
@@ -11099,10 +11526,105 @@ def render() -> None:
                         "evalúa el buffer como si nada más hubiera corrido hoy."
                     ),
                 )
+            st.markdown("**Parámetros DDMRP**")
+            ddmrp_a, ddmrp_b, ddmrp_c = st.columns(3)
+            with ddmrp_a:
+                venom_ltf = float(
+                    st.number_input(
+                        "Factor de lead time (LTF)",
+                        min_value=0.1, max_value=1.0, value=0.5, step=0.05,
+                        help=(
+                            "Qué tan larga es la zona verde y la base de la roja frente "
+                            "al lead time: 0.2–0.4 lead time largo, 0.41–0.6 medio "
+                            "(estándar), 0.61–1.0 corto."
+                        ),
+                    )
+                )
+                venom_min_green_units = float(
+                    st.number_input(
+                        "Mínimo de orden (unidades)",
+                        min_value=1.0, max_value=500.0, value=float(minimum_positive_quantity),
+                        step=1.0,
+                        help="Piso de la zona verde: Venom no pide menos que esto. Por defecto, el mínimo de unidades de CODEC.",
+                    )
+                )
+            with ddmrp_b:
+                venom_vf = float(
+                    st.number_input(
+                        "Factor de variabilidad (VF)",
+                        min_value=0.0, max_value=1.0, value=0.5, step=0.05,
+                        help=(
+                            "Tamaño de la zona roja de seguridad: 0–0.4 baja "
+                            "variabilidad, 0.41–0.6 media (estándar), 0.61–1.0 alta."
+                        ),
+                    )
+                )
+                venom_order_cycle_days = float(
+                    st.number_input(
+                        "Ciclo de pedido (días)",
+                        min_value=0.0, max_value=60.0, value=0.0, step=0.5,
+                        help="Zona verde mínima = ADU × ciclo de pedido. 0 = sin ciclo de pedido.",
+                    )
+                )
+            with ddmrp_c:
+                trigger_labels = {
+                    "yellow": "Techo amarillo (estándar)",
+                    "red": "Techo rojo (solo urgencias)",
+                    "green": "Techo verde (siempre llenar)",
+                }
+                venom_trigger_zone = st.selectbox(
+                    "Disparador de reorden",
+                    options=list(trigger_labels),
+                    format_func=trigger_labels.get,
+                    help=(
+                        "Cuándo se reordena: si el NFP queda bajo este techo, se pide "
+                        "hasta el techo verde."
+                    ),
+                )
+                venom_shipping_multiple = st.number_input(
+                    "Múltiplo de envío (unidades)",
+                    min_value=1, max_value=100, value=1, step=1,
+                    help="La cantidad se redondea hacia arriba a un múltiplo de este valor.",
+                )
+            flag_a, flag_b = st.columns(2)
+            with flag_a:
+                venom_subtract_lead_time_demand = st.toggle(
+                    "Restar demanda del lead time (demanda calificada)",
+                    value=True,
+                    help=(
+                        "Activo: NFP = on-hand + on-order − ADU × lead time. "
+                        "Apagado: NFP = on-hand + on-order."
+                    ),
+                )
+                venom_consider_incoming = st.toggle(
+                    "Considerar incoming en tránsito",
+                    value=True,
+                    help="Suma STOCK.INCOMING_TR al on-order del NFP.",
+                )
+            with flag_b:
+                venom_cap_to_store_capacity = st.toggle(
+                    "Limitar a la capacidad de la tienda",
+                    value=False,
+                    help=(
+                        "Venom tiene su propia capacidad: la de CAP_RECIBO completa, "
+                        "aparte de lo que ya usaron los demás engines y sin sumarse a "
+                        "ello. Kazuhira solo ve el remanente de los demás engines, "
+                        "sin contar a Venom."
+                    ),
+                )
+                venom_only_manual_skus = st.toggle(
+                    "Usar solo los SKUs específicos",
+                    value=False,
+                    help=(
+                        "Ignora los tipos de sección y evalúa con DDMRP únicamente los "
+                        "SKUs capturados abajo."
+                    ),
+                )
             venom_section_type_labels = {
                 "IS_INFALTABLE": "Infaltable",
                 "IS_GOLDEN": "Golden",
                 "IS_ANCHOR": "Anchor",
+                "IS_KVI": "KVI",
                 "BL": "BL (CATALOGO.LIST_TYPE)",
             }
             venom_section_type_options = [
@@ -11121,10 +11643,29 @@ def render() -> None:
                     "bloqueado en esta corrida y no se puede seleccionar."
                 ),
             )
-            if not venom_section_types:
+            st.markdown("#### SKUs específicos por origen")
+            if venom_origins:
+                venom_sku_columns = st.columns(2)
+                for index, origin in enumerate(venom_origins):
+                    with venom_sku_columns[index % 2]:
+                        venom_manual_skus_by_origin_raw[origin] = st.text_area(
+                            f"{format_origin(origin)}",
+                            value="",
+                            placeholder="Ejemplo: 10087, 10589, 10848",
+                            key=f"venom_manual_skus_{origin}",
+                            help=(
+                                "Estos SKUs se evalúan con DDMRP en las tiendas destino "
+                                "elegidas, surtidos solo desde este warehouse, aunque no "
+                                "califiquen en ningún tipo de sección. Acepta comas o "
+                                "saltos de línea."
+                            ),
+                        )
+            if not venom_section_types and not any(
+                parse_manual_skus(raw) for raw in venom_manual_skus_by_origin_raw.values()
+            ):
                 st.info(
-                    "Selecciona al menos un tipo de sección para que Venom "
-                    "genere líneas."
+                    "Selecciona al menos un tipo de sección o captura SKUs "
+                    "específicos para que Venom genere líneas."
                 )
         else:
             venom_origins = []
@@ -11148,12 +11689,7 @@ def render() -> None:
             eyebrow="ENGINE / 06 · GARANTÍA TOTAL",
             title="KAZUHIRA ENGINE",
             description=(
-                "Corre al final de todo, después de Venom. Sobre las tiendas "
-                "que se planean hoy (Bulk de Fountain9 + SCHEDULE con día "
-                "válido), cubre toda tienda-SKU del catálogo cuya posición "
-                "(stock + incoming + lo ya asignado) esté por debajo de 1 "
-                "DOH, sin importar si Fountain9 la recomendó. Sin fila en "
-                "STOCK cuenta como 0. Fórmula: ADU × (Duration+LeadTime)."
+                ENGINE_INFO["Kazuhira"]["card"]
                 if not is_raiden
                 else "Bloqueado para el perfil Raiden."
             ),
@@ -11210,7 +11746,7 @@ def render() -> None:
                 )
             with kaz_right:
                 kazuhira_ignore_store_capacity = st.toggle(
-                    "Ignorar capacidad de tienda (m³)",
+                    "Ignorar capacidad de tienda (solo Kazuhira)",
                     value=bool(
                         st.session_state["mb_kazuhira_ignore_store_capacity"]
                     ),
@@ -11317,6 +11853,13 @@ def render() -> None:
                 int(origin): parsed
                 for origin, raw_value in liquid_manual_skus_by_origin_raw.items()
                 if include_liquid_engine
+                and (parsed := parse_manual_skus(raw_value))
+            }
+            venom_manual_skus_by_origin = {
+                int(origin): parsed
+                for origin, raw_value in venom_manual_skus_by_origin_raw.items()
+                if include_venom_engine
+                and int(origin) in venom_origins
                 and (parsed := parse_manual_skus(raw_value))
             }
             with st.status("Ejecutando motor de planeación…", expanded=True) as status:
@@ -11439,6 +11982,8 @@ def render() -> None:
                     enable_rackeados_rule=enable_rackeados_rule,
                     enable_closed_stores_rule=enable_closed_stores_rule,
                     enable_regional_block_rule=enable_regional_block_rule,
+                    enable_global_blocks_rule=enable_global_blocks_rule,
+                    ignore_store_capacity=ignore_store_capacity,
                     enable_route_cost_block_rule=enable_route_cost_block_rule,
                     simulation_mode=simulation_mode,
                     minimum_positive_quantity=minimum_positive_quantity,
@@ -11446,8 +11991,20 @@ def render() -> None:
                     include_special_doh_fill=include_special_doh_fill,
                     include_no_fountain9_coverage=include_no_fountain9_coverage,
                     special_doh_target=float(special_doh_target),
+                    special_doh_targets=special_doh_targets,
+                    solidus_swa_priority=solidus_swa_priority,
                     include_naked_engine=include_naked_engine,
+                    shalashaska_extra_cities=tuple(shalashaska_extra_cities),
+                    shalashaska_allow_sensitive=shalashaska_allow_sensitive,
+                    shalashaska_evacuation_fraction=shalashaska_evacuation_fraction,
                     cover_fountain9_hardcodes=cover_fountain9_hardcodes,
+                    hardcode_zero_total=hardcode_zero_total,
+                    hardcode_inventory_below_demand=hardcode_inventory_below_demand,
+                    hardcode_low_net_transfer=hardcode_low_net_transfer,
+                    net_transfer_max=net_transfer_max,
+                    destination_stock_below=destination_stock_below,
+                    raise_small_roq_to_minimum=raise_small_roq_to_minimum,
+                    use_extra_mov_columns=use_extra_mov_columns,
                     include_solidus_engine=include_solidus_engine,
                     include_shalashaska_engine=include_shalashaska_engine,
                     shalashaska_target_doh=float(shalashaska_target_doh),
@@ -11479,6 +12036,17 @@ def render() -> None:
                     venom_consider_current_planning=(
                         venom_consider_current_planning
                     ),
+                    venom_ltf=venom_ltf,
+                    venom_vf=venom_vf,
+                    venom_min_green_units=venom_min_green_units,
+                    venom_order_cycle_days=venom_order_cycle_days,
+                    venom_trigger_zone=venom_trigger_zone,
+                    venom_subtract_lead_time_demand=venom_subtract_lead_time_demand,
+                    venom_consider_incoming=venom_consider_incoming,
+                    venom_shipping_multiple=int(venom_shipping_multiple),
+                    venom_cap_to_store_capacity=venom_cap_to_store_capacity,
+                    venom_manual_skus_by_origin=venom_manual_skus_by_origin,
+                    venom_only_manual_skus=venom_only_manual_skus,
                 )
                 status.update(label="Planeación finalizada", state="complete", expanded=False)
             st.session_state["last_run"] = run

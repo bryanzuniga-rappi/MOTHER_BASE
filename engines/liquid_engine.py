@@ -288,7 +288,9 @@ def apply_liquid_engine(
     *,
     automatic_tail: bool,
     automatic_tail_origins: set[int] | None = None,
-    forecast_horizon_days: int,
+    forecast_horizon_days: int = 7,
+    catalog_adu: dict[tuple[int, int], float] | None = None,
+    duration_by_store: dict[int, float] | None = None,
     max_doh: float = 14.0,
     tail_threshold: int = 10,
     reason_column: str = "PLANNING_REASON",
@@ -327,7 +329,7 @@ def apply_liquid_engine(
         )
     summary["tasks_before"] = result.tasks_used
     if forecast_horizon_days <= 0:
-        raise ValueError("Los días del horizonte de forecast deben ser mayores a cero.")
+        raise ValueError("El horizonte de respaldo (días) debe ser mayor a cero.")
 
     blocked_city_set = set(blocked_cities)
     plan_by_key = {
@@ -486,16 +488,16 @@ def apply_liquid_engine(
                 continue
 
             capacity = catalogs.store_capacity.get(
-                destination,
-                config.default_store_capacity_m3,
+                destination, config.default_store_capacity_m3
             )
+            capacity_limit = engine.store_capacity_limit_m3(catalogs, config, destination)
             capacity_row = capacity_by_store.get(destination)
             used_m3 = (
                 float(capacity_row["M3_CONTABILIZADO_CAPACIDAD"])
                 if capacity_row
                 else 0.0
             )
-            remaining_m3 = max(capacity - used_m3, 0.0)
+            remaining_m3 = max(capacity_limit - used_m3, 0.0)
             capacity_units = (
                 int(math.floor((remaining_m3 / m3_per_unit) + 1e-9))
                 if m3_per_unit > 0
@@ -510,7 +512,12 @@ def apply_liquid_engine(
                 engine.to_float(plan_row.get("PREDICTED_DEMAND", 0.0)),
                 0.0,
             )
-            adu = predicted_demand / forecast_horizon_days
+            # ADU de CATALOGO; solo si falta se deriva de la demanda predicha del
+            # Bulk entre la Duration de la tienda (moda del propio Bulk) o, sin
+            # ella, el horizonte de respaldo.
+            horizon = float((duration_by_store or {}).get(destination) or forecast_horizon_days)
+            catalog_value = float((catalog_adu or {}).get((destination, sku), 0.0) or 0.0)
+            adu = catalog_value if catalog_value > 0 else predicted_demand / horizon
             current_inventory = max(
                 float(catalogs.stock_base.get((destination, sku), 0.0)),
                 0.0,
@@ -520,6 +527,7 @@ def apply_liquid_engine(
             options.append(
                 {
                     "destination": destination,
+                    "horizon": horizon,
                     "store": store,
                     "city_norm": city_norm,
                     "is_golden": is_golden,
@@ -682,7 +690,7 @@ def apply_liquid_engine(
                 "RETAIL_ID": sku,
                 "SKU_NAME": "",
                 "PREDICTED_OPENING_INVENTORY": option["current_inventory"],
-                "PREDICTED_DEMAND": option["adu"] * forecast_horizon_days,
+                "PREDICTED_DEMAND": option["adu"] * option["horizon"],
                 "CURRENT_INVENTORY": option["current_inventory"],
                 "MOV_ORIGINAL": 0,
                 "REGLA_DEMANDA": "LIQUID_ENGINE",

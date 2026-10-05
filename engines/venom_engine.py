@@ -39,7 +39,10 @@ VENOM_CUT = "ENVIADOS POR VENOM ENGINE"
 LTF_MEDIUM = 0.5
 VF_MEDIUM = 0.5
 
-SECTION_TYPES = ("IS_INFALTABLE", "IS_GOLDEN", "IS_ANCHOR", "BL", "OOWL")
+SECTION_TYPES = ("IS_INFALTABLE", "IS_GOLDEN", "IS_ANCHOR", "IS_KVI", "BL", "OOWL")
+
+# Techo de la zona que dispara el reorden (estándar DDMRP: amarillo).
+TRIGGER_ZONES = ("yellow", "red", "green")
 
 
 def empty_venom_summary(enabled: bool) -> dict[str, Any]:
@@ -72,6 +75,18 @@ def empty_venom_summary(enabled: bool) -> dict[str, Any]:
         "skipped_blocked_city": 0,
         "skipped_route_cost": 0,
         "skipped_excluded_sku": 0,
+        "skipped_capacity_cap": 0,
+        "units_cut_by_capacity": 0,
+        "manual_pairs": 0,
+        "ltf": LTF_MEDIUM,
+        "vf": VF_MEDIUM,
+        "order_cycle_days": 0.0,
+        "trigger_zone": "yellow",
+        "subtract_lead_time_demand": True,
+        "consider_incoming": False,
+        "shipping_multiple": 1,
+        "cap_to_store_capacity": False,
+        "only_manual_skus": False,
     }
 
 
@@ -81,15 +96,22 @@ def compute_ddmrp_zones(
     ltf: float = LTF_MEDIUM,
     vf: float = VF_MEDIUM,
     minimum_green_units: float = 3.0,
+    order_cycle_days: float = 0.0,
 ) -> dict[str, float]:
-    """Calcula las zonas roja/amarilla/verde de un buffer DDMRP."""
+    """Calcula las zonas roja/amarilla/verde de un buffer DDMRP.
+
+    Verde = máx(ADU × LT × LTF, mínimo de orden, ADU × ciclo de pedido)."""
     adu = max(float(adu), 0.0)
     lead_time_days = max(float(lead_time_days), 0.0)
     red_base = adu * lead_time_days * ltf
     red_safety = red_base * vf
     red_zone = red_base + red_safety
     yellow_zone = adu * lead_time_days
-    green_zone = max(adu * lead_time_days * ltf, minimum_green_units)
+    green_zone = max(
+        adu * lead_time_days * ltf,
+        minimum_green_units,
+        adu * max(float(order_cycle_days), 0.0),
+    )
     top_of_red = red_zone
     top_of_yellow = red_zone + yellow_zone
     top_of_green = top_of_yellow + green_zone
@@ -98,6 +120,7 @@ def compute_ddmrp_zones(
         "lead_time_days": lead_time_days,
         "ltf": ltf,
         "vf": vf,
+        "order_cycle_days": float(order_cycle_days),
         "red_base": red_base,
         "red_safety": red_safety,
         "red_zone": red_zone,
@@ -228,8 +251,32 @@ def apply_venom_engine(
     closed_or_excluded_store_ids: set[int],
     blocked_cities: tuple[str, ...],
     reason_column: str = "PLANNING_REASON",
+    ltf: float = LTF_MEDIUM,
+    vf: float = VF_MEDIUM,
+    min_green_units: float | None = None,
+    order_cycle_days: float = 0.0,
+    trigger_zone: str = "yellow",
+    subtract_lead_time_demand: bool = True,
+    consider_incoming: bool = False,
+    shipping_multiple: int = 1,
+    cap_to_store_capacity: bool = False,
+    manual_skus_by_origin: dict[int, set[int]] | None = None,
+    only_manual_skus: bool = False,
 ) -> dict[str, Any]:
-    """Corre el llenado DDMRP de Venom al final de toda la planeación."""
+    """Corre el llenado DDMRP de Venom al final de toda la planeación.
+
+    ltf/vf: factores de lead time y de variabilidad. min_green_units: mínimo de
+    orden (None = mínimo de unidades de CODEC). order_cycle_days: ciclo de pedido
+    para la zona verde. trigger_zone: techo que dispara el reorden (yellow,
+    red o green; se ordena hasta el techo verde). subtract_lead_time_demand:
+    resta ADU × LT en el NFP (apagado: NFP = on-hand + on-order).
+    consider_incoming: suma STOCK.INCOMING_TR al on-order. shipping_multiple:
+    redondea hacia arriba la cantidad a un múltiplo. cap_to_store_capacity: tope
+    de m³ propio de Venom (capacidad completa de la tienda, aparte de lo que ya
+    usaron los demás engines, que no se ve afectado). manual_skus_by_origin: SKUs
+    concretos que se evalúan con DDMRP desde ese origen, sin importar el tipo de
+    sección; only_manual_skus limita el universo a ellos.
+    """
     # OOWL bloqueado a nivel motor: no se envía mínimo operativo sin
     # pronóstico, sin importar section_types.
     section_types = set(section_types) - {"OOWL"}
@@ -242,6 +289,27 @@ def apply_venom_engine(
 
     if lead_time_days <= 0:
         raise ValueError("Venom Engine: el lead time debe ser mayor a cero.")
+    if not 0 < ltf <= 1:
+        raise ValueError("Venom Engine: el factor de lead time (LTF) debe estar en (0, 1].")
+    if not 0 <= vf <= 1:
+        raise ValueError("Venom Engine: el factor de variabilidad (VF) debe estar en [0, 1].")
+    if order_cycle_days < 0:
+        raise ValueError("Venom Engine: el ciclo de pedido no puede ser negativo.")
+    if trigger_zone not in TRIGGER_ZONES:
+        raise ValueError(f"Venom Engine: disparador inválido ({trigger_zone}).")
+    if shipping_multiple < 1:
+        raise ValueError("Venom Engine: el múltiplo de envío debe ser al menos 1.")
+    green_minimum = (
+        float(min_green_units)
+        if min_green_units is not None
+        else float(config.minimum_positive_quantity)
+    )
+    summary.update(
+        ltf=float(ltf), vf=float(vf), order_cycle_days=float(order_cycle_days),
+        trigger_zone=trigger_zone, subtract_lead_time_demand=bool(subtract_lead_time_demand),
+        consider_incoming=bool(consider_incoming), shipping_multiple=int(shipping_multiple),
+        cap_to_store_capacity=bool(cap_to_store_capacity), only_manual_skus=bool(only_manual_skus),
+    )
     if not venom_origins:
         raise ValueError("Venom Engine: selecciona al menos un warehouse origen.")
     if not venom_destinations:
@@ -266,9 +334,26 @@ def apply_venom_engine(
     capacity_by_store = {
         row["WAREHOUSE_DESTINATION"]: row for row in result.capacity_rows
     }
+    # Capacidad propia de Venom: arranca en cero por tienda y NO se suma a lo
+    # que ya usaron los demás engines (ni se les resta a ellos después).
+    venom_cap_used: Counter[int] = Counter()
 
-    # --- 1) Universo de candidatos DDMRP (Infaltable/Golden/Anchor/BL) -----
+    # SKUs concretos por origen: solo cuentan los orígenes que Venom usa.
+    manual_origins_by_sku: dict[int, tuple[int, ...]] = {}
+    for source in venom_origins:
+        for manual_sku in (manual_skus_by_origin or {}).get(source, set()):
+            manual_origins_by_sku[manual_sku] = (
+                *manual_origins_by_sku.get(manual_sku, ()), source,
+            )
+
+    # --- 1) Universo de candidatos DDMRP (Infaltable/Golden/Anchor/KVI/BL) --
     dd_pairs: set[tuple[int, int]] = set()
+    if only_manual_skus:
+        section_types = set()
+    if "IS_KVI" in section_types:
+        dd_pairs |= {
+            pair for pair in catalogs.kvi_products if pair[0] in destinations
+        }
     if "IS_INFALTABLE" in section_types:
         dd_pairs |= {
             pair for pair in catalogs.infaltable_products if pair[0] in destinations
@@ -288,6 +373,14 @@ def apply_venom_engine(
             if key[0] in destinations
             and engine.clean_text(info.get("list_type")).upper() == "BL"
         }
+
+    manual_pairs = {
+        (destination, manual_sku)
+        for manual_sku in manual_origins_by_sku
+        for destination in destinations
+    }
+    summary["manual_pairs"] = len(manual_pairs)
+    dd_pairs |= manual_pairs
 
     handled_pairs: set[tuple[int, int]] = set()
     no_adu_pairs: set[tuple[int, int]] = set()
@@ -328,7 +421,8 @@ def apply_venom_engine(
         store = catalogs.stores[destination]
         summary["candidates_ddmrp"] += 1
         zones = compute_ddmrp_zones(
-            adu, lead_time_days, minimum_green_units=config.minimum_positive_quantity
+            adu, lead_time_days, ltf=ltf, vf=vf,
+            minimum_green_units=green_minimum, order_cycle_days=order_cycle_days,
         )
         on_hand = max(float(catalogs.stock_base.get((destination, sku), 0.0)), 0.0)
         on_order = (
@@ -336,22 +430,27 @@ def apply_venom_engine(
             if consider_current_planning
             else 0
         )
-        qualified_demand = adu * lead_time_days
+        if consider_incoming:
+            on_order += max(float(catalogs.incoming_stock.get((destination, sku), 0.0)), 0.0)
+        qualified_demand = adu * lead_time_days if subtract_lead_time_demand else 0.0
         nfp = on_hand + on_order - qualified_demand
-        if nfp >= zones["top_of_yellow"]:
+        trigger_level = zones[f"top_of_{trigger_zone}"]
+        if nfp >= trigger_level:
             summary["skipped_buffer_healthy"] += 1
             continue
         quantity_needed = int(math.ceil(zones["top_of_green"] - nfp))
         if quantity_needed <= 0:
             summary["skipped_buffer_healthy"] += 1
             continue
+        if shipping_multiple > 1:
+            quantity_needed = int(math.ceil(quantity_needed / shipping_multiple) * shipping_multiple)
 
         # Origen preferido: el que ya tenga tarea abierta a esta tienda-SKU
         # queda primero (evita rutas nuevas cuando ya hay una activa), luego
         # el resto de venom_origins en el orden seleccionado.
         eligible_origins = [
             source
-            for source in venom_origins
+            for source in (manual_origins_by_sku.get(sku) or venom_origins)
             if not engine.is_regional_block(
                 catalogs,
                 source,
@@ -364,7 +463,9 @@ def apply_venom_engine(
             )
             and not engine.is_schedule_blocked(catalogs, source, destination)
         ]
-        blocked_origin_count = len(venom_origins) - len(eligible_origins)
+        blocked_origin_count = len(manual_origins_by_sku.get(sku) or venom_origins) - len(
+            eligible_origins
+        )
         if blocked_origin_count:
             summary["skipped_regional_block"] += blocked_origin_count
 
@@ -373,6 +474,27 @@ def apply_venom_engine(
             continue
 
         m3_per_unit = catalogs.volume_m3.get(sku, config.default_m3_per_unit)
+        venom_cap_before = float(venom_cap_used[destination])
+        quantity_to_send = quantity_needed
+        capacity_capped = False
+        if cap_to_store_capacity:
+            venom_capacity = catalogs.store_capacity.get(
+                destination, config.default_store_capacity_m3
+            )
+            remaining_m3 = max(venom_capacity - venom_cap_before, 0.0)
+            cap_units = (
+                int(math.floor(remaining_m3 / m3_per_unit + 1e-9))
+                if m3_per_unit > 0
+                else quantity_needed
+            )
+            if cap_units <= 0:
+                summary["skipped_capacity_cap"] += 1
+                summary["skipped_no_capacity"] += 1
+                continue
+            if cap_units < quantity_needed:
+                summary["units_cut_by_capacity"] += quantity_needed - cap_units
+                quantity_to_send = cap_units
+                capacity_capped = True
         picks = _allocate_across_origins(
             catalogs,
             config,
@@ -380,7 +502,7 @@ def apply_venom_engine(
             source_candidates=tuple(eligible_origins),
             destination=destination,
             sku=sku,
-            quantity_needed=quantity_needed,
+            quantity_needed=quantity_to_send,
             consumed_by_origin_sku=consumed_by_origin_sku,
             summary=summary,
         )
@@ -402,10 +524,14 @@ def apply_venom_engine(
         profile = engine.product_priority_profile(catalogs, destination, sku)
         origenes_usados = ", ".join(f"{source}:{qty}" for source, qty in picks)
         assigned_m3 = assigned_total * m3_per_unit
-        # Informativo únicamente: Venom no escribe en result.capacity_rows,
-        # así que esto no refleja ni afecta ningún gasto real de CAP_RECIBO.
+        venom_cap_used[destination] += assigned_m3
+        # Venom no escribe en result.capacity_rows: no afecta el gasto real de
+        # CAP_RECIBO que ven los demás engines (Kazuhira incluido). Con su tope
+        # activo, las columnas de capacidad muestran el ledger propio de Venom.
         cap_row = capacity_by_store.get(destination)
-        cap_before = float(cap_row["M3_CONTABILIZADO_CAPACIDAD"]) if cap_row else 0.0
+        shared_cap_before = float(cap_row["M3_CONTABILIZADO_CAPACIDAD"]) if cap_row else 0.0
+        cap_before = venom_cap_before if cap_to_store_capacity else shared_cap_before
+        cap_after = float(venom_cap_used[destination]) if cap_to_store_capacity else shared_cap_before
         base_row.update(
             {
                 "PREDICTED_OPENING_INVENTORY": on_hand,
@@ -433,9 +559,9 @@ def apply_venom_engine(
                     destination, config.default_store_capacity_m3
                 ),
                 "M3_CAPACIDAD_ANTES": cap_before,
-                "M3_CAPACIDAD_DESPUES": cap_before,
+                "M3_CAPACIDAD_DESPUES": cap_after,
                 "EXCEDE_CAPACIDAD_EN_ESTA_LINEA": False,
-                "PASA_CAPACIDAD": True,
+                "PASA_CAPACIDAD": not capacity_capped,
                 "TAREAS_ANTES": tasks_before,
                 "TAREAS_GENERADAS": tasks_generated,
                 "TAREAS_ACUMULADAS": tasks_before + tasks_generated,
@@ -443,15 +569,21 @@ def apply_venom_engine(
                 "ORIGENES_USADOS": origenes_usados,
                 "DETALLE_MOTIVO": (
                     "Venom DDMRP: ADU="
-                    f"{adu:.4f}, Lead Time={lead_time_days:g}d, LTF={LTF_MEDIUM:g}, "
-                    f"VF={VF_MEDIUM:g}, Top of Red={zones['top_of_red']:.2f}, "
+                    f"{adu:.4f}, Lead Time={lead_time_days:g}d, LTF={ltf:g}, "
+                    f"VF={vf:g}, Top of Red={zones['top_of_red']:.2f}, "
                     f"Top of Yellow={zones['top_of_yellow']:.2f}, "
                     f"Top of Green={zones['top_of_green']:.2f}, NFP={nfp:.2f} "
                     f"(On-Hand={on_hand:.0f}, On-Order={on_order:.0f} "
                     f"{'considerado' if consider_current_planning else 'ignorado'}, "
                     f"Demanda calificada={qualified_demand:.2f}). "
                     f"Objetivo {quantity_needed}, asignado {assigned_total}. "
-                    "Ontop manual: no cuenta contra CAP_RECIBO de la tienda."
+                    + (
+                        "Tope de capacidad propio de Venom: usó "
+                        f"{cap_after:.4f} m3 de {catalogs.store_capacity.get(destination, config.default_store_capacity_m3):.4f} "
+                        "(no se suma a lo usado por los demás engines)."
+                        if cap_to_store_capacity
+                        else "Ontop manual: no cuenta contra CAP_RECIBO de la tienda."
+                    )
                 ),
             }
         )
