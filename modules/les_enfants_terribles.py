@@ -447,7 +447,7 @@ PLANNING_REASON_COLUMN = "PLANNING_REASON"
 
 # Sello de versión (resultados, advertencias y run['build']). Subir en cada
 # entrega.
-APP_BUILD = "2026-10-05 · kazuhira-v12"
+APP_BUILD = "2026-10-05 · kazuhira-v13"
 
 # REGLA_DEMANDA de filas de cobertura, nunca de la necesidad original de
 # Fountain9; 'Requerido' las excluye.
@@ -1303,10 +1303,8 @@ def detect_copernico_warehouses(uploaded_files) -> set[int]:
             text = raw_bytes.decode("utf-8-sig", errors="replace")
         except Exception:
             continue
-        try:
-            dialect = csv.Sniffer().sniff(text[:8192], delimiters=",;\t")
-        except csv.Error:
-            dialect = csv.excel
+        # Mismo formato fijo que el lector de COPÉRNICO del motor (sin Sniffer).
+        dialect = engine.copernico_csv_dialect(text.split("\n", 1)[0])
         reader = csv.DictReader(io.StringIO(text), dialect=dialect)
         if not reader.fieldnames:
             continue
@@ -2889,6 +2887,8 @@ def attribute_row(row: dict[str, Any]) -> tuple[str, str]:
     if hit is not None:
         return hit
     rule = str(row.get("REGLA_DEMANDA", ""))
+    if rule.startswith("KAZUHIRA_") or tipo in KAZUHIRA_UNCOVERED_LABELS.values():
+        return ("Kazuhira", NO_COVERAGE)        # huecos que Kazuhira declara
     if rule.startswith("CATALOGO_"):
         if tipo == CATALOG_UNIVERSE_POST_KAZUHIRA_CUT:
             return ("Kazuhira", NO_COVERAGE)

@@ -366,6 +366,14 @@ def copernico_is_usable(location: Any, warehouse: int | None = None) -> bool:
     return len(value) >= 8
 
 
+def copernico_csv_dialect(header_line: str) -> type[csv.Dialect]:
+    """Dialecto de COPÉRNICO: separador detectado en el encabezado (coma, punto y
+    coma o tabulador) y comilla doble estándar; nunca la comilla simple."""
+    counts = {delimiter: header_line.count(delimiter) for delimiter in (",", ";", "\t")}
+    delimiter = max(counts, key=counts.get) if any(counts.values()) else ","
+    return type("CopernicoDialect", (csv.excel,), {"delimiter": delimiter})
+
+
 def load_copernico_unusable_csv(
     paths: Path | Iterable[Path],
 ) -> tuple[
@@ -420,16 +428,18 @@ def load_copernico_unusable_csv(
     lost_zone_units = 0.0
     lost_zone_warehouses: set[int] = set()
     files_processed = 0
+    row_count_mismatches: list[dict[str, Any]] = []
 
     for path in path_list:
         with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as handle:
-            sample = handle.read(8192)
+            # Formato fijo: solo se detecta el separador (en el encabezado). El
+            # csv.Sniffer adivinaba la comilla simple como entrecomillado porque
+            # las descripciones de producto traen apóstrofes, y eso fusionaba o
+            # desalineaba filas sin avisar.
+            dialect = copernico_csv_dialect(handle.readline())
             handle.seek(0)
-            try:
-                dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
-            except csv.Error:
-                dialect = csv.excel
             reader = csv.DictReader(handle, dialect=dialect)
+            file_rows = 0
             if reader.fieldnames is None:
                 raise ValueError(
                     f"COPÉRNICO ({path.name}): el CSV no contiene encabezados"
@@ -466,6 +476,7 @@ def load_copernico_unusable_csv(
 
             for row_number, row in enumerate(reader, start=2):
                 total_rows += 1
+                file_rows += 1
                 warehouse = to_id(
                     row.get(field_lookup["Bodega"]),
                     f"COPÉRNICO ({path.name}) fila {row_number}.Bodega",
@@ -545,6 +556,18 @@ def load_copernico_unusable_csv(
                     unusable_by_reason.setdefault(
                         "OTRO_NO_USABLE", defaultdict(float)
                     )[(warehouse, sku)] += balance
+        # Verificación: filas leídas vs líneas de datos del archivo. Si no
+        # coinciden, el CSV se leyó mal (comillas sin cerrar, saltos de línea
+        # dentro de una celda) y el descuento por ubicación y el storage del
+        # 856 pueden estar incompletos.
+        with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as handle:
+            physical_rows = max(
+                sum(1 for line in handle if line.strip(" \r\n\t")) - 1, 0
+            )
+        if physical_rows != file_rows:
+            row_count_mismatches.append(
+                {"file": path.name, "read": file_rows, "lines": physical_rows}
+            )
         files_processed += 1
 
     storage_overrides: dict[tuple[int, int], str] = {}
@@ -579,6 +602,7 @@ def load_copernico_unusable_csv(
         "unusable_warehouse_skus": len(unusable_stock),
         "unusable_warehouses": warehouses,
         "unusable_units": sum(unusable_stock.values()),
+        "row_count_mismatches": row_count_mismatches,
         "storage_overrides_856": len(storage_overrides),
         "storage_conflicts_856": storage_conflicts,
         "warehouse_856_rows": warehouse_856_rows,
@@ -836,6 +860,14 @@ def load_catalogs(
                 f"Overrides de storage 856: "
                 f"{copernico_summary['storage_overrides_856']:,}."
             )
+            for mismatch in copernico_summary["row_count_mismatches"]:
+                warnings.append(
+                    f"COPÉRNICO {mismatch['file']}: se leyeron {mismatch['read']:,} "
+                    f"filas pero el archivo tiene {mismatch['lines']:,} líneas de "
+                    "datos. Revisa comillas o saltos de línea dentro de las celdas: "
+                    "el descuento por ubicación y el storage del 856 podrían estar "
+                    "incompletos."
+                )
             if copernico_summary["warehouse_856_unknown_zone_rows"]:
                 warnings.append(
                     "COPÉRNICO 856: se excluyeron "
@@ -1226,10 +1258,17 @@ def allocation_storage_summary(
     catalogs: Catalogs,
     allocations: Iterable[tuple[int, int]],
     sku: int,
+    fallback_sources: Iterable[int] = (),
 ) -> str:
-    """Resume STORAGE para un caso atendido desde uno o varios orígenes."""
+    """Resume STORAGE para un caso atendido desde uno o varios orígenes.
+
+    Sin unidades asignadas, ``fallback_sources`` (los orígenes de la corrida)
+    permite que la zona de COPÉRNICO también mande en el reporte."""
     used_sources = [source for source, quantity in allocations if quantity > 0]
     if not used_sources:
+        for source in fallback_sources:
+            if clean_text(catalogs.copernico_storage_by_warehouse.get((source, sku))):
+                return source_storage_type(catalogs, source, sku)
         return source_storage_type(catalogs, 0, sku)
     values = [source_storage_type(catalogs, source, sku) for source in used_sources]
     if len(set(values)) == 1:
@@ -2119,7 +2158,9 @@ def plan_transfers(
             "ORIGENES_USADOS": " | ".join(
                 f"{source}:{quantity}" for source, quantity in allocations
             ),
-            "STORAGE": allocation_storage_summary(catalogs, allocations, sku),
+            "STORAGE": allocation_storage_summary(
+                catalogs, allocations, sku, config.origin_warehouses
+            ),
             "VALUE": allocation_value_summary(catalogs, allocations, sku),
             "TIPO_DE_CORTE": tipo_corte,
             "DETALLE_MOTIVO": detalle_motivo,
@@ -2328,6 +2369,7 @@ def plan_transfers(
                     catalogs,
                     second_allocations,
                     sku,
+                    config.origin_warehouses,
                 ),
                 "TIPO_DE_CORTE": tipo_corte,
                 "DETALLE_MOTIVO": detalle_motivo,
