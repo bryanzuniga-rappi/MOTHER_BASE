@@ -11334,9 +11334,21 @@ def render() -> None:
             st.session_state["mb_engine_naked_enabled"] = not include_naked_engine
             st.rerun()
     with st.container(border=True, key="engine_otacon_module"):
-        st.caption("ENGINE / 02 · RESIDUAL · ACTIVO")
-        st.markdown("### Otacon (residual)")
-        st.caption(ENGINE_INFO["Otacon"]["card"])
+        # Otacon must use the same engine card as every other engine.  Its
+        # controls remain below the card, but the engine identity/status is
+        # rendered through the shared action-card component.
+        if render_action_card(
+            key="engine_otacon_card",
+            eyebrow="ENGINE / 02 · RESIDUAL",
+            title="OTACON ENGINE",
+            description=ENGINE_INFO["Otacon"]["card"],
+            active=True,
+            tone="purple",
+            status="ACTIVO",
+            min_height=150,
+            help_text="Otacon completa el residual después de Naked.",
+        ):
+            st.rerun()
         cover_fountain9_hardcodes = False
         hardcode_zero_total = True
         hardcode_inventory_below_demand = True
