@@ -370,12 +370,13 @@ Los engines se aplican en una secuencia explícita. Activar uno no le otorga rec
 
 ```mermaid
 flowchart TD
-    A["Naked · demanda Fountain9"] --> B["Shalashaska · mermar"]
-    B --> C["Solidus · coberturas"]
-    C --> D["Liquid · remanentes"]
-    D --> E["Venom · DDMRP"]
-    E --> F["Kazuhira · garantía total"]
-    F --> G["OWNER, Insumos y entregables"]
+    A["Naked · DOI literal Fountain9"] --> B["Otacon · residual y mínimos"]
+    B --> C["Solidus · coberturas de catálogo"]
+    C --> D["Shalashaska · mermar"]
+    D --> E["Liquid · remanentes"]
+    E --> F["Venom · DDMRP"]
+    F --> G["Kazuhira · garantía total"]
+    G --> H["OWNER, Insumos y entregables"]
 ```
 
 ### Cómo leer el pipeline en 30 segundos
