@@ -39,6 +39,7 @@ def _fake_streamlit(calls):
     fake.toggle.return_value = False
     fake.checkbox.return_value = False
     fake.session_state = {}
+    fake.text_area.side_effect = lambda label, value="", **kw: value   # como el widget real
     fake.markdown.side_effect = lambda *args, **kw: calls.append(args[0] if args else "")
     fake.expander.side_effect = lambda label, **kw: (
         calls.append("EXPANDER:" + label) or MagicMock()

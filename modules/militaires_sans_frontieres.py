@@ -33,6 +33,7 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 from mother_base_theme import render_system_stamp
 from modules.les_enfants_terribles import render_capped_dataframe, rows_to_csv_bytes
+from modules.mail_sender import GMAIL_SEND_SCOPE
 
 
 def configured_data_dashboard_spreadsheet_id() -> str:
@@ -167,7 +168,9 @@ def build_oauth_authorization_url() -> str:
         "client_id": configured_oauth_client_id(),
         "redirect_uri": configured_oauth_redirect_uri(),
         "response_type": "code",
-        "scope": OAUTH_SCOPE,
+        # Drive (Militaires) + enviar correo (Les Enfants Terribles: "Enviar por
+        # mail"). gmail.send solo permite enviar; no lee la bandeja.
+        "scope": " ".join([OAUTH_SCOPE, GMAIL_SEND_SCOPE]),
         "access_type": "offline",
         "prompt": "consent",
     }
@@ -1269,7 +1272,10 @@ def render() -> None:
                 "de Workspace disponible para autorizar Domain-Wide "
                 "Delegation. Autorizas una sola vez con tu propia cuenta; "
                 "la app queda actuando con tus permisos exactos desde "
-                "entonces, guardando un token en Secrets."
+                "entonces, guardando un token en Secrets. Pide permiso de "
+                "Drive y de enviar correo (solo enviar; no lee tu bandeja): "
+                "el segundo lo usa el botón «Enviar por mail» de Les Enfants "
+                "Terribles."
             )
             if not oauth_is_configured():
                 st.warning(

@@ -505,6 +505,27 @@ La autenticación de Big Boss se configura mediante `BIG_BOSS_PASSWORD` en Strea
 
 Los archivos son temporales dentro de la sesión. Descárgalos antes de cerrar o dejar expirar la sesión.
 
+### Envío por mail
+
+Debajo de las tarjetas de resultados, el botón **Enviar por mail** manda **un solo correo** con el paquete de la corrida:
+
+| Adjunto | Contenido |
+|---|---|
+| `Copernico_<bodega>_<fecha>.csv` | Cada COPÉRNICO subido, sin cambios, renombrado con su bodega (`444-831` si un archivo trae varias; sufijo `_2` si se repite). |
+| `Reporte_Planeación_<fecha>.xlsx` | Solo la hoja `BASE_TRANSFERS` del reporte, con el mismo contenido. |
+| `Sin_Recomendación_<fecha>.csv` | El archivo de Fountain9 sin recomendación. |
+| `OVERVIEW_<fecha>.csv` | La misma tabla "Overview general" de la pantalla. |
+
+Los destinatarios son una lista editable (uno por línea, o separados por comas); por defecto, `javier.ballesteros@rappi.com`, `bryan.zuniga@rappi.com` y `dorian.santiago@rappi.com`. Las direcciones inválidas bloquean el botón. En modo simulación no hay archivos y el botón no aparece. El envío sale de la cuenta de Google autorizada en Secrets (`DATA_DASHBOARD_OAUTH_*`, el mismo cliente que usa Militaires).
+
+**Configuración (una sola vez).** Un token autorizado solo para Drive no puede enviar correo:
+
+1. Habilita la **API de Gmail** en el proyecto de Google Cloud del cliente OAuth.
+2. En Militaires, abre "Conectar mi cuenta personal de Google (OAuth)" y autoriza de nuevo: ahora pide Drive y `gmail.send` (solo enviar; no lee la bandeja).
+3. Pega el nuevo refresh token en Secrets (`DATA_DASHBOARD_OAUTH_REFRESH_TOKEN`, o `MAIL_OAUTH_REFRESH_TOKEN` si lo quieres separado del de Drive) y reinicia la app.
+
+**Límites.** Gmail acepta unos 25 MB por correo; con la codificación, ~18 MB de adjuntos. Si no caben sueltos se comprimen en un solo `Planeacion_<fecha>.zip`. Si la hoja `BASE_TRANSFERS` por sí sola excede el límite (por ejemplo, ~35 MB en un reporte de 138 mil filas) el botón lo avisa al instante, antes de procesar, y hay que compartirla por Drive. Armar el adjunto de un reporte normal tarda unos 8 segundos.
+
 ### Breakdown de resultados
 
 La interfaz separa cuatro vistas para evitar mezclar causas diferentes:

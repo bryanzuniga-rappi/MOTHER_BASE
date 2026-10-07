@@ -49,6 +49,7 @@ from reportlab.platypus import (
 )
 
 import modelo_abasto as engine
+from modules import mail_sender
 from engines.liquid_engine import (
     LIQUID_CUT,
     LIQUID_REASON,
@@ -447,7 +448,7 @@ PLANNING_REASON_COLUMN = "PLANNING_REASON"
 
 # Sello de versión (resultados, advertencias y run['build']). Subir en cada
 # entrega.
-APP_BUILD = "2026-10-05 · kazuhira-v13"
+APP_BUILD = "2026-10-05 · kazuhira-v14"
 
 # REGLA_DEMANDA de filas de cobertura, nunca de la necesidad original de
 # Fountain9; 'Requerido' las excluye.
@@ -1288,6 +1289,31 @@ COPERNICO_REQUIRED_WAREHOUSES: frozenset[int] = frozenset({444, 831, 856})
 COPERNICO_BODEGA_HEADER_ALIASES = {"BODEGA", "WAREHOUSE ID", "WAREHOUSE_ID"}
 
 
+def copernico_warehouses_from_text(text: str) -> set[int]:
+    """Bodegas de la columna Bodega de un CSV de COPÉRNICO ya decodificado."""
+    warehouses: set[int] = set()
+    # Mismo formato fijo que el lector de COPÉRNICO del motor (sin Sniffer).
+    dialect = engine.copernico_csv_dialect(text.split("\n", 1)[0])
+    reader = csv.DictReader(io.StringIO(text), dialect=dialect)
+    if not reader.fieldnames:
+        return warehouses
+    bodega_field = next(
+        (
+            field_name
+            for field_name in reader.fieldnames
+            if engine.clean_text(field_name).upper() in COPERNICO_BODEGA_HEADER_ALIASES
+        ),
+        None,
+    )
+    if bodega_field is None:
+        return warehouses
+    for row in reader:
+        value = engine.to_id(row.get(bodega_field), "Bodega", allow_none=True)
+        if value is not None:
+            warehouses.add(value)
+    return warehouses
+
+
 def detect_copernico_warehouses(uploaded_files) -> set[int]:
     """Lee la columna Bodega de cada archivo COPÉRNICO cargado, sin guardar nada en
     disco, para saber qué warehouses cubre antes de validar la corrida.
@@ -1303,26 +1329,7 @@ def detect_copernico_warehouses(uploaded_files) -> set[int]:
             text = raw_bytes.decode("utf-8-sig", errors="replace")
         except Exception:
             continue
-        # Mismo formato fijo que el lector de COPÉRNICO del motor (sin Sniffer).
-        dialect = engine.copernico_csv_dialect(text.split("\n", 1)[0])
-        reader = csv.DictReader(io.StringIO(text), dialect=dialect)
-        if not reader.fieldnames:
-            continue
-        bodega_field = next(
-            (
-                field_name
-                for field_name in reader.fieldnames
-                if engine.clean_text(field_name).upper()
-                in COPERNICO_BODEGA_HEADER_ALIASES
-            ),
-            None,
-        )
-        if bodega_field is None:
-            continue
-        for row in reader:
-            value = engine.to_id(row.get(bodega_field), "Bodega", allow_none=True)
-            if value is not None:
-                warehouses.add(value)
+        warehouses |= copernico_warehouses_from_text(text)
         try:
             uploaded_file.seek(0)
         except Exception:
@@ -7845,6 +7852,18 @@ def execute_planning(
         "venom": venom_summary,
         "kazuhira": kazuhira_summary,
         "build": APP_BUILD,
+        "run_date": run_date.isoformat(),
+        "copernico_inputs": [
+            {
+                "path": str(path),
+                "warehouses": sorted(
+                    copernico_warehouses_from_text(
+                        path.read_text(encoding="utf-8-sig", errors="replace")
+                    )
+                ),
+            }
+            for path in copernico_paths
+        ],
         "input_consolidation": consolidation_summary,
         "engine_selection": engine_selection,
         "excluded_skus": sorted(excluded_sku_set),
@@ -8924,6 +8943,57 @@ def render_engine_header(
     render_kpi_cards(cards, columns_count=4)
 
 
+def render_mail_section(run: dict[str, Any]) -> None:
+    """Un solo botón: manda por correo COPÉRNICO, BASE_TRANSFERS, Sin recomendación y
+    OVERVIEW de la corrida a una lista editable de destinatarios."""
+    st.markdown('<span class="section-label">ENVIAR POR MAIL</span>', unsafe_allow_html=True)
+    if run.get("simulation"):
+        st.caption("Modo simulación: la corrida no generó archivos que enviar.")
+        return
+    st.caption("Un solo correo con " + ", ".join(mail_sender.preview_names(run)) + ".")
+    recipients_text = st.text_area(
+        "Destinatarios (uno por línea)",
+        value="\n".join(mail_sender.DEFAULT_RECIPIENTS),
+        key="mb_mail_recipients",
+        height=100,
+        help="También acepta comas o punto y coma. Se envía desde la cuenta de Google autorizada en Secrets.",
+    )
+    recipients, invalid = mail_sender.parse_recipients(recipients_text)
+    if invalid:
+        st.warning("Direcciones no válidas: " + ", ".join(invalid))
+    if st.button(
+        "Enviar por mail",
+        key="mb_mail_send",
+        disabled=bool(invalid) or not recipients,
+    ):
+        with st.spinner("Armando y enviando el correo…"):
+            try:
+                result = mail_sender.send_run_package(run, recipients)
+            except mail_sender.MailError as error:
+                st.error(str(error))
+            except Exception as error:  # nunca debe tumbar la pantalla de resultados
+                st.error(f"No se pudo enviar el correo: {error}")
+            else:
+                st.session_state["mb_mail_last"] = {
+                    "run": str(run.get("zip")),
+                    "recipients": result.recipients,
+                    "attachments": result.attachments,
+                    "notes": result.notes,
+                }
+    last = st.session_state.get("mb_mail_last")
+    if last and last.get("run") == str(run.get("zip")):
+        sent = ", ".join(
+            f"{name} ({size / 1024 / 1024:,.1f} MB)" for name, size in last["attachments"]
+        )
+        st.success(
+            f"Correo enviado a {len(last['recipients'])} destinatario(s): "
+            + ", ".join(last["recipients"])
+            + f". Adjuntos: {sent}."
+        )
+        for note in last.get("notes", []):
+            st.caption(note)
+
+
 def render_engine_summary_table(
     summary_rows: list[dict[str, Any]], swa_enabled: bool
 ) -> None:
@@ -9137,6 +9207,8 @@ def render_results(run: dict[str, Any]) -> None:
         ],
         columns_count=3,
     )
+
+    render_mail_section(run)
 
     st.markdown(
         '<div class="result-title">CIUDADES + TIENDAS ATENDIDAS.</div>',
