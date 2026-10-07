@@ -177,11 +177,12 @@ def inject_mother_base_theme() -> None:
             background: var(--white);
         }
         .engine-panel.naked { background: var(--acid); }
+        .engine-panel.otacon { background: #8a3ffc; color: var(--white); }
         .engine-panel.solidus { background: var(--blue); color: var(--white); }
         .engine-panel.liquid { background: var(--coral); }
         .engine-panel.shalashaska { background: var(--orange); }
         .engine-panel.venom { background: #8a3ffc; color: var(--white); }
-        .engine-panel.kazuhira { background: var(--ink); color: var(--acid); }
+        .engine-panel.kazuhira { background: var(--ink) !important; color: var(--acid); }
         .engine-panel.insumos { background: var(--yellow); }
         .engine-panel h4, .engine-panel p { color: inherit !important; }
         .engine-panel .stage {

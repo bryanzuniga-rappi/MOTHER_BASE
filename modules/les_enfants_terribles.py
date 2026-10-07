@@ -790,7 +790,9 @@ def inject_styles() -> None:
         div[data-baseweb="select"] > div {
             border: 2px solid var(--ink) !important;
             border-radius: 0 !important;
-            background: var(--white) !important;
+            /* Slight contrast separates comma-separated SKU fields from the
+               warm page background without changing the visual system. */
+            background: #e8e4d9 !important;
         }
 
         .stButton > button,
