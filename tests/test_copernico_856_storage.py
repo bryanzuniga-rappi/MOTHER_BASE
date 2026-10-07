@@ -286,7 +286,7 @@ def test_kazuhira_declared_gaps_are_attributed_to_kazuhira_not_naked():
     for label in m.KAZUHIRA_UNCOVERED_LABELS.values():
         row = {"TIPO_DE_CORTE": label, "REGLA_DEMANDA": "KAZUHIRA_SIN_STOCK_ORIGEN"}
         assert m.attribute_row(row) == ("Kazuhira", "—"), label
-    assert m.attribute_row({"TIPO_DE_CORTE": "OK COMPLETO POR FOUNTAIN9", "REGLA_DEMANDA": "ROQ"})[0] == "Naked"
+    assert m.attribute_row({"TIPO_DE_CORTE": "OK COMPLETO POR FOUNTAIN9", "REGLA_DEMANDA": "ROQ"})[0] == "Otacon"
 
 
 def test_warehouse_detection_uses_the_same_fixed_format(tmp_path):

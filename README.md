@@ -2,6 +2,8 @@
 
 **Centro de comando para planear transferencias de abasto entre CEDIS y tiendas.**
 
+Build: `2026-10-07 · naked-otacon-v2`.
+
 Mother Base toma la recomendación diaria de Fountain9, la contrasta con el inventario y las restricciones operativas vigentes, y produce una propuesta de transferencias lista para revisar y ejecutar. Su objetivo no es reemplazar al criterio operativo: es volverlo consistente, trazable y repetible.
 
 La aplicación está construida en Streamlit y utiliza un motor de planeación propio. Los resultados se descargan como Excel, CSV operativos, PDF ejecutivo y ZIP consolidado.
@@ -107,7 +109,7 @@ La aplicación pide una confirmación explícita antes de ejecutar. Esa confirma
 | **Origen** | CEDIS o bodega desde la cual se envía inventario. |
 | **Destino** | Tienda que recibirá producto. |
 | **SKU** | Producto identificado por `RETAIL_ID` / `PRODUCT_ID`. |
-| **Tarea** | Una combinación única `origen + destino + SKU`. Una misma línea puede contener muchas unidades. |
+| **Tarea** | Una combinación única `origen + destino + SKU` por archivo operativo (OWNER puede dividir 425/856). Una misma línea puede contener muchas unidades. |
 | **ROQ / MOV** | Recomendación natural conservada desde Fountain9. |
 | **ADU** | Venta diaria promedio (`Average Daily Units`). |
 | **DOH** | Días de inventario: inventario disponible entre ADU. |
@@ -138,7 +140,7 @@ flowchart TD
 | `auth.py` | Estado de sesión y perfiles Big Boss / Raiden. |
 | `modules/les_enfants_terribles.py` | Pantallas de planeación, validación de inputs, orquestación, análisis y descargas. |
 | `modelo_abasto.py` | Motor puro: carga catálogos, consolida Fountain9, calcula objetivos, asigna stock y escribe entregables. |
-| `engines/mission_control.py` | Selecciona la cola base Naked / hardcodes. |
+| `engines/mission_control.py` | Selecciona la cola residual de Otacon y sus hardcodes. |
 | `engines/naked_engine.py` | Clasifica la recomendación natural y los casos sin recomendación. |
 | `engines/solidus_engine.py` | Clasifica protecciones manuales de la cola base. |
 | `engines/shalashaska_engine.py` | Evacuación de producto por mermar. |
@@ -169,7 +171,7 @@ Por esta razón no se debe paralelizar la fase de asignación sin rediseñar el 
 
 ### 1. Consolidación de la demanda
 
-Los CSV de Fountain9 se consolidan por destino–SKU. Para valores de recomendación repetidos se conserva el máximo cuando corresponde, evitando inflar la demanda por archivos o filas duplicadas.
+Los CSV se consolidan por destino–SKU para Otacon. Las instrucciones DOI se suman por origen–destino–SKU, incluso si se repiten entre archivos; se deben cargar solamente los archivos que integran la corrida. Las demás columnas MOV conservan su máximo.
 
 ### 2. Construcción de candidatos
 
@@ -181,18 +183,13 @@ Cada fila se enriquece con ciudad, prioridad de tienda, categoría comercial, vo
 4. KVI
 5. Regular
 
-Dentro de la misma categoría se atiende primero la recomendación natural, luego protecciones manuales, prioridad de tienda, stockout, destino, SKU y orden de entrada.
+Dentro de cada categoría se conserva la prioridad de tienda de DATA_TRANSFERS; después se atienden DOI menor, DOH menor y tienda-SKU como desempate estable.
 
 ### 3. Asignación base
 
-Para cada necesidad, el sistema intenta cubrir la cantidad objetivo con los orígenes seleccionados en CODEC. El orden de esos orígenes define la prioridad de consumo de stock.
-
-Cuando hay stock limitado, el motor protege el aprovechamiento del inventario con dos pasadas:
-
-1. Intenta cubrir solicitudes completas y difiere las que no caben.
-2. Atiende solicitudes posteriores más pequeñas y después usa el remanente para cubrir parcialmente lo diferido.
-
-Ejemplo: si quedan 4 unidades y las solicitudes son 10, 1 y 1, primero se cubren las dos solicitudes de 1 y las 2 unidades restantes se asignan al caso de 10.
+Naked ejecuta DOI desde su origen fijo. Otacon completa el residual con los orígenes
+configurados. Ambas pasadas descuentan únicamente las unidades efectivas, sus m³
+y las tareas nuevas. Los parciales siguen la prioridad comercial y de DATA_TRANSFERS.
 
 ### 4. Engines posteriores
 
@@ -214,9 +211,9 @@ Entre otras, la base contiene contratos para tiendas, stock, capacidad, producto
 
 ### Fountain9
 
-Se carga como uno o varios CSV. Aporta la necesidad natural, variables de demanda e inventario y, cuando existe, la decisión final de asignación de Fountain9 mediante `Allocation (Store Based)`.
-
-La columna `Allocation (Store Based)` permite construir el reporte comparativo. Si no está presente, el reporte se omite; la planeación no se bloquea.
+Los CSV aportan MOV, demanda e inventario. Naked requiere `Allocation (DOI Based)`
+y `Source Id Before Multi Source`; sin DOI no ejecuta nada. Otacon puede seguir
+planeando a partir de MOV. La comparación y auditoría usan DOI como referencia principal.
 
 ### COPÉRNICO
 
@@ -277,7 +274,7 @@ Estas reglas no deben cambiarse sin una revisión conjunta de Supply y Desarroll
 |---|---|
 | **Stock es mandante** | Nunca se asignan más unidades que el stock final ajustado del origen. |
 | **Capacidad es mandante** | Ninguna tienda puede superar su `CAP_RECIBO` acumulado en m³. |
-| **Tareas compartidas** | Naked, Solidus, Shalashaska y Liquid comparten `MAX_TASKS`. |
+| **Tareas compartidas** | Naked, Otacon, Solidus, Shalashaska y Liquid comparten `MAX_TASKS`. |
 | **Bloqueos explícitos** | Tiendas, ciudades, rutas, productos, restricciones regionales y frecuencia no pueden saltarse. |
 | **Prioridad comercial** | Infaltable > Golden > Anchor > KVI > Regular. |
 | **OWNER no crea stock** | En 425/856 se usa el menor entre stock ajustado y stock del owner. |
@@ -324,7 +321,8 @@ flowchart TD
 
 | Etapa | Qué hace | Pregunta que responde |
 |---|---|---|
-| **Naked** | Ejecuta la necesidad natural de Fountain9 y sus mínimos operativos cuando Fountain9 no generó un ROQ positivo. | “¿Qué pidió el forecast para hoy?” |
+| **Naked** | Ejecuta Allocation DOI con origen fijo, sin mínimos y con parciales. | “¿Cuánto de Fountain9 se ejecutó literalmente?” |
+| **Otacon** | Cubre el residual con el máximo MOV, mínimos y reasignación de origen. | “¿Cuánto más puede cubrir Mother Base?” |
 | **Shalashaska** | Evacúa inventario próximo a caducar por las rutas que ya saldrán: primero por ADU/DOH y luego por share de ventas. | “¿Cómo evitamos que este producto merme?” |
 | **Solidus** | Agrega coberturas tácticas: AVL, prevención, refuerzo Golden/Infaltable/Anchor y quiebres sin recomendación útil. | “¿Qué riesgo importante no cubrió la recomendación natural?” |
 | **Liquid** | Distribuye remanente disponible después de las prioridades anteriores. | “¿Dónde todavía podemos aprovechar este saldo?” |
@@ -332,27 +330,55 @@ flowchart TD
 | **Kazuhira** | Última red de seguridad: revisa quiebres del universo planificable y cubre los que aún sean posibles. | “¿Quedó algún quiebre real que todavía podamos resolver?” |
 | **OWNER e Insumos** | Separa 425/856 por propietario y agrega insumos elegibles al bulk correspondiente. | “¿Cómo debe quedar el archivo listo para ejecutar?” |
 
-**Regla común:** ningún engine puede saltarse stock, bloqueos o restricciones de ruta. Naked, Shalashaska, Solidus y Liquid también comparten el límite operativo de tareas; Kazuhira solo puede ignorarlo si Big Boss activa explícitamente ese bypass.
+**Regla común:** ningún engine puede saltarse stock, bloqueos o restricciones de ruta. Naked, Otacon, Solidus, Shalashaska y Liquid comparten el límite operativo de tareas; Kazuhira solo puede ignorarlo si Big Boss activa explícitamente ese bypass.
 
 ### Visibilidad por engine
 
 Cada engine tiene un nombre, una cobertura y una etapa fijos en todos los reportes. `ENGINE_INFO` (en `modules/les_enfants_terribles.py`) es el registro único de qué hace, dónde corre y cómo funciona cada uno.
 
-- **Atribución:** `attribute_row()` asigna cada fila a un `ENGINE` y una `COBERTURA`. Naked = Fountain9 y Mínimos (hardcode). **Solidus = AVL, Preventivo, Refuerzo Golden / Infaltable / Anchor y Cobertura sin Fountain9.** Los demás engines no tienen cobertura (`—`).
-- **Dónde se ve:** tabla "Resumen por engine" (todos los engines en orden de ejecución, con estado, casos, tareas, unidades y SWA; Naked y Solidus también con su total); un panel con color propio y un expander "Cómo funciona" al inicio de cada engine; las columnas `ENGINE` y `COBERTURA` en `BASE_TRANSFERS`; la tabla "Efectivamente planeado" (ordenada por etapa) y el PDF ejecutivo.
-- **Tareas y unidades por engine** salen de las líneas reales de asignación (`PLANNING_REASON`), así que la suma de tareas de todos los engines coincide con las líneas del Bulk.
+- **Atribución:** `attribute_row()` asigna cada fila a un `ENGINE` y una `COBERTURA`. Naked = ejecución literal DOI. Otacon = residual y mínimos (hardcode). **Solidus = AVL, Preventivo, Refuerzo Golden / Infaltable / Anchor y Cobertura sin Fountain9.** Los demás engines no tienen cobertura (`—`).
+- **Dónde se ve:** tabla "Resumen por engine" (todos los engines en orden de ejecución, con estado, casos, tareas, unidades y SWA; Naked, Otacon y Solidus también con su total); un panel con color propio y un expander "Cómo funciona" al inicio de cada engine; las columnas `ENGINE` y `COBERTURA` en `BASE_TRANSFERS`; la tabla "Efectivamente planeado" (ordenada por etapa) y el PDF ejecutivo.
+- **Tareas y unidades por engine** salen de las líneas reales de asignación (`PLANNING_REASON`), la tarea se atribuye al primer engine que abre la combinación. Insumos se reporta aparte y no consume MAX_TASKS.
 
 ### Naked Engine
 
-Atiende la recomendación natural con ROQ positivo. Incluye un toggle independiente, **Cubrir a Fountain9**, para hardcodes en los que Fountain9 no produce ROQ positivo pero el negocio determina que debe haber una cobertura mínima:
+Ejecuta exclusivamente `Allocation (DOI Based)` desde `Source Id Before Multi Source`.
+No reasigna origen ni eleva cantidades pequeñas. Las instrucciones repetidas se suman
+por origen F9, destino y SKU. Los planes secundarios también participan.
 
-- Inventario y demanda en cero: objetivo mínimo configurado.
-- Inventario menor a demanda con ROQ no positivo: objetivo mínimo.
-- Net transfer bajo y poco inventario en destino: mínimo de 3 unidades.
+Antes y durante cada envío aplica stock ajustado, COPÉRNICO, NO_DISPONIBLE, rackeados,
+OWNER, bloqueos, rutas, calendario, capacidad de tienda y tareas configuradas.
+Permite parciales: DOI 20 con 12 utilizables ejecuta 12 y declara el corte de 8.
+Un origen vacío o inválido queda sin ejecución literal y se declara en la auditoría.
+Los DOI fraccionarios se rechazan con archivo y fila para evitar elevar la instrucción.
 
-Estos casos pertenecen a Naked porque cubren una necesidad que Fountain9 no formuló como ROQ positivo; no deben confundirse con Solidus. Cada regla se apaga por separado y la de net transfer tiene umbrales editables (net transfer máximo y stock destino menor a; ambos en 3 por defecto).
+`Primary Source Id`, `Allocated Qty Before Multi Source` y
+`Source Current Inv Before Multi Source` son referencias, nunca instrucciones de ejecución.
+Se conservan junto con `Is Secondary Plan` y `Link Type` en la auditoría.
 
-Otras variables de Naked: **Subir recomendaciones pequeñas al mínimo** (apagado, se envía el ROQ redondeado hacia arriba, sin piso) y **Usar columnas adicionales de MOV** (apagado, solo cuenta la columna MOV en vez del máximo con las columnas opcionales). En el Bulk llevan `PLANNING_REASON` = `MÍNIMO · NAKED ENGINE`; la recomendación natural, `FOUNTAIN9 · NAKED ENGINE`.
+### Otacon Engine
+
+Corre inmediatamente después de Naked con los recursos remanentes:
+
+```text
+objetivo = max(columnas MOV configuradas, suma DOI por tienda-SKU)
+objetivo con mínimos = aplicar mínimos y hardcodes de Mother Base
+residual Otacon = max(objetivo con mínimos - Naked realmente ejecutado, 0)
+```
+
+Puede cambiar de origen. DOI siempre participa, incluso si se desactivan las demás
+columnas opcionales. Store Based permanece como columna secundaria del máximo;
+nunca determina la ejecución literal de Naked.
+
+Los controles de mínimos, hardcodes y columnas MOV pertenecen a Otacon y son
+independientes de encender Naked. Prioriza Infaltable, Golden, Anchor, KVI y Regular;
+conserva PRIORIDAD de DATA_TRANSFERS y después compara DOI, DOH y tienda-SKU.
+DOI/DOH de urgencia, si faltan en el CSV, se ordenan al final; no se confunden con
+la cantidad `Allocation (DOI Based)`. Ante escasez se permite parcial por prioridad.
+
+Las asignaciones comparten stock, capacidad y tareas: ampliar una ruta existente
+no vuelve a consumir una tarea. OWNER se reserva en estas dos pasadas para que el
+residual se calcule sobre cantidades realmente ejecutables.
 
 ### Solidus Engine
 
@@ -375,7 +401,7 @@ El Refuerzo usa el universo de los buckets activos (hoja GOLDEN_INFALTABLES_ANCH
 
 ### Kazuhira Engine (garantía total de cobertura)
 
-Última pasada del pipeline (Naked → Shalashaska → Solidus → Liquid → Venom → **Kazuhira** → partición OWNER → Insumos). Solo Big Boss; apagado por defecto. Mandato: ninguna tienda-SKU del catálogo queda en quiebre si hay stock en CEDIS, venga o no de Fountain9. Corre al final y no dentro de Solidus porque necesita el stock final; tiene prioridad sobre Insumos en el stock del 444.
+Última pasada del pipeline (Naked → Otacon → Solidus → Shalashaska → Liquid → Venom → **Kazuhira** → partición OWNER → Insumos). Solo Big Boss; apagado por defecto. Mandato: ninguna tienda-SKU del catálogo queda en quiebre si hay stock en CEDIS, venga o no de Fountain9. Corre al final y no dentro de Solidus porque necesita el stock final; tiene prioridad sobre Insumos en el stock del 444.
 
 | Tema | Regla |
 |---|---|
@@ -409,7 +435,7 @@ Evacúa inventario marcado como **POR_MERMAR**. No usa ese valor para inflar el 
 flowchart TD
     A["POR_MERMAR origen-SKU"] --> B["Validar stock ajustado"]
     B --> C["Filtrar categorías sensibles"]
-    C --> D["Tomar rutas: tienda con ROQ positivo, ciudad activa"]
+    C --> D["Rutas activadas por Naked, Otacon o Solidus; ciudad activa"]
     D --> E["Nivelar por ADU y DOH interno"]
     E --> F["Evacuar remanente por SHARE_VENTAS"]
     F --> G["Registrar m³, tarea y motivo"]
@@ -449,7 +475,7 @@ Ejecuta al final como cobertura DDMRP. Calcula zonas de buffer y propone llenado
 | SKUs específicos por origen | Se evalúan con DDMRP aunque no califiquen en ningún tipo; se surten solo desde ese origen. "Usar solo los SKUs específicos" ignora los tipos | Vacío |
 | Limitar a la capacidad de la tienda | Tope de m³ propio de Venom | Apagado |
 
-**Capacidad.** Venom no consume el ledger de capacidad de los engines anteriores ni se consolida con sus líneas. Con su tope activo usa la capacidad completa de la tienda como presupuesto propio: si otros engines ya usaron 9 de 10 pallets, Venom aún puede usar sus propios 10, que no se suman a esos 9. Kazuhira solo ve el remanente de lo que usaron los demás engines (en el ejemplo, 1 pallet), sin contar a Venom. Esto debe mantenerse para que su impacto sea auditable.
+**Capacidad.** Venom conserva su capacidad independiente y su detalle por engine. El CSV final consolida combinaciones repetidas sin mezclar sus ledgers de capacidad. Con su tope activo usa la capacidad completa de la tienda como presupuesto propio: si otros engines ya usaron 9 de 10 pallets, Venom aún puede usar sus propios 10, que no se suman a esos 9. Kazuhira solo ve el remanente de lo que usaron los demás engines (en el ejemplo, 1 pallet), sin contar a Venom. Esto debe mantenerse para que su impacto sea auditable.
 
 ### Checks posteriores
 
@@ -539,15 +565,23 @@ La interfaz separa cuatro vistas para evitar mezclar causas diferentes:
 
 ### Reporte Fountain9 vs Mother Base
 
-Cuando existe `Allocation (Store Based)`, el reporte tiene tres bloques:
+La referencia principal es la suma de `Allocation (DOI Based)`. La comparación conserva
+sus vistas de mismo alcance, adicional y total Mother Base.
 
-| Bloque | Pregunta que responde |
-|---|---|
-| Cara a cara | En los casos que Fountain9 evaluó, ¿qué cubrió cada sistema? |
-| Mother Base adicional | ¿Qué atendió Mother Base que Fountain9 no evaluó? |
-| Total Mother Base | ¿Cuál es el impacto completo de Mother Base? |
+`AUDITORIA_FOUNTAIN9` en Excel y `Auditoria_Fountain9_<fecha>.csv` contienen una fila por
+origen F9, destino y SKU: DOI solicitado, Naked literal, porcentaje de cumplimiento,
+motivo del corte, Otacon recuperado, recuperación posterior, cobertura final y faltante.
+El PDF resume esas cifras y la interfaz muestra la tabla descargable.
 
-No se debe leer la comparación como una competencia de igualdad de condiciones: Mother Base incorpora mecanismos y universos que Fountain9 puede no tener en su archivo de entrada.
+La recuperación se aplica una sola vez a las instrucciones pendientes, en orden estable
+de destino, SKU y origen F9. No prueba que Otacon haya usado el origen original: esa
+trazabilidad está en `DETALLE_ASIGNACION`. La cobertura DOI final se limita a lo pedido;
+el total Mother Base incluye además la necesidad adicional atendida por el pipeline.
+
+Los CSV operativos tienen una fila por origen–destino–SKU **dentro de cada archivo**.
+425/856 conservan archivos separados por OWNER. La consolidación también se aplica
+después de Insumos. Las cantidades por engine permanecen separadas en el Excel.
+
 
 ---
 
@@ -596,11 +630,22 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Para desarrollo y pruebas:
+Para reproducir esta validación con Python 3.12.15:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.lock
+.\.venv\Scripts\python.exe -m pytest -q
+```
+
+`requirements-dev.lock` fija todas las versiones de la validación. Para resolver
+dependencias nuevas de forma intencional, usa `requirements-dev.txt` y regenera el lock.
+
+Para desarrollo con los rangos permitidos:
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q
+python -m pytest -q
 ```
 
 ### Configuración local
@@ -623,7 +668,7 @@ DATA_DASHBOARD_SPREADSHEET_ID = "id-del-dashboard"
 
 ### Versión e instalación
 
-- **Sello de versión:** `APP_BUILD` aparece en resultados, advertencias, `run["build"]` y la hoja RESUMEN del Excel. Súbelo en cada entrega (formato `kazuhira-vN`).
+- **Sello de versión:** `APP_BUILD` aparece en resultados, advertencias, `run["build"]` y la hoja RESUMEN del Excel. Súbelo en cada entrega (build actual `naked-otacon-v2`).
 - **Chequeo de instalación** (`modules/install_check.py`): al abrir la app avisa si `modules/les_enfants_terribles.py` es una versión sin sello, si hay archivos sueltos en la raíz o si el `.gitignore` quedó guardado como `download`.
 
 ### Streamlit Community Cloud
@@ -672,7 +717,7 @@ Los engines deben conservar la trazabilidad de cada decisión: motivo, cantidad 
 - La UI orquesta; el motor decide y devuelve estructuras comprobables.
 - Las pruebas deben declarar la regla con un caso de entrada y resultado esperado, no solo validar que una función no falle.
 - No modifique las etiquetas de salida sin actualizar el breakdown, los exports y pruebas relacionadas.
-- No fusionar líneas de Venom con líneas del resto de engines.
+- Conservar las contribuciones de Venom separadas en el detalle; consolidarlas únicamente en los CSV operativos.
 
 ### Estilo de comentarios y documentación
 
@@ -699,7 +744,7 @@ Se asume que quien mantiene el proyecto conoce el negocio; se documenta lo que e
 
 ```bash
 python -m compileall app.py auth.py modelo_abasto.py engines modules
-pytest -q
+python -m pytest -q
 ```
 
 Además de la suite, pruebe manualmente:

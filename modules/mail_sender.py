@@ -226,7 +226,14 @@ def base_transfers_xlsx_bytes(report_path: Path) -> bytes:
             header_cells.append(cell)
         sheet.append(header_cells)
         for row in rows:
-            sheet.append(list(row))
+            values = list(row)
+            # En modo streaming una celda vacía final necesita estilo para
+            # conservar el ancho de la fila al volver a leer el adjunto.
+            if values and values[-1] is None:
+                last = WriteOnlyCell(sheet, value=None)
+                last.font = Font(name="Calibri")
+                values[-1] = last
+            sheet.append(values)
         buffer = io.BytesIO()
         target.save(buffer)
         return buffer.getvalue()

@@ -127,7 +127,7 @@ def test_swa_ganado_by_engine_empty_when_no_rows():
     assert m.swa_ganado_by_engine([]) == {}
 
 
-def test_engines_sorted_in_execution_order_shalashaska_before_solidus():
+def test_engines_sorted_in_execution_order_solidus_before_shalashaska():
     """El orden de la tabla es el de ejecución: Naked → Shalashaska → Solidus."""
     result = SimpleNamespace(
         base_rows=[
@@ -145,7 +145,7 @@ def test_engines_sorted_in_execution_order_shalashaska_before_solidus():
     )
     rows = m.build_planned_by_engine_rows(result)
     engines_in_order = [row["ENGINE"] for row in rows]
-    assert engines_in_order.index("Shalashaska") < engines_in_order.index("Solidus")
+    assert engines_in_order.index("Solidus") < engines_in_order.index("Shalashaska")
 
 
 def test_attribute_engine_known_add_on_engines():
@@ -171,8 +171,8 @@ def test_planned_by_engine_only_includes_assigned_rows():
     )
     rows = m.build_planned_by_engine_rows(result)
     engines = {row["ENGINE"] for row in rows}
-    assert engines == {"Naked", "Solidus"}
-    naked_row = next(r for r in rows if r["ENGINE"] == "Naked")
+    assert engines == {"Otacon", "Solidus"}
+    naked_row = next(r for r in rows if r["ENGINE"] == "Otacon")
     assert naked_row["CASOS"] == 1
     assert naked_row["UNIDADES"] == 10
     avl_row = next(r for r in rows if r["COBERTURA"] == "AVL")
@@ -192,8 +192,8 @@ def test_planned_by_engine_groups_multiple_causales_within_same_engine():
     )
     rows = m.build_planned_by_engine_rows(result)
     causales = {(row["ENGINE"], row["CAUSAL"]): row["CASOS"] for row in rows}
-    assert causales[("Naked", "OK")] == 2
-    assert causales[("Naked", "OK PARCIAL - CORTE POR STOCK")] == 1
+    assert causales[("Otacon", "OK")] == 2
+    assert causales[("Otacon", "OK PARCIAL - CORTE POR STOCK")] == 1
 
 
 def test_planned_by_engine_includes_insumos_when_summary_given():

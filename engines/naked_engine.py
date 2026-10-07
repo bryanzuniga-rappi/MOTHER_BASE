@@ -1,6 +1,6 @@
-"""Naked Engine — necesidad natural de Fountain9.
+"""Clasificación MOV para Otacon; nombre de módulo conservado por compatibilidad.
 
-Posición: base de la planeación (primer engine).
+Posición: selección del residual, después de ejecutar DOI mediante Naked.
 Entrada: fila consolidada del Bulk (ROQ_INPUT / MOV_ORIGINAL).
 Salida: predicados que clasifican la fila (recomendación positiva o no).
 """

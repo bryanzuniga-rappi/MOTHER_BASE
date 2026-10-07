@@ -1,7 +1,7 @@
 """Les Enfants Terribles — módulo de planeación (UI y orquestación).
 
-Posición: ejecuta, en orden, Naked → Shalashaska → Solidus (AVL, Preventivo,
-Refuerzo, Cobertura sin Fountain9) → Liquid → Venom → Kazuhira → partición
+Posición: ejecuta, en orden, Naked → Otacon → Solidus (AVL, Preventivo,
+Refuerzo, Cobertura sin Fountain9) → Shalashaska → Liquid → Venom → Kazuhira → partición
 OWNER → Insumos, con un presupuesto de tareas compartido. ENGINE_INFO es el
 registro de qué hace cada engine (lo usan pantalla y PDF).
 Entrada: Bulk de Fountain9, DATA_TRANSFERS y COPÉRNICO.
@@ -428,7 +428,9 @@ DURATION_COLUMN = "Duration"
 LEAD_TIME_COLUMN = "Primary Source Lead Time (Days)"
 # Decisión final de asignación de Fountain9 (opcional; alimenta el comparativo
 # Fountain9 vs Mother Base).
-FOUNTAIN9_ALLOCATION_COLUMN = "Allocation (Store Based)"
+FOUNTAIN9_ALLOCATION_COLUMN = "Allocation (DOI Based)"
+FOUNTAIN9_DOI_COLUMN = "Allocation (DOI Based)"
+FOUNTAIN9_SOURCE_COLUMN = "Source Id Before Multi Source"
 
 MOV_MAX_OPTIONAL_COLUMNS = (
     "Replenishment Quantity for Plan Duration (Batch Size Rounded)",
@@ -448,7 +450,7 @@ PLANNING_REASON_COLUMN = "PLANNING_REASON"
 
 # Sello de versión (resultados, advertencias y run['build']). Subir en cada
 # entrega.
-APP_BUILD = "2026-10-05 · kazuhira-v14"
+APP_BUILD = "2026-10-07 · naked-otacon-v2"
 
 # REGLA_DEMANDA de filas de cobertura, nunca de la necesidad original de
 # Fountain9; 'Requerido' las excluye.
@@ -464,7 +466,8 @@ ENGINE_TOPUP_REGLA_DEMANDA: frozenset[str] = frozenset(
     }
 )
 PLANNING_REASON_FOUNTAIN9 = "FOUNTAIN9 · NAKED ENGINE"
-PLANNING_REASON_MANUAL_FORECAST_ZERO = "MÍNIMO · NAKED ENGINE"
+PLANNING_REASON_OTACON = "REMANENTE · OTACON ENGINE"
+PLANNING_REASON_MANUAL_FORECAST_ZERO = "MÍNIMO · OTACON ENGINE"
 PLANNING_REASON_AVL = "CUBRIR AVL · SOLIDUS ENGINE"
 PLANNING_REASON_PREVENTIVE = "EVITAR QUIEBRES · SOLIDUS ENGINE"
 PLANNING_REASON_SPECIAL_DOH = "REFUERZO GOLDEN/INFALTABLE/ANCHOR · SOLIDUS ENGINE"
@@ -1356,6 +1359,7 @@ def consolidate_plan_files(
     consolidated: dict[tuple[int, int], dict[str, Any]] = {}
     source_row_count = 0
     source_counts: Counter[str] = Counter()
+    fountain9_instructions: dict[tuple[int | None, int, int], int] = defaultdict(int)
     # Para la moda de Duration/Lead Time por tienda (ver más abajo).
     duration_values_by_store: dict[int, list[float]] = defaultdict(list)
     lead_time_values_by_store: dict[int, list[float]] = defaultdict(list)
@@ -1436,7 +1440,18 @@ def consolidate_plan_files(
             fountain9_allocation_field = field_lookup.get(
                 engine.normalize_header(FOUNTAIN9_ALLOCATION_COLUMN)
             )
+            fountain9_doi_field = field_lookup.get(
+                engine.normalize_header(FOUNTAIN9_DOI_COLUMN)
+            )
+            fountain9_source_field = field_lookup.get(
+                engine.normalize_header(FOUNTAIN9_SOURCE_COLUMN)
+            )
 
+            trace_columns = (
+                "Primary Source Id", "Allocated Qty Before Multi Source",
+                "Source Current Inv Before Multi Source", "Is Secondary Plan", "Link Type",
+                "DOI", "DOH",
+            )
             for csv_row, raw in enumerate(reader, start=2):
                 if not any(engine.clean_text(value) for value in raw.values()):
                     continue
@@ -1490,6 +1505,14 @@ def consolidate_plan_files(
                         "FOUNTAIN9_ALLOCATION": None,
                     }
                 record = consolidated[key]
+                for column in trace_columns:
+                    field = field_lookup.get(engine.normalize_header(column))
+                    value = raw.get(field, "") if field else ""
+                    if column in ("DOI", "DOH"):
+                        if engine.clean_text(value):
+                            record[column] = min(record.get(column, float("inf")), engine.to_float(value, float("inf")))
+                    elif engine.clean_text(value):
+                        record.setdefault("F9_REFERENCE", {}).setdefault(column, set()).add(str(value))
                 record["PREDICTED_DEMAND"] += engine.to_float(
                     raw.get(required_lookup["Predicted Demand for selected duration"], "")
                 )
@@ -1515,6 +1538,8 @@ def consolidate_plan_files(
                     row_mov_candidates.append(
                         engine.to_float(raw.get(field_name, ""))
                     )
+                if fountain9_doi_field is not None:
+                    row_mov_candidates.append(engine.to_float(raw.get(fountain9_doi_field, "")))
                 row_mov_max = max(row_mov_candidates)
                 # Duplicados de la misma tienda-SKU: se toma el MÁXIMO, no la suma.
                 record["ROQ_INPUT"] = max(record["ROQ_INPUT"], row_mov_max)
@@ -1522,11 +1547,22 @@ def consolidate_plan_files(
                     row_f9_allocation = engine.to_float(
                         raw.get(fountain9_allocation_field, "")
                     )
-                    # Mismo criterio que ROQ_INPUT: máximo entre filas/
-                    # archivos duplicados, nunca suma.
-                    record["FOUNTAIN9_ALLOCATION"] = max(
-                        record["FOUNTAIN9_ALLOCATION"] or 0.0, row_f9_allocation
+                    # Allocation DOI es una instrucción ejecutable: duplicados
+                    # se suman para que el comparativo coincida con Naked.
+                    record["FOUNTAIN9_ALLOCATION"] = (
+                        (record["FOUNTAIN9_ALLOCATION"] or 0.0) + row_f9_allocation
                     )
+                if fountain9_doi_field is not None:
+                    doi_quantity = engine.to_float(raw.get(fountain9_doi_field, ""))
+                    if doi_quantity > 0:
+                        if not math.isfinite(doi_quantity) or not doi_quantity.is_integer():
+                            raise ValueError(f"{path.name} fila {csv_row}: Allocation DOI debe ser entero finito")
+                        raw_source = raw.get(fountain9_source_field, "") if fountain9_source_field else ""
+                        try:
+                            source = engine.to_id(raw_source, FOUNTAIN9_SOURCE_COLUMN, allow_none=True)
+                        except (ValueError, TypeError):
+                            source = engine.clean_text(raw_source)
+                        fountain9_instructions[(source, destination, sku)] += int(doi_quantity)
                 record["NET_INTER_STORE_TRANSFERS"] += engine.to_float(
                     raw.get(required_lookup["Net Inter-Store Transfers"], "")
                 )
@@ -1548,6 +1584,7 @@ def consolidate_plan_files(
         )
         demand = record["PREDICTED_DEMAND"]
         opening = record["PREDICTED_OPENING_INVENTORY"]
+        record["ROQ_INPUT"] = max(record["ROQ_INPUT"], record["FOUNTAIN9_ALLOCATION"] or 0)
         roq_input = record["ROQ_INPUT"]
         net_transfer = record["NET_INTER_STORE_TRANSFERS"]
         zero_total_rule = (
@@ -1619,6 +1656,27 @@ def consolidate_plan_files(
         "rows_by_file": dict(source_counts),
         "duration_mode_by_store": duration_mode_by_store,
         "lead_time_mode_by_store": lead_time_mode_by_store,
+        # Instrucciones ejecutables de Fountain9. Se conservan separadas de
+        # la consolidación tienda-SKU porque Naked necesita respetar origen.
+        "fountain9_instructions": [
+            {
+                "WAREHOUSE_SOURCE": source,
+                "WAREHOUSE_DESTINATION": destination,
+                "RETAIL_ID": sku,
+                "QUANTITY": quantity,
+                "REFERENCE": {
+                    column: " | ".join(sorted(values))
+                    for column, values in consolidated[(destination, sku)].get("F9_REFERENCE", {}).items()
+                },
+            }
+            for (source, destination, sku), quantity in sorted(
+                fountain9_instructions.items(),
+                key=lambda item: (
+                    item[0][1], item[0][2],
+                    item[0][0] is None, str(item[0][0]),
+                ),
+            )
+        ],
     }
     return output_path, consolidated, summary
 
@@ -1636,6 +1694,8 @@ def enrich_consolidated_plan_read(
             "NET_INTER_STORE_TRANSFERS"
         ]
         row["ROQ_INPUT"] = source["ROQ_INPUT"]
+        row["DOI"] = source.get("DOI", float("inf"))
+        row["DOH"] = source.get("DOH", float("inf"))
         row["NET_TRANSFER_HARDCODE_3"] = source["NET_TRANSFER_HARDCODE_3"]
         row["SOURCE_FILES"] = " | ".join(sorted(source["SOURCE_FILES"]))
         row["SOURCE_ROWS"] = source["SOURCE_ROWS"]
@@ -1651,6 +1711,34 @@ def enrich_consolidated_plan_read(
             f"{consolidation_summary['unique_requirements']:,} combinaciones "
             "Warehouse-SKU."
         )
+
+
+def build_naked_fountain9_rows(
+    instructions: list[dict[str, Any]],
+    plan_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Arma la cola estricta de Naked desde Allocation (DOI Based)."""
+    by_key = {
+        (int(row["WAREHOUSE_DESTINATION"]), int(row["RETAIL_ID"])): row
+        for row in plan_rows
+    }
+    naked_rows: list[dict[str, Any]] = []
+    for instruction in instructions:
+        destination = int(instruction["WAREHOUSE_DESTINATION"])
+        sku = int(instruction["RETAIL_ID"])
+        if (destination, sku) not in by_key:
+            continue
+        base = dict(by_key[(destination, sku)])
+        base.update(
+            {
+                "FORCED_TARGET": int(instruction["QUANTITY"]),
+                "FORCED_SOURCE": instruction.get("WAREHOUSE_SOURCE"),
+                "FORCED_RULE": "FOUNTAIN9_DOI",
+                "ALLOW_PARTIAL": True,
+            }
+        )
+        naked_rows.append(base)
+    return naked_rows
 
 
 def attach_consolidated_input_to_result(
@@ -1670,7 +1758,7 @@ def attach_consolidated_input_to_result(
         ]
         row["ARCHIVOS_INPUT"] = " | ".join(sorted(source["SOURCE_FILES"]))
         row["FILAS_INPUT_SUMADAS"] = source["SOURCE_ROWS"]
-        if source["NET_TRANSFER_HARDCODE_3"]:
+        if source["NET_TRANSFER_HARDCODE_3"] and row.get("REGLA_DEMANDA") != "FOUNTAIN9_DOI":
             row["MOV_ORIGINAL"] = source["ROQ_INPUT"]
             row["REGLA_DEMANDA"] = "HARDCODE_3_NET_TRANSFER_BAJO"
 
@@ -1687,7 +1775,7 @@ def attach_consolidated_input_to_result(
         if (
             key in manual_keys
             and allocation.get(PLANNING_REASON_COLUMN)
-            == PLANNING_REASON_FOUNTAIN9
+            == PLANNING_REASON_OTACON
         ):
             allocation[PLANNING_REASON_COLUMN] = (
                 PLANNING_REASON_MANUAL_FORECAST_ZERO
@@ -2553,10 +2641,12 @@ def append_insumos_to_bulk_444(
             "Se encontraron insumos elegibles, pero no se generó BulkCD_444.csv."
         )
 
+    for row in selected:
+        row.setdefault("WAREHOUSE_SOURCE", 444)
     engine.enrich_rows_with_product_info(selected, catalogs)
     engine.write_csv(
         bulk_path,
-        regular_444_rows + selected,
+        consolidate_bulk_rows(regular_444_rows + selected),
         BULK_OUTPUT_COLUMNS,
     )
     # SWA de Insumos: se calcula desde sus propias filas (no pasan por
@@ -2587,6 +2677,34 @@ def append_insumos_to_bulk_444(
     )
     summary["stock_detail"].sort(key=lambda row: row["PRODUCT_ID"])
     return summary
+
+
+def consolidate_bulk_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """El sistema operativo acepta una sola ruta origen-destino-SKU."""
+    grouped: dict[tuple[int, int, int], dict[str, Any]] = {}
+    for row in rows:
+        key = (
+            int(row["WAREHOUSE_SOURCE"]),
+            int(row["WAREHOUSE_DESTINATION"]),
+            int(row["RETAIL_ID"]),
+        )
+        existing = grouped.get(key)
+        if existing is None:
+            grouped[key] = dict(row)
+            continue
+        existing["QUANTITY"] = int(existing.get("QUANTITY", 0) or 0) + int(
+            row.get("QUANTITY", 0) or 0
+        )
+        for column in ("PLANNED_DATE", "ROUTE", "DELIVERY_PRIORITY", "STORAGE", "OWNER_NAME"):
+            if str(existing.get(column, "")) != str(row.get(column, "")):
+                raise ValueError(f"Bulk incompatible en {key}: {column}")
+        reasons = {
+            reason for item in (existing, row)
+            for reason in str(item.get(PLANNING_REASON_COLUMN, "")).split(" + ") if reason
+        }
+        existing[PLANNING_REASON_COLUMN] = " + ".join(sorted(reasons))
+    return [grouped[key] for key in sorted(grouped)]
+
 
 
 def rewrite_bulk_csvs_with_planning_reason(
@@ -2624,7 +2742,7 @@ def rewrite_bulk_csvs_with_planning_reason(
         )
         engine.write_csv(
             path,
-            rows,
+            consolidate_bulk_rows(rows),
             BULK_OUTPUT_COLUMNS,
         )
 
@@ -2725,9 +2843,9 @@ def ordered_breakdown_rows(
 # TIPO_DE_CORTE que NO aparezca aquí se le atribuye a la pasada base
 # Naked/Solidus (la cascada principal de plan_transfers).
 # --- Registro de engines (orden real de ejecución) -------------------------
-# Naked → Shalashaska → Solidus → Liquid → Venom → Kazuhira → OWNER → Insumos.
+# Naked → Otacon → Solidus → Shalashaska → Liquid → Venom → Kazuhira.
 ENGINE_ORDER = (
-    "Naked", "Shalashaska", "Solidus", "Liquid", "Venom", "Kazuhira", "Insumos",
+    "Naked", "Otacon", "Solidus", "Shalashaska", "Liquid", "Venom", "Kazuhira", "Insumos",
 )
 NO_COVERAGE = "—"
 COVERAGE_FOUNTAIN9 = "Fountain9"
@@ -2737,7 +2855,8 @@ COVERAGE_PREVENTIVE = "Preventivo"
 COVERAGE_SPECIAL_DOH = "Refuerzo (Infaltable/Golden/Anchor/KVI)"
 COVERAGE_NO_FOUNTAIN9 = "Cobertura sin Fountain9"
 COVERAGE_ORDER: dict[str, tuple[str, ...]] = {
-    "Naked": (COVERAGE_FOUNTAIN9, COVERAGE_MINIMUMS),
+    "Naked": (COVERAGE_FOUNTAIN9,),
+    "Otacon": (COVERAGE_FOUNTAIN9, COVERAGE_MINIMUMS),
     "Solidus": (
         COVERAGE_AVL, COVERAGE_PREVENTIVE, COVERAGE_SPECIAL_DOH,
         COVERAGE_NO_FOUNTAIN9,
@@ -2755,7 +2874,8 @@ ENGINE_COVERAGE_BY_CUT: dict[str, tuple[str, str]] = {
 }
 ENGINE_COVERAGE_BY_REASON: dict[str, tuple[str, str]] = {
     PLANNING_REASON_FOUNTAIN9: ("Naked", COVERAGE_FOUNTAIN9),
-    PLANNING_REASON_MANUAL_FORECAST_ZERO: ("Naked", COVERAGE_MINIMUMS),
+    PLANNING_REASON_OTACON: ("Otacon", COVERAGE_FOUNTAIN9),
+    PLANNING_REASON_MANUAL_FORECAST_ZERO: ("Otacon", COVERAGE_MINIMUMS),
     PLANNING_REASON_AVL: ("Solidus", COVERAGE_AVL),
     PLANNING_REASON_PREVENTIVE: ("Solidus", COVERAGE_PREVENTIVE),
     PLANNING_REASON_SPECIAL_DOH: ("Solidus", COVERAGE_SPECIAL_DOH),
@@ -2770,34 +2890,41 @@ SWEEP_ONLY_ENGINE = "Barrido de catálogo"
 ENGINE_INFO: dict[str, dict[str, Any]] = {
     "Naked": {
         "stage": "Etapa 1",
-        "role": "Cubre la recomendación natural de Fountain9 (ROQ positivo) y sus mínimos.",
-        "position": "Base de la planeación; primera prioridad sobre el presupuesto de tareas.",
-        "card": (
-            "Cubre la recomendación natural de Fountain9 (ROQ positivo) y, si lo "
-            "activas, un mínimo cuando no hubo ROQ. Corre primero y tiene prioridad "
-            "sobre las tareas. Aquí configuras las 3 reglas de mínimo y sus umbrales."
-        ),
+        "role": "Ejecuta fielmente Allocation (DOI Based) de Fountain9.",
+        "position": "Primera pasada, con Source Id Before Multi Source fijo y sin mínimo.",
+        "card": "Ejecuta Allocation (DOI Based) desde el origen exacto que Fountain9 indicó. Sin mínimo y sin cambiar de origen.",
         "how": (
-            "Toma el MOV efectivo de Fountain9 (máximo entre MOV y sus columnas adicionales) y asigna desde los orígenes en el orden elegido.",
+            "Toma Allocation (DOI Based) y Source Id Before Multi Source.",
             "Respeta stock ajustado, capacidad de la tienda, bloqueos y el presupuesto de tareas.",
-            "Con «Cubrir a Fountain9» arma además un mínimo cuando Fountain9 no dio ROQ positivo, con 3 reglas que se apagan por separado.",
+            "Si no logra ejecutar una parte, declara el corte; Otacon puede recuperarla después.",
         ),
         "coverages": {
-            COVERAGE_FOUNTAIN9: "Necesidad con ROQ positivo.",
-            COVERAGE_MINIMUMS: "Mínimo cuando Fountain9 no dio ROQ positivo (reglas HARDCODE).",
+            COVERAGE_FOUNTAIN9: "Allocation DOI de Fountain9.",
         },
     },
-    "Shalashaska": {
+    "Otacon": {
         "stage": "Etapa 2",
+        "role": "Reasigna el inventario residual para cubrir la necesidad propia.",
+        "position": "Después de Naked; puede elegir un origen alternativo.",
+        "card": "Completa el residual con el máximo de MOV y columnas configuradas, descontando lo que Naked ejecutó.",
+        "how": (
+            "Conserva mínimos y reglas hardcode de Mother Base.",
+            "Calcula el máximo de las columnas configuradas y descuenta Naked ejecutado.",
+            "Puede reasignar el origen con el stock, capacidad y tareas remanentes.",
+        ),
+        "coverages": {COVERAGE_FOUNTAIN9: "Residual tras Naked.", COVERAGE_MINIMUMS: "Mínimos (hardcode)."},
+    },
+    "Shalashaska": {
+        "stage": "Etapa 4",
         "role": "Evacúa inventario próximo a caducar (POR_MERMAR).",
-        "position": "Después de Naked, antes de Solidus.",
+        "position": "Después de Solidus.",
         "card": (
-            "Evacúa inventario próximo a caducar (POR_MERMAR) hacia tiendas con ROQ "
-            "positivo que ya reciben del mismo origen. Solo viaja a las ciudades que "
+            "Evacúa inventario próximo a caducar (POR_MERMAR) hacia tiendas que ya "
+            "reciben del mismo origen mediante Naked, Otacon o Solidus. Solo viaja a las ciudades que "
             "ese origen cubre (puedes sumar más) y puede enviar solo un % de la merma."
         ),
         "how": (
-            "Solo envía a tiendas con ROQ positivo de Fountain9 que ya reciben del mismo origen; los mínimos (hardcode) no cuentan.",
+            "Envía a tiendas activadas por Naked, Otacon o Solidus desde el mismo origen; los mínimos solos no activan una ruta.",
             "Solo a las ciudades que cubre cada origen (444, 811, 831 y 834: CDMX; 425: Guadalajara; 856 y 49: Monterrey) más las que agregues.",
             "Puede evacuar solo un porcentaje de la merma y excluir categorías sensibles (Huevo).",
             "Reparte parejo por ADU y luego por SHARE_VENTAS; POR_MERMAR no sustituye al stock final.",
@@ -2806,7 +2933,7 @@ ENGINE_INFO: dict[str, dict[str, Any]] = {
     "Solidus": {
         "stage": "Etapa 3",
         "role": "Coberturas tácticas de catálogo con el stock, la capacidad y las tareas que quedan.",
-        "position": "Después de Shalashaska. Sus coberturas corren en cadena: AVL → Preventivo → Refuerzo → Cobertura sin Fountain9.",
+        "position": "Después de Otacon. Sus coberturas corren en cadena: AVL → Preventivo → Refuerzo → Cobertura sin Fountain9.",
         "card": (
             "Cuatro coberturas de catálogo con lo que sobra: AVL (quiebres), Preventivo "
             "(inventario bajo), Refuerzo por bucket (Infaltable, Golden, Anchor, KVI) y "
@@ -2817,7 +2944,7 @@ ENGINE_INFO: dict[str, dict[str, Any]] = {
             "Cada cobertura actúa solo donde Fountain9 no pidió algo positivo; nunca modifica una recomendación de Fountain9.",
             "Refuerzo: Infaltable, Golden, Anchor y KVI con toggle y DOH propios; si un SKU está en varios buckets, gana el DOH más alto.",
             "Con poca capacidad o tareas atiende primero el mayor SWA (toggle).",
-            "Comparten stock, capacidad y presupuesto de tareas con Naked, Shalashaska y Liquid.",
+            "Comparten stock, capacidad y presupuesto de tareas con Naked, Otacon, Shalashaska y Liquid.",
         ),
         "coverages": {
             COVERAGE_AVL: "Quiebres (stock 0) del catálogo, hasta el DOH objetivo.",
@@ -2827,9 +2954,9 @@ ENGINE_INFO: dict[str, dict[str, Any]] = {
         },
     },
     "Liquid": {
-        "stage": "Etapa 4",
+        "stage": "Etapa 5",
         "role": "Agota el stock remanente de origen.",
-        "position": "Después de Solidus, antes de Venom.",
+        "position": "Después de Shalashaska, antes de Venom.",
         "card": (
             "Agota el stock remanente de origen: SKUs que tú indicas y saldos bajo un "
             "umbral. Solo envía a tiendas que ya recibieron producto de otro engine, "
@@ -2842,7 +2969,7 @@ ENGINE_INFO: dict[str, dict[str, Any]] = {
         ),
     },
     "Venom": {
-        "stage": "Etapa 5",
+        "stage": "Etapa 6",
         "role": "Recompone buffers DDMRP sobre lo ya planeado.",
         "position": "Después de Liquid, antes de Kazuhira.",
         "card": (
@@ -2859,7 +2986,7 @@ ENGINE_INFO: dict[str, dict[str, Any]] = {
         ),
     },
     "Kazuhira": {
-        "stage": "Etapa 6",
+        "stage": "Etapa 7",
         "role": "Garantía final: cubre todo quiebre que aún sea posible resolver.",
         "position": "Última pasada, antes de la partición OWNER. Solo Big Boss.",
         "card": (
@@ -2900,9 +3027,11 @@ def attribute_row(row: dict[str, Any]) -> tuple[str, str]:
         if tipo == CATALOG_UNIVERSE_POST_KAZUHIRA_CUT:
             return ("Kazuhira", NO_COVERAGE)
         return (SWEEP_ONLY_ENGINE, NO_COVERAGE)
+    if rule == "FOUNTAIN9_DOI":
+        return ("Naked", COVERAGE_FOUNTAIN9)
     if rule in MANUAL_FORECAST_ZERO_RULES:
-        return ("Naked", COVERAGE_MINIMUMS)
-    return ("Naked", COVERAGE_FOUNTAIN9)
+        return ("Otacon", COVERAGE_MINIMUMS)
+    return ("Otacon", COVERAGE_FOUNTAIN9)
 
 
 def attribute_engine(tipo_de_corte: str) -> str:
@@ -2994,11 +3123,17 @@ def build_engine_summary_rows(
         key = attribute_row(row)
         cases[key] += 1
         swa[key] += float(row.get("SWA_POTENTIAL_GAIN_COUNTRY", 0.0) or 0.0)
-    for line in getattr(result, "allocation_rows", []):
+    seen_task_keys = set()
+    for index, line in enumerate(getattr(result, "allocation_rows", [])):
         key = ENGINE_COVERAGE_BY_REASON.get(
             str(line.get(PLANNING_REASON_COLUMN, "")), ("Naked", COVERAGE_FOUNTAIN9)
         )
-        tasks[key] += 1
+        task_key = tuple(line.get(c) for c in ("WAREHOUSE_SOURCE", "WAREHOUSE_DESTINATION", "RETAIL_ID", "OWNER_NAME"))
+        if task_key[:3] == (None, None, None):
+            task_key = ("fixture", index)
+        if task_key not in seen_task_keys:
+            tasks[key] += 1
+            seen_task_keys.add(task_key)
         units[key] += int(line.get("QUANTITY", 0) or 0)
     insumos_key = ("Insumos", NO_COVERAGE)
     if insumos_summary:
@@ -3622,7 +3757,7 @@ def build_fountain9_comparison_report(
     catalogs,
     consolidated: dict[tuple[int, int], dict[str, Any]],
 ) -> dict[str, Any]:
-    """Compara 'Allocation (Store Based)' de Fountain9 contra Mother Base en tres
+    """Compara 'Allocation (DOI Based)' de Fountain9 contra Mother Base en tres
     bloques: mismo alcance, adicional (fuera del alcance de Fountain9) y total.
     """
     universe = [
@@ -3746,6 +3881,60 @@ def build_fountain9_comparison_report(
         "solo_mother_base": solo_mb,
         "ninguno_cubrio": ninguno_cubrio,
     }
+
+
+def build_fountain9_audit(result, instructions, excluded=None, naked_enabled=True):
+    """Concilia DOI por origen F9 sin duplicar la recuperación entre instrucciones."""
+    excluded = excluded or {}
+    naked = Counter()
+    otacon = Counter()
+    other = Counter()
+    total = Counter()
+    for row in result.allocation_rows:
+        key = (int(row["WAREHOUSE_DESTINATION"]), int(row["RETAIL_ID"]))
+        qty = int(row["QUANTITY"])
+        reason = row.get(PLANNING_REASON_COLUMN, "")
+        total[key] += qty
+        if reason == PLANNING_REASON_FOUNTAIN9:
+            naked[(row["WAREHOUSE_SOURCE"], *key)] += qty
+        elif reason in (PLANNING_REASON_OTACON, PLANNING_REASON_MANUAL_FORECAST_ZERO):
+            otacon[key] += qty
+        else:
+            other[key] += qty
+    cuts = {}
+    final_cuts = defaultdict(set)
+    for row in result.base_rows:
+        key = (int(row["WAREHOUSE_DESTINATION"]), int(row["RETAIL_ID"]))
+        if row.get("REGLA_DEMANDA") == "FOUNTAIN9_DOI":
+            cuts[(row.get("F9_SOURCE"), *key)] = row.get("TIPO_DE_CORTE", "")
+        if int(row.get("CANTIDAD_FALTANTE", 0) or 0) > 0:
+            final_cuts[key].add(str(row.get("TIPO_DE_CORTE", "")))
+    rows = []
+    for instruction in instructions:
+        source = instruction.get("WAREHOUSE_SOURCE")
+        key = (int(instruction["WAREHOUSE_DESTINATION"]), int(instruction["RETAIL_ID"]))
+        requested = int(instruction["QUANTITY"])
+        literal = min(requested, naked[(source, *key)])
+        recovered = min(requested - literal, otacon[key])
+        otacon[key] -= recovered
+        later = min(requested - literal - recovered, other[key])
+        other[key] -= later
+        covered = literal + recovered + later
+        cause = "" if literal == requested else (
+            excluded.get(key) or ("NAKED_DESACTIVADO" if not naked_enabled else
+                                  cuts.get((source, *key), "SIN_ASIGNACION")))
+        rows.append({
+            "ORIGEN_F9": source if source is not None else "",
+            "WAREHOUSE_DESTINATION": key[0], "RETAIL_ID": key[1],
+            "DOI_SOLICITADO": requested, "NAKED_EJECUTADO": literal,
+            "CUMPLIMIENTO_NAKED_PCT": round(100 * literal / requested, 2),
+            "MOTIVO_CORTE_NAKED": cause,
+            "OTACON_RECUPERADO": recovered, "OTROS_ENGINES_RECUPERADO": later,
+            "COBERTURA_FINAL_MB": covered, "FALTANTE_FINAL": requested - covered,
+            "MOTIVO_FALTANTE_FINAL": (excluded.get(key) or " | ".join(sorted(final_cuts[key])) or cause) if covered < requested else "",
+            **instruction.get("REFERENCE", {}),
+        })
+    return rows
 
 
 def clear_previous_workspace() -> None:
@@ -4239,19 +4428,27 @@ def build_planning_analytics(
             }
         )
 
-    target_units = sum(int(row["CANTIDAD_OBJETIVO"]) for row in eligible_rows)
+    target_units, target_m3 = engine.planning_target_totals(eligible_rows)
     assigned_units = sum(int(row["CANTIDAD_ASIGNADA"]) for row in eligible_rows)
-    target_m3 = sum(float(row["M3_OBJETIVO"]) for row in eligible_rows)
     # Solo Naked/Solidus (necesidad original de Fountain9) — para las
     # tarjetas "Requerido" de Planeación Lista, que nunca deben incluir lo
     # que AVL/Shalashaska/Liquid/Venom agregan como su propia cobertura.
-    naked_eligible_cases = len(naked_eligible_rows)
-    naked_target_units = sum(
-        int(row["CANTIDAD_OBJETIVO"]) for row in naked_eligible_rows
-    )
-    naked_target_m3 = sum(
-        float(row["M3_OBJETIVO"]) for row in naked_eligible_rows
-    )
+    need_by_key = {}
+    doi_by_key = Counter()
+    volume_by_key = {}
+    for row in naked_eligible_rows:
+        key = (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"])
+        target = int(row["CANTIDAD_OBJETIVO"])
+        if row.get("REGLA_DEMANDA") == "FOUNTAIN9_DOI":
+            doi_by_key[key] += target
+        else:
+            need_by_key[key] = max(need_by_key.get(key, 0), int(row.get("MB_TOTAL_TARGET", 0) or target))
+        volume_by_key[key] = float(row["M3_OBJETIVO"]) / target if target else 0
+    for key, qty in doi_by_key.items():
+        need_by_key[key] = max(need_by_key.get(key, 0), qty)
+    naked_eligible_cases = len(need_by_key)
+    naked_target_units = sum(need_by_key.values())
+    naked_target_m3 = sum(qty * volume_by_key[key] for key, qty in need_by_key.items())
     original_roq_total = sum(original_roq_units(row) for row in eligible_rows)
     original_roq_fulfilled = sum(
         min(int(row["CANTIDAD_ASIGNADA"]), original_roq_units(row))
@@ -4358,6 +4555,7 @@ def apply_reporting_labels(result) -> None:
         row["STOCK_EXCLUIDO_RACKEADO_444"] = stock_excluded_by_rack_444
         if (
             bool(row.get("RACKEADO_444", False))
+            and (row.get("REGLA_DEMANDA") != "FOUNTAIN9_DOI" or row.get("F9_SOURCE") == 444)
             and stock_excluded_by_rack_444 > 0
             and assigned < target
             and "CORTE POR STOCK" in cut_type
@@ -5544,6 +5742,7 @@ def apply_avl_fill(
                     "CITY": city,
                     "STORAGE": engine.source_storage_type(catalogs, source, sku),
                     "VALUE": engine.source_value_category(catalogs, source, sku),
+                    "TASK_BYPASS": ignore_task_budget,
                     PLANNING_REASON_COLUMN: (
                         PLANNING_REASON_AVL
                         if candidate_mode == "stockout"
@@ -5828,6 +6027,7 @@ def write_executive_pdf(
     venom: dict[str, Any],
     input_consolidation: dict[str, Any],
     outliers_f9: dict[str, Any],
+    fountain9_audit: list[dict[str, Any]] | None = None,
 ) -> None:
     """Genera un reporte PDF ejecutivo, legible y listo para compartir."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -6483,6 +6683,19 @@ def write_executive_pdf(
         author="Mother Base Supply Command",
         subject="Planeación ejecutiva de abasto y transferencias",
     )
+    if fountain9_audit:
+        story.append(PageBreak())
+        story.append(Paragraph("Fountain9 DOI: cumplimiento y recuperación", title_style))
+        data = [["Métrica", "Unidades"]]
+        for label, column in (
+            ("Fountain9 solicitado", "DOI_SOLICITADO"),
+            ("Naked ejecutado literalmente", "NAKED_EJECUTADO"),
+            ("Otacon recuperado", "OTACON_RECUPERADO"),
+            ("Cobertura final de DOI", "COBERTURA_FINAL_MB"),
+            ("Faltante final", "FALTANTE_FINAL"),
+        ):
+            data.append([label, str(sum(row[column] for row in fountain9_audit))])
+        story.append(Table(data, colWidths=[300, 100]))
     document.build(story, onFirstPage=decorate_page, onLaterPages=decorate_page)
 
 
@@ -6813,10 +7026,29 @@ def execute_planning(
             config,
         )
         daily_plan_rows = list(active_plan_rows)
+        # 1) Naked ejecuta la decisión ya tomada por Fountain9. No usa MOV,
+        # mínimos ni reasignación: Allocation DOI + Source Before Multi Source.
+        naked_rows = build_naked_fountain9_rows(
+            consolidation_summary.get("fountain9_instructions", []),
+            daily_plan_rows,
+        ) if include_naked_engine else []
+        naked_result = engine.plan_transfers(naked_rows, catalogs, config)
+        for allocation in naked_result.allocation_rows:
+            allocation[PLANNING_REASON_COLUMN] = PLANNING_REASON_FOUNTAIN9
+
+        naked_executed: dict[tuple[int, int], int] = defaultdict(int)
+        for allocation in naked_result.allocation_rows:
+            naked_executed[(
+                int(allocation["WAREHOUSE_DESTINATION"]),
+                int(allocation["RETAIL_ID"]),
+            )] += int(allocation.get("QUANTITY", 0) or 0)
+
+        # 2) Otacon conserva la lógica histórica, pero sólo para el residual
+        # que Naked no logró ejecutar. Reasignar origen es válido aquí.
         engine_plan_rows, engine_selection = select_engine_rows(
             daily_plan_rows,
             config,
-            include_naked=include_naked_engine,
+            include_naked=True,
             include_hardcodes=cover_fountain9_hardcodes,
             hardcode_rules=frozenset(
                 rule
@@ -6828,10 +7060,23 @@ def execute_planning(
                 if enabled
             ),
         )
+        for row in engine_plan_rows:
+            base_target, base_rule = engine.calculate_target_quantity(row, config)
+            executed = naked_executed.get(
+                (int(row["WAREHOUSE_DESTINATION"]), int(row["RETAIL_ID"])), 0
+            )
+            row["MB_TOTAL_TARGET"] = base_target
+            row["FORCED_TARGET"] = max(base_target - executed, 0)
+            row["FORCED_RULE"] = base_rule if row.get("ES_MANUAL_FORECAST_ZERO") else "OTACON_RESIDUAL"
+            row["ALLOW_PARTIAL"] = True
 
-        result = engine.plan_transfers(engine_plan_rows, catalogs, config)
-        for allocation in result.allocation_rows:
-            allocation[PLANNING_REASON_COLUMN] = PLANNING_REASON_FOUNTAIN9
+        engine_plan_rows = [row for row in engine_plan_rows if row["FORCED_TARGET"] > 0 or
+                            not naked_executed.get((row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"]))]
+        result = engine.plan_transfers(
+            engine_plan_rows, catalogs, config, initial_result=naked_result
+        )
+        for allocation in result.allocation_rows[len(naked_result.allocation_rows):]:
+            allocation[PLANNING_REASON_COLUMN] = PLANNING_REASON_OTACON
         result.warnings.extend(plan_read.warnings)
         fountain_recommended_keys = {
             (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"])
@@ -6897,68 +7142,6 @@ def execute_planning(
         shalashaska_summary = empty_shalashaska_summary(
             include_shalashaska_engine
         )
-        if include_shalashaska_engine:
-            # Ciudades activas: las forzadas por los orígenes + las que agregó el
-            # usuario. Sin ninguna regla aplicable no se restringe por ciudad.
-            shalashaska_allowed_cities: set[str] | None = shalashaska_forced_cities(
-                origins
-            ) | {engine.normalize_city(city) for city in shalashaska_extra_cities}
-            if not shalashaska_allowed_cities:
-                shalashaska_allowed_cities = None
-            # Regla mandante: solo recibe merma una tienda con ROQ positivo de
-            # Fountain9; los mínimos (hardcode) no cuentan.
-            shalashaska_non_natural_keys = {
-                (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"])
-                for row in result.base_rows
-                if row.get("REGLA_DEMANDA") in MANUAL_FORECAST_ZERO_RULES
-            } | {
-                key
-                for key, record in consolidated_input.items()
-                if record.get("NET_TRANSFER_HARDCODE_3")
-            }
-            expiring_rows = load_expiring_inventory(data_path)
-            store_shares_cache = load_store_shares(data_path)
-            catalog_fill_rows_cache, catalog_warnings = load_avl_catalog_rows(
-                data_path
-            )
-            result.warnings.extend(catalog_warnings)
-            catalog_adu = {
-                (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"]): row["ADU"]
-                for row in catalog_fill_rows_cache
-                if row["RETAIL_ID"] not in excluded_sku_set
-            }
-            shalashaska_summary = apply_shalashaska_engine(
-                result,
-                catalogs,
-                config,
-                expiring_rows,
-                catalog_adu,
-                engine_blocked_store_ids,
-                blocked_cities,
-                store_shares_cache,
-                run_date=run_date,
-                target_doh=shalashaska_target_doh,
-                reason_column=PLANNING_REASON_COLUMN,
-                allowed_cities=shalashaska_allowed_cities,
-                non_natural_keys=shalashaska_non_natural_keys,
-                evacuation_fraction=shalashaska_evacuation_fraction,
-                excluded_categories=(
-                    frozenset() if shalashaska_allow_sensitive else SENSITIVE_CATEGORIES
-                ),
-            )
-            if shalashaska_summary["sensitive_unclassified"]:
-                result.warnings.append(
-                    f"Shalashaska: {shalashaska_summary['sensitive_unclassified']:,} "
-                    "SKUs en riesgo no tienen CATEGORY_NAME en la hoja DATA, así que "
-                    "no se pudo verificar si son categoría sensible."
-                )
-            result.warnings.append(
-                "Shalashaska Engine: se evacuaron "
-                f"{shalashaska_summary['units_evacuated']:,} de "
-                f"{shalashaska_summary['units_at_risk']:,} unidades próximas a "
-                f"caducar mediante {shalashaska_summary['tasks_added']:,} tareas nuevas."
-            )
-
         catalog_fill_rows: list[dict[str, Any]] = []
         include_avl_fill = include_solidus_engine and include_avl_fill
         include_preventive_fill = (
@@ -7102,6 +7285,52 @@ def execute_planning(
                 "Fountain9 (ausentes del archivo o con sin recomendación "
                 "pero quiebre real), usando la moda de Duration/Lead Time "
                 "por tienda de su propio Bulk."
+            )
+
+        # Shalashaska corre después de Solidus: puede evacuar merma hacia las
+        # tiendas que las coberturas tácticas ya activaron en esta corrida.
+        if include_shalashaska_engine:
+            shalashaska_allowed_cities: set[str] | None = shalashaska_forced_cities(
+                origins
+            ) | {engine.normalize_city(city) for city in shalashaska_extra_cities}
+            if not shalashaska_allowed_cities:
+                shalashaska_allowed_cities = None
+            shalashaska_non_natural_keys = {
+                (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"])
+                for row in result.base_rows
+                if row.get("REGLA_DEMANDA") in MANUAL_FORECAST_ZERO_RULES
+            } | {
+                key for key, record in consolidated_input.items()
+                if record.get("NET_TRANSFER_HARDCODE_3")
+            }
+            expiring_rows = load_expiring_inventory(data_path)
+            store_shares_cache = load_store_shares(data_path)
+            catalog_adu = {
+                (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"]): row["ADU"]
+                for row in ensure_catalog_rows()
+                if row["RETAIL_ID"] not in excluded_sku_set
+            }
+            shalashaska_summary = apply_shalashaska_engine(
+                result, catalogs, config, expiring_rows, catalog_adu,
+                engine_blocked_store_ids, blocked_cities, store_shares_cache,
+                run_date=run_date, target_doh=shalashaska_target_doh,
+                reason_column=PLANNING_REASON_COLUMN,
+                allowed_cities=shalashaska_allowed_cities,
+                non_natural_keys=shalashaska_non_natural_keys,
+                evacuation_fraction=shalashaska_evacuation_fraction,
+                excluded_categories=(
+                    frozenset() if shalashaska_allow_sensitive else SENSITIVE_CATEGORIES
+                ),
+            )
+            if shalashaska_summary["sensitive_unclassified"]:
+                result.warnings.append(
+                    f"Shalashaska: {shalashaska_summary['sensitive_unclassified']:,} "
+                    "SKUs sin CATEGORY_NAME; no se pudo validar categoría sensible."
+                )
+            result.warnings.append(
+                "Shalashaska Engine: se evacuaron "
+                f"{shalashaska_summary['units_evacuated']:,} de "
+                f"{shalashaska_summary['units_at_risk']:,} unidades próximas a caducar."
             )
 
         attach_consolidated_input_to_result(result, consolidated_input)
@@ -7478,7 +7707,7 @@ def execute_planning(
             if row.get(PLANNING_REASON_COLUMN) == PLANNING_REASON_FOUNTAIN9
         ]
         naked_summary = {
-            "enabled": True,
+            "enabled": include_naked_engine,
             "units": sum(int(row["QUANTITY"]) for row in naked_allocation_rows),
             "tasks": len(naked_allocation_rows),
             "stores": len(
@@ -7571,6 +7800,23 @@ def execute_planning(
         annotate_base_rows_with_engine(result.base_rows)
         engine.enrich_rows_with_product_info(result.base_rows, catalogs)
         engine.enrich_rows_with_product_info(result.allocation_rows, catalogs)
+        excluded_f9 = {}
+        for instruction in consolidation_summary.get("fountain9_instructions", []):
+            destination, sku = instruction["WAREHOUSE_DESTINATION"], instruction["RETAIL_ID"]
+            if sku in excluded_sku_set:
+                excluded_f9[(destination, sku)] = "SKU_BLOQUEADO"
+            elif destination in engine_blocked_store_ids:
+                excluded_f9[(destination, sku)] = (
+                    "TIENDA_CERRADA" if destination in closed_store_ids else
+                    "OUTLIER_F9" if destination in outlier_store_ids else "TIENDA_EXCLUIDA")
+            elif catalogs.stores.get(destination, {}).get("city_norm") in blocked_cities:
+                excluded_f9[(destination, sku)] = "CIUDAD_BLOQUEADA"
+        fountain9_audit = build_fountain9_audit(
+            result, consolidation_summary.get("fountain9_instructions", []),
+            excluded_f9, include_naked_engine,
+        )
+        result.fountain9_audit = fountain9_audit
+        result.build = APP_BUILD
         local_files = engine.create_output_files(
             result,
             config,
@@ -7579,6 +7825,11 @@ def execute_planning(
             output_dir,
         )
         local_files = [Path(path) for path in local_files]
+        if fountain9_audit:
+            audit_path = output_dir / f"Auditoria_Fountain9_{run_date:%d-%m-%Y}.csv"
+            audit_columns = list(dict.fromkeys(k for row in fountain9_audit for k in row))
+            engine.write_csv(audit_path, fountain9_audit, audit_columns)
+            local_files.append(audit_path)
         if sweep_healthy_path is not None and sweep_healthy_count:
             local_files.append(sweep_healthy_path)
         elif sweep_healthy_path is not None:
@@ -7626,9 +7877,9 @@ def execute_planning(
         )
         engine_enabled = {
             ("Naked", COVERAGE_FOUNTAIN9): include_naked_engine,
-            ("Naked", COVERAGE_MINIMUMS): (
-                include_naked_engine
-                and cover_fountain9_hardcodes
+            ("Otacon", COVERAGE_FOUNTAIN9): True,
+            ("Otacon", COVERAGE_MINIMUMS): (
+                cover_fountain9_hardcodes
                 and (hardcode_zero_total or hardcode_inventory_below_demand or hardcode_low_net_transfer)
             ),
             ("Shalashaska", NO_COVERAGE): include_shalashaska_engine,
@@ -7702,6 +7953,7 @@ def execute_planning(
             venom=venom_summary,
             input_consolidation=consolidation_summary,
             outliers_f9=outlier_summary,
+            fountain9_audit=fountain9_audit,
         )
         local_files.append(pdf_path)
         print(
@@ -7713,10 +7965,10 @@ def execute_planning(
             f"filas sumadas: {consolidation_summary['source_rows']:,}"
         )
         print(f"Requerimientos activos del día: {len(daily_plan_rows):,}")
-        print(f"Requerimientos enviados a Naked/Solidus: {len(engine_plan_rows):,}")
+        print(f"Requerimientos enviados a Otacon: {len(engine_plan_rows):,}")
         print(
-            "Loadout — Naked: "
-            f"{engine_selection['naked_requirements']:,} / Solidus: "
+            "Otacon — MOV: "
+            f"{engine_selection['naked_requirements']:,} / mínimos: "
             f"{engine_selection['solidus_requirements']:,} / omitidos: "
             f"{engine_selection['omitted_by_loadout']:,}"
         )
@@ -7825,6 +8077,7 @@ def execute_planning(
         "cuts_detail_rows": cuts_detail_rows,
         "no_recommendation_rows": no_recommendation_rows,
         "fountain9_comparison": fountain9_comparison,
+        "fountain9_audit": fountain9_audit,
         "swa_report": swa_report,
         "warnings": list(result.warnings),
         "logs": captured.getvalue(),
@@ -8885,7 +9138,7 @@ def render_bucket_universe_report(bucket_label: str, report: dict[str, Any]) -> 
 
 
 ENGINE_CSS_CLASS = {
-    "Naked": "naked", "Shalashaska": "shalashaska", "Solidus": "solidus",
+    "Naked": "naked", "Otacon": "otacon", "Shalashaska": "shalashaska", "Solidus": "solidus",
     "Liquid": "liquid", "Venom": "venom", "Kazuhira": "kazuhira",
     "Insumos": "insumos",
 }
@@ -8924,7 +9177,7 @@ def render_engine_header(
     )
     if totals is None:
         return
-    scope = "Fountain9 + mínimos" if engine_name == "Naked" else "sus 4 coberturas"
+    scope = {"Naked": "DOI literal de Fountain9", "Otacon": "residual y mínimos"}.get(engine_name, "sus 4 coberturas")
     tone = "blue" if engine_name == "Solidus" else "acid"
     category = f"{engine_name.upper()} · TOTAL"
     cards = [
@@ -9025,7 +9278,7 @@ def render_results(run: dict[str, Any]) -> None:
     st.markdown(
         """
         <div class="report-note">
-            REQUERIDO = necesidad original de Naked (Fountain9 y mínimos), sin la cobertura de Shalashaska, Solidus, Liquid, Venom ni Kazuhira · PLANEACIÓN FINAL = todo lo asignado, con todos los engines · PALLETS = mismo dato que M³ (VOLUMETRIA).
+            REQUERIDO = necesidad original de Naked y Otacon (DOI y residual), sin la cobertura de Shalashaska, Solidus, Liquid, Venom ni Kazuhira · PLANEACIÓN FINAL = todo lo asignado, con todos los engines · PALLETS = mismo dato que M³ (VOLUMETRIA).
         </div>
         """,
         unsafe_allow_html=True,
@@ -9108,7 +9361,7 @@ def render_results(run: dict[str, Any]) -> None:
                 "label": "UNIDADES",
                 "value": f"{planning_summary.get('naked_target_units', 0):,}",
                 "description": (
-                    "Suma de CANTIDAD_OBJETIVO SOLO de la pasada base de Naked "
+                    "Necesidad de Naked y Otacon consolidada una vez por tienda-SKU "
                     "(necesidad original de Fountain9). No incluye lo que AVL, "
                     "Shalashaska, Liquid o Venom agregan como cobertura propia."
                 ),
@@ -9119,7 +9372,7 @@ def render_results(run: dict[str, Any]) -> None:
                 "label": "TAREAS",
                 "value": f"{planning_summary.get('naked_eligible_cases', 0):,}",
                 "description": (
-                    "Casos tienda-SKU evaluados solo por Naked; el máximo de "
+                    "Casos tienda-SKU evaluados por Naked y Otacon; el máximo de "
                     "tareas si cada caso se cubriera con una sola línea."
                 ),
                 "tone": "blue",
@@ -9129,7 +9382,7 @@ def render_results(run: dict[str, Any]) -> None:
                 "label": "PALLETS",
                 "value": f"{planning_summary.get('naked_target_m3', 0):,.2f}",
                 "description": (
-                    "Suma de M3_OBJETIVO SOLO de la pasada base de Naked."
+                    "m³ de la necesidad consolidada de Naked y Otacon, sin duplicar el residual."
                 ),
                 "tone": "blue",
             },
@@ -9497,7 +9750,7 @@ def render_results(run: dict[str, Any]) -> None:
 
     st.markdown("##### Sin recomendación — por qué Fountain9 no pidió nada")
     st.caption(
-        "Solo Naked: Fountain9 no pidió nada para estas tienda-SKU. Los motivos usan "
+        "Otacon: Fountain9 no pidió nada para estas tienda-SKU. Los motivos usan "
         "solo columnas del Bulk (demanda, opening, net transfer). SWA_INFORMATIVO no "
         "es 'perdido': suele ser un desfase entre el opening predicho y el stock "
         "real."
@@ -9521,6 +9774,12 @@ def render_results(run: dict[str, Any]) -> None:
         file_label="breakdown_overview",
     )
 
+    audit = run.get("fountain9_audit", [])
+    if audit:
+        st.markdown("### Auditoría Fountain9 DOI")
+        st.caption("Una fila por origen F9, tienda y SKU. La recuperación se distribuye una sola vez entre las instrucciones pendientes.")
+        render_capped_dataframe(audit, key="fountain9_doi_audit")
+
     fountain9_comparison = run.get("fountain9_comparison", {})
     if fountain9_comparison.get("enabled"):
         st.markdown(
@@ -9529,7 +9788,7 @@ def render_results(run: dict[str, Any]) -> None:
         )
         st.caption(
             "Cuánto más cubre Mother Base de lo que Fountain9 evalúa. 'Allocation "
-            "(Store Based)' es la decisión final de Fountain9, no su ROQ/MOV."
+            "(DOI Based)' es la instrucción ejecutable de Fountain9."
         )
         f9 = fountain9_comparison["fountain9"]
         mb_mismo = fountain9_comparison["mother_base_mismo_alcance"]
@@ -9575,7 +9834,7 @@ def render_results(run: dict[str, Any]) -> None:
                     "category": "FOUNTAIN9 · PIEZAS",
                     "label": "UNIDADES ASIGNADAS",
                     "value": f"{f9['piezas']:,}",
-                    "description": "Suma de 'Allocation (Store Based)' en el universo compartido.",
+                    "description": "Suma de 'Allocation (DOI Based)' en el universo compartido.",
                     "tone": "blue",
                 },
                 {
@@ -9752,7 +10011,7 @@ def render_results(run: dict[str, Any]) -> None:
         )
     elif run.get("fountain9_comparison") is not None:
         st.caption(
-            "ℹ️ El Bulk de esta corrida no trae 'Allocation (Store Based)': no hay "
+            "ℹ️ El Bulk de esta corrida no trae 'Allocation (DOI Based)': no hay "
             "con qué comparar."
         )
 
@@ -9816,7 +10075,7 @@ def render_results(run: dict[str, Any]) -> None:
     st.markdown(
         """
         <div class="report-note">
-            Un bloque por engine, en orden de ejecución: Naked → Shalashaska → Solidus → Liquid → Venom → Kazuhira, más Insumos como anexo. Solidus agrupa 4 coberturas de catálogo (AVL, Preventivo, Refuerzo y Cobertura sin Fountain9); los mínimos (hardcode) son de Naked.
+            Un bloque por engine, en orden de ejecución: Naked → Otacon → Solidus → Shalashaska → Liquid → Venom → Kazuhira, más Insumos como anexo. Solidus agrupa 4 coberturas de catálogo (AVL, Preventivo, Refuerzo y Cobertura sin Fountain9); los mínimos (hardcode) son de Otacon.
         </div>
         """,
         unsafe_allow_html=True,
@@ -9869,68 +10128,7 @@ def render_results(run: dict[str, Any]) -> None:
             columns_count=4,
         )
 
-    shalashaska = run.get("shalashaska", {})
-    if shalashaska.get("enabled"):
-        render_engine_header("Shalashaska", engine_summary_rows, swa_enabled)
-        st.markdown(
-            '<span class="section-label">SHALASHASKA ENGINE · EVACUACIÓN</span>',
-            unsafe_allow_html=True,
-        )
-        render_kpi_cards(
-            [
-                {
-                    "category": "TAREAS · SHALASHASKA",
-                    "label": "TAREAS NUEVAS UTILIZADAS",
-                    "value": f"{shalashaska.get('tasks_added', 0):,}",
-                    "description": (
-                        "Nuevas combinaciones origen–destino–SKU creadas para "
-                        "evacuar inventario próximo a caducar. Comparten el mismo "
-                        "límite global con los demás engines."
-                    ),
-                    "tone": "blue",
-                },
-                {
-                    "category": "UNIDADES · RIESGO",
-                    "label": "UNIDADES POR MERMAR",
-                    "value": f"{shalashaska.get('units_at_risk', 0):,}",
-                    "description": (
-                        "Unidades informadas por POR_MERMAR para los orígenes "
-                        "seleccionados y sin SKUs excluidos, antes de aplicar el "
-                        "stock final mandante, bloqueos y capacidad."
-                    ),
-                    "tone": "coral",
-                },
-                {
-                    "category": "UNIDADES · EVACUADAS",
-                    "label": "UNIDADES REUBICADAS",
-                    "value": f"{shalashaska.get('units_evacuated', 0):,}",
-                    "description": (
-                        "Unidades próximas a caducar que sí fueron distribuidas. "
-                        "Primero se nivelan por necesidad y DOH; el sobrante se "
-                        "diversifica mediante share de ventas."
-                    ),
-                    "tone": "acid",
-                },
-                {
-                    "category": "VALOR · PROTEGIDO",
-                    "label": "VALOR REUBICADO",
-                    "value": f"${shalashaska.get('value_protected', 0):,.2f}",
-                    "description": (
-                        "Valor proporcional del inventario por mermar que fue "
-                        "reubicado en tiendas con oportunidad de venta. No representa "
-                        "venta garantizada ni ahorro contable realizado."
-                    ),
-                },
-                *([swa_card("Shalashaska", swa_by_engine)] if swa_enabled else []),
-            ],
-            columns_count=4,
-        )
-        if shalashaska.get("units_not_evacuated", 0) > 0:
-            st.warning(
-                f"Quedaron {shalashaska['units_not_evacuated']:,} unidades sin "
-                "evacuar por stock mandante, falta de ADU o ruta natural, "
-                "restricciones, capacidad o límite compartido de tareas."
-            )
+    render_engine_header("Otacon", engine_summary_rows, swa_enabled)
 
     if any(
         run.get(key, {}).get("enabled")
@@ -10193,6 +10391,69 @@ def render_results(run: dict[str, Any]) -> None:
             f"{no_fountain9.get('units_added', 0):,} unidades adicionales."
         )
 
+    shalashaska = run.get("shalashaska", {})
+    if shalashaska.get("enabled"):
+        render_engine_header("Shalashaska", engine_summary_rows, swa_enabled)
+        st.markdown(
+            '<span class="section-label">SHALASHASKA ENGINE · EVACUACIÓN</span>',
+            unsafe_allow_html=True,
+        )
+        render_kpi_cards(
+            [
+                {
+                    "category": "TAREAS · SHALASHASKA",
+                    "label": "TAREAS NUEVAS UTILIZADAS",
+                    "value": f"{shalashaska.get('tasks_added', 0):,}",
+                    "description": (
+                        "Nuevas combinaciones origen–destino–SKU creadas para "
+                        "evacuar inventario próximo a caducar. Comparten el mismo "
+                        "límite global con los demás engines."
+                    ),
+                    "tone": "blue",
+                },
+                {
+                    "category": "UNIDADES · RIESGO",
+                    "label": "UNIDADES POR MERMAR",
+                    "value": f"{shalashaska.get('units_at_risk', 0):,}",
+                    "description": (
+                        "Unidades informadas por POR_MERMAR para los orígenes "
+                        "seleccionados y sin SKUs excluidos, antes de aplicar el "
+                        "stock final mandante, bloqueos y capacidad."
+                    ),
+                    "tone": "coral",
+                },
+                {
+                    "category": "UNIDADES · EVACUADAS",
+                    "label": "UNIDADES REUBICADAS",
+                    "value": f"{shalashaska.get('units_evacuated', 0):,}",
+                    "description": (
+                        "Unidades próximas a caducar que sí fueron distribuidas. "
+                        "Primero se nivelan por necesidad y DOH; el sobrante se "
+                        "diversifica mediante share de ventas."
+                    ),
+                    "tone": "acid",
+                },
+                {
+                    "category": "VALOR · PROTEGIDO",
+                    "label": "VALOR REUBICADO",
+                    "value": f"${shalashaska.get('value_protected', 0):,.2f}",
+                    "description": (
+                        "Valor proporcional del inventario por mermar que fue "
+                        "reubicado en tiendas con oportunidad de venta. No representa "
+                        "venta garantizada ni ahorro contable realizado."
+                    ),
+                },
+                *([swa_card("Shalashaska", swa_by_engine)] if swa_enabled else []),
+            ],
+            columns_count=4,
+        )
+        if shalashaska.get("units_not_evacuated", 0) > 0:
+            st.warning(
+                f"Quedaron {shalashaska['units_not_evacuated']:,} unidades sin "
+                "evacuar por stock mandante, falta de ADU o ruta natural, "
+                "restricciones, capacidad o límite compartido de tareas."
+            )
+
     liquid = run.get("liquid", {})
     if liquid.get("enabled"):
         render_engine_header("Liquid", engine_summary_rows, swa_enabled)
@@ -10289,7 +10550,7 @@ def render_results(run: dict[str, Any]) -> None:
                     "value": f"{venom.get('tasks_added', 0):,}",
                     "description": (
                         "Nuevas líneas de Venom, del mismo presupuesto compartido "
-                        "de tareas que Naked/Solidus/Shalashaska/Liquid. Cuentan "
+                        "de tareas que Naked/Otacon/Solidus/Shalashaska/Liquid. Cuentan "
                         "aunque dupliquen un trío origen-destino-SKU ya usado."
                     ),
                     "tone": "blue",
@@ -10904,7 +11165,7 @@ def render() -> None:
             step=1,
             help=(
                 "Piso general de unidades cuando el modelo decide enviar "
-                "algo: MOV_MINIMO_3, los hardcodes de Naked (Cubrir a "
+                "algo: MOV_MINIMO_3, los hardcodes de Otacon (Cubrir a "
                 "Fountain9), AVL, Preventivo, y el Refuerzo Golden/"
                 "Infaltable/Anchor sin ADU disponible. Default 4 para Big "
                 "Boss, 3 para Raiden — se puede ajustar cada corrida."
@@ -11041,7 +11302,7 @@ def render() -> None:
         # Soporte legado conservado en backend para una futura reactivación.
         apply_origin_storage_override = False
         st.caption(
-            "Presupuesto de tareas compartido: Naked, Solidus, Shalashaska y Liquid "
+            "Presupuesto de tareas compartido: Naked, Otacon, Solidus, Shalashaska y Liquid "
             "nunca lo exceden."
         )
 
@@ -11072,6 +11333,10 @@ def render() -> None:
         ):
             st.session_state["mb_engine_naked_enabled"] = not include_naked_engine
             st.rerun()
+    with st.container(border=True, key="engine_otacon_module"):
+        st.caption("ENGINE / 02 · RESIDUAL · ACTIVO")
+        st.markdown("### Otacon (residual)")
+        st.caption(ENGINE_INFO["Otacon"]["card"])
         cover_fountain9_hardcodes = False
         hardcode_zero_total = True
         hardcode_inventory_below_demand = True
@@ -11080,97 +11345,91 @@ def render() -> None:
         destination_stock_below = 3.0
         raise_small_roq_to_minimum = True
         use_extra_mov_columns = True
-        if include_naked_engine:
-            naked_left, naked_right = st.columns(2)
-            with naked_left:
-                raise_small_roq_to_minimum = st.toggle(
-                    "Subir recomendaciones pequeñas al mínimo",
-                    value=True,
-                    help=(
-                        "Una recomendación positiva de Fountain9 menor al mínimo "
-                        "de unidades se sube a ese mínimo. Apagado: se envía el "
-                        "ROQ redondeado hacia arriba, sin piso."
-                    ),
-                )
-            with naked_right:
-                use_extra_mov_columns = st.toggle(
-                    "Usar columnas adicionales de MOV",
-                    value=True,
-                    help=(
-                        "El MOV efectivo es el máximo entre la columna MOV y las "
-                        "columnas opcionales del Bulk de Fountain9. Apagado: "
-                        "solo cuenta la columna MOV."
-                    ),
-                )
-            cover_fountain9_hardcodes = st.toggle(
-                "Cubrir a Fountain9",
+        naked_left, naked_right = st.columns(2)
+        with naked_left:
+            raise_small_roq_to_minimum = st.toggle(
+                "Subir recomendaciones pequeñas al mínimo",
                 value=True,
                 help=(
-                    "Cuando Fountain9 no dio un ROQ positivo (MOV ≤ 0), el "
-                    "modelo igual puede armar un mínimo de unidades según "
-                    "inventario y demanda en destino. Apagar esto deja esos "
-                    "casos sin cubrir por Naked; Solidus puede cubrirlos por "
-                    "su cuenta si aplica."
+                    "Una recomendación positiva de Fountain9 menor al mínimo "
+                    "de unidades se sube a ese mínimo. Apagado: se envía el "
+                    "ROQ redondeado hacia arriba, sin piso."
                 ),
             )
-            if cover_fountain9_hardcodes:
-                rule_left, rule_center, rule_right = st.columns(3)
-                with rule_left:
-                    hardcode_zero_total = st.toggle(
-                        "Cubrir forecast y stock en cero",
-                        value=True,
-                        help=(
-                            "Regla HARDCODE_4_CERO_TOTAL: demanda y opening "
-                            "predichos en cero."
-                        ),
-                    )
-                with rule_center:
-                    hardcode_inventory_below_demand = st.toggle(
-                        "Cubrir inventario menor a la demanda",
-                        value=True,
-                        help=(
-                            "Regla HARDCODE_3_INVENTARIO_MENOR_DEMANDA: ROQ no "
-                            "positivo y opening predicho menor a la demanda."
-                        ),
-                    )
-                with rule_right:
-                    hardcode_low_net_transfer = st.toggle(
-                        "Cubrir net transfer bajo",
-                        value=True,
-                        help=(
-                            "Regla HARDCODE_3_NET_TRANSFER_BAJO: ROQ no positivo, "
-                            "net transfer bajo y poco stock en destino."
-                        ),
-                    )
-                if hardcode_low_net_transfer:
-                    net_left, net_right = st.columns(2)
-                    with net_left:
-                        net_transfer_max = float(
-                            st.number_input(
-                                "Net transfer máximo (unidades)",
-                                min_value=0.0,
-                                max_value=50.0,
-                                value=3.0,
-                                step=1.0,
-                                help="La regla aplica con net transfer menor o igual a este valor.",
-                            )
-                        )
-                    with net_right:
-                        destination_stock_below = float(
-                            st.number_input(
-                                "Stock destino menor a (unidades)",
-                                min_value=0.0,
-                                max_value=50.0,
-                                value=3.0,
-                                step=1.0,
-                                help="La regla aplica con stock en destino estrictamente menor a este valor.",
-                            )
-                        )
-        else:
-            st.caption(
-                "Naked Engine está apagado. Activa la tarjeta para incluir la "
-                "recomendación natural de Fountain9."
+        with naked_right:
+            use_extra_mov_columns = st.toggle(
+                "Usar columnas adicionales de MOV",
+                value=True,
+                help=(
+                    "El MOV efectivo es el máximo entre la columna MOV y las "
+                    "columnas opcionales del Bulk de Fountain9. Apagado: "
+                    "cuentan MOV y Allocation DOI."
+                ),
             )
+        cover_fountain9_hardcodes = st.toggle(
+            "Cubrir a Fountain9",
+            value=True,
+            help=(
+                "Cuando Fountain9 no dio un ROQ positivo (MOV ≤ 0), el "
+                "modelo igual puede armar un mínimo de unidades según "
+                "inventario y demanda en destino. Apagar esto deja esos "
+                "casos sin cubrir por Otacon; Solidus puede cubrirlos por "
+                "su cuenta si aplica."
+            ),
+        )
+        if cover_fountain9_hardcodes:
+            rule_left, rule_center, rule_right = st.columns(3)
+            with rule_left:
+                hardcode_zero_total = st.toggle(
+                    "Cubrir forecast y stock en cero",
+                    value=True,
+                    help=(
+                        "Regla HARDCODE_4_CERO_TOTAL: demanda y opening "
+                        "predichos en cero."
+                    ),
+                )
+            with rule_center:
+                hardcode_inventory_below_demand = st.toggle(
+                    "Cubrir inventario menor a la demanda",
+                    value=True,
+                    help=(
+                        "Regla HARDCODE_3_INVENTARIO_MENOR_DEMANDA: ROQ no "
+                        "positivo y opening predicho menor a la demanda."
+                    ),
+                )
+            with rule_right:
+                hardcode_low_net_transfer = st.toggle(
+                    "Cubrir net transfer bajo",
+                    value=True,
+                    help=(
+                        "Regla HARDCODE_3_NET_TRANSFER_BAJO: ROQ no positivo, "
+                        "net transfer bajo y poco stock en destino."
+                    ),
+                )
+            if hardcode_low_net_transfer:
+                net_left, net_right = st.columns(2)
+                with net_left:
+                    net_transfer_max = float(
+                        st.number_input(
+                            "Net transfer máximo (unidades)",
+                            min_value=0.0,
+                            max_value=50.0,
+                            value=3.0,
+                            step=1.0,
+                            help="La regla aplica con net transfer menor o igual a este valor.",
+                        )
+                    )
+                with net_right:
+                    destination_stock_below = float(
+                        st.number_input(
+                            "Stock destino menor a (unidades)",
+                            min_value=0.0,
+                            max_value=50.0,
+                            value=3.0,
+                            step=1.0,
+                            help="La regla aplica con stock en destino estrictamente menor a este valor.",
+                        )
+                    )
 
     include_avl_fill = False
     include_preventive_fill = False
@@ -11188,7 +11447,7 @@ def render() -> None:
         )
         if render_action_card(
             key="engine_solidus_card",
-            eyebrow="ENGINE / 02 · CATALOG COVERAGE",
+            eyebrow="ENGINE / 03 · CATALOG COVERAGE",
             title="SOLIDUS ENGINE",
             description=(
                 ENGINE_INFO["Solidus"]["card"]
@@ -11327,7 +11586,7 @@ def render() -> None:
         )
         if render_action_card(
             key="engine_shalashaska_card",
-            eyebrow="ENGINE / 03 · EXPIRATION EVACUATION",
+            eyebrow="ENGINE / 04 · EXPIRATION EVACUATION",
             title="SHALASHASKA ENGINE",
             description=ENGINE_INFO["Shalashaska"]["card"],
             active=include_shalashaska_engine,
@@ -11423,7 +11682,7 @@ def render() -> None:
         )
         if render_action_card(
             key="engine_liquid_card",
-            eyebrow="ENGINE / 04 · INVENTORY LIQUIDATION",
+            eyebrow="ENGINE / 05 · INVENTORY LIQUIDATION",
             title="LIQUID ENGINE",
             description=(
                 ENGINE_INFO["Liquid"]["card"]
@@ -11538,7 +11797,7 @@ def render() -> None:
         include_venom_engine = bool(st.session_state["mb_engine_venom_enabled"])
         if render_action_card(
             key="engine_venom_card",
-            eyebrow="ENGINE / 05 · DDMRP POST-PLANEACIÓN",
+            eyebrow="ENGINE / 06 · DDMRP POST-PLANEACIÓN",
             title="VENOM ENGINE",
             description=ENGINE_INFO["Venom"]["card"],
             active=include_venom_engine,
@@ -11758,7 +12017,7 @@ def render() -> None:
         )
         if render_action_card(
             key="engine_kazuhira_card",
-            eyebrow="ENGINE / 06 · GARANTÍA TOTAL",
+            eyebrow="ENGINE / 07 · GARANTÍA TOTAL",
             title="KAZUHIRA ENGINE",
             description=(
                 ENGINE_INFO["Kazuhira"]["card"]
@@ -11807,7 +12066,7 @@ def render() -> None:
                     help=(
                         "Si se activa, Kazuhira no se detiene aunque el "
                         "presupuesto compartido de tareas (MAX_TASKS) ya se "
-                        "haya agotado por Naked/Solidus/Shalashaska/Liquid/"
+                        "haya agotado por Naked/Otacon/Solidus/Shalashaska/Liquid/"
                         "Venom — la garantía de cobertura total se vuelve "
                         "absoluta en vez de 'mejor esfuerzo dentro del "
                         "límite'."

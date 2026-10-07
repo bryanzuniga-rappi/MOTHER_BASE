@@ -1,7 +1,4 @@
-"""Registro de engines: orden de ejecución, atribución por fila y resumen.
-
-Solidus es un engine propio con 4 coberturas (AVL, Preventivo, Refuerzo,
-Cobertura sin Fountain9); los mínimos (hardcode) pertenecen a Naked."""
+"""Registro de engines: Naked ejecuta DOI y Otacon conserva los mínimos."""
 
 import re
 from pathlib import Path
@@ -10,7 +7,7 @@ from types import SimpleNamespace
 import modules.les_enfants_terribles as m
 
 ENGINE_ORDER = (
-    "Naked", "Shalashaska", "Solidus", "Liquid", "Venom", "Kazuhira", "Insumos",
+    "Naked", "Otacon", "Solidus", "Shalashaska", "Liquid", "Venom", "Kazuhira", "Insumos",
 )
 
 
@@ -19,14 +16,12 @@ ENGINE_ORDER = (
 def test_engine_order_is_the_real_execution_order():
     assert m.ENGINE_ORDER == ENGINE_ORDER
     source = (Path(m.__file__)).read_text(encoding="utf-8")
-    positions = [
-        source.index(marker)
-        for marker in (
-            "engine.plan_transfers(", "= apply_shalashaska_engine(",
-            "avl_summary = apply_avl_fill(", "= apply_liquid_engine(",
-            "= apply_venom_engine(", "kazuhira_summary = apply_avl_fill(",
-        )
-    ]
+    markers = (
+        "engine.plan_transfers(", "avl_summary = apply_avl_fill(",
+        "= apply_shalashaska_engine(", "= apply_liquid_engine(",
+        "= apply_venom_engine(", "kazuhira_summary = apply_avl_fill(",
+    )
+    positions = [source.rindex(marker) if marker == "= apply_shalashaska_engine(" else source.index(marker) for marker in markers]
     assert positions == sorted(positions)
 
 
@@ -56,8 +51,8 @@ def test_every_planning_reason_is_mapped_to_an_engine():
     assert not missing, missing
 
 
-def test_csv_reason_of_minimums_says_naked_not_solidus():
-    assert "NAKED" in m.PLANNING_REASON_MANUAL_FORECAST_ZERO
+def test_csv_reason_of_minimums_says_otacon_not_solidus():
+    assert "OTACON" in m.PLANNING_REASON_MANUAL_FORECAST_ZERO
     assert "SOLIDUS" not in m.PLANNING_REASON_MANUAL_FORECAST_ZERO
 
 
@@ -73,12 +68,12 @@ def test_attribute_row_each_solidus_coverage():
         assert m.attribute_row({"TIPO_DE_CORTE": cut}) == ("Solidus", coverage)
 
 
-def test_attribute_row_hardcode_minimums_belong_to_naked():
+def test_attribute_row_hardcode_minimums_belong_to_otacon():
     for rule in m.MANUAL_FORECAST_ZERO_RULES:
         row = {"TIPO_DE_CORTE": "OK MANUAL POR NET TRANSFER BAJO", "REGLA_DEMANDA": rule}
-        assert m.attribute_row(row) == ("Naked", "Mínimos (hardcode)")
+        assert m.attribute_row(row) == ("Otacon", "Mínimos (hardcode)")
     natural = {"TIPO_DE_CORTE": "OK COMPLETO POR FOUNTAIN9", "REGLA_DEMANDA": "ROQ_FOUNTAIN9"}
-    assert m.attribute_row(natural) == ("Naked", "Fountain9")
+    assert m.attribute_row(natural) == ("Otacon", "Fountain9")
 
 
 def test_attribute_row_other_engines_and_sweep_rows():
@@ -94,7 +89,7 @@ def test_annotate_base_rows_adds_engine_and_coverage():
     rows = [{"TIPO_DE_CORTE": "ENVIADOS PARA CUBRIR AVL"}, {"TIPO_DE_CORTE": "OK", "REGLA_DEMANDA": "X"}]
     m.annotate_base_rows_with_engine(rows)
     assert (rows[0]["ENGINE"], rows[0]["COBERTURA"]) == ("Solidus", "AVL")
-    assert (rows[1]["ENGINE"], rows[1]["COBERTURA"]) == ("Naked", "Fountain9")
+    assert (rows[1]["ENGINE"], rows[1]["COBERTURA"]) == ("Otacon", "Fountain9")
 
 
 # --- resumen por engine ------------------------------------------------------------------
@@ -148,12 +143,13 @@ def test_summary_solidus_total_is_the_sum_of_its_coverages():
     assert by_key[("Solidus", "AVL")]["TAREAS"] == 2
 
 
-def test_summary_naked_includes_minimums_and_counts_tasks_from_real_lines():
+def test_summary_otacon_includes_minimums_and_counts_tasks_from_real_lines():
     by_key, _ = _summary()
-    assert by_key[("Naked", "Total")]["TAREAS"] == 2
-    assert by_key[("Naked", "Total")]["UNIDADES"] == 14
-    assert by_key[("Naked", "Mínimos (hardcode)")]["CASOS"] == 1
-    assert by_key[("Naked", "Mínimos (hardcode)")]["SWA_GANADO"] == 0.5
+    assert by_key[("Naked", "Total")]["TAREAS"] == 1
+    assert by_key[("Naked", "Total")]["UNIDADES"] == 10
+    assert by_key[("Otacon", "Total")]["TAREAS"] == 1
+    assert by_key[("Otacon", "Mínimos (hardcode)")]["CASOS"] == 1
+    assert by_key[("Otacon", "Mínimos (hardcode)")]["SWA_GANADO"] == 0.5
 
 
 def test_summary_tasks_match_total_allocation_lines_and_insumos_has_none():

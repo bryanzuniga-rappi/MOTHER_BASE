@@ -84,7 +84,7 @@ def _run_with_everything_enabled():
 def test_every_engine_gets_its_panel_in_execution_order():
     sequence = _sequence(_render(_run_with_everything_enabled()))
     panels = [item.split(":")[1] for item in sequence if item.startswith("PANEL:")]
-    assert panels == ["naked", "shalashaska", "solidus", "liquid", "venom", "kazuhira", "insumos"]
+    assert panels == ["naked", "otacon", "solidus", "shalashaska", "liquid", "venom", "kazuhira", "insumos"]
 
 
 def test_solidus_panel_comes_first_and_groups_its_four_coverages():
@@ -102,7 +102,7 @@ def test_each_panel_has_a_how_it_works_expander():
     calls = _render(_run_with_everything_enabled())
     expanders = [c for c in calls if isinstance(c, str) and c.startswith("EXPANDER:Cómo funciona")]
     assert [e.split()[-1] for e in expanders] == [
-        "Naked", "Shalashaska", "Solidus", "Liquid", "Venom", "Kazuhira", "Insumos",
+        "Naked", "Otacon", "Solidus", "Shalashaska", "Liquid", "Venom", "Kazuhira", "Insumos",
     ]
 
 

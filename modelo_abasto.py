@@ -43,7 +43,7 @@ class Config:
     # Bypass global (CODEC): ningún engine corta por capacidad de tienda. El
     # uso de m³ se sigue registrando para los reportes.
     ignore_store_capacity: bool = False
-    # Naked: sube las recomendaciones positivas pequeñas de Fountain9 al mínimo
+    # Otacon: sube las recomendaciones positivas pequeñas de Fountain9 al mínimo
     # de unidades. Apagado: se envía ceil(MOV) tal cual.
     raise_small_roq_to_minimum: bool = True
 
@@ -89,7 +89,7 @@ OUTPUT_COLUMNS = [
 ]
 
 OWNER_SPLIT_SOURCES = {425, 856}
-OWNER_REPORT_COLUMNS = [*OUTPUT_COLUMNS, "OWNER_NAME"]
+OWNER_REPORT_COLUMNS = [*OUTPUT_COLUMNS, "OWNER_NAME", "PLANNING_REASON"]
 
 CDMX = "CDMX"
 GDL = "GDL"
@@ -1523,7 +1523,16 @@ def apply_owner_inventory_partition(
         return {"applied": False, "tasks_added": 0, "units_cut_task_cap": 0}
 
     original_rows = list(result.allocation_rows)
-    extra_task_budget = max(config.max_tasks - len(original_rows), 0)
+    explicit_tasks = {
+        (r["WAREHOUSE_SOURCE"], r["WAREHOUSE_DESTINATION"], r["RETAIL_ID"], r.get("OWNER_NAME", ""))
+        for r in original_rows if r.get("OWNER_NAME") or r["WAREHOUSE_SOURCE"] not in OWNER_SPLIT_SOURCES
+    }
+    explicit_routes = {key[:3] for key in explicit_tasks}
+    pending_routes = {
+        (r["WAREHOUSE_SOURCE"], r["WAREHOUSE_DESTINATION"], r["RETAIL_ID"])
+        for r in original_rows if r["WAREHOUSE_SOURCE"] in OWNER_SPLIT_SOURCES and not r.get("OWNER_NAME")
+    } - explicit_routes
+    extra_task_budget = max(config.max_tasks - len(explicit_tasks) - len(pending_routes), 0)
     remaining = {
         key: int(quantity) for key, quantity in catalogs.owner_stock.items()
     }
@@ -1542,44 +1551,37 @@ def apply_owner_inventory_partition(
             partitioned.append(row)
             continue
 
-        pools = sorted(
-            (
-                (owner, quantity)
-                for (pool_source, pool_sku, owner), quantity in remaining.items()
-                if pool_source == source and pool_sku == sku and quantity > 0
-            ),
-            key=lambda item: (-item[1], item[0]),
-        )
-        if requested <= 0 or not pools:
-            units_cut += max(requested, 0)
+        reserved_owner = original.get("OWNER_NAME")
+        if reserved_owner:
+            remaining[(source, sku, reserved_owner)] -= requested
+            partitioned.append(dict(original))
+            owner_lines[(source, reserved_owner)] += 1
             continue
 
-        single = next(
-            ((owner, quantity) for owner, quantity in pools if quantity >= requested),
-            None,
-        )
-        if single is not None:
-            chunks = [(single[0], requested)]
-        elif extra_task_budget > 0:
-            chunks: list[tuple[str, int]] = []
-            pending = requested
-            for owner, available in pools:
-                quantity = min(pending, available)
-                if quantity > 0:
-                    chunks.append((owner, quantity))
-                    pending -= quantity
-                if pending <= 0:
-                    break
-            extra_needed = max(len(chunks) - 1, 0)
-            if extra_needed > extra_task_budget:
-                owner, available = pools[0]
-                chunks = [(owner, min(requested, available))]
-            else:
-                extra_task_budget -= extra_needed
-                tasks_added += extra_needed
-        else:
-            owner, available = pools[0]
-            chunks = [(owner, min(requested, available))]
+        route = (source, int(original["WAREHOUSE_DESTINATION"]), sku)
+        pools = [(owner, quantity) for (src, product, owner), quantity in remaining.items()
+                 if src == source and product == sku and quantity > 0]
+        pools.sort(key=lambda item: ((*route, item[0]) not in explicit_tasks,
+                                      item[1] < requested, -item[1], item[0]))
+        chunks = []
+        pending = requested
+        for owner, available in pools:
+            task_key = (*route, owner)
+            if task_key not in explicit_tasks:
+                if route in pending_routes:
+                    pending_routes.remove(route)
+                elif extra_task_budget > 0 or original.get("TASK_BYPASS", False):
+                    extra_task_budget = max(extra_task_budget - 1, 0)
+                    tasks_added += 1
+                else:
+                    continue
+                explicit_tasks.add(task_key)
+            quantity = min(pending, available)
+            if quantity > 0:
+                chunks.append((owner, quantity))
+                pending -= quantity
+            if pending <= 0:
+                break
 
         assigned = 0
         for owner, quantity in chunks:
@@ -1595,7 +1597,10 @@ def apply_owner_inventory_partition(
         units_cut += max(requested - assigned, 0)
 
     result.allocation_rows = partitioned
-    result.tasks_used = len(partitioned)
+    result.tasks_used = len({
+        (r["WAREHOUSE_SOURCE"], r["WAREHOUSE_DESTINATION"], r["RETAIL_ID"], r.get("OWNER_NAME", ""))
+        for r in partitioned if int(r.get("QUANTITY", 0)) > 0
+    })
     setattr(result, "owner_partition_applied", True)
 
     if units_cut:
@@ -1657,6 +1662,8 @@ def apply_owner_inventory_partition(
         }
         m3_by_destination: Counter[int] = Counter()
         for allocation in partitioned:
+            if "VENOM" in str(allocation.get("PLANNING_REASON", "")):
+                continue
             destination = int(allocation["WAREHOUSE_DESTINATION"])
             sku = int(allocation["RETAIL_ID"])
             m3_by_destination[destination] += (
@@ -1763,6 +1770,7 @@ def plan_transfers(
     plan_rows: list[dict[str, Any]],
     catalogs: Catalogs,
     config: Config,
+    initial_result: PlanningResult | None = None,
 ) -> PlanningResult:
     prepared: list[dict[str, Any]] = []
     for row in plan_rows:
@@ -1778,7 +1786,11 @@ def plan_transfers(
             if store
             else row.get("CSV_WAREHOUSE_NAME", "")
         )
-        target, demand_rule = calculate_target_quantity(row, config)
+        if row.get("FORCED_TARGET") is not None:
+            target = max(int(row["FORCED_TARGET"]), 0)
+            demand_rule = str(row.get("FORCED_RULE", "FOUNTAIN9_DOI"))
+        else:
+            target, demand_rule = calculate_target_quantity(row, config)
         priority_profile = product_priority_profile(catalogs, destination, sku)
         is_infaltable = priority_profile["is_infaltable"]
         is_golden = priority_profile["is_golden"]
@@ -1818,9 +1830,9 @@ def plan_transfers(
     prepared.sort(
         key=lambda row: (
             row["RANGO_PRIORIDAD_PRODUCTO"],
-            0 if not row["ES_MANUAL_FORECAST_ZERO"] else 1,
             row["PRIORIDAD_TIENDA"],
-            0 if row["ES_STOCKOUT"] else 1,
+            float(row.get("DOI", float("inf"))),
+            float(row.get("DOH", float("inf"))),
             row["WAREHOUSE_DESTINATION"],
             row["RETAIL_ID"],
             row["INPUT_ROW"],
@@ -1845,6 +1857,68 @@ def plan_transfers(
     tasks_used = 0
     base_rows: list[dict[str, Any]] = []
     allocation_rows: list[dict[str, Any]] = []
+    if initial_result is not None:
+        base_rows = list(initial_result.base_rows)
+        allocation_rows = list(initial_result.allocation_rows)
+        tasks_used = int(initial_result.tasks_used)
+        for allocation in allocation_rows:
+            source = int(allocation["WAREHOUSE_SOURCE"])
+            destination = int(allocation["WAREHOUSE_DESTINATION"])
+            sku = int(allocation["RETAIL_ID"])
+            quantity = int(allocation.get("QUANTITY", 0) or 0)
+            if quantity <= 0:
+                continue
+            get_stock_info(source, sku)
+            stock_remaining[(source, sku)] = max(
+                stock_remaining[(source, sku)] - quantity, 0
+            )
+            m3 = catalogs.volume_m3.get(sku, config.default_m3_per_unit)
+            cap_used_normal[destination] += quantity * m3
+            actual_m3_by_store[destination] += quantity * m3
+            if cap_used_normal[destination] >= store_capacity_limit_m3(
+                catalogs, config, destination
+            ) - 1e-9:
+                cap_closed[destination] = True
+    owner_remaining = dict(catalogs.owner_stock)
+    task_keys = set()
+    for allocation in allocation_rows:
+        source, destination, sku = (int(allocation[k]) for k in ("WAREHOUSE_SOURCE", "WAREHOUSE_DESTINATION", "RETAIL_ID"))
+        owner = str(allocation.get("OWNER_NAME", ""))
+        task_keys.add((source, destination, sku, owner))
+        if owner:
+            owner_remaining[(source, sku, owner)] = owner_remaining.get((source, sku, owner), 0) - int(allocation["QUANTITY"])
+
+    def reserve_candidates(candidates, destination, sku):
+        nonlocal tasks_used
+        chunks = []
+        for source, requested in candidates:
+            if source in OWNER_SPLIT_SOURCES:
+                pools = [(owner, qty) for (src, product, owner), qty in owner_remaining.items()
+                         if src == source and product == sku and qty > 0]
+                pools.sort(key=lambda item: (
+                    (source, destination, sku, item[0]) not in task_keys,
+                    item[1] < requested, -item[1], item[0]))
+            else:
+                pools = [("", requested)]
+            pending = requested
+            for owner, available in pools:
+                key = (source, destination, sku, owner)
+                if key not in task_keys and tasks_used >= config.max_tasks:
+                    continue
+                quantity = min(pending, available)
+                if quantity <= 0:
+                    continue
+                if key not in task_keys:
+                    tasks_used += 1
+                    task_keys.add(key)
+                if owner:
+                    owner_remaining[(source, sku, owner)] -= quantity
+                chunks.append((source, quantity, owner))
+                pending -= quantity
+                if pending <= 0:
+                    break
+        return chunks
+
     deferred_stock_rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
 
     for planning_order, row in enumerate(prepared, start=1):
@@ -1891,9 +1965,30 @@ def plan_transfers(
         stock_insufficient = False
         capacity_target = 0
 
+        forced_source = row.get("FORCED_SOURCE")
+        is_forced = "FORCED_SOURCE" in row
+        allow_partial = bool(row.get("ALLOW_PARTIAL", False))
+        forced_source_valid = (
+            not is_forced or forced_source in config.origin_warehouses
+        )
+        eligible_sources = (
+            (int(forced_source),)
+            if is_forced and forced_source_valid
+            else config.origin_warehouses
+        )
+
         if target <= 0:
             tipo_corte = "SIN DEMANDA"
             detalle_motivo = "MOV cero y no activa reglas de hardcode"
+        elif is_forced and not forced_source_valid:
+            tipo_corte = "F9 SIN ORIGEN" if forced_source is None else "F9 ORIGEN INVALIDO"
+            detalle_motivo = (
+                "Fountain9 no indicó Source Id Before Multi Source"
+                if forced_source is None
+                else f"El origen Fountain9 {forced_source} no está configurado"
+            )
+            passes_capacity = False
+            passes_tasks = False
         elif not city_norm:
             tipo_corte = "ERROR DE DATOS"
             detalle_motivo = "El warehouse destino no existe en TIENDA"
@@ -1921,7 +2016,7 @@ def plan_transfers(
             capacity_target = min(target, max(capacity_units, 0))
             capacity_limited = capacity_target < target
             remaining_candidate = capacity_target
-            for source in config.origin_warehouses:
+            for source in eligible_sources:
                 if regional_blocks[source] or schedule_blocks[source]:
                     continue
                 available = stock_remaining[(source, sku)]
@@ -1935,22 +2030,22 @@ def plan_transfers(
             # Una necesidad que no puede cubrirse completa con el stock
             # elegible remanente no debe consumir inventario.
             stock_insufficient = remaining_candidate > 0
-            if stock_insufficient:
+            if stock_insufficient and not allow_partial:
                 candidate_allocations = []
 
-            available_task_slots = max(config.max_tasks - tasks_used, 0)
-            allocations = candidate_allocations[:available_task_slots]
-            passes_tasks = len(allocations) == len(candidate_allocations)
+            chunks = reserve_candidates(candidate_allocations, destination, sku)
+            allocations = [(source, quantity) for source, quantity, owner in chunks]
+            passes_tasks = sum(q for _, q in allocations) == sum(q for _, q in candidate_allocations)
 
-            for source, quantity in allocations:
+            for source, quantity, owner in chunks:
                 stock_remaining[(source, sku)] -= quantity
-                tasks_used += 1
                 allocation_rows.append(
                     {
                         "WAREHOUSE_DESTINATION": destination,
                         "WAREHOUSE_SOURCE": source,
                         "RETAIL_ID": sku,
                         "QUANTITY": int(quantity),
+                        "OWNER_NAME": owner,
                         "PLANNED_DATE": "",
                         "ROUTE": 1,
                         "DELIVERY_PRIORITY": 1,
@@ -1965,19 +2060,19 @@ def plan_transfers(
             missing = target - assigned
             blocked_stock = sum(
                 origin_before[source]
-                for source in config.origin_warehouses
+                for source in eligible_sources
                 if regional_blocks[source]
             )
             schedule_blocked_stock = sum(
                 origin_before[source]
-                for source in config.origin_warehouses
+                for source in eligible_sources
                 if schedule_blocks[source] and not regional_blocks[source]
             )
             # Unidades excluidas por COPÉRNICO (ubicación no usable, LOST,
             # etc.) en orígenes que de otra forma serían elegibles.
             copernico_unusable_stock = sum(
                 origin_info[source].get("copernico_unusable", 0)
-                for source in config.origin_warehouses
+                for source in eligible_sources
                 if not regional_blocks[source] and not schedule_blocks[source]
             )
             copernico_reason = (
@@ -1986,7 +2081,7 @@ def plan_transfers(
                     sku,
                     (
                         source
-                        for source in config.origin_warehouses
+                        for source in eligible_sources
                         if not regional_blocks[source]
                         and not schedule_blocks[source]
                     ),
@@ -2087,7 +2182,7 @@ def plan_transfers(
                 suffix = f" ({', '.join(diagnostics)})" if diagnostics else ""
                 eligible_remaining = sum(
                     origin_before[source]
-                    for source in config.origin_warehouses
+                    for source in eligible_sources
                     if not regional_blocks[source] and not schedule_blocks[source]
                 )
                 if stock_insufficient and eligible_remaining > 0:
@@ -2122,7 +2217,9 @@ def plan_transfers(
             "WAREHOUSE_NAME": row["WAREHOUSE_NAME"],
             "CITY": city,
             "RETAIL_ID": sku,
-            "SKU_NAME": row["SKU_NAME"],
+            "SKU_NAME": row.get("SKU_NAME", ""),
+            "F9_SOURCE": row.get("FORCED_SOURCE"),
+            "MB_TOTAL_TARGET": row.get("MB_TOTAL_TARGET", 0),
             "PREDICTED_OPENING_INVENTORY": row["PREDICTED_OPENING_INVENTORY"],
             "PREDICTED_DEMAND": row["PREDICTED_DEMAND"],
             "CURRENT_INVENTORY": row["CURRENT_INVENTORY"],
@@ -2152,7 +2249,7 @@ def plan_transfers(
             ),
             "PASA_CAPACIDAD": passes_capacity,
             "TAREAS_ANTES": task_before,
-            "TAREAS_GENERADAS": len(allocations),
+            "TAREAS_GENERADAS": tasks_used - task_before,
             "TAREAS_ACUMULADAS": tasks_used,
             "PASA_TAREAS": passes_tasks,
             "ORIGENES_USADOS": " | ".join(
@@ -2186,7 +2283,12 @@ def plan_transfers(
             )
         base_rows.append(report_row)
 
-        if stock_insufficient and assigned_total == 0 and capacity_target > 0:
+        if (
+            stock_insufficient
+            and assigned_total == 0
+            and capacity_target > 0
+            and not allow_partial
+        ):
             deferred_stock_rows.append((row, report_row))
 
     # Segunda pasada: una vez atendidas todas las necesidades que cabían
@@ -2235,25 +2337,25 @@ def plan_transfers(
                 candidates.append((source, quantity))
                 remaining -= quantity
 
-        available_task_slots = max(config.max_tasks - tasks_used, 0)
-        second_allocations = candidates[:available_task_slots]
+        task_before_second_pass = tasks_used
+        chunks = reserve_candidates(candidates, destination, sku)
+        second_allocations = [(source, quantity) for source, quantity, owner in chunks]
         if not second_allocations:
             continue
 
-        task_before_second_pass = tasks_used
         assigned_by_origin = {
             source: 0 for source in config.origin_warehouses
         }
-        for source, quantity in second_allocations:
+        for source, quantity, owner in chunks:
             stock_remaining[(source, sku)] -= quantity
             assigned_by_origin[source] += quantity
-            tasks_used += 1
             allocation_rows.append(
                 {
                     "WAREHOUSE_DESTINATION": destination,
                     "WAREHOUSE_SOURCE": source,
                     "RETAIL_ID": sku,
                     "QUANTITY": int(quantity),
+                    "OWNER_NAME": owner,
                     "PLANNED_DATE": "",
                     "ROUTE": 1,
                     "DELIVERY_PRIORITY": 1,
@@ -2271,7 +2373,7 @@ def plan_transfers(
         if capacity_after >= capacity - 1e-9:
             cap_closed[destination] = True
 
-        task_limited = len(second_allocations) < len(candidates)
+        task_limited = sum(q for _, q in second_allocations) < sum(q for _, q in candidates)
         capacity_limited = second_pass_target < target
         blocked_stock = sum(
             second_pass_before[source]
@@ -2353,7 +2455,7 @@ def plan_transfers(
                 "EXCEDE_CAPACIDAD_EN_ESTA_LINEA": False,
                 "PASA_CAPACIDAD": not capacity_limited,
                 "TAREAS_ANTES": task_before_second_pass,
-                "TAREAS_GENERADAS": len(second_allocations),
+                "TAREAS_GENERADAS": tasks_used - task_before_second_pass,
                 "TAREAS_ACUMULADAS": tasks_used,
                 "PASA_TAREAS": not task_limited,
                 "ORIGENES_USADOS": " | ".join(
@@ -2391,7 +2493,7 @@ def plan_transfers(
             )
 
     capacity_rows: list[dict[str, Any]] = []
-    destinations = sorted({row["WAREHOUSE_DESTINATION"] for row in prepared})
+    destinations = sorted({row["WAREHOUSE_DESTINATION"] for row in base_rows})
     for destination in destinations:
         store = catalogs.stores.get(destination, {})
         capacity_rows.append(
@@ -2486,6 +2588,31 @@ def write_rectangular_sheet(
     return row_count
 
 
+def planning_target_totals(rows: list[dict[str, Any]]) -> tuple[int, float]:
+    """Cuenta la necesidad original una vez, sin sumar de nuevo el corte de Naked."""
+    doi = Counter()
+    full_target = Counter()
+    volumes = {}
+    units, m3 = 0, 0.0
+    for row in rows:
+        target = int(row.get("CANTIDAD_OBJETIVO", 0) or 0)
+        if row.get("REGLA_DEMANDA") == "FOUNTAIN9_DOI" or row.get("MB_TOTAL_TARGET", 0):
+            key = (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"])
+            if row.get("REGLA_DEMANDA") == "FOUNTAIN9_DOI":
+                doi[key] += target
+            else:
+                full_target[key] = max(full_target[key], int(row["MB_TOTAL_TARGET"]))
+            volumes[key] = float(row.get("M3_POR_UNIDAD", 0) or 0)
+        else:
+            units += target
+            m3 += float(row.get("M3_OBJETIVO", 0) or 0)
+    for key in doi.keys() | full_target.keys():
+        target = max(doi[key], full_target[key])
+        units += target
+        m3 += target * volumes[key]
+    return units, m3
+
+
 def write_planning_report(
     path: Path,
     result: PlanningResult,
@@ -2523,6 +2650,19 @@ def write_planning_report(
         integer_format = workbook.add_format({"num_format": "#,##0"})
         decimal_format = workbook.add_format({"num_format": "0.000000"})
 
+        audit = getattr(result, "fountain9_audit", [])
+        if audit:
+            audit_headers = list(dict.fromkeys(key for row in audit for key in row))
+            sheet = workbook.add_worksheet("AUDITORIA_FOUNTAIN9")
+            for col, header in enumerate(audit_headers):
+                sheet.write(0, col, header, header_format)
+            for index, row in enumerate(audit, 1):
+                for col, header in enumerate(audit_headers):
+                    sheet.write(index, col, excel_safe(row.get(header, "")))
+            sheet.freeze_panes(1, 0)
+            sheet.autofilter(0, 0, len(audit), len(audit_headers) - 1)
+            sheet.set_column(0, len(audit_headers) - 1, 24)
+
         status_counts = Counter(row["TIPO_DE_CORTE"] for row in result.base_rows)
         units_by_source = Counter()
         tasks_by_source = Counter()
@@ -2531,7 +2671,7 @@ def write_planning_report(
             units_by_source[source] += row["QUANTITY"]
             tasks_by_source[source] += 1
 
-        target_units = sum(row["CANTIDAD_OBJETIVO"] for row in result.base_rows)
+        target_units, _ = planning_target_totals(result.base_rows)
         assigned_units = sum(row["CANTIDAD_ASIGNADA"] for row in result.base_rows)
         total_input_rows = sum(
             row.get("CANTIDAD_FILAS_INPUT", 1) for row in result.base_rows
@@ -2543,6 +2683,7 @@ def write_planning_report(
             bool(row.get("DUPLICADO_CONFLICTIVO", False)) for row in result.base_rows
         )
         metrics = [
+            ("BUILD", getattr(result, "build", "")),
             ("FECHA_EJECUCION", run_date.strftime("%d-%m-%Y")),
             ("ARCHIVO_INPUT", input_filename),
             ("ORIGENES_CONFIGURADOS", ", ".join(map(str, config.origin_warehouses))),
@@ -2610,7 +2751,7 @@ def write_planning_report(
 
         base = workbook.add_worksheet("BASE_TRANSFERS")
         base.hide_gridlines(2)
-        base_headers = list(result.base_rows[0]) if result.base_rows else []
+        base_headers = list(dict.fromkeys(k for row in result.base_rows for k in row))
         if base_headers:
             base_count = write_rectangular_sheet(
                 workbook,
@@ -2664,6 +2805,20 @@ def write_planning_report(
         workbook.close()
 
 
+def consolidate_operational_rows(rows):
+    grouped = {}
+    for row in rows:
+        key = tuple(row[k] for k in ("WAREHOUSE_SOURCE", "WAREHOUSE_DESTINATION", "RETAIL_ID"))
+        if key not in grouped:
+            grouped[key] = dict(row)
+        else:
+            for column in ("PLANNED_DATE", "ROUTE", "DELIVERY_PRIORITY", "STORAGE", "OWNER_NAME"):
+                if str(grouped[key].get(column, "")) != str(row.get(column, "")):
+                    raise ValueError(f"Bulk incompatible en {key}: {column}")
+            grouped[key]["QUANTITY"] += row["QUANTITY"]
+    return list(grouped.values())
+
+
 def create_output_files(
     result: PlanningResult,
     config: Config,
@@ -2694,11 +2849,11 @@ def create_output_files(
                 path = output_dir / (
                     f"BulkCD_{source}_{safe_filename(owner)}.csv"
                 )
-                write_csv(path, owner_rows, OUTPUT_COLUMNS)
+                write_csv(path, consolidate_operational_rows(owner_rows), OUTPUT_COLUMNS)
                 paths.append(path)
         else:
             path = output_dir / f"BulkCD_{source}.csv"
-            write_csv(path, rows, OUTPUT_COLUMNS)
+            write_csv(path, consolidate_operational_rows(rows), OUTPUT_COLUMNS)
             paths.append(path)
     return paths
 

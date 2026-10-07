@@ -170,12 +170,12 @@ def test_card_texts_are_short_and_name_the_engines_purpose():
         assert text.count(".") <= 4, engine            # sin párrafos largos
 
 
-def test_cards_are_numbered_in_the_order_they_appear_with_solidus_second():
+def test_switchable_cards_reserve_stage_two_for_otacon():
     _k, fake = run_codec()
     ordered = sorted(CARD_KEYS, key=lambda e: list(fake.cards).index(CARD_KEYS[e]))
     assert ordered == ["Naked", "Solidus", "Shalashaska", "Liquid", "Venom", "Kazuhira"]
     eyebrows = [fake.cards[CARD_KEYS[e]]["eyebrow"] for e in ordered]
-    assert [x.split("·")[0].strip() for x in eyebrows] == [f"ENGINE / 0{i}" for i in range(1, 7)]
+    assert [x.split("·")[0].strip() for x in eyebrows] == [f"ENGINE / 0{i}" for i in (1, 3, 4, 5, 6, 7)]
 
 
 def test_raiden_still_sees_the_locked_message_on_restricted_engines():

@@ -345,7 +345,7 @@ def apply_shalashaska_engine(
         source = int(allocation["WAREHOUSE_SOURCE"])
         destination = int(allocation["WAREHOUSE_DESTINATION"])
         allocation_key = (destination, int(allocation["RETAIL_ID"]))
-        if allocation_key in non_natural_keys:
+        if allocation_key in non_natural_keys and "SOLIDUS" not in str(allocation.get(reason_column, "")):
             # Un mínimo (hardcode) no da derecho a recibir merma: la tienda debe
             # tener un ROQ positivo de Fountain9.
             summary["stores_without_positive_roq"] += 1
@@ -600,14 +600,11 @@ def apply_shalashaska_engine(
                 candidate_tasks += 1
                 is_new_task = True
             else:
-                allocation["QUANTITY"] = int(allocation["QUANTITY"]) + int(quantity)
-                previous_reason = engine.clean_text(allocation.get(reason_column))
-                if SHALASHASKA_REASON not in previous_reason:
-                    allocation[reason_column] = (
-                        f"{previous_reason} + {SHALASHASKA_REASON}"
-                        if previous_reason
-                        else SHALASHASKA_REASON
-                    )
+                contribution = dict(allocation)
+                contribution["QUANTITY"] = int(quantity)
+                contribution[reason_column] = SHALASHASKA_REASON
+                contribution.pop("OWNER_NAME", None)
+                result.allocation_rows.append(contribution)
                 is_new_task = False
 
             quantity = int(quantity)

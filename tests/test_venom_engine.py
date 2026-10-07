@@ -427,7 +427,7 @@ def test_venom_base_row_has_same_schema_as_naked_solidus():
     # STORAGE/VALUE se normalizan aparte (normalize_result_storage) y
     # STOCK_ANTES_*/STOCK_REMANENTE_* nunca se leen con corchetes en otra parte
     # del código.
-    allowed_missing = {"STORAGE", "VALUE", "STOCK_ANTES_444", "STOCK_REMANENTE_444"}
+    allowed_missing = {"F9_SOURCE", "MB_TOTAL_TARGET","STORAGE", "VALUE", "STOCK_ANTES_444", "STOCK_REMANENTE_444"}
     assert missing <= allowed_missing, (
         "Venom no tiene columnas de Naked/Solidus que no están en la lista "
         f"de excepciones conocidas: {missing - allowed_missing}"

@@ -1,6 +1,6 @@
-"""Clasificación de los mínimos (hardcode) de Naked.
+"""Clasificación de los mínimos (hardcode) de Otacon.
 
-Nombre histórico: no es el Solidus Engine. Los mínimos pertenecen a Naked
+Nombre histórico: no es el Solidus Engine. Los mínimos pertenecen a Otacon
 (toggle "Cubrir a Fountain9"); el Solidus Engine real —AVL, Preventivo,
 Refuerzo y Cobertura sin Fountain9— vive en modules/les_enfants_terribles.py
 (apply_avl_fill).

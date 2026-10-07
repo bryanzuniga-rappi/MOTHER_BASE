@@ -1,4 +1,4 @@
-"""Variables de Naked: reglas de hardcode individuales, umbrales de net
+"""Variables de Otacon: reglas de hardcode individuales, umbrales de net
 transfer, piso mínimo y columnas adicionales de MOV."""
 
 from datetime import date
@@ -111,5 +111,5 @@ def test_summary_marks_minimums_off_when_all_three_rules_are_off():
         hardcode_low_net_transfer=False,
     )
     row = next(r for r in run["engine_summary_rows"]
-               if (r["ENGINE"], r["COBERTURA"]) == ("Naked", "Mínimos (hardcode)"))
+               if (r["ENGINE"], r["COBERTURA"]) == ("Otacon", "Mínimos (hardcode)"))
     assert row["ESTADO"] == "APAGADO"

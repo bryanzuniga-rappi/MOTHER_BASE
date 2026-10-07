@@ -617,14 +617,11 @@ def apply_liquid_engine(
             allocation_key = (source, destination, sku)
             existing = existing_allocations.get(allocation_key)
             if existing is not None:
-                existing["QUANTITY"] = int(existing["QUANTITY"]) + int(quantity)
-                previous_reason = str(existing.get(reason_column, "")).strip()
-                if LIQUID_REASON not in previous_reason:
-                    existing[reason_column] = (
-                        f"{previous_reason} + {LIQUID_REASON}"
-                        if previous_reason
-                        else LIQUID_REASON
-                    )
+                contribution = dict(existing)
+                contribution["QUANTITY"] = int(quantity)
+                contribution[reason_column] = LIQUID_REASON
+                contribution.pop("OWNER_NAME", None)
+                result.allocation_rows.append(contribution)
                 is_new_task = False
             else:
                 if result.tasks_used >= config.max_tasks:

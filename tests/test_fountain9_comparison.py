@@ -1,6 +1,6 @@
 """Pruebas del reporte comparativo Fountain9 vs Mother Base
 (build_fountain9_comparison_report), y de la lectura opcional de
-'Allocation (Store Based)' en consolidate_plan_files."""
+'Allocation (DOI Based)' en consolidate_plan_files."""
 
 import csv
 from pathlib import Path
@@ -223,7 +223,7 @@ def test_swa_not_counted_when_not_a_stockout():
     assert report["mother_base_mismo_alcance"]["swa_ganado"] == 0.0
 
 
-# --- lectura opcional de Allocation (Store Based) en consolidate_plan_files
+# --- lectura opcional de Allocation (DOI Based) en consolidate_plan_files
 
 def _write_plan_csv(path: Path, headers: list[str], rows: list[list]) -> None:
     with path.open("w", newline="", encoding="utf-8") as f:
@@ -244,7 +244,7 @@ def test_fountain9_allocation_column_read_when_present(tmp_path):
             "Warehouseid", "SKU ID", "Predicted Demand for selected duration",
             "Predicted Opening Inventory",
             "Replenishment Quantity for Plan Duration (MOV)",
-            "Net Inter-Store Transfers", "Allocation (Store Based)",
+            "Net Inter-Store Transfers", "Allocation (DOI Based)",
         ],
         [[100, 10, "5", "0", "5", "0", "3"]],
     )
@@ -276,7 +276,7 @@ def test_fountain9_allocation_none_when_column_absent(tmp_path):
     assert consolidated[(100, 10)]["FOUNTAIN9_ALLOCATION"] is None
 
 
-def test_fountain9_allocation_takes_max_across_duplicate_rows(tmp_path):
+def test_fountain9_allocation_sums_duplicate_instructions(tmp_path):
     """Mismo criterio que ROQ_INPUT: máximo entre filas duplicadas, nunca
     suma — consistente con cómo tratamos 'la cantidad final de otro
     sistema' en el resto del pipeline."""
@@ -287,7 +287,7 @@ def test_fountain9_allocation_takes_max_across_duplicate_rows(tmp_path):
             "Warehouseid", "SKU ID", "Predicted Demand for selected duration",
             "Predicted Opening Inventory",
             "Replenishment Quantity for Plan Duration (MOV)",
-            "Net Inter-Store Transfers", "Allocation (Store Based)",
+            "Net Inter-Store Transfers", "Allocation (DOI Based)",
         ],
         [
             [100, 10, "5", "0", "5", "0", "3"],
@@ -299,4 +299,4 @@ def test_fountain9_allocation_takes_max_across_duplicate_rows(tmp_path):
     _, consolidated, _ = m.consolidate_plan_files(
         [plan_path], catalogs, CONFIG, output_path
     )
-    assert consolidated[(100, 10)]["FOUNTAIN9_ALLOCATION"] == 9.0
+    assert consolidated[(100, 10)]["FOUNTAIN9_ALLOCATION"] == 12.0

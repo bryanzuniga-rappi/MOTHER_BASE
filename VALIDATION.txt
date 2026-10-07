@@ -1,0 +1,42 @@
+MOTHER BASE — 2026-10-07 · naked-otacon-v2
+
+Validación
+  Entorno aislado: CPython 3.12.15, Windows.
+  Suite completa: 574 passed in 106.12s.
+  Verificación posterior de la conciliación de objetivos y UI: 56 passed in 29.29s.
+  Comando: python -m pytest -q --tb=short
+  Versiones fijadas en requirements-dev.lock; requirements-dev.txt las aplica
+  como restricciones y conserva las dependencias de producción.
+
+Cambios comprobados
+  - Naked ejecuta Allocation DOI desde Source Before Multi Source, con parciales.
+  - Los destinos y productos excluidos no reaparecen como candidatos Naked.
+  - Otacon descuenta Naked ejecutado y conserva DOI dentro del máximo MOV.
+  - La ampliación Naked/Otacon de una ruta reutiliza la tarea existente.
+  - Stock, capacidad y OWNER se reservan antes de la siguiente asignación.
+  - Solidus corre antes de Shalashaska, que aprovecha sus rutas activadas.
+  - Aportes de engines separados en auditoría y consolidados en CSV operativo.
+  - OWNER 425/856 conserva archivos separados; Insumos se consolida al final.
+  - Auditoría por origen F9, destino y SKU en CSV, Excel, interfaz y resumen PDF.
+  - Los totales de necesidad en Excel y UI no vuelven a sumar el corte de Naked
+    cuando Otacon recupera ese residual.
+  - Se conserva la capacidad independiente de Venom y la regresión de Kazuhira.
+  - Se corrigió la preservación de celdas vacías finales en el Excel para correo.
+  - El ZIP excluye secrets.toml, entornos, cachés y scripts temporales de edición.
+
+Alcance de las pruebas
+  Casos sintéticos de lectura, restricciones, parciales, reasignación, OWNER,
+  conservación de stock/m³/tareas, prioridades, interfaz y contenido de exports.
+  El detalle por engine no se colapsa para crear los CSV operativos.
+  La recuperación DOI entre varias instrucciones se distribuye sin duplicación.
+
+Límite de la validación
+  El ZIP de entrada no incluía el CSV real citado ni un DATA_TRANSFERS operativo.
+  No se ejecutó conciliación con fechas históricas reales ni se publicaron cambios.
+  El resultado requiere esa conciliación operativa antes de desplegar en producción.
+
+Reproducción
+  Con Python 3.12.15:
+    python -m venv .venv
+    .venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+    .venv\Scripts\python.exe -m pytest -q
