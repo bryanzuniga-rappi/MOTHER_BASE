@@ -4,6 +4,13 @@
 
 Build: `2026-10-07 · naked-otacon-v2`.
 
+Estado de referencia: esta documentación corresponde a la versión que contiene
+el flujo **Naked → Otacon → Solidus → Shalashaska → Liquid → Venom → Kazuhira →
+Insumos** y la tarjeta visual estándar de Otacon. Si el comportamiento de la
+aplicación no coincide con este documento, primero valida que se esté ejecutando
+la misma copia de `modules/les_enfants_terribles.py` y que el sello `APP_BUILD`
+coincida.
+
 Mother Base toma la recomendación diaria de Fountain9, la contrasta con el inventario y las restricciones operativas vigentes, y produce una propuesta de transferencias lista para revisar y ejecutar. Su objetivo no es reemplazar al criterio operativo: es volverlo consistente, trazable y repetible.
 
 La aplicación está construida en Streamlit y utiliza un motor de planeación propio. Los resultados se descargan como Excel, CSV operativos, PDF ejecutivo y ZIP consolidado.
@@ -151,6 +158,36 @@ flowchart TD
 | `mother_base_theme.py` | Sistema visual de la aplicación. |
 | `tests/` | Pruebas de reglas de negocio y contratos críticos. |
 
+### Mapa de implementación
+
+El sistema está separado en cuatro capas. Esta separación ayuda a decidir dónde
+hacer un cambio y evita poner reglas de negocio dentro de la interfaz.
+
+| Capa | Archivos principales | Qué debe contener |
+|---|---|---|
+| Entrada y sesión | `app.py`, `auth.py` | Navegación Streamlit, autenticación y perfil activo. |
+| Orquestación | `modules/les_enfants_terribles.py` | Carga, validación, configuración CODEC, orden de engines, breakdown y descargas. |
+| Dominio | `modelo_abasto.py`, `engines/*.py` | Normalización, ledger de recursos, candidatos, asignaciones, motivos y restricciones. |
+| Presentación | `mother_base_theme.py`, exportadores del módulo | Componentes visuales, tarjetas, tablas, Excel, CSV, PDF y ZIP. |
+
+La ruta de una decisión es: **fuente → normalización → candidato → filtro →
+ledger → asignación → motivo → exportación**. Una regla nueva debe poder seguirse
+por esa ruta sin depender del estado visual de Streamlit.
+
+### Cómo se aplica un cambio de código
+
+1. Cambia el módulo de dominio u orquestación que posee la regla.
+2. Conserva `ENGINE`, `COBERTURA`, `PLANNING_REASON` y los motivos de corte.
+3. Añade o actualiza una prueba con datos mínimos reproducibles.
+4. Ejecuta compilación y suite completa.
+5. Actualiza `APP_BUILD`, `README.md` y `VALIDATION.txt` si cambia el contrato.
+6. Empaqueta únicamente archivos de aplicación; nunca `.venv*`, `.python`, `__pycache__`, `.pytest_cache`, datos de ejecución ni secretos.
+
+El cambio visual de una tarjeta debe hacerse en `mother_base_theme.py` o mediante
+`render_action_card`; no se debe crear un segundo componente visual para un
+engine. Otacon usa la misma tarjeta estándar que los demás engines y conserva sus
+controles de configuración debajo de ella.
+
 ### Principio de diseño del motor
 
 El motor es secuencial a propósito. Cada asignación modifica tres recursos compartidos:
@@ -263,6 +300,30 @@ Mother Base tolera columnas opcionales y varios alias, pero no puede inferir una
 | **SCHEDULE** | Origen–destino | Días permitidos y universo operativo de Kazuhira | Si la pareja no existe, no se inventa una restricción de frecuencia. |
 | **OWNER** | Origen–SKU–owner | Inventario separable de 425/856 | Un owner insuficiente recorta o divide el bulk; no aumenta stock. |
 | **BLOQUEOS / RUTA_COSTOS / RACKEADOS** | SKU o tienda-SKU | Restricciones explícitas | Siempre ganan frente a una recomendación o engine. |
+
+### Linaje de datos y responsabilidad
+
+La unidad funcional de demanda es **destino–SKU**. La unidad física de stock es
+**origen–SKU**. Una transferencia necesita ambas dimensiones y además debe
+conservar `ENGINE`, `COBERTURA`, origen efectivo, motivo de planeación y motivo
+de corte cuando la asignación sea parcial.
+
+Antes de consolidar se conserva el origen Fountain9 de cada DOI. Después de
+consolidar, Otacon puede elegir otro origen permitido para cubrir el residual,
+pero esa reasignación debe quedar explícita en el origen efectivo y en la
+auditoría Fountain9. Un origen alterno nunca debe presentarse como el origen
+original del DOI.
+
+Reglas de calidad que aplican antes del ledger:
+
+- Normalizar IDs como texto cuando puedan contener ceros a la izquierda.
+- Convertir cantidades y volúmenes a números finitos; `NaN`, infinitos y texto
+  no pueden entrar al ledger.
+- Rechazar duplicados donde el contrato exige una fila única; sumar solo donde
+  la fuente lo permite, como instrucciones DOI repetidas.
+- Conservar filas rechazadas con una causa descargable; no descartarlas en
+  silencio.
+- Registrar los archivos Fountain9 y COPÉRNICO exactos usados en cada corrida.
 
 ---
 
