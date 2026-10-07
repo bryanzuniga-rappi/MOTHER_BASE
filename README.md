@@ -294,53 +294,412 @@ The build stamp is stored in `APP_BUILD` and should be updated for every intenti
 
 **Raiden** is an operational profile with restricted engines and protected-city rules.
 
+## Business problem and expected result
+
+A Fountain9 recommendation is not automatically an executable transfer. MOTHER BASE must evaluate inventory, receiving capacity, commercial priority, routes, schedules, closed stores, product locks, task budget, owner stock and non-pickable inventory at the same time.
+
+The expected result is a proposal that a Supply operator can review and execute:
+
+| Business question | Where to answer it |
+|---|---|
+| What transfers should be created? | Operational CSVs and the planning workbook. |
+| What was fully or partially covered? | Assignment detail, breakdown tables and KPIs. |
+| Which engine created a line? | `ENGINE` and `COBERTURA` in `BASE_TRANSFERS`. |
+| Why was a case not sent? | Cut tables and the row-level reason fields. |
+| Which source inventory was used? | Assignment detail and origin analysis. |
+| What changed versus Fountain9? | Fountain9 comparison and residual audit. |
+| Are priority products still at risk? | Golden, Infaltable, Anchor, KVI and health checks. |
+
+A silent gap is a defect. Every relevant store-SKU must be assigned, explicitly rejected with a reason, or classified as healthy/no need.
+
+## Run lifecycle
+
+```mermaid
+flowchart TD
+    A["Validate DATA_TRANSFERS"] --> B["Load Fountain9 and COPERNICO"]
+    B --> C["Configure CODEC"]
+    C --> D["Consolidate and normalize"]
+    D --> E["Run shared-ledger engines"]
+    E --> F["Audit cuts and restrictions"]
+    F --> G["Export Excel, CSV, PDF and ZIP"]
+    G --> H["Supply approval and execution"]
+```
+
+### 1. Source validation
+
+The application checks required sheets, expected headers, freshness and duplicate keys. Validation errors must be corrected at the source or deliberately acknowledged; they must not be hidden by a UI fallback.
+
+### 2. Demand consolidation
+
+Fountain9 files are consolidated by destination-SKU. Repeated DOI instructions are summed by source-destination-SKU only when the source contract permits it. MOV-related columns retain their maximum where specified by the contract.
+
+The run must use only the files belonging to that planning date. Mixing files from different runs changes the demand baseline and invalidates reconciliation.
+
+### 3. Candidate construction
+
+Each candidate is enriched with store city, store priority, commercial category, unit volume, current stock, receiving capacity, route restrictions, schedule and target quantity.
+
+Commercial priority is:
+
+```
+Infaltable > Golden > Anchor > KVI > Regular
+```
+
+Within a category, DATA_TRANSFERS store priority is preserved. DOI, DOH and stable store-SKU ordering are used as deterministic tie breakers.
+
+### 4. Assignment
+
+Each candidate is evaluated against the current shared ledger. An assignment consumes the effective source stock, destination capacity and a task when the engine requires one. A partial assignment updates the ledger with the actual units, not the original requested quantity.
+
+### 5. Audit and export
+
+The result contains planned lines, unplanned demand, cuts, restriction diagnostics, engine totals, source usage and comparison data. Web tables may be capped for browser performance; downloads must retain the complete detail.
+
+## Source contracts
+
+### DATA_TRANSFERS
+
+DATA_TRANSFERS is the operational catalog and configuration source. It provides the store, product, stock, capacity, ownership, lock, route, priority, schedule and parameter tables used by the run.
+
+Before planning, validate:
+
+- Required sheets exist.
+- Headers match the accepted contract.
+- Store, SKU, origin and owner identifiers have consistent types.
+- Required keys are unique where uniqueness is expected.
+- Capacity, priority and status values are valid.
+- The source is fresh enough for the planning SLA.
+- External imports such as IMPORTRANGE have no permission errors.
+
+### Fountain9
+
+Fountain9 files provide demand and recommendation signals. Naked requires the DOI allocation and the source identifier before multi-source logic. Otacon can use MOV and configured minimum rules even when a positive DOI is absent.
+
+Fountain9 is the reference for literal demand execution. It is not the authority for available stock, route permission or receiving capacity; those are controlled by the operational catalog and ledgers.
+
+### COPERNICO
+
+COPERNICO supplies non-pickable and rack-related information. It is required when planning from the configured 444, 831 or 856 origins. COPERNICO can reduce usable inventory and qualify logistics conditions; it cannot create stock or override a lock.
+
+### SCHEDULE
+
+SCHEDULE controls permitted origin-destination days. When the frequency block is active, a pair outside its allowed schedule cannot receive a transfer. A missing pair is not automatically converted into a restriction unless the configured rule says so.
+
+### SWA
+
+SWA supplies sales-opportunity information used for prioritization and reporting. It must not silently alter the stock ledger or create an assignment without an engine rule.
+
+### OWNER
+
+OWNER separates stock by owner for 425 and 856. Owner stock is a ceiling inside adjusted stock. A missing or insufficient owner balance cuts the candidate; it never increases the origin's physical inventory.
+
+## Data quality and normalization
+
+The normalizer must:
+
+- Treat identifiers as strings when leading zeroes are meaningful.
+- Convert quantities, dates and volumes to validated types.
+- Reject non-finite quantities.
+- Normalize whitespace and known aliases at the boundary.
+- Preserve original values needed for audit.
+- Keep rejected rows and their reasons.
+- Avoid silently inventing defaults when a mandatory field is missing.
+- Record the exact input file names and validation timestamp.
+
+The main keys are:
+
+| Key | Meaning |
+|---|---|
+| destination-SKU | A store's need for a product. |
+| origin-SKU | Physical inventory available at a source. |
+| source-destination-SKU | A transfer instruction and its source route. |
+| destination-owner-SKU | Owner-constrained inventory at 425/856. |
+
+## Detailed engine behavior
+
+### Naked
+
+Naked answers: “How much of the Fountain9 recommendation can be executed literally?”
+
+It starts from the DOI source, applies the normal ledgers and creates partial lines when necessary. It does not raise quantities to a minimum, use residual MOV logic or silently switch origin.
+
+### Otacon
+
+Otacon answers: “How much additional need can be covered after Naked?”
+
+Its residual target is conceptually:
+
+```
+residual = max(target after configured minimum rules
+               - units actually executed by Naked, 0)
+```
+
+Otacon evaluates configured origin alternatives. If a valid alternative has stock and the route, capacity, task and lock rules permit it, the transfer is created from that effective origin. The audit must preserve both the Fountain9 reference context and the actual source used.
+
+Otacon controls include:
+
+- Raising small positive recommendations to the configured minimum.
+- Using additional MOV columns.
+- Covering forecast and destination-stock zero cases.
+- Covering Fountain9 residuals.
+- Limiting maximum net transfer.
+- Applying destination stock-below-demand thresholds.
+
+All controls must be visible in CODEC, documented in their help text and reflected in the run parameters.
+
+### Solidus
+
+Solidus is catalog coverage, not residual DOI execution. It evaluates AVL, preventive targets, bucket reinforcement and coverage without usable Fountain9 demand. Its four coverage categories must remain separately attributable in reports.
+
+### Shalashaska
+
+Shalashaska uses the near-expiry universe. It prioritizes routes that are already active through Naked, Otacon or Solidus and respects the same restrictions. It must not create a route merely because stock is close to expiry.
+
+### Liquid
+
+Liquid uses eligible remaining inventory after earlier priorities. It requires an eligible demand signal and an active route. Its DOH calculation uses ADU and the configured fallback hierarchy. It must report no eligible destination, capacity, route, stock or task as a concrete reason.
+
+### Venom
+
+Venom calculates DDMRP zones from lead time, variability, factors, ADU, order cycle and configured thresholds. Venom's capacity and detail remain auditable as a separate contribution even when the final operational CSV consolidates equal origin-destination-SKU rows.
+
+### Kazuhira
+
+Kazuhira is disabled by default and available only under the configured Big Boss policy. It reviews the final catalog universe for remaining breaks and can use non-Fountain9 CEDIS stock where the route and policy allow it. It must never be treated as part of the natural Fountain9 result.
+
+### OWNER and Insumos
+
+After engine planning, the output is partitioned by owner when required. Insumos adds eligible supplies and respects its MOQ, stock, route, lock and schedule rules. Insumos does not consume the shared task budget, but it does consume 444 stock and must remain visible in the final audit.
+
+## Restrictions and blocking rules
+
+| Rule | Operational effect |
+|---|---|
+| Closed stores | No destination assignment. |
+| Manual store exclusions | Temporary destination block for the run. |
+| Blocked cities | Prevents assignment to configured cities. |
+| Product locks | Excludes locked SKU or store-SKU combinations. |
+| Route cost restrictions | Blocks the configured destination-SKU route. |
+| Regional restrictions | Applies to configured products from CDMX to GDL/MTY. |
+| Racked inventory | Racked 444 stock cannot be shipped. |
+| Schedule | Blocks origin-destination pairs outside frequency. |
+| Store capacity | Limits cumulative receiving volume. |
+| Owner balance | Limits 425/856 owner-specific transfers. |
+| COPERNICO non-pickable | Reduces usable stock. |
+| FRUVER 811 rule | Removes configured FRUVER stock from 811. |
+
+Master toggles are applied while catalogs are loaded so every engine sees the same restricted structures. Engines must not implement divergent versions of the same blocking rule.
+
+## CODEC configuration
+
+CODEC controls the run. Before pressing execute, Supply should confirm:
+
+- Selected origins and origin-specific policies.
+- Maximum task budget.
+- Store capacity behavior.
+- Closed-store and route-lock toggles.
+- Schedule/frequency enforcement.
+- COPERNICO and owner inputs.
+- Naked enabled state.
+- Otacon minimum, MOV and residual settings.
+- Optional Solidus, Shalashaska, Liquid, Venom and Kazuhira settings.
+- Whether the run is simulation or operational.
+
+A configuration is part of the run evidence. Save or export it with the result whenever the process requires reproducibility.
+
+## Reading the result
+
+Review the result in this order:
+
+1. **Build and input manifest:** confirm the code version and exact source files.
+2. **Engine summary:** verify expected engines are active and totals are plausible.
+3. **Fountain9 comparison:** separate literal Naked execution from Otacon residual recovery.
+4. **Cuts:** group by stock, capacity, task, lock, route, schedule and owner.
+5. **Origin consumption:** reconcile used stock against adjusted stock.
+6. **Destination capacity:** verify cumulative m³.
+7. **Priority health:** review Infaltable, Golden, Anchor and KVI.
+8. **Operational files:** confirm origin and owner partitioning.
+9. **Approval:** only then release files for execution.
+
+## Output field semantics
+
+The most important fields are:
+
+| Field | Meaning |
+|---|---|
+| `ENGINE` | Engine that generated or owns the line. |
+| `COBERTURA` | Business coverage category. |
+| `PLANNING_REASON` | Machine-readable planning reason. |
+| Effective origin | Source actually used by the transfer. |
+| Fountain9 source | Original DOI/source context when available. |
+| Requested units | Target before resource constraints. |
+| Planned units | Actual assigned units. |
+| Cut reason | Why requested units were not fully planned. |
+| Volume | Units multiplied by product volume. |
+| Owner | Owner partition for applicable origins. |
+
+## Daily operating checklist
+
+### Before the run
+
+- Confirm the planning date and business cycle.
+- Confirm DATA_TRANSFERS freshness.
+- Confirm all Fountain9 files belong to the same run.
+- Confirm COPERNICO files for 444, 831 and 856 where required.
+- Confirm owner and schedule information.
+- Confirm new locks, closed stores and regional restrictions.
+- Confirm maximum tasks and receiving capacity policy.
+- Confirm Big Boss/Raiden profile.
+
+### During the run
+
+- Read validation warnings before executing.
+- Check that Naked and Otacon are visible and configured.
+- Confirm Otacon residual settings match the current business rule.
+- Do not upload unrelated Fountain9 files to “complete” the data.
+- Do not approve an output merely because total units look reasonable.
+
+### After the run
+
+- Check planned versus requested units.
+- Check residual recovery by Otacon.
+- Check all major cut reasons.
+- Check stock and m³ reconciliation.
+- Review priority health.
+- Download and archive the exact outputs.
+- Obtain Supply approval before operational execution.
+
+## Deployment
+
+### Streamlit Community Cloud
+
+1. Push application source without secrets or local artifacts.
+2. Create the Streamlit app from the production branch.
+3. Set `app.py` as the main file.
+4. Add secrets through the deployment settings.
+5. Confirm Python/runtime and dependency lock.
+6. Run a controlled test with representative files.
+7. Review logs, source freshness and exports.
+8. Promote only after reconciliation.
+
+### Security
+
+- Keep `.streamlit/secrets.toml` outside Git.
+- Rotate any exposed credential immediately.
+- Do not place service-account JSON, passwords or tokens in CSV, ZIP or README files.
+- Use HTTPS and the platform's XSRF protections.
+- Restrict access to DATA_TRANSFERS and dashboard sources.
+- Treat generated operational files as sensitive business data.
+
+## Testing strategy
+
+The test suite covers pure business rules, contracts, engine attribution, UI labels and controlled end-to-end scenarios.
+
+Minimum commands:
+
+```bash
+python -m compileall app.py auth.py modelo_abasto.py engines modules
+python -m pytest -q
+```
+
+Focused validation for the current handoff:
+
+```bash
+python -m pytest tests/test_handoff_contract.py tests/test_naked_doi_otacon.py -q
+```
+
+Manual validation must include:
+
+- Empty and partial Fountain9 recommendations.
+- Residual recovery from a permitted alternate origin.
+- No recovery when stock or route rules make the alternate unusable.
+- Duplicate DOI instructions.
+- 444, 425 and 856 owner behavior.
+- COPERNICO reductions.
+- Store capacity and task limits.
+- Closed stores, schedules and regional restrictions.
+- All exports and owner partitions.
+
+A test is meaningful when it describes the input rule and expected business result, not merely that a function executed without an exception.
+
+## Release process
+
+For a release:
+
+1. Update the build stamp.
+2. Run compileall and the full test suite.
+3. Replay representative historical dates.
+4. Reconcile units, tasks, stock, capacity and cuts.
+5. Review the README and release notes.
+6. Package source without secrets, caches, virtual environments or local results.
+7. Verify the ZIP can be opened and its contents are limited to the intended release.
+8. Deploy to a controlled environment.
+9. Obtain operational approval.
+10. Tag the reconciled release for rollback.
+
+## Troubleshooting
+
+### Otacon is not visible
+
+- Verify the running source contains the current `modules/les_enfants_terribles.py`.
+- Verify `APP_BUILD`.
+- Restart Streamlit after replacing source files.
+- Clear the browser/session state.
+- Confirm the UI renders `engine_otacon_card` through `render_action_card`.
+
+### Otacon shows zero residual recovery
+
+Inspect the run evidence in this order:
+
+1. Was Naked enabled and did it consume the need?
+2. Was Otacon enabled/configured for the relevant coverage?
+3. Were alternate origins configured?
+4. Did those origins have adjusted stock for the SKU?
+5. Were routes, schedules, locks or regional rules blocking them?
+6. Was destination capacity available?
+7. Was the task budget already exhausted?
+8. Did owner limits reduce the usable stock?
+9. Is the reported source invalid only because it is not one of the configured Fountain9 origins?
+
+Zero recovery can be a correct result when no permitted stock remains. The audit must distinguish “no eligible source” from “engine did not run.”
+
+### Outputs do not match the UI
+
+Confirm the build stamp, input manifest and session restart. A stale browser session or a different checkout can display an older engine order even when the repository was updated.
+
+### Windows cannot open the ZIP
+
+Regenerate the package outside the active source folder, exclude virtual environments and caches, wait for OneDrive synchronization to finish, then test the archive with a ZIP reader before delivery. Never include `.streamlit/secrets.toml`.
+
 ## Known limitations
 
-- Big Boss currently uses a shared password rather than corporate SSO.
-- The application keeps large CSV consolidations in memory.
-- There is no persistent audit store for every run's inputs and parameters.
-- Server date controls schedule evaluation; historical delivery dates are not simulated.
-- `STOCK.INCOMING` is not part of base planning.
-- Multi-user concurrency and load testing require additional infrastructure.
-
-## Production checklist
-
-- [ ] Python and locked dependencies are installed.
-- [ ] Secrets are configured outside Git.
-- [ ] Required data sheets are available and fresh.
-- [ ] COPERNICO is loaded for dependent origins.
-- [ ] OWNER stock is available for 425/856.
-- [ ] No assignment exceeds adjusted stock.
-- [ ] No destination exceeds capacity.
-- [ ] Task limits are respected.
-- [ ] Closed stores and locks are absent from operational CSVs.
-- [ ] Fountain9 versus MOTHER BASE differences are reviewed.
-- [ ] The release ZIP contains no secrets, caches or virtual environments.
-
-## Support and troubleshooting
-
-If Otacon is missing from the UI, verify:
-
-1. The running copy contains the current `modules/les_enfants_terribles.py`.
-2. `APP_BUILD` matches the expected build.
-3. The app was restarted after replacing the file.
-4. The browser is not displaying a cached old session.
-5. The current source uses `render_action_card` with key `engine_otacon_card`.
-
-If residual recovery is zero, inspect usable stock, source-origin configuration, route locks, schedules, destination capacity, task budget and owner limits before treating it as a code defect.
+- Big Boss uses a shared password rather than corporate SSO.
+- Raiden is an operational profile without a separate password.
+- Large CSV files are consolidated in memory.
+- There is no persistent audit database for every run.
+- Server date controls schedule evaluation.
+- Historical delivery-date simulation is not available.
+- Incoming inventory is not part of base planning.
+- Multi-user concurrency and load testing need additional infrastructure.
+- The Militaires Sans Frontières reporting module remains under development.
 
 ## Glossary
 
-- **DOI:** Fountain9 allocation recommendation.
-- **MOV:** Movement or sales signal used by residual and coverage rules.
-- **Residual:** Need left after the preceding engine.
-- **Ledger:** Shared state of stock, capacity and tasks.
-- **COVERAGE:** Business coverage category attached to an assignment.
-- **PLANNING_REASON:** Machine-readable explanation for why a line was planned.
-- **Cut reason:** Explanation for a partial or rejected assignment.
-- **SWA:** Sales opportunity analysis.
-- **ADU:** Average daily usage.
-- **DOH:** Days on hand.
-- **MOQ:** Minimum order quantity.
+- **ADU:** Average Daily Usage.
+- **AVL:** Available-to-list/catalog coverage rule.
 - **CEDIS:** Distribution center.
+- **COBERTURA:** Business coverage classification.
+- **COPERNICO:** Inventory availability and non-pickable source.
+- **DOH:** Days on Hand.
+- **DOI:** Fountain9 allocation recommendation.
+- **ENGINE:** Planning engine responsible for a line.
+- **KVI:** Key Value Item.
+- **Ledger:** Shared state of stock, capacity and tasks.
+- **MOV:** Movement or sales signal.
+- **MOQ:** Minimum Order Quantity.
+- **OWNER:** Owner-specific stock partition.
+- **PLANNING_REASON:** Machine-readable planning reason.
+- **Residual:** Requirement left after a preceding engine.
+- **SWA:** Sales opportunity analysis.
+- **SKU:** Stock Keeping Unit.
 
