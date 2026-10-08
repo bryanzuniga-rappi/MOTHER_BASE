@@ -169,6 +169,25 @@ def upload_run_package_to_drive(run: dict[str, Any]) -> str:
     return str(response.get("webViewLink") or response.get("id") or filename)
 
 
+def send_drive_notification(
+    run: dict[str, Any], recipients: list[str], drive_link: str
+) -> None:
+    """Notifica por correo que el ZIP ya está en Drive, sin adjuntar archivos."""
+    if not recipients:
+        raise MailError("Agrega al menos un destinatario para la notificación.")
+    filename = drive_package_name(run)
+    message = EmailMessage()
+    message["To"] = ", ".join(recipients)
+    message["Subject"] = f"MOTHER BASE · ZIP disponible en Drive · {filename}"
+    message.set_content(
+        "La corrida de MOTHER BASE ya fue subida a Drive.\n\n"
+        f"Archivo: {filename}\n"
+        f"Abrir en Drive: {drive_link}\n\n"
+        "Este correo es solo una notificación; no contiene archivos adjuntos."
+    )
+    send_message(build_gmail_service(), message)
+
+
 def copernico_attachment_names(
     inputs: Iterable[dict[str, Any]], label: str
 ) -> list[tuple[dict[str, Any], str]]:
