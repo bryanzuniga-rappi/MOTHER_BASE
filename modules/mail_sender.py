@@ -140,11 +140,14 @@ def drive_package_name(run: dict[str, Any]) -> str:
 
 def upload_run_package_to_drive(run: dict[str, Any]) -> str:
     """Arma el ZIP completo y lo sube a la carpeta de Drive operativa."""
-    package = build_package(run)
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-        for attachment in package.attachments:
-            archive.writestr(attachment.name, attachment.data)
+        files = [Path(path) for path in run.get("files", [])]
+        if not files:
+            raise MailPackageError("La corrida no tiene archivos para subir a Drive.")
+        for path in files:
+            if path.exists() and path.is_file():
+                archive.write(path, arcname=path.name)
     payload = buffer.getvalue()
     filename = drive_package_name(run)
     try:
