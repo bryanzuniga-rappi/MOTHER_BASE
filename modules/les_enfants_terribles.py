@@ -780,7 +780,8 @@ def inject_styles() -> None:
         div[data-testid="stVerticalBlockBorderWrapper"] {
             border: 1px solid #c9c5bb;
             border-radius: 10px;
-            background: var(--white);
+            background: var(--white) !important;
+            background-color: var(--white) !important;
             box-shadow: none;
         }
 
