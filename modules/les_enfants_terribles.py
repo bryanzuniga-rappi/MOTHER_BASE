@@ -784,6 +784,12 @@ def inject_styles() -> None:
             box-shadow: none;
         }
 
+        div[data-testid="stVerticalBlockBorderWrapper"]:has(.st-key-engine_otacon_card),
+        div[data-testid="stVerticalBlockBorderWrapper"]:has(.st-key-engine_kazuhira_card) {
+            background: var(--white) !important;
+            background-color: var(--white) !important;
+        }
+
         /* Keep the complete engine module on the same paper panel.  Otacon
            and Kazuhira contain controls below their action card, so styling
            only the card leaves the outer module transparent over the grid. */
@@ -6738,6 +6744,7 @@ def execute_planning(
     special_doh_targets: dict[str, float] | None = None,
     solidus_swa_priority: bool = True,
     include_naked_engine: bool = True,
+    include_otacon_engine: bool = True,
     cover_fountain9_hardcodes: bool = True,
     hardcode_zero_total: bool = True,
     hardcode_inventory_below_demand: bool = True,
@@ -7071,6 +7078,8 @@ def execute_planning(
                 if enabled
             ),
         )
+        if not include_otacon_engine:
+            engine_plan_rows = []
         for row in engine_plan_rows:
             base_target, base_rule = engine.calculate_target_quantity(row, config)
             executed = naked_executed.get(
@@ -11330,6 +11339,7 @@ def render() -> None:
         )
 
     st.session_state.setdefault("mb_engine_naked_enabled", True)
+    st.session_state.setdefault("mb_engine_otacon_enabled", True)
     st.session_state.setdefault("mb_engine_solidus_enabled", True)
     st.session_state.setdefault("mb_engine_shalashaska_enabled", False)
     st.session_state.setdefault("mb_engine_liquid_enabled", False)
@@ -11357,6 +11367,9 @@ def render() -> None:
             st.session_state["mb_engine_naked_enabled"] = not include_naked_engine
             st.rerun()
     with st.container(border=True, key="engine_otacon_module"):
+        include_otacon_engine = bool(
+            st.session_state["mb_engine_otacon_enabled"]
+        )
         # Otacon must use the same engine card as every other engine.  Its
         # controls remain below the card, but the engine identity/status is
         # rendered through the shared action-card component.
@@ -11365,12 +11378,17 @@ def render() -> None:
             eyebrow="ENGINE / 02 · RESIDUAL",
             title="OTACON ENGINE",
             description=ENGINE_INFO["Otacon"]["card"],
-            active=True,
+            active=include_otacon_engine,
             tone="purple",
-            status="ACTIVO",
+            status=(
+                "ACTIVO"
+                if include_otacon_engine
+                else "INACTIVO · CLIC PARA ACTIVAR"
+            ),
             min_height=150,
-            help_text="Otacon completa el residual después de Naked.",
+            help_text="Haz clic en la tarjeta para activar o desactivar Otacon Engine.",
         ):
+            st.session_state["mb_engine_otacon_enabled"] = not include_otacon_engine
             st.rerun()
         cover_fountain9_hardcodes = False
         hardcode_zero_total = True
@@ -12360,6 +12378,7 @@ def render() -> None:
                     special_doh_targets=special_doh_targets,
                     solidus_swa_priority=solidus_swa_priority,
                     include_naked_engine=include_naked_engine,
+                    include_otacon_engine=include_otacon_engine,
                     shalashaska_extra_cities=tuple(shalashaska_extra_cities),
                     shalashaska_allow_sensitive=shalashaska_allow_sensitive,
                     shalashaska_evacuation_fraction=shalashaska_evacuation_fraction,
