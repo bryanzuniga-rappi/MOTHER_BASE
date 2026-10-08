@@ -790,6 +790,19 @@ def inject_styles() -> None:
             background-color: var(--white) !important;
         }
 
+        /* Streamlit places the module key on the inner block rather than on
+           the border wrapper. Style both levels so the controls area cannot
+           fall through to the grid background. */
+        .st-key-engine_otacon_module,
+        .st-key-engine_otacon_module > div,
+        .st-key-engine_otacon_module [data-testid="stVerticalBlock"],
+        .st-key-engine_kazuhira_module,
+        .st-key-engine_kazuhira_module > div,
+        .st-key-engine_kazuhira_module [data-testid="stVerticalBlock"] {
+            background: var(--white) !important;
+            background-color: var(--white) !important;
+        }
+
         /* Keep the complete engine module on the same paper panel.  Otacon
            and Kazuhira contain controls below their action card, so styling
            only the card leaves the outer module transparent over the grid. */
