@@ -9145,6 +9145,17 @@ ENGINE_CSS_CLASS = {
     "Insumos": "insumos",
 }
 
+ENGINE_PANEL_INLINE_STYLE = {
+    "Naked": "background-color:#d9ff3f;color:#111111;",
+    "Otacon": "background-color:#8a3ffc;color:#fffdf7;",
+    "Solidus": "background-color:#5e7cff;color:#fffdf7;",
+    "Shalashaska": "background-color:#ffb000;color:#111111;",
+    "Liquid": "background-color:#ff5a47;color:#111111;",
+    "Venom": "background-color:#8a3ffc;color:#fffdf7;",
+    "Kazuhira": "background-color:#111111;color:#d9ff3f;",
+    "Insumos": "background-color:#fff000;color:#111111;",
+}
+
 
 def render_engine_header(
     engine_name: str,
@@ -9157,7 +9168,8 @@ def render_engine_header(
     """
     info = ENGINE_INFO[engine_name]
     st.markdown(
-        f'<div class="engine-panel {ENGINE_CSS_CLASS[engine_name]}">'
+        f'<div class="engine-panel {ENGINE_CSS_CLASS[engine_name]}" '
+        f'style="{ENGINE_PANEL_INLINE_STYLE[engine_name]}">'
         f'<div class="stage">{html.escape(info["stage"].upper())}</div>'
         f"<h4>{html.escape(engine_name.upper())}</h4>"
         f'<p>{html.escape(info["role"])}</p>'
