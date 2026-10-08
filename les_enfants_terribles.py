@@ -1,0 +1,12419 @@
+"""Les Enfants Terribles — módulo de planeación (UI y orquestación).
+
+Posición: ejecuta, en orden, Naked → Otacon → Solidus (AVL, Preventivo,
+Refuerzo, Cobertura sin Fountain9) → Shalashaska → Liquid → Venom → Kazuhira → partición
+OWNER → Insumos, con un presupuesto de tareas compartido. ENGINE_INFO es el
+registro de qué hace cada engine (lo usan pantalla y PDF).
+Entrada: Bulk de Fountain9, DATA_TRANSFERS y COPÉRNICO.
+Salida: zip con CSV de carga, Excel y PDF ejecutivo, más reportes en pantalla.
+Reglas y engines: ver README.
+"""
+
+from __future__ import annotations
+
+from collections import Counter, defaultdict
+from collections.abc import Iterable
+from contextlib import redirect_stdout
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+from zoneinfo import ZoneInfo
+import html
+import io
+import math
+import csv
+import re
+import statistics
+import shutil
+import tempfile
+import time
+import urllib.error
+import urllib.request
+import zipfile
+
+import openpyxl
+import streamlit as st
+from reportlab.lib import colors as pdf_colors
+from reportlab.lib.enums import TA_CENTER, TA_LEFT
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import mm
+from reportlab.platypus import (
+    KeepTogether,
+    PageBreak,
+    Paragraph,
+    SimpleDocTemplate,
+    Spacer,
+    Table,
+    TableStyle,
+)
+
+import modelo_abasto as engine
+from modules import mail_sender
+from engines.liquid_engine import (
+    LIQUID_CUT,
+    LIQUID_REASON,
+    apply_liquid_engine,
+    empty_liquid_summary,
+    load_store_shares,
+    parse_manual_skus,
+)
+from engines.shalashaska_engine import (
+    SENSITIVE_CATEGORIES,
+    SHALASHASKA_CUT,
+    shalashaska_forced_cities,
+    SHALASHASKA_REASON,
+    apply_shalashaska_engine,
+    empty_shalashaska_summary,
+    load_expiring_inventory,
+)
+from engines.venom_engine import (
+    SECTION_TYPES as VENOM_SECTION_TYPES,
+    VENOM_CUT,
+    VENOM_REASON,
+    apply_venom_engine,
+    empty_venom_summary,
+)
+from engines.mission_control import select_engine_rows
+from mother_base_theme import (
+    inject_mother_base_theme,
+    render_action_card,
+    render_system_stamp,
+)
+
+
+APP_NAME = "Les Enfants Terribles"
+MAX_UPLOAD_MB = 500
+
+
+def configured_data_transfers_spreadsheet_id() -> str:
+    """Lee el ID del Google Sheet DATA_TRANSFERS desde Streamlit Secrets."""
+    try:
+        return str(st.secrets.get("DATA_TRANSFERS_SPREADSHEET_ID", ""))
+    except Exception:
+        return ""
+
+
+ORIGIN_WAREHOUSES = {
+    444: "CITYPARK TURBO",
+    831: "CITYPARK CHEDRAUI",
+    811: "CEDA TURBO",
+    834: "CEDA CHEDRAUI",
+    425: "CEDIS LOCAL GDL",
+    856: "CEDIS - LOCAL MTY",
+    49: "NODO ALTAVISTA",
+}
+
+ALEPH_SHEETS = {
+    "CATALOGO",
+    "KVI",
+    "SHARE_VENTAS",
+    "NO_DISPONIBLE",
+    "POR_MERMAR",
+    "STOCK",
+    "INSUMOS",
+    "GOLDEN_INFALTABLES_ANCHOR",
+    "TIENDA",
+    "STORAGE",
+    "OWNER",
+    "DATA",
+    "SWA",
+}
+
+MANUAL_BACKEND_SHEETS = {"TIENDAS_CERRADAS"}
+
+REQUIRED_DATABASE_SHEETS = (
+    "TIENDAS_CERRADAS",
+    "VOLUMETRIA",
+    "BLOQUEOS_FORANEAS",
+    "BLOQUEOS",
+    "RUTA_COSTOS",
+    "PRIORIDAD",
+    "444_HV",
+    "831_HV",
+    "RACKEADOS",
+    "CAP_RECIBO",
+    "CATALOGO",
+    "KVI",
+    "SHARE_VENTAS",
+    "NO_DISPONIBLE",
+    "POR_MERMAR",
+    "STOCK",
+    "INSUMOS",
+    "GOLDEN_INFALTABLES_ANCHOR",
+    "TIENDA",
+    "STORAGE",
+    "OWNER",
+    "SCHEDULE",
+    "DATA",
+    "SWA",
+)
+
+SHEET_DESCRIPTIONS = {
+    "TIENDAS_CERRADAS": (
+        "Lista permanente de warehouses destino bloqueados. Los requerimientos de "
+        "estas tiendas se eliminan automáticamente antes de asignar stock y no "
+        "pueden reactivarse desde la interfaz."
+    ),
+    "VOLUMETRIA": (
+        "Volumen en metros cúbicos por unidad de cada SKU. Se utiliza para "
+        "calcular el consumo de capacidad de recibo de las tiendas."
+    ),
+    "BLOQUEOS_FORANEAS": (
+        "Productos con restricciones regionales de envío, especialmente desde "
+        "orígenes de CDMX hacia Guadalajara o Monterrey. Antes se llamaba "
+        "BLOQUEOS; el nombre cambió, el comportamiento no."
+    ),
+    "BLOQUEOS": (
+        "Lista de exclusión global de SKUs (columna PRODUCT_ID, un SKU por "
+        "fila), mantenida directamente por negocio. Ningún SKU de esta lista "
+        "se envía a ningún lugar; se une al campo \"Excluir SKUs\" de CODEC "
+        "en cada corrida. No confundir con BLOQUEOS_FORANEAS."
+    ),
+    "RUTA_COSTOS": (
+        "Combinaciones de tienda destino y producto que no cuentan con una ruta "
+        "de costos habilitada para la transferencia."
+    ),
+    "PRIORIDAD": (
+        "Prioridad de atención por warehouse destino. El valor 1 representa la "
+        "prioridad más alta."
+    ),
+    "444_HV": (
+        "Clasificación referencial de productos de alto valor cuando la mercancía "
+        "sale del warehouse 444."
+    ),
+    "831_HV": (
+        "Clasificación referencial de productos de alto valor cuando la mercancía "
+        "sale del warehouse 831."
+    ),
+    "OVER_ORIGEN_STORAGE": (
+        "Override opcional de STORAGE_TYPE por warehouse origen y producto. "
+        "WAREHOUSE_ID identifica el origen, nunca la tienda destino."
+    ),
+    "OWNER": (
+        "Inventario disponible separado por owner. Para los orígenes 425 y 856 "
+        "divide los entregables de Turbo y Chedraui sin mezclar inventario."
+    ),
+    "RACKEADOS": (
+        "Productos rackeados por warehouse. Para el origen 444, estos productos "
+        "se excluyen completamente del stock utilizable."
+    ),
+    "CAP_RECIBO": (
+        "Capacidad máxima de recibo de cada tienda expresada en metros cúbicos."
+    ),
+    "CATALOGO": (
+        "Catálogo de surtido por tienda y producto con su ADU. Se utiliza para "
+        "detectar oportunidades de quiebre y completar tareas disponibles mediante "
+        "la cobertura AVL opcional."
+    ),
+    "KVI": (
+        "Productos KVI definidos por warehouse destino y PRODUCT_ID. Se atienden "
+        "antes que los productos regulares, sin poder saltarse bloqueos operativos."
+    ),
+    "NO_DISPONIBLE": (
+        "Stock no disponible por warehouse y producto que debe descontarse del "
+        "inventario disponible final."
+    ),
+    "POR_MERMAR": (
+        "Inventario próximo a caducar por warehouse origen y producto. Incluye "
+        "unidades disponibles, valor en riesgo, llegada y caducidad; alimenta "
+        "Shalashaska Engine sin sustituir el stock final mandante."
+    ),
+    "STOCK": (
+        "Stock disponible final por warehouse y producto. Es la fuente mandante "
+        "para determinar cuánto puede enviarse."
+    ),
+    "INSUMOS": (
+        "Cantidades de insumos calculadas automáticamente por Aleph para cada "
+        "tienda. Solo se anexan al BulkCD_444 cuando la tienda ya recibe producto "
+        "normal desde ese mismo origen."
+    ),
+    "GOLDEN_INFALTABLES_ANCHOR": (
+        "Clasificación por warehouse destino y producto. Define por separado "
+        "INFALTABLES, GOLDEN y ANCHOR con jerarquía estricta en ese orden."
+    ),
+    "TIENDA": (
+        "Catálogo de warehouses con el nombre y la ciudad de cada tienda o nodo."
+    ),
+    "STORAGE": (
+        "Condición de almacenamiento de cada producto, como room temperature, "
+        "refrigerated o freezer."
+    ),
+    "SHARE_VENTAS": (
+        "Share general de ventas por tienda. Liquid Engine lo utiliza para "
+        "distribuir excedentes cuando ya no puede nivelar por DOH."
+    ),
+    "SCHEDULE": (
+        "Frecuencia de envío permitida por combinación de WAREHOUSE_ID destino "
+        "y ORIGEN. El toggle 'Bloquear envíos fuera de frecuencia' de CODEC usa "
+        "esta hoja para impedir que un origen envíe a una tienda en un día no "
+        "programado. Un par destino-origen ausente de SCHEDULE no tiene "
+        "restricción de frecuencia."
+    ),
+    "DATA": (
+        "Catálogo maestro de producto (nombre, categoría, marca, maker, EAN, "
+        "etc.). SYNC_ID es la llave que empata con el SKU que usa todo el "
+        "resto del sistema (RETAIL_ID de Fountain9, PRODUCT_ID de CATALOGO). "
+        "Se usa para darle nombre y categoría legibles a reportes y "
+        "entregables, no para ninguna regla de negocio."
+    ),
+    "SWA": (
+        "Sales Weighted Availability por WAREHOUSE_ID/PRODUCT_ID "
+        "(SWA_POTENTIAL_GAIN_COUNTRY), actualizada cada hora vía Aleph. "
+        "Aún sin consumir en ninguna regla de negocio — cargada para uso "
+        "futuro."
+    ),
+}
+
+ALEPH_MAX_AGE_HOURS = {
+    "STOCK": 1.2,
+    "INSUMOS": 1.2,
+    "NO_DISPONIBLE": 1.2,
+    "POR_MERMAR": 24.0,
+    "KVI": 24.0,
+    "CATALOGO": 24.0,
+    "GOLDEN_INFALTABLES_ANCHOR": 24.0,
+    "TIENDA": 24.0,
+    "STORAGE": 24.0,
+    "SHARE_VENTAS": 24.0,
+    "OWNER": 1.2,
+    "DATA": 24.0,
+    "SWA": 1.2,
+}
+
+DEMAND_RULE_LABELS = {
+    "MOV_MINIMO_3": "ROQ POSITIVO",
+    "HARDCODE_4_CERO_TOTAL": "FORECAST 0 · FORZADO A 4",
+    "HARDCODE_3_INVENTARIO_MENOR_DEMANDA": "ROQ 0 · INVENTARIO MENOR A DEMANDA",
+    "SIN_DEMANDA": "SIN RECOMENDACIÓN",
+    "AVL_DOH": "COBERTURA AVL POR DOH",
+    "PREVENTIVO_DOH": "BLINDAJE PREVENTIVO POR DOH",
+    "HARDCODE_3_NET_TRANSFER_BAJO": "NET TRANSFER BAJO · FORZADO A 3",
+}
+
+MANUAL_FORECAST_ZERO_RULES = frozenset(
+    {
+        "HARDCODE_4_CERO_TOTAL",
+        "HARDCODE_3_INVENTARIO_MENOR_DEMANDA",
+        "HARDCODE_3_NET_TRANSFER_BAJO",
+    }
+)
+# TIPO_DE_CORTE por motivo de hardcode (una etiqueta por regla).
+HARDCODE_CUT_LABELS: dict[str, str] = {
+    "HARDCODE_4_CERO_TOTAL": "OK MANUAL POR FORECAST Y STOCK EN CERO",
+    "HARDCODE_3_INVENTARIO_MENOR_DEMANDA": (
+        "OK MANUAL POR INVENTARIO MENOR A DEMANDA"
+    ),
+    "HARDCODE_3_NET_TRANSFER_BAJO": "OK MANUAL POR NET TRANSFER BAJO",
+}
+
+# Barrido de universo de CATALOGO: etiquetas de filas de solo visibilidad (no
+# consumen stock, tareas ni capacidad). Se definen antes de BREAKDOWN_ORDER
+# porque ese tuple se evalúa al importar.
+CATALOG_UNIVERSE_HEALTHY_CUT = "OK SIN NECESIDAD · FUERA DEL BULK DE FOUNTAIN9"
+CATALOG_UNIVERSE_HEALTHY_REGLA = "CATALOGO_SIN_NECESIDAD"
+CATALOG_UNIVERSE_UNCOVERED_CUT = "QUIEBRE SIN EVALUAR · FUERA DE COBERTURA ACTIVA"
+CATALOG_UNIVERSE_UNCOVERED_REGLA = "CATALOGO_QUIEBRE_SIN_EVALUAR"
+# Con Kazuhira activo, un quiebre que sigue en cero ya fue evaluado y no se
+# pudo cubrir.
+CATALOG_UNIVERSE_POST_KAZUHIRA_CUT = "QUIEBRE NO CUBIERTO · EVALUADO POR KAZUHIRA"
+CATALOG_UNIVERSE_POST_KAZUHIRA_REGLA = "CATALOGO_QUIEBRE_POST_KAZUHIRA"
+# Quiebres que ninguna regla de cobertura puede cubrir por configuración, no
+# por falta de stock.
+CATALOG_UNIVERSE_EXCLUDED_PRODUCT_CUT = (
+    "QUIEBRE NO CUBIERTO · PRODUCTO EXCLUIDO (BLOQUEOS O CODEC)"
+)
+CATALOG_UNIVERSE_EXCLUDED_PRODUCT_REGLA = "CATALOGO_PRODUCTO_EXCLUIDO"
+CATALOG_UNIVERSE_NO_STORE_CUT = "QUIEBRE NO CUBIERTO · TIENDA SIN REGISTRO EN TIENDA"
+CATALOG_UNIVERSE_NO_STORE_REGLA = "CATALOGO_TIENDA_SIN_REGISTRO"
+
+# Kazuhira: última pasada (después de Venom). Cubre todo quiebre del universo
+# de catálogo con stock en CEDIS, venga o no de Fountain9, con la fórmula de
+# Cobertura sin Fountain9. Ver README.
+PLANNING_REASON_KAZUHIRA = "COBERTURA TOTAL · KAZUHIRA ENGINE"
+KAZUHIRA_CUT = "ENVIADOS PARA GARANTIZAR COBERTURA TOTAL · KAZUHIRA"
+KAZUHIRA_REGLA_DEMANDA = "KAZUHIRA_COBERTURA_TOTAL"
+# (Definidas antes de BREAKDOWN_ORDER a propósito: ese tuple se evalúa al
+# importar el módulo y referencia KAZUHIRA_CUT.)
+
+# Motivos por los que Kazuhira no cubrió una tienda-SKU evaluada (skip_reasons
+# de apply_avl_fill). SANO no es un hueco: ya hay 1 DOH.
+KAZUHIRA_REASON_HEALTHY = "SANO"
+KAZUHIRA_UNCOVERED_LABELS: dict[str, str] = {
+    "SIN_STOCK_ORIGEN": "QUIEBRE NO CUBIERTO · SIN STOCK EN CEDIS",
+    "BLOQUEO_ORIGEN": "QUIEBRE NO CUBIERTO · BLOQUEO REGIONAL/SCHEDULE CON STOCK EN CEDIS",
+    "CAPACIDAD": "QUIEBRE NO CUBIERTO · CAPACIDAD DE TIENDA",
+    "SIN_TAREAS": "QUIEBRE NO CUBIERTO · SIN PRESUPUESTO DE TAREAS",
+    "RUTA_COSTOS": "QUIEBRE NO CUBIERTO · RUTA DE COSTOS BLOQUEADA",
+    "INCOMING": "QUIEBRE NO CUBIERTO · INCOMING CUBRE LA NECESIDAD",
+    "SIN_DURATION": "QUIEBRE NO CUBIERTO · SIN DURATION/LEAD TIME",
+}
+
+# Columnas del CSV de universo sano (filas que NO viven en base_rows).
+HEALTHY_UNIVERSE_COLUMNS = [
+    "WAREHOUSE_DESTINATION",
+    "WAREHOUSE_NAME",
+    "CITY",
+    "RETAIL_ID",
+    "PRODUCT_NAME",
+    "CATEGORY_NAME",
+    "PREDICTED_OPENING_INVENTORY",
+    "TIPO_DE_CORTE",
+]
+
+BREAKDOWN_ORDER = (
+    "CORTE POR CIUDAD BLOQUEADA",
+    "CORTE POR PRODUCTO RACKEADO 444",
+    "CORTE POR STOCK",
+    "OK MANUAL POR FORECAST Y STOCK EN CERO",
+    "OK MANUAL POR INVENTARIO MENOR A DEMANDA",
+    "OK MANUAL POR NET TRANSFER BAJO",
+    "OK MANUAL PARCIAL POR CUPO DE TAREAS",
+    "OK COMPLETO POR FOUNTAIN9",
+    "OK PARCIAL - CORTE POR PRODUCTO RACKEADO 444",
+    "OK PARCIAL - CORTE POR STOCK",
+    "ENVIADOS PARA CUBRIR AVL",
+    "ENVIADOS PARA PREVENIR QUIEBRE",
+    "ENVIADOS PARA REFORZAR GOLDEN/INFALTABLE/ANCHOR",
+    "ENVIADOS PARA CUBRIR QUIEBRE SIN FOUNTAIN9",
+    SHALASHASKA_CUT,
+    LIQUID_CUT,
+    KAZUHIRA_CUT,
+    "SIN RECOMENDACIÓN",
+    *KAZUHIRA_UNCOVERED_LABELS.values(),
+    CATALOG_UNIVERSE_EXCLUDED_PRODUCT_CUT,
+    CATALOG_UNIVERSE_NO_STORE_CUT,
+    CATALOG_UNIVERSE_POST_KAZUHIRA_CUT,
+    CATALOG_UNIVERSE_UNCOVERED_CUT,
+    CATALOG_UNIVERSE_HEALTHY_CUT,
+    "CORTE POR RUTA DE COSTOS",
+    "CORTE POR TIENDA CERRADA",
+    "INSUMOS",
+    "CORTE POR CAPACIDAD DE TIENDA",
+    "CORTE POR CAPACIDAD DE TAREAS",
+    "OK PARCIAL - CORTE POR CAPACIDAD DE TAREAS",
+    "CORTE POR BLOQUEO REGIONAL",
+    "OK PARCIAL - CORTE POR BLOQUEO REGIONAL",
+    "CORTE POR FRECUENCIA DE ENVÍO",
+    "OK PARCIAL - CORTE POR FRECUENCIA DE ENVÍO",
+    "CORTE POR COPÉRNICO",
+    "OK PARCIAL - CORTE POR COPÉRNICO",
+    "CORTE POR COPÉRNICO LOST",
+    "OK PARCIAL - CORTE POR COPÉRNICO LOST",
+    "CORTE POR COPÉRNICO CANCELADOS",
+    "OK PARCIAL - CORTE POR COPÉRNICO CANCELADOS",
+    # "CORTE POR COPÉRNICO RECIBO" ya no existe: RECIBO_* dejó de ser
+    # motivo de exclusión (copernico_is_usable), así que esa etiqueta
+    # nunca vuelve a generarse.
+    "CORTE POR COPÉRNICO ZONA 856",
+    "OK PARCIAL - CORTE POR COPÉRNICO ZONA 856",
+    "CORTE POR COPÉRNICO OTRO",
+    "OK PARCIAL - CORTE POR COPÉRNICO OTRO",
+    VENOM_CUT,
+    "ERROR DE DATOS",
+)
+
+INPUT_DESTINATION_COLUMNS = ("Warehouseid", "Node_Store")
+INPUT_PLAN_COLUMNS = (
+    "SKU ID",
+    "Predicted Demand for selected duration",
+    "Predicted Opening Inventory",
+    "Replenishment Quantity for Plan Duration (MOV)",
+    "Net Inter-Store Transfers",
+)
+
+# MOV efectivo = máximo entre la columna MOV y estas 11 columnas opcionales de
+# Fountain9.
+DURATION_COLUMN = "Duration"
+LEAD_TIME_COLUMN = "Primary Source Lead Time (Days)"
+# Decisión final de asignación de Fountain9 (opcional; alimenta el comparativo
+# Fountain9 vs Mother Base).
+FOUNTAIN9_ALLOCATION_COLUMN = "Allocation (DOI Based)"
+FOUNTAIN9_DOI_COLUMN = "Allocation (DOI Based)"
+FOUNTAIN9_SOURCE_COLUMN = "Source Id Before Multi Source"
+
+MOV_MAX_OPTIONAL_COLUMNS = (
+    "Replenishment Quantity for Plan Duration (Batch Size Rounded)",
+    "Replenishment Quantity for Plan Duration (MOQ)",
+    "Replenishment Quantity for Plan Duration (Initial Allocation)",
+    "Replenishment Quantity for Plan Duration (Max Cap. Adj.)",
+    "Replenishment Quantity for Plan Duration (Max Cap. Adj.) (Batch Size Rounded)",
+    "Replenishment Quantity for Plan Duration (Max Cap. Adj.) (MOQ)",
+    "Replenishment Quantity for Plan Duration Diff.",
+    "Allocation Quantity for Plan Duration",
+    "Replenishment(Allocation) Quantity for Plan Duration Editable",
+    "Allocation (Store Based)",
+    "Allocation (DOI Based)",
+)
+
+PLANNING_REASON_COLUMN = "PLANNING_REASON"
+
+# Sello de versión (resultados, advertencias y run['build']). Subir en cada
+# entrega.
+APP_BUILD = "2026-10-07 · naked-otacon-v2"
+
+# REGLA_DEMANDA de filas de cobertura, nunca de la necesidad original de
+# Fountain9; 'Requerido' las excluye.
+ENGINE_TOPUP_REGLA_DEMANDA: frozenset[str] = frozenset(
+    {
+        "AVL_DOH",
+        "PREVENTIVO_DOH",
+        "REFUERZO_ESPECIALES_DOH",
+        "LIQUID_ENGINE",
+        "SHALASHASKA_ENGINE",
+        "VENOM_DDMRP",
+        "VENOM_OOWL_MINIMO",
+    }
+)
+PLANNING_REASON_FOUNTAIN9 = "FOUNTAIN9 · NAKED ENGINE"
+PLANNING_REASON_OTACON = "REMANENTE · OTACON ENGINE"
+PLANNING_REASON_MANUAL_FORECAST_ZERO = "MÍNIMO · OTACON ENGINE"
+PLANNING_REASON_AVL = "CUBRIR AVL · SOLIDUS ENGINE"
+PLANNING_REASON_PREVENTIVE = "EVITAR QUIEBRES · SOLIDUS ENGINE"
+PLANNING_REASON_SPECIAL_DOH = "REFUERZO GOLDEN/INFALTABLE/ANCHOR · SOLIDUS ENGINE"
+SPECIAL_DOH_CUT = "ENVIADOS PARA REFORZAR GOLDEN/INFALTABLE/ANCHOR"
+PLANNING_REASON_NO_FOUNTAIN9 = "COBERTURA SIN FOUNTAIN9 · SOLIDUS ENGINE"
+NO_FOUNTAIN9_CUT = "ENVIADOS PARA CUBRIR QUIEBRE SIN FOUNTAIN9"
+# ADU de respaldo (unidades/día) cuando no hay ADU propio ni de ciudad.
+FICTITIOUS_ADU_NO_FOUNTAIN9 = 0.14
+PLANNING_REASON_INSUMOS = "INSUMOS"
+BULK_OUTPUT_COLUMNS = [*engine.OUTPUT_COLUMNS, PLANNING_REASON_COLUMN]
+
+INSUMOS_COLUMNS = [
+    "WAREHOUSE_DESTINATION",
+    "WAREHOUSE_SOURCE",
+    "RETAIL_ID",
+    "QUANTITY",
+    "PLANNED_DATE",
+    "ROUTE",
+    "DELIVERY_PRIORITY",
+]
+
+INSUMO_STOCK_RULES = {
+    85097: {"name": "BOLSA 1", "target_stock": 7_000, "moq": 1_000},
+    86195: {"name": "BOLSA 2", "target_stock": 2_100, "moq": 200},
+    76491: {"name": "STICKER", "target_stock": 5_000, "moq": 1_000},
+    82126: {"name": "INSUMO 82126", "target_stock": 1_050, "moq": 350},
+    90532: {"name": "INSUMO 90532", "target_stock": 1_050, "moq": 350},
+}
+
+# SKUs de INSUMOS limitados a ciertas ciudades: los renglones de otras tiendas
+# se descartan.
+INSUMO_CITY_RESTRICTIONS: dict[int, frozenset[str]] = {
+    90532: frozenset({"CDMX"}),
+}
+
+CITY_DISPLAY_NAMES = {
+    "CDMX": "Ciudad de México",
+    "GDL": "Guadalajara",
+    "MTY": "Monterrey",
+}
+
+DEFAULT_STORAGE = "Room Temperature"
+MISSING_STORAGE_VALUES = {"", "UNKNOWN", "UNKNOW", "N/A", "NA", "NONE", "NULL"}
+
+ENGLISH_MONTHS = {
+    "JANUARY": 1,
+    "FEBRUARY": 2,
+    "MARCH": 3,
+    "APRIL": 4,
+    "MAY": 5,
+    "JUNE": 6,
+    "JULY": 7,
+    "AUGUST": 8,
+    "SEPTEMBER": 9,
+    "OCTOBER": 10,
+    "NOVEMBER": 11,
+    "DECEMBER": 12,
+}
+
+TIMEZONE_OFFSETS = {
+    "UTC": 0,
+    "GMT": 0,
+    "EDT": -4,
+    "EST": -5,
+    "CDT": -5,
+    "CST": -6,
+    "MDT": -6,
+    "MST": -7,
+    "PDT": -7,
+    "PST": -8,
+}
+
+
+def inject_styles() -> None:
+    st.markdown(
+        """
+        <style>
+        @import url('https://fonts.googleapis.com/css2?family=Archivo+Black&family=IBM+Plex+Mono:wght@400;500;600;700&display=swap');
+
+        :root {
+            --ink: #111111;
+            --paper: #f2efe6;
+            --acid: #d9ff3f;
+            --coral: #ff5a47;
+            --blue: #5e7cff;
+            --white: #fffdf7;
+            --muted: #6f6b63;
+        }
+
+        html,
+        body,
+        #root {
+            background-color: #f2efe6 !important;
+            color: #111111 !important;
+            color-scheme: light !important;
+        }
+
+        html, body, [class*="css"] {
+            font-family: "IBM Plex Mono", monospace;
+            color: #111111 !important;
+        }
+
+        .stApp,
+        [data-testid="stApp"],
+        [data-testid="stAppViewContainer"],
+        [data-testid="stMain"],
+        section.main,
+        .main {
+            color: #111111 !important;
+            background-color: #f2efe6 !important;
+        }
+
+        .stApp,
+        [data-testid="stAppViewContainer"],
+        [data-testid="stMain"] {
+            background-image:
+                linear-gradient(rgba(17,17,17,.055) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(17,17,17,.055) 1px, transparent 1px) !important;
+            background-size: 28px 28px !important;
+        }
+
+        [data-testid="stMainBlockContainer"],
+        .block-container {
+            background-color: transparent !important;
+        }
+
+        [data-testid="stHeader"] { background: transparent !important; }
+        [data-testid="stToolbar"], #MainMenu, footer { visibility: hidden; }
+        .block-container { max-width: 1440px; padding: 2rem 3rem 4rem; }
+
+        .hero {
+            border: 4px solid var(--ink);
+            background: var(--coral);
+            box-shadow: 10px 10px 0 var(--ink);
+            padding: 28px 32px;
+            margin: 6px 10px 34px 0;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .hero::after {
+            content: "RUN / ALLOCATE / EXPORT";
+            position: absolute;
+            right: -42px;
+            top: 34px;
+            transform: rotate(8deg);
+            border: 3px solid var(--ink);
+            background: var(--acid);
+            padding: 8px 46px;
+            font-weight: 800;
+            letter-spacing: .08em;
+        }
+
+        .hero-kicker {
+            display: inline-block;
+            border: 3px solid var(--ink);
+            background: var(--white);
+            padding: 5px 9px;
+            font-weight: 800;
+            margin-bottom: 18px;
+        }
+
+        .hero h1 {
+            font-family: "Archivo Black", sans-serif;
+            font-size: clamp(2.6rem, 7vw, 6.5rem);
+            line-height: .88;
+            letter-spacing: -.06em;
+            margin: 0;
+            max-width: 1050px;
+            color: var(--ink);
+        }
+
+        .hero p {
+            max-width: 780px;
+            font-weight: 700;
+            font-size: 1rem;
+            margin: 22px 0 0;
+        }
+
+        .section-label {
+            display: inline-block;
+            background: var(--ink);
+            color: var(--white);
+            border: 3px solid var(--ink);
+            padding: 7px 12px;
+            margin: 18px 0 10px;
+            font-weight: 800;
+            letter-spacing: .08em;
+        }
+
+        .info-strip {
+            border: 3px solid var(--ink);
+            background: var(--acid);
+            box-shadow: 6px 6px 0 var(--ink);
+            padding: 14px 16px;
+            margin: 8px 7px 24px 0;
+            font-weight: 700;
+        }
+
+        .database-status {
+            border: 4px solid var(--ink);
+            box-shadow: 8px 8px 0 var(--ink);
+            padding: 20px 22px;
+            margin: 8px 9px 22px 0;
+        }
+
+        .database-status.online { background: var(--acid); }
+        .database-status.review { background: var(--coral); }
+
+        .database-title {
+            font-family: "Archivo Black", sans-serif;
+            font-size: clamp(1.4rem, 3vw, 2.4rem);
+            line-height: 1;
+        }
+
+        .source-card {
+            height: 138px;
+            border: 3px solid var(--ink);
+            box-shadow: 5px 5px 0 var(--ink);
+            padding: 14px 15px;
+            margin: 0 5px 18px 0;
+            box-sizing: border-box;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .source-card.ok { background: #baf264; }
+        .source-card.error { background: var(--coral); }
+
+        .source-card-name {
+            font-family: "Archivo Black", sans-serif;
+            font-size: .95rem;
+            line-height: 1.05;
+            overflow-wrap: anywhere;
+        }
+
+        .source-card-meta {
+            margin-top: 9px;
+            color: #242424;
+            font-size: .68rem;
+            font-weight: 800;
+        }
+
+        .source-card-result {
+            margin-top: 13px;
+            border-top: 2px solid var(--ink);
+            padding-top: 9px;
+            font-size: .78rem;
+            font-weight: 900;
+            text-transform: uppercase;
+        }
+
+        .source-card-tooltip {
+            position: absolute;
+            inset: 0;
+            z-index: 5;
+            box-sizing: border-box;
+            background: var(--ink);
+            color: var(--white);
+            padding: 12px 13px;
+            opacity: 0;
+            visibility: hidden;
+            overflow-y: auto;
+            font-size: .68rem;
+            font-weight: 700;
+            line-height: 1.35;
+            text-transform: none;
+            transition: opacity .12s ease, visibility 0s linear .12s;
+        }
+
+        .source-card-tooltip strong {
+            display: block;
+            color: var(--acid);
+            margin-bottom: 6px;
+            font-size: .67rem;
+            letter-spacing: .05em;
+        }
+
+        .source-card:hover .source-card-tooltip {
+            opacity: 1;
+            visibility: visible;
+            transition: opacity .12s ease 1s, visibility 0s linear 1s;
+        }
+
+        div[data-testid="stFileUploader"] {
+            border: 4px dashed var(--ink);
+            background: var(--white);
+            box-shadow: 8px 8px 0 var(--ink);
+            padding: 18px;
+            margin: 8px 9px 24px 0;
+        }
+
+        div[data-testid="stFileUploaderDropzone"] {
+            background: var(--white);
+            border: 0;
+            min-height: 190px;
+        }
+
+        div[data-testid="stForm"],
+        div[data-testid="stExpander"] {
+            border: 3px solid var(--ink);
+            border-radius: 0;
+            background: var(--white);
+            box-shadow: 6px 6px 0 var(--ink);
+        }
+
+        div[data-testid="stVerticalBlockBorderWrapper"] {
+            border: 1px solid #c9c5bb;
+            border-radius: 10px;
+            background: var(--white);
+            box-shadow: none;
+        }
+
+        div[data-testid="stTextInput"] input,
+        div[data-testid="stNumberInput"] input,
+        div[data-testid="stDateInput"] input,
+        div[data-baseweb="select"] > div {
+            border: 2px solid var(--ink) !important;
+            border-radius: 0 !important;
+            /* Slight contrast separates comma-separated SKU fields from the
+               warm page background without changing the visual system. */
+            background: #e8e4d9 !important;
+        }
+
+        .stButton > button,
+        .stDownloadButton > button,
+        div[data-testid="stFormSubmitButton"] > button {
+            border: 3px solid var(--ink);
+            border-radius: 0;
+            background: var(--acid);
+            color: var(--ink);
+            box-shadow: 5px 5px 0 var(--ink);
+            font-family: "IBM Plex Mono", monospace;
+            font-weight: 900;
+            text-transform: uppercase;
+            min-height: 50px;
+            transition: transform .08s ease, box-shadow .08s ease;
+        }
+
+        .stButton > button:hover,
+        .stDownloadButton > button:hover,
+        div[data-testid="stFormSubmitButton"] > button:hover {
+            color: var(--ink);
+            border-color: var(--ink);
+            transform: translate(3px, 3px);
+            box-shadow: 2px 2px 0 var(--ink);
+        }
+
+        div[data-testid="stMetric"] {
+            border: 3px solid var(--ink);
+            background: var(--white);
+            box-shadow: 5px 5px 0 var(--ink);
+            padding: 14px 16px;
+        }
+
+        div[data-testid="stMetricLabel"] { font-weight: 800; }
+        div[data-testid="stMetricValue"] { font-family: "Archivo Black", sans-serif; }
+
+        .kpi-card {
+            min-height: 132px;
+            border: 3px solid var(--ink);
+            background: var(--white);
+            box-shadow: 5px 5px 0 var(--ink);
+            padding: 13px 15px;
+            margin: 0 5px 18px 0;
+            box-sizing: border-box;
+            position: relative;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+        }
+
+        .kpi-card.acid { background: var(--acid); }
+        .kpi-card.blue { background: var(--blue); color: var(--white); }
+        .kpi-card.coral { background: var(--coral); }
+        .kpi-card.purple { background: #8a3ffc; color: #fffdf7; }
+        .kpi-card.yellow { background: #fff000; }
+        .kpi-card.violet { background: #bd00ff; color: #fffdf7; }
+        .kpi-card.pink { background: #ff007f; color: #fffdf7; }
+
+        .kpi-card-category {
+            font-size: .62rem;
+            font-weight: 900;
+            letter-spacing: .08em;
+            opacity: .75;
+        }
+
+        .kpi-card-label {
+            margin-top: 7px;
+            font-size: .72rem;
+            font-weight: 900;
+            line-height: 1.2;
+        }
+
+        .kpi-card-value {
+            margin-top: 10px;
+            font-family: "Archivo Black", sans-serif;
+            font-size: clamp(1.45rem, 2.6vw, 2.25rem);
+            line-height: 1;
+        }
+
+        .kpi-card-tooltip {
+            position: absolute;
+            inset: 0;
+            z-index: 5;
+            box-sizing: border-box;
+            background: var(--ink);
+            color: var(--white);
+            padding: 13px 14px;
+            opacity: 0;
+            visibility: hidden;
+            overflow-y: auto;
+            font-size: .69rem;
+            font-weight: 700;
+            line-height: 1.4;
+            transition: opacity .12s ease, visibility 0s linear .12s;
+        }
+
+        .kpi-card-tooltip strong {
+            display: block;
+            color: var(--acid);
+            margin-bottom: 7px;
+            font-size: .66rem;
+            letter-spacing: .06em;
+        }
+
+        .kpi-card:hover .kpi-card-tooltip {
+            opacity: 1;
+            visibility: visible;
+            transition: opacity .12s ease 1s, visibility 0s linear 1s;
+        }
+
+        [data-testid="stAlert"] {
+            border: 3px solid var(--ink);
+            border-radius: 0;
+        }
+
+        .result-title {
+            font-family: "Archivo Black", sans-serif;
+            font-size: clamp(2rem, 5vw, 4.3rem);
+            line-height: .95;
+            margin: 38px 0 18px;
+        }
+
+        .report-title {
+            font-family: "Archivo Black", sans-serif;
+            font-size: clamp(1.8rem, 4vw, 3.1rem);
+            line-height: .95;
+            margin: 52px 0 18px;
+        }
+
+        .report-note {
+            border: 3px solid var(--ink);
+            background: var(--blue);
+            color: var(--white);
+            box-shadow: 5px 5px 0 var(--ink);
+            padding: 12px 14px;
+            margin: 0 6px 22px 0;
+            font-size: .78rem;
+            font-weight: 800;
+        }
+
+        .origin-banner {
+            border: 3px solid var(--ink);
+            background: var(--acid);
+            box-shadow: 6px 6px 0 var(--ink);
+            padding: 14px 17px;
+            margin: 30px 7px 20px 0;
+            font-family: "Archivo Black", sans-serif;
+            font-size: clamp(1.05rem, 2.2vw, 1.7rem);
+            line-height: 1.1;
+        }
+
+        .file-pill {
+            border: 2px solid var(--ink);
+            background: var(--blue);
+            color: white;
+            padding: 7px 10px;
+            display: inline-block;
+            font-weight: 700;
+        }
+
+        @media (max-width: 800px) {
+            .block-container { padding: 1rem 1rem 3rem; }
+            .hero { padding: 22px 18px; }
+            .hero::after { display: none; }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def format_origin(warehouse_id: int) -> str:
+    return f"{warehouse_id} - {ORIGIN_WAREHOUSES[warehouse_id]}"
+
+
+def database_sheet_type(sheet_name: str) -> str:
+    if sheet_name in ALEPH_SHEETS:
+        return "ALEPH"
+    if sheet_name in MANUAL_BACKEND_SHEETS:
+        return "BACKEND"
+    return "IMPORTRANGE"
+
+
+def database_sheet_control(sheet_name: str) -> str:
+    if sheet_name in ALEPH_SHEETS:
+        return "C7"
+    return "A1"
+
+
+def render_kpi_cards(
+    cards: list[dict[str, Any]],
+    *,
+    columns_count: int = 4,
+) -> None:
+    """Renderiza KPIs brutalistas con definición visible tras 1 s de hover."""
+    if not cards:
+        return
+    for start in range(0, len(cards), columns_count):
+        columns = st.columns(columns_count)
+        for column, card in zip(columns, cards[start : start + columns_count]):
+            tone = str(card.get("tone", ""))
+            if tone not in {"acid", "blue", "coral", "purple", "yellow", "violet", "pink"}:
+                tone = ""
+            class_name = f"kpi-card {tone}".strip()
+            card_html = (
+                f'<div class="{class_name}">'
+                f'<div><div class="kpi-card-category">'
+                f'{html.escape(str(card.get("category", "KPI")))}</div>'
+                f'<div class="kpi-card-label">'
+                f'{html.escape(str(card["label"]))}</div></div>'
+                f'<div class="kpi-card-value">'
+                f'{html.escape(str(card["value"]))}</div>'
+                f'<div class="kpi-card-tooltip"><strong>QUÉ SIGNIFICA</strong>'
+                f'{html.escape(str(card["description"]))}</div>'
+                '</div>'
+            )
+            with column:
+                st.markdown(card_html, unsafe_allow_html=True)
+
+
+def contains_ref_error(value: Any) -> bool:
+    return value is not None and "#REF!" in str(value).upper()
+
+
+def parse_update_timestamp(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, date):
+        parsed = datetime.combine(value, datetime.min.time())
+    else:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+
+        english = re.fullmatch(
+            r"([A-Za-z]+)\s+(\d{1,2}),\s*(\d{4}),?\s*"
+            r"(\d{1,2}):(\d{2})(?::(\d{2}))?\s*"
+            r"(AM|PM)?(?:\s+([A-Za-z]{2,5}(?:[+-]\d{1,2}(?::?\d{2})?)?))?",
+            raw,
+            flags=re.IGNORECASE,
+        )
+        if english:
+            month_name, day, year, hour, minute, second, meridiem, zone = english.groups()
+            month = ENGLISH_MONTHS.get(month_name.upper())
+            if month is None:
+                return None
+            hour_number = int(hour)
+            if meridiem and hour_number <= 12:
+                if meridiem.upper() == "PM" and hour_number < 12:
+                    hour_number += 12
+                elif meridiem.upper() == "AM" and hour_number == 12:
+                    hour_number = 0
+            if hour_number > 23:
+                return None
+            zone_name = (zone or "").upper()
+            gmt_offset = re.fullmatch(
+                r"GMT([+-])(\d{1,2})(?::?(\d{2}))?", zone_name
+            )
+            if gmt_offset:
+                sign, offset_hours, offset_minutes = gmt_offset.groups()
+                offset = timedelta(
+                    hours=int(offset_hours), minutes=int(offset_minutes or 0)
+                )
+                if sign == "-":
+                    offset = -offset
+                tzinfo = timezone(offset)
+            elif zone_name in TIMEZONE_OFFSETS:
+                tzinfo = timezone(
+                    timedelta(hours=TIMEZONE_OFFSETS[zone_name])
+                )
+            else:
+                tzinfo = ZoneInfo("America/Mexico_City")
+            try:
+                return datetime(
+                    int(year),
+                    month,
+                    int(day),
+                    hour_number,
+                    int(minute),
+                    int(second or 0),
+                    tzinfo=tzinfo,
+                )
+            except ValueError:
+                return None
+
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            parsed = None
+            for date_format in (
+                "%d/%m/%Y %H:%M:%S",
+                "%m/%d/%Y %H:%M:%S",
+                "%d-%m-%Y %H:%M:%S",
+                "%Y-%m-%d %H:%M:%S",
+            ):
+                try:
+                    parsed = datetime.strptime(raw, date_format)
+                    break
+                except ValueError:
+                    continue
+            if parsed is None:
+                return None
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=ZoneInfo("America/Mexico_City"))
+    return parsed
+
+
+def relative_update_text(
+    value: Any,
+    now: datetime | None = None,
+    max_age_hours: float | None = None,
+) -> tuple[str, bool]:
+    parsed = parse_update_timestamp(value)
+    if parsed is None:
+        return "C7 SIN FECHA VÁLIDA", False
+
+    reference = now or datetime.now(ZoneInfo("America/Mexico_City"))
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=ZoneInfo("America/Mexico_City"))
+    seconds = (reference.astimezone(timezone.utc) - parsed.astimezone(timezone.utc)).total_seconds()
+    if seconds < -300:
+        return "C7 TIENE FECHA FUTURA", False
+    seconds = max(seconds, 0)
+
+    if seconds < 60:
+        detail = "Hace menos de 1 min"
+    elif seconds < 7200:
+        minutes = int(seconds // 60)
+        detail = f"Hace {minutes} min"
+    elif seconds < 86400:
+        hours = seconds / 3600
+        detail = f"Hace {hours:.1f} h"
+    else:
+        days = seconds / 86400
+        detail = f"Hace {days:.1f} días"
+
+    healthy = max_age_hours is None or seconds <= max_age_hours * 3600
+    if not healthy:
+        detail += " · DESACTUALIZADA"
+    return detail, healthy
+
+
+def inspect_database(workbook_bytes: bytes) -> dict[str, Any]:
+    """Valida presencia de hojas, actualizaciones Aleph y errores IMPORTRANGE."""
+    rows: list[dict[str, Any]] = []
+    formula_workbook = openpyxl.load_workbook(
+        io.BytesIO(workbook_bytes), read_only=True, data_only=False
+    )
+    value_workbook = openpyxl.load_workbook(
+        io.BytesIO(workbook_bytes), read_only=True, data_only=True
+    )
+    try:
+        for sheet_name in REQUIRED_DATABASE_SHEETS:
+            if sheet_name not in formula_workbook.sheetnames:
+                rows.append(
+                    {
+                        "HOJA": sheet_name,
+                        "TIPO": database_sheet_type(sheet_name),
+                        "CONTROL": database_sheet_control(sheet_name),
+                        "DETALLE": "HOJA NO ENCONTRADA",
+                        "ESTADO": "ERROR",
+                    }
+                )
+                continue
+
+            formula_sheet = formula_workbook[sheet_name]
+            value_sheet = value_workbook[sheet_name]
+            if sheet_name in ALEPH_SHEETS:
+                value = value_sheet["C7"].value
+                if value is None:
+                    value = formula_sheet["C7"].value
+                detail, healthy = relative_update_text(
+                    value,
+                    max_age_hours=ALEPH_MAX_AGE_HOURS.get(sheet_name, 24.0),
+                )
+                if contains_ref_error(value):
+                    healthy = False
+                    detail = "#REF! DETECTADO EN C7"
+            elif sheet_name in MANUAL_BACKEND_SHEETS:
+                formula_value = formula_sheet["A1"].value
+                displayed_value = value_sheet["A1"].value
+                header = engine.normalize_header(
+                    displayed_value if displayed_value is not None else formula_value
+                )
+                healthy = header == "WAREHOUSE_ID"
+                detail = (
+                    "BLOQUEO BACKEND DISPONIBLE"
+                    if healthy
+                    else "A1 DEBE SER WAREHOUSE_ID"
+                )
+            else:
+                formula_value = formula_sheet["A1"].value
+                displayed_value = value_sheet["A1"].value
+                healthy = not (
+                    contains_ref_error(formula_value)
+                    or contains_ref_error(displayed_value)
+                )
+                detail = "SIN #REF!" if healthy else "#REF! DETECTADO"
+
+            rows.append(
+                {
+                    "HOJA": sheet_name,
+                    "TIPO": database_sheet_type(sheet_name),
+                    "CONTROL": database_sheet_control(sheet_name),
+                    "DETALLE": detail,
+                    "ESTADO": "OK" if healthy else "ERROR",
+                }
+            )
+    finally:
+        formula_workbook.close()
+        value_workbook.close()
+
+    healthy_count = sum(row["ESTADO"] == "OK" for row in rows)
+    return {
+        "online": healthy_count == len(rows),
+        "healthy_count": healthy_count,
+        "total_count": len(rows),
+        "error_count": len(rows) - healthy_count,
+        "rows": rows,
+    }
+
+
+def extract_available_cities(workbook_bytes: bytes) -> dict[str, str]:
+    workbook = openpyxl.load_workbook(
+        io.BytesIO(workbook_bytes), read_only=True, data_only=True
+    )
+    try:
+        labels: dict[str, str] = {}
+        for row in engine.iter_sheet_records(
+            workbook,
+            "TIENDA",
+            ["CITY"],
+            ["CITY"],
+        ):
+            raw_city = engine.clean_text(row["CITY"])
+            normalized_city = engine.normalize_city(raw_city)
+            if not normalized_city:
+                continue
+            labels.setdefault(
+                normalized_city,
+                CITY_DISPLAY_NAMES.get(normalized_city, raw_city or normalized_city),
+            )
+    finally:
+        workbook.close()
+
+    preferred_order = {"CDMX": 0, "GDL": 1, "MTY": 2}
+    return dict(
+        sorted(
+            labels.items(),
+            key=lambda item: (
+                preferred_order.get(item[0], 99),
+                item[1].upper(),
+            ),
+        )
+    )
+
+
+def extract_available_stores(workbook_bytes: bytes) -> dict[int, str]:
+    """Construye las opciones de tienda con formato `WAREHOUSE_ID - Nombre`."""
+    workbook = openpyxl.load_workbook(
+        io.BytesIO(workbook_bytes), read_only=True, data_only=True
+    )
+    try:
+        labels: dict[int, str] = {}
+        for row in engine.iter_sheet_records(
+            workbook,
+            "TIENDA",
+            ["WAREHOUSE_ID", "WAREHOUSE_NAME"],
+            ["WAREHOUSE_ID", "WAREHOUSE_NAME"],
+        ):
+            warehouse = engine.to_id(
+                row["WAREHOUSE_ID"],
+                "TIENDA.WAREHOUSE_ID",
+                allow_none=True,
+            )
+            if warehouse is None:
+                continue
+            name = engine.clean_text(row["WAREHOUSE_NAME"])
+            labels[warehouse] = f"{warehouse} - {name or 'SIN NOMBRE'}"
+    finally:
+        workbook.close()
+    return dict(sorted(labels.items(), key=lambda item: item[1].upper()))
+
+
+def save_uploaded_file(uploaded_file, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    uploaded_file.seek(0)
+    with destination.open("wb") as handle:
+        shutil.copyfileobj(uploaded_file, handle, length=8 * 1024 * 1024)
+    uploaded_file.seek(0)
+
+
+# Los únicos warehouses que hoy tienen COPÉRNICO propio. Si alguno de estos
+# se selecciona como origen, la corrida exige tener cargado un archivo
+# COPÉRNICO que cubra ese warehouse específico.
+COPERNICO_REQUIRED_WAREHOUSES: frozenset[int] = frozenset({444, 831, 856})
+COPERNICO_BODEGA_HEADER_ALIASES = {"BODEGA", "WAREHOUSE ID", "WAREHOUSE_ID"}
+
+
+def copernico_warehouses_from_text(text: str) -> set[int]:
+    """Bodegas de la columna Bodega de un CSV de COPÉRNICO ya decodificado."""
+    warehouses: set[int] = set()
+    # Mismo formato fijo que el lector de COPÉRNICO del motor (sin Sniffer).
+    dialect = engine.copernico_csv_dialect(text.split("\n", 1)[0])
+    reader = csv.DictReader(io.StringIO(text), dialect=dialect)
+    if not reader.fieldnames:
+        return warehouses
+    bodega_field = next(
+        (
+            field_name
+            for field_name in reader.fieldnames
+            if engine.clean_text(field_name).upper() in COPERNICO_BODEGA_HEADER_ALIASES
+        ),
+        None,
+    )
+    if bodega_field is None:
+        return warehouses
+    for row in reader:
+        value = engine.to_id(row.get(bodega_field), "Bodega", allow_none=True)
+        if value is not None:
+            warehouses.add(value)
+    return warehouses
+
+
+def detect_copernico_warehouses(uploaded_files) -> set[int]:
+    """Lee la columna Bodega de cada archivo COPÉRNICO cargado, sin guardar nada en
+    disco, para saber qué warehouses cubre antes de validar la corrida.
+    """
+    warehouses: set[int] = set()
+    for uploaded_file in uploaded_files or ():
+        try:
+            uploaded_file.seek(0)
+            raw_bytes = uploaded_file.getvalue()
+        except Exception:
+            continue
+        try:
+            text = raw_bytes.decode("utf-8-sig", errors="replace")
+        except Exception:
+            continue
+        warehouses |= copernico_warehouses_from_text(text)
+        try:
+            uploaded_file.seek(0)
+        except Exception:
+            pass
+    return warehouses
+
+
+def consolidate_plan_files(
+    plan_paths: list[Path],
+    catalogs,
+    config: engine.Config,
+    output_path: Path,
+    *,
+    use_extra_mov_columns: bool = True,
+    net_transfer_rule_enabled: bool = True,
+    net_transfer_max: float = 3.0,
+    destination_stock_below: float = 3.0,
+) -> tuple[Path, dict[tuple[int, int], dict[str, Any]], dict[str, Any]]:
+    """Suma archivos y produce el CSV canónico que consume el motor."""
+    if not plan_paths:
+        raise ValueError("Debes cargar al menos un archivo de planeación.")
+
+    numeric_columns = list(INPUT_PLAN_COLUMNS)
+    consolidated: dict[tuple[int, int], dict[str, Any]] = {}
+    source_row_count = 0
+    source_counts: Counter[str] = Counter()
+    fountain9_instructions: dict[tuple[int | None, int, int], int] = defaultdict(int)
+    # Para la moda de Duration/Lead Time por tienda (ver más abajo).
+    duration_values_by_store: dict[int, list[float]] = defaultdict(list)
+    lead_time_values_by_store: dict[int, list[float]] = defaultdict(list)
+
+    for path in plan_paths:
+        with path.open(
+            "r",
+            encoding="utf-8-sig",
+            errors="replace",
+            newline="",
+        ) as handle:
+            sample = handle.read(8192)
+            handle.seek(0)
+            try:
+                dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
+            except csv.Error:
+                dialect = csv.excel
+            reader = csv.DictReader(handle, dialect=dialect)
+            if reader.fieldnames is None:
+                raise ValueError(f"{path.name}: el archivo no contiene encabezados.")
+            field_lookup = {
+                engine.normalize_header(name): name for name in reader.fieldnames
+            }
+            destination_fields = [
+                field_lookup[engine.normalize_header(alias)]
+                for alias in INPUT_DESTINATION_COLUMNS
+                if engine.normalize_header(alias) in field_lookup
+            ]
+            if not destination_fields:
+                raise ValueError(
+                    f"{path.name}: falta Warehouseid o Node_Store. "
+                    "Una de estas dos columnas es obligatoria."
+                )
+
+            net_transfer_aliases = {
+                engine.normalize_header("Net Inter-Store Transfers"),
+                engine.normalize_header("Net Inter Store Transfers"),
+            }
+            required_lookup: dict[str, str] = {}
+            missing: list[str] = []
+            for column in numeric_columns:
+                normalized = engine.normalize_header(column)
+                if column == "Net Inter-Store Transfers":
+                    match = next(
+                        (
+                            field_lookup[alias]
+                            for alias in net_transfer_aliases
+                            if alias in field_lookup
+                        ),
+                        None,
+                    )
+                else:
+                    match = field_lookup.get(normalized)
+                if match is None:
+                    missing.append(column)
+                else:
+                    required_lookup[column] = match
+            if missing:
+                raise ValueError(
+                    f"{path.name}: faltan columnas obligatorias: {missing}."
+                )
+
+            # Columnas opcionales para el máximo del MOV efectivo: se resuelven
+            # las que sí estén presentes en ESTE archivo, sin exigir ninguna.
+            optional_mov_lookup: dict[str, str] = {}
+            for column in MOV_MAX_OPTIONAL_COLUMNS:
+                match = field_lookup.get(engine.normalize_header(column))
+                if match is not None:
+                    optional_mov_lookup[column] = match
+
+            # Duration/Lead Time: opcionales, para la moda por tienda que
+            # alimenta la cobertura de SKUs sin fila de Fountain9 (ver
+            # build_no_fountain9_coverage_candidates).
+            duration_field = field_lookup.get(engine.normalize_header(DURATION_COLUMN))
+            lead_time_field = field_lookup.get(engine.normalize_header(LEAD_TIME_COLUMN))
+            # Asignación real de Fountain9 (opcional) — para el reporte
+            # comparativo contra la nuestra, ver build_fountain9_comparison_report.
+            fountain9_allocation_field = field_lookup.get(
+                engine.normalize_header(FOUNTAIN9_ALLOCATION_COLUMN)
+            )
+            fountain9_doi_field = field_lookup.get(
+                engine.normalize_header(FOUNTAIN9_DOI_COLUMN)
+            )
+            fountain9_source_field = field_lookup.get(
+                engine.normalize_header(FOUNTAIN9_SOURCE_COLUMN)
+            )
+
+            trace_columns = (
+                "Primary Source Id", "Allocated Qty Before Multi Source",
+                "Source Current Inv Before Multi Source", "Is Secondary Plan", "Link Type",
+                "DOI", "DOH",
+            )
+            for csv_row, raw in enumerate(reader, start=2):
+                if not any(engine.clean_text(value) for value in raw.values()):
+                    continue
+                destination_values: list[int] = []
+                for destination_field in destination_fields:
+                    raw_destination = raw.get(destination_field, "")
+                    if engine.clean_text(raw_destination):
+                        destination_values.append(
+                            engine.to_id(
+                                raw_destination,
+                                f"{path.name} fila {csv_row}.{destination_field}",
+                            )
+                        )
+                if not destination_values:
+                    raise ValueError(
+                        f"{path.name} fila {csv_row}: Warehouseid/Node_Store vacío."
+                    )
+                if len(set(destination_values)) > 1:
+                    raise ValueError(
+                        f"{path.name} fila {csv_row}: Warehouseid y Node_Store "
+                        f"no coinciden ({destination_values})."
+                    )
+                destination = destination_values[0]
+                if duration_field is not None:
+                    duration_value = engine.to_float(raw.get(duration_field, ""))
+                    if duration_value > 0:
+                        duration_values_by_store[destination].append(duration_value)
+                if lead_time_field is not None:
+                    lead_time_value = engine.to_float(raw.get(lead_time_field, ""))
+                    if lead_time_value > 0:
+                        lead_time_values_by_store[destination].append(lead_time_value)
+                sku_field = required_lookup["SKU ID"]
+                sku = engine.to_id(
+                    raw.get(sku_field, ""),
+                    f"{path.name} fila {csv_row}.SKU ID",
+                )
+                key = (destination, sku)
+                if key not in consolidated:
+                    consolidated[key] = {
+                        "WAREHOUSE_DESTINATION": destination,
+                        "RETAIL_ID": sku,
+                        "PREDICTED_DEMAND": 0.0,
+                        "PREDICTED_OPENING_INVENTORY": 0.0,
+                        "ROQ_INPUT": 0.0,
+                        "NET_INTER_STORE_TRANSFERS": 0.0,
+                        "SOURCE_FILES": set(),
+                        "SOURCE_ROWS": 0,
+                        # None = la columna nunca estuvo presente para esta
+                        # llave en ningún archivo; se vuelve número en
+                        # cuanto se encuentra al menos una vez.
+                        "FOUNTAIN9_ALLOCATION": None,
+                    }
+                record = consolidated[key]
+                for column in trace_columns:
+                    field = field_lookup.get(engine.normalize_header(column))
+                    value = raw.get(field, "") if field else ""
+                    if column in ("DOI", "DOH"):
+                        if engine.clean_text(value):
+                            record[column] = min(record.get(column, float("inf")), engine.to_float(value, float("inf")))
+                    elif engine.clean_text(value):
+                        record.setdefault("F9_REFERENCE", {}).setdefault(column, set()).add(str(value))
+                record["PREDICTED_DEMAND"] += engine.to_float(
+                    raw.get(required_lookup["Predicted Demand for selected duration"], "")
+                )
+                record["PREDICTED_OPENING_INVENTORY"] += engine.to_float(
+                    raw.get(required_lookup["Predicted Opening Inventory"], "")
+                )
+                # MOV efectivo de ESTA fila: el máximo entre la columna
+                # (MOV) obligatoria y cualquiera de las 11 opcionales que
+                # sí estén presentes en este archivo.
+                row_mov_candidates = [
+                    engine.to_float(
+                        raw.get(
+                            required_lookup[
+                                "Replenishment Quantity for Plan Duration (MOV)"
+                            ],
+                            "",
+                        )
+                    )
+                ]
+                for column, field_name in (
+                    optional_mov_lookup.items() if use_extra_mov_columns else ()
+                ):
+                    row_mov_candidates.append(
+                        engine.to_float(raw.get(field_name, ""))
+                    )
+                if fountain9_doi_field is not None:
+                    row_mov_candidates.append(engine.to_float(raw.get(fountain9_doi_field, "")))
+                row_mov_max = max(row_mov_candidates)
+                # Duplicados de la misma tienda-SKU: se toma el MÁXIMO, no la suma.
+                record["ROQ_INPUT"] = max(record["ROQ_INPUT"], row_mov_max)
+                if fountain9_allocation_field is not None:
+                    row_f9_allocation = engine.to_float(
+                        raw.get(fountain9_allocation_field, "")
+                    )
+                    # Allocation DOI es una instrucción ejecutable: duplicados
+                    # se suman para que el comparativo coincida con Naked.
+                    record["FOUNTAIN9_ALLOCATION"] = (
+                        (record["FOUNTAIN9_ALLOCATION"] or 0.0) + row_f9_allocation
+                    )
+                if fountain9_doi_field is not None:
+                    doi_quantity = engine.to_float(raw.get(fountain9_doi_field, ""))
+                    if doi_quantity > 0:
+                        if not math.isfinite(doi_quantity) or not doi_quantity.is_integer():
+                            raise ValueError(f"{path.name} fila {csv_row}: Allocation DOI debe ser entero finito")
+                        raw_source = raw.get(fountain9_source_field, "") if fountain9_source_field else ""
+                        try:
+                            source = engine.to_id(raw_source, FOUNTAIN9_SOURCE_COLUMN, allow_none=True)
+                        except (ValueError, TypeError):
+                            source = engine.clean_text(raw_source)
+                        fountain9_instructions[(source, destination, sku)] += int(doi_quantity)
+                record["NET_INTER_STORE_TRANSFERS"] += engine.to_float(
+                    raw.get(required_lookup["Net Inter-Store Transfers"], "")
+                )
+                record["SOURCE_FILES"].add(path.name)
+                record["SOURCE_ROWS"] += 1
+                source_row_count += 1
+                source_counts[path.name] += 1
+
+    if not consolidated:
+        raise ValueError("Los archivos cargados no contienen requerimientos válidos.")
+
+    output_rows: list[dict[str, Any]] = []
+    net_transfer_hardcodes = 0
+    for key, record in consolidated.items():
+        destination, sku = key
+        destination_stock = max(
+            float(catalogs.stock_base.get((destination, sku), 0.0)),
+            0.0,
+        )
+        demand = record["PREDICTED_DEMAND"]
+        opening = record["PREDICTED_OPENING_INVENTORY"]
+        record["ROQ_INPUT"] = max(record["ROQ_INPUT"], record["FOUNTAIN9_ALLOCATION"] or 0)
+        roq_input = record["ROQ_INPUT"]
+        net_transfer = record["NET_INTER_STORE_TRANSFERS"]
+        zero_total_rule = (
+            math.isclose(demand, 0.0, abs_tol=1e-9)
+            and math.isclose(opening, 0.0, abs_tol=1e-9)
+        )
+        deficit_rule = opening < demand
+        net_transfer_rule = (
+            net_transfer_rule_enabled
+            and roq_input <= 0
+            and net_transfer <= net_transfer_max
+            and destination_stock < destination_stock_below
+            and not zero_total_rule
+            and not deficit_rule
+        )
+        record["NET_TRANSFER_HARDCODE_3"] = net_transfer_rule
+        effective_roq = 3.0 if net_transfer_rule else roq_input
+        net_transfer_hardcodes += int(net_transfer_rule)
+        output_rows.append(
+            {
+                "Warehouseid": destination,
+                "SKU ID": sku,
+                "Current Inventory": destination_stock,
+                "Predicted Demand for selected duration": demand,
+                "Predicted Opening Inventory": opening,
+                "Replenishment Quantity for Plan Duration (MOV)": effective_roq,
+                "Net Inter-Store Transfers": net_transfer,
+            }
+        )
+
+    canonical_columns = [
+        "Warehouseid",
+        "SKU ID",
+        "Current Inventory",
+        "Predicted Demand for selected duration",
+        "Predicted Opening Inventory",
+        "Replenishment Quantity for Plan Duration (MOV)",
+        "Net Inter-Store Transfers",
+    ]
+    output_rows.sort(key=lambda row: (row["Warehouseid"], row["SKU ID"]))
+    engine.write_csv(output_path, output_rows, canonical_columns)
+
+    unique_count = len(consolidated)
+    duplicated_keys = sum(
+        int(record["SOURCE_ROWS"] > 1) for record in consolidated.values()
+    )
+    # Moda de Duration/Lead Time por tienda — una sola vez, sobre TODAS las
+    # filas de esa tienda en TODOS los archivos cargados (no por archivo).
+    # statistics.mode() toma el primer valor más frecuente en caso de
+    # empate (determinístico, sin lanzar excepción).
+    duration_mode_by_store: dict[int, float] = {
+        store: statistics.mode(values)
+        for store, values in duration_values_by_store.items()
+        if values
+    }
+    lead_time_mode_by_store: dict[int, float] = {
+        store: statistics.mode(values)
+        for store, values in lead_time_values_by_store.items()
+        if values
+    }
+    summary = {
+        "files": len(plan_paths),
+        "file_names": [path.name for path in plan_paths],
+        "source_rows": source_row_count,
+        "unique_requirements": unique_count,
+        "rows_consolidated": max(source_row_count - unique_count, 0),
+        "duplicated_keys": duplicated_keys,
+        "net_transfer_hardcodes": net_transfer_hardcodes,
+        "rows_by_file": dict(source_counts),
+        "duration_mode_by_store": duration_mode_by_store,
+        "lead_time_mode_by_store": lead_time_mode_by_store,
+        # Instrucciones ejecutables de Fountain9. Se conservan separadas de
+        # la consolidación tienda-SKU porque Naked necesita respetar origen.
+        "fountain9_instructions": [
+            {
+                "WAREHOUSE_SOURCE": source,
+                "WAREHOUSE_DESTINATION": destination,
+                "RETAIL_ID": sku,
+                "QUANTITY": quantity,
+                "REFERENCE": {
+                    column: " | ".join(sorted(values))
+                    for column, values in consolidated[(destination, sku)].get("F9_REFERENCE", {}).items()
+                },
+            }
+            for (source, destination, sku), quantity in sorted(
+                fountain9_instructions.items(),
+                key=lambda item: (
+                    item[0][1], item[0][2],
+                    item[0][0] is None, str(item[0][0]),
+                ),
+            )
+        ],
+    }
+    return output_path, consolidated, summary
+
+
+def enrich_consolidated_plan_read(
+    plan_read,
+    consolidated: dict[tuple[int, int], dict[str, Any]],
+    consolidation_summary: dict[str, Any],
+) -> None:
+    """Restaura trazabilidad y métricas originales después de normalizar el CSV."""
+    for row in plan_read.rows:
+        key = (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"])
+        source = consolidated[key]
+        row["NET_INTER_STORE_TRANSFERS"] = source[
+            "NET_INTER_STORE_TRANSFERS"
+        ]
+        row["ROQ_INPUT"] = source["ROQ_INPUT"]
+        row["DOI"] = source.get("DOI", float("inf"))
+        row["DOH"] = source.get("DOH", float("inf"))
+        row["NET_TRANSFER_HARDCODE_3"] = source["NET_TRANSFER_HARDCODE_3"]
+        row["SOURCE_FILES"] = " | ".join(sorted(source["SOURCE_FILES"]))
+        row["SOURCE_ROWS"] = source["SOURCE_ROWS"]
+
+    plan_read.input_row_count = consolidation_summary["source_rows"]
+    plan_read.duplicate_row_count = consolidation_summary["rows_consolidated"]
+    plan_read.duplicate_key_count = consolidation_summary["duplicated_keys"]
+    plan_read.conflicting_duplicate_key_count = 0
+    if consolidation_summary["rows_consolidated"]:
+        plan_read.warnings.append(
+            "Archivos múltiples: se sumaron y consolidaron "
+            f"{consolidation_summary['source_rows']:,} filas en "
+            f"{consolidation_summary['unique_requirements']:,} combinaciones "
+            "Warehouse-SKU."
+        )
+
+
+def build_naked_fountain9_rows(
+    instructions: list[dict[str, Any]],
+    plan_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Arma la cola estricta de Naked desde Allocation (DOI Based)."""
+    by_key = {
+        (int(row["WAREHOUSE_DESTINATION"]), int(row["RETAIL_ID"])): row
+        for row in plan_rows
+    }
+    naked_rows: list[dict[str, Any]] = []
+    for instruction in instructions:
+        destination = int(instruction["WAREHOUSE_DESTINATION"])
+        sku = int(instruction["RETAIL_ID"])
+        if (destination, sku) not in by_key:
+            continue
+        base = dict(by_key[(destination, sku)])
+        base.update(
+            {
+                "FORCED_TARGET": int(instruction["QUANTITY"]),
+                "FORCED_SOURCE": instruction.get("WAREHOUSE_SOURCE"),
+                "FORCED_RULE": "FOUNTAIN9_DOI",
+                "ALLOW_PARTIAL": True,
+            }
+        )
+        naked_rows.append(base)
+    return naked_rows
+
+
+def attach_consolidated_input_to_result(
+    result,
+    consolidated: dict[tuple[int, int], dict[str, Any]],
+) -> None:
+    """Agrega al reporte Net Transfers y conserva el ROQ realmente recibido."""
+    for row in result.base_rows:
+        key = (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"])
+        source = consolidated.get(key)
+        if source is None:
+            row.setdefault("NET_INTER_STORE_TRANSFERS", "")
+            row.setdefault("ARCHIVOS_INPUT", "CATALOGO")
+            continue
+        row["NET_INTER_STORE_TRANSFERS"] = source[
+            "NET_INTER_STORE_TRANSFERS"
+        ]
+        row["ARCHIVOS_INPUT"] = " | ".join(sorted(source["SOURCE_FILES"]))
+        row["FILAS_INPUT_SUMADAS"] = source["SOURCE_ROWS"]
+        if source["NET_TRANSFER_HARDCODE_3"] and row.get("REGLA_DEMANDA") != "FOUNTAIN9_DOI":
+            row["MOV_ORIGINAL"] = source["ROQ_INPUT"]
+            row["REGLA_DEMANDA"] = "HARDCODE_3_NET_TRANSFER_BAJO"
+
+    manual_keys = {
+        (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"])
+        for row in result.base_rows
+        if row.get("REGLA_DEMANDA") in MANUAL_FORECAST_ZERO_RULES
+    }
+    for allocation in result.allocation_rows:
+        key = (
+            allocation["WAREHOUSE_DESTINATION"],
+            allocation["RETAIL_ID"],
+        )
+        if (
+            key in manual_keys
+            and allocation.get(PLANNING_REASON_COLUMN)
+            == PLANNING_REASON_OTACON
+        ):
+            allocation[PLANNING_REASON_COLUMN] = (
+                PLANNING_REASON_MANUAL_FORECAST_ZERO
+            )
+
+
+def omit_unexecuted_manual_task_rows(result) -> None:
+    """Omite manualidades sin asignación cuando se agotó el cupo de tareas."""
+    result.base_rows[:] = [
+        row
+        for row in result.base_rows
+        if not (
+            row.get("REGLA_DEMANDA") in MANUAL_FORECAST_ZERO_RULES
+            and int(row.get("CANTIDAD_ASIGNADA", 0) or 0) <= 0
+            and row.get("TIPO_DE_CORTE")
+            == "CORTE POR CAPACIDAD DE TAREAS"
+        )
+    ]
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_public_database() -> bytes:
+    """Exporta el Google Sheet público completo como XLSX y conserva 5 min de caché."""
+    spreadsheet_id = configured_data_transfers_spreadsheet_id()
+    if not spreadsheet_id:
+        raise RuntimeError(
+            "Falta configurar DATA_TRANSFERS_SPREADSHEET_ID en Secrets "
+            "(.streamlit/secrets.toml en local, o App settings → Secrets en "
+            "Streamlit Community Cloud)."
+        )
+    export_url = (
+        "https://docs.google.com/spreadsheets/d/"
+        f"{spreadsheet_id}/export?format=xlsx"
+    )
+    request = urllib.request.Request(
+        export_url,
+        headers={"User-Agent": "Mozilla/5.0 TransferPlanner/1.0"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=300) as response:
+            workbook_bytes = response.read()
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as exc:
+        raise RuntimeError(
+            "No pude consultar la base de datos. Confirma que el Google Sheet "
+            "siga configurado como 'Cualquier persona con el enlace: Lector'."
+        ) from exc
+
+    if not workbook_bytes:
+        raise RuntimeError("Google devolvió una base de datos vacía.")
+    if not zipfile.is_zipfile(io.BytesIO(workbook_bytes)):
+        raise RuntimeError(
+            "Google no devolvió un archivo Excel válido. Revisa el acceso público."
+        )
+    return workbook_bytes
+
+
+@st.cache_resource(
+    scope="session",
+    show_spinner="Validando fuentes de información…",
+)
+def load_database_resource() -> dict[str, Any]:
+    """Descarga, inspecciona y conserva la base entre todos los reruns normales."""
+    try:
+        workbook_bytes = fetch_public_database()
+        return {
+            "workbook_bytes": workbook_bytes,
+            "health": inspect_database(workbook_bytes),
+            "city_labels": extract_available_cities(workbook_bytes),
+            "store_labels": extract_available_stores(workbook_bytes),
+            "error": "",
+        }
+    except Exception as exc:
+        # También se conserva el error: sólo el botón de actualización reintenta.
+        return {
+            "workbook_bytes": None,
+            "health": None,
+            "city_labels": {},
+            "store_labels": {},
+            "error": str(exc),
+        }
+
+
+def save_database(workbook_bytes: bytes, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("wb") as handle:
+        handle.write(workbook_bytes)
+
+
+def load_closed_store_ids(database_path: Path) -> set[int]:
+    """Carga el bloqueo permanente de tiendas definido en DATA_TRANSFERS."""
+    closed_stores: set[int] = set()
+    workbook = openpyxl.load_workbook(database_path, read_only=True, data_only=True)
+    try:
+        for record in engine.iter_sheet_records(
+            workbook,
+            "TIENDAS_CERRADAS",
+            ["WAREHOUSE_ID"],
+            ["WAREHOUSE_ID"],
+        ):
+            warehouse = engine.to_id(
+                record["WAREHOUSE_ID"],
+                "TIENDAS_CERRADAS.WAREHOUSE_ID",
+                allow_none=True,
+            )
+            if warehouse is not None:
+                closed_stores.add(warehouse)
+    finally:
+        workbook.close()
+    return closed_stores
+
+
+def load_venom_catalog_lookup(
+    database_path: Path,
+) -> tuple[dict[tuple[int, int], dict[str, Any]], list[str]]:
+    """Carga CATALOGO completo (ADU + LIST_TYPE) para el Venom Engine."""
+    consolidated: dict[tuple[int, int], dict[str, Any]] = {}
+    warnings: list[str] = []
+    workbook = openpyxl.load_workbook(database_path, read_only=True, data_only=True)
+    try:
+        has_list_type = False
+        if "CATALOGO" in workbook.sheetnames:
+            try:
+                _header_row_number, header_positions = engine.find_header_row(
+                    workbook["CATALOGO"], ["WAREHOUSE_ID", "PRODUCT_ID", "ADU"]
+                )
+                has_list_type = "LIST_TYPE" in header_positions
+            except ValueError:
+                has_list_type = False
+        required = ["WAREHOUSE_ID", "PRODUCT_ID", "ADU"]
+        optional = ["LIST_TYPE"] if has_list_type else []
+        for record in engine.iter_sheet_records(
+            workbook,
+            "CATALOGO",
+            required,
+            required + optional,
+        ):
+            destination = engine.to_id(
+                record["WAREHOUSE_ID"],
+                "CATALOGO.WAREHOUSE_ID",
+                allow_none=True,
+            )
+            sku = engine.to_id(
+                record["PRODUCT_ID"],
+                "CATALOGO.PRODUCT_ID",
+                allow_none=True,
+            )
+            if destination is None or sku is None:
+                continue
+            adu = max(engine.to_float(record["ADU"], 0.0), 0.0)
+            list_type = (
+                engine.clean_text(record.get("LIST_TYPE")).upper()
+                if has_list_type
+                else ""
+            )
+            key = (destination, sku)
+            existing = consolidated.get(key)
+            if existing is None:
+                consolidated[key] = {"adu": adu, "list_type": list_type}
+            else:
+                if adu > existing["adu"]:
+                    existing["adu"] = adu
+                if list_type and not existing["list_type"]:
+                    existing["list_type"] = list_type
+    finally:
+        workbook.close()
+
+    if not has_list_type:
+        warnings.append(
+            "Venom Engine: CATALOGO no tiene columna LIST_TYPE; ningún "
+            "producto calificará como BL (el resto de tipos de sección no se "
+            "ve afectado)."
+        )
+    return consolidated, warnings
+
+
+def load_avl_catalog_rows(
+    database_path: Path,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Carga CATALOGO y consolida una ADU por tienda-SKU."""
+    consolidated: dict[tuple[int, int], float] = {}
+    warnings: list[str] = []
+    workbook = openpyxl.load_workbook(database_path, read_only=True, data_only=True)
+    try:
+        for record in engine.iter_sheet_records(
+            workbook,
+            "CATALOGO",
+            ["WAREHOUSE_ID", "PRODUCT_ID", "ADU"],
+            ["WAREHOUSE_ID", "PRODUCT_ID", "ADU"],
+        ):
+            destination = engine.to_id(
+                record["WAREHOUSE_ID"],
+                "CATALOGO.WAREHOUSE_ID",
+                allow_none=True,
+            )
+            sku = engine.to_id(
+                record["PRODUCT_ID"],
+                "CATALOGO.PRODUCT_ID",
+                allow_none=True,
+            )
+            adu = max(engine.to_float(record["ADU"], 0.0), 0.0)
+            if destination is None or sku is None:
+                continue
+            key = (destination, sku)
+            if key in consolidated and not math.isclose(
+                consolidated[key], adu, abs_tol=1e-9
+            ):
+                previous = consolidated[key]
+                consolidated[key] = max(previous, adu)
+                if len(warnings) < 20:
+                    warnings.append(
+                        f"CATALOGO: {key} tiene ADU {previous} y {adu}; "
+                        f"se usó la mayor ({consolidated[key]})."
+                    )
+            else:
+                consolidated[key] = adu
+    finally:
+        workbook.close()
+
+    rows = [
+        {
+            "WAREHOUSE_DESTINATION": destination,
+            "RETAIL_ID": sku,
+            "ADU": adu,
+        }
+        for (destination, sku), adu in consolidated.items()
+    ]
+    return rows, warnings
+
+
+def resolve_adu_with_city_fallback(
+    catalog_rows: list[dict[str, Any]],
+    catalogs,
+    keys_to_resolve: set[tuple[int, int]] | None = None,
+) -> tuple[dict[tuple[int, int], float], dict[tuple[int, int], str]]:
+    """Cascada de ADU de AVL, Preventivo y Refuerzo: propio → promedio de la ciudad →
+    sin dato.
+    """
+    own_adu: dict[tuple[int, int], float] = {}
+    for row in catalog_rows:
+        key = (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"])
+        adu = float(row["ADU"])
+        if adu > 0:
+            own_adu[key] = adu
+
+    city_sku_adu_sum: dict[tuple[str, int], float] = defaultdict(float)
+    city_sku_adu_count: dict[tuple[str, int], int] = defaultdict(int)
+    for (destination, sku), adu in own_adu.items():
+        city_norm = catalogs.stores.get(destination, {}).get("city_norm", "")
+        if not city_norm:
+            continue
+        city_sku_adu_sum[(city_norm, sku)] += adu
+        city_sku_adu_count[(city_norm, sku)] += 1
+
+    resolved: dict[tuple[int, int], float] = {}
+    source: dict[tuple[int, int], str] = {}
+    all_keys = (
+        set(keys_to_resolve)
+        if keys_to_resolve is not None
+        else {
+            (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"])
+            for row in catalog_rows
+        }
+    )
+    for key in all_keys:
+        destination, sku = key
+        if key in own_adu:
+            resolved[key] = own_adu[key]
+            source[key] = "PROPIO"
+            continue
+        city_norm = catalogs.stores.get(destination, {}).get("city_norm", "")
+        city_key = (city_norm, sku)
+        count = city_sku_adu_count.get(city_key, 0)
+        if city_norm and count > 0:
+            resolved[key] = city_sku_adu_sum[city_key] / count
+            source[key] = "PROMEDIO_CIUDAD"
+        # Sin ADU propio ni de la ciudad: no se agrega, queda "sin dato".
+    return resolved, source
+
+
+def build_golden_infaltable_anchor_health_check(
+    result,
+    catalogs,
+    target_doh: float,
+    catalog_rows: list[dict[str, Any]],
+    targets_by_bucket: dict[str, float] | None = None,
+) -> dict[str, Any]:
+    """Verificación de salud al final del pipeline (después de Shalashaska, Liquid y
+    Venom). Con ``targets_by_bucket`` cada bucket usa su DOH (el más alto si hay
+    traslape); sin él, ``target_doh`` aplica a Infaltable, Golden y Anchor.
+    """
+    bucket_keys = {
+        "INFALTABLE": catalogs.infaltable_products,
+        "GOLDEN": catalogs.golden_products,
+        "ANCHOR": catalogs.anchor_products,
+        "KVI": catalogs.kvi_products,
+    }
+    targets = (
+        dict(targets_by_bucket)
+        if targets_by_bucket
+        else {bucket: target_doh for bucket in ("INFALTABLE", "GOLDEN", "ANCHOR")}
+    )
+    target_by_key: dict[tuple[int, int], float] = {}
+    for bucket, bucket_target in targets.items():
+        for bucket_key in bucket_keys[bucket]:
+            target_by_key[bucket_key] = max(
+                target_by_key.get(bucket_key, 0.0), float(bucket_target)
+            )
+    keys = set(target_by_key)
+    if not keys:
+        return {"enabled": False, "checked": 0, "below_target": [], "no_adu": 0}
+
+    adu_by_key, _source = resolve_adu_with_city_fallback(
+        catalog_rows, catalogs, keys_to_resolve=keys
+    )
+    assigned_by_key: Counter[tuple[int, int]] = Counter()
+    for allocation in result.allocation_rows:
+        assigned_by_key[
+            (allocation["WAREHOUSE_DESTINATION"], allocation["RETAIL_ID"])
+        ] += int(allocation.get("QUANTITY", 0) or 0)
+
+    below_target: list[dict[str, Any]] = []
+    no_adu = 0
+    for destination, sku in keys:
+        key = (destination, sku)
+        adu = adu_by_key.get(key, 0.0)
+        if adu <= 0:
+            no_adu += 1
+            continue  # sin ADU no hay forma de evaluar DOH para este caso
+        initial_stock = max(float(catalogs.stock_base.get(key, 0.0)), 0.0)
+        final_position = initial_stock + assigned_by_key.get(key, 0)
+        final_doh = final_position / adu
+        key_target = target_by_key[key]
+        if final_doh < key_target - 1e-6:
+            store = catalogs.stores.get(destination, {})
+            priority_profile = engine.product_priority_profile(
+                catalogs, destination, sku
+            )
+            product_info = catalogs.product_catalog.get(sku, {})
+            below_target.append(
+                {
+                    "WAREHOUSE_DESTINATION": destination,
+                    "WAREHOUSE_NAME": store.get("warehouse_name", ""),
+                    "RETAIL_ID": sku,
+                    "PRODUCT_NAME": product_info.get("PRODUCT_NAME", ""),
+                    "CATEGORY_NAME": product_info.get("CATEGORY_NAME", ""),
+                    "TIPO": priority_profile["type"],
+                    "DOH_FINAL": round(final_doh, 3),
+                    "DOH_OBJETIVO": round(key_target, 3),
+                    "UNIDADES_FALTANTES": int(
+                        math.ceil(max((key_target - final_doh) * adu, 0.0))
+                    ),
+                }
+            )
+
+    return {
+        "enabled": True,
+        "checked": len(keys),
+        "no_adu": no_adu,
+        "below_target": sorted(below_target, key=lambda row: row["DOH_FINAL"]),
+    }
+
+
+GOLDEN_INFALTABLE_ANCHOR_RISK_DOH = 3.0
+
+
+def _diagnose_uncovered_bucket_reason(
+    destination: int,
+    sku: int,
+    catalogs,
+    config: engine.Config,
+    closed_store_ids: set[int],
+    blocked_cities: tuple[str, ...],
+    capacity_by_store: dict[int, dict[str, Any]],
+) -> str:
+    """Por qué una tienda-SKU del universo Golden/Infaltable/Anchor sigue sin cubrirse."""
+    if sku in catalogs.excluded_products:
+        return "SKU EXCLUIDO GLOBALMENTE"
+    if destination in closed_store_ids:
+        return "TIENDA CERRADA"
+    store = catalogs.stores.get(destination, {})
+    city_norm = store.get("city_norm", "")
+    if city_norm in set(blocked_cities):
+        return "CIUDAD BLOQUEADA"
+
+    capacity_row = capacity_by_store.get(destination)
+    capacity_total = catalogs.store_capacity.get(
+        destination, config.default_store_capacity_m3
+    )
+    capacity_used = (
+        float(capacity_row["M3_CONTABILIZADO_CAPACIDAD"])
+        if capacity_row is not None
+        else 0.0
+    )
+    m3_per_unit = catalogs.volume_m3.get(sku, config.default_m3_per_unit)
+    remaining_capacity_m3 = max(capacity_total - capacity_used, 0.0)
+    if m3_per_unit > 0 and remaining_capacity_m3 < m3_per_unit:
+        return "CAPACIDAD DE TIENDA LLENA (real restante)"
+
+    per_origin_reasons: list[str] = []
+    any_origin_open = False
+    for source in config.origin_warehouses:
+        info = engine.source_stock_components(catalogs, source, sku)
+        if info["rackeado"]:
+            per_origin_reasons.append(f"{source}: RACKEADO")
+            continue
+        if info["copernico_unusable"] > 0 and info["adjusted"] <= 0:
+            reason = engine.dominant_copernico_reason(catalogs, sku, [source])
+            per_origin_reasons.append(
+                f"{source}: COPÉRNICO {reason or 'NO USABLE'}"
+            )
+            continue
+        if engine.is_regional_block(
+            catalogs, source, destination, sku, city_norm, False
+        ):
+            per_origin_reasons.append(f"{source}: BLOQUEO REGIONAL")
+            continue
+        if engine.is_schedule_blocked(catalogs, source, destination):
+            per_origin_reasons.append(f"{source}: BLOQUEO POR FRECUENCIA")
+            continue
+        if (destination, sku) in catalogs.route_cost_blocks:
+            per_origin_reasons.append(f"{source}: SIN RUTA DE COSTOS")
+            continue
+        if info["adjusted"] <= 0:
+            per_origin_reasons.append(f"{source}: SIN STOCK")
+            continue
+        any_origin_open = True
+
+    if any_origin_open:
+        return "SIN MOTIVO DE BLOQUEO IDENTIFICADO"
+    if per_origin_reasons:
+        return " | ".join(per_origin_reasons)
+    return "SIN MOTIVO DE BLOQUEO IDENTIFICADO"
+
+
+def build_bucket_universe_report(
+    bucket_keys: set[tuple[int, int]],
+    result,
+    catalogs,
+    config: engine.Config,
+    closed_store_ids: set[int],
+    blocked_cities: tuple[str, ...],
+    catalog_rows: list[dict[str, Any]],
+    target_doh: float = GOLDEN_INFALTABLE_ANCHOR_RISK_DOH,
+) -> dict[str, Any]:
+    """Reporte del universo completo de un bucket (Golden, Infaltable o Anchor), no solo
+    lo que algún engine tocó.
+    """
+    if not bucket_keys:
+        return {
+            "enabled": False,
+            "summary": {},
+            "rows": [],
+        }
+
+    adu_by_key, adu_source_by_key = resolve_adu_with_city_fallback(
+        catalog_rows, catalogs, keys_to_resolve=bucket_keys
+    )
+    assigned_by_key: Counter[tuple[int, int]] = Counter()
+    for allocation in result.allocation_rows:
+        assigned_by_key[
+            (allocation["WAREHOUSE_DESTINATION"], allocation["RETAIL_ID"])
+        ] += int(allocation.get("QUANTITY", 0) or 0)
+    capacity_by_store = {
+        row["WAREHOUSE_DESTINATION"]: row for row in result.capacity_rows
+    }
+
+    rows: list[dict[str, Any]] = []
+    summary_counts: Counter[str] = Counter()
+    for destination, sku in bucket_keys:
+        store = catalogs.stores.get(destination, {})
+        adu = adu_by_key.get(key := (destination, sku), 0.0)
+        stock_initial = max(float(catalogs.stock_base.get(key, 0.0)), 0.0)
+        assigned_today = assigned_by_key.get(key, 0)
+        stock_final = stock_initial + assigned_today
+
+        if adu > 0:
+            doh_initial = stock_initial / adu
+            doh_final = stock_final / adu
+            was_at_risk = doh_initial < target_doh
+            was_stocked_out = stock_initial <= 0
+            is_saved = doh_final >= target_doh
+
+            if not was_at_risk:
+                categoria = "SIN_PROBLEMA"
+            elif is_saved and was_stocked_out:
+                categoria = "QUEBRADO_Y_SE_SALVO"
+            elif is_saved:
+                categoria = "IBA_A_QUEBRAR_Y_SE_SALVO"
+            else:
+                categoria = "NO_CUBIERTO"
+        else:
+            # Sin ADU (ni propio ni de la ciudad) no hay forma de calcular un
+            # DOH real.
+            doh_initial = None
+            doh_final = None
+            categoria = "NO_CUBIERTO"
+        summary_counts[categoria] += 1
+
+        motivo = ""
+        if categoria == "NO_CUBIERTO":
+            if adu <= 0:
+                motivo = "SIN ADU PARA CALCULAR DOH (ni propio ni de la ciudad)"
+            else:
+                motivo = _diagnose_uncovered_bucket_reason(
+                    destination,
+                    sku,
+                    catalogs,
+                    config,
+                    closed_store_ids,
+                    blocked_cities,
+                    capacity_by_store,
+                )
+
+        product_info = catalogs.product_catalog.get(sku, {})
+        rows.append(
+            {
+                "WAREHOUSE_DESTINATION": destination,
+                "WAREHOUSE_NAME": store.get("warehouse_name", ""),
+                "RETAIL_ID": sku,
+                "PRODUCT_NAME": product_info.get("PRODUCT_NAME", ""),
+                "CATEGORY_NAME": product_info.get("CATEGORY_NAME", ""),
+                "SWA_POTENTIAL_GAIN_COUNTRY": get_swa_potential_gain(
+                    catalogs, destination, sku
+                ),
+                "ADU": round(adu, 4),
+                "ADU_ORIGEN": adu_source_by_key.get(key, "SIN_DATO"),
+                "STOCK_INICIAL": int(stock_initial),
+                "DOH_INICIAL": (
+                    round(doh_initial, 3)
+                    if doh_initial is not None and math.isfinite(doh_initial)
+                    else None
+                ),
+                "UNIDADES_ASIGNADAS_HOY": int(assigned_today),
+                "STOCK_FINAL": int(stock_final),
+                "DOH_FINAL": (
+                    round(doh_final, 3)
+                    if doh_final is not None and math.isfinite(doh_final)
+                    else None
+                ),
+                "CATEGORIA": categoria,
+                "MOTIVO_NO_CUBIERTO": motivo,
+            }
+        )
+
+    rows.sort(
+        key=lambda row: (
+            {
+                "NO_CUBIERTO": 0,
+                "QUEBRADO_Y_SE_SALVO": 1,
+                "IBA_A_QUEBRAR_Y_SE_SALVO": 2,
+                "SIN_PROBLEMA": 3,
+            }[row["CATEGORIA"]],
+            row["DOH_FINAL"] if row["DOH_FINAL"] is not None else -1,
+            row["WAREHOUSE_DESTINATION"],
+            row["RETAIL_ID"],
+        )
+    )
+
+    return {
+        "enabled": True,
+        "universe_size": len(bucket_keys),
+        "target_doh": target_doh,
+        "summary": {
+            "sin_problema": summary_counts.get("SIN_PROBLEMA", 0),
+            "iba_a_quebrar_y_se_salvo": summary_counts.get(
+                "IBA_A_QUEBRAR_Y_SE_SALVO", 0
+            ),
+            "quebrado_y_se_salvo": summary_counts.get("QUEBRADO_Y_SE_SALVO", 0),
+            "no_cubierto": summary_counts.get("NO_CUBIERTO", 0),
+        },
+        "rows": rows,
+    }
+
+
+def load_insumos_rows(
+    database_path: Path,
+    catalogs,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Lee INSUMOS tal como lo entrega Aleph; no recalcula sus cantidades."""
+    rows: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    workbook = openpyxl.load_workbook(database_path, read_only=True, data_only=True)
+    try:
+        for sheet_row, record in enumerate(
+            engine.iter_sheet_records(
+                workbook,
+                "INSUMOS",
+                INSUMOS_COLUMNS,
+                INSUMOS_COLUMNS,
+            ),
+            start=14,
+        ):
+            destination = engine.to_id(
+                record["WAREHOUSE_DESTINATION"],
+                f"INSUMOS fila {sheet_row}.WAREHOUSE_DESTINATION",
+                allow_none=True,
+            )
+            source = engine.to_id(
+                record["WAREHOUSE_SOURCE"],
+                f"INSUMOS fila {sheet_row}.WAREHOUSE_SOURCE",
+                allow_none=True,
+            )
+            sku = engine.to_id(
+                record["RETAIL_ID"],
+                f"INSUMOS fila {sheet_row}.RETAIL_ID",
+                allow_none=True,
+            )
+            quantity_value = engine.to_float(record["QUANTITY"], 0.0)
+
+            if destination is None or source is None or sku is None:
+                warnings.append(
+                    f"INSUMOS fila {sheet_row}: se omitió por tener identificadores vacíos."
+                )
+                continue
+            if quantity_value <= 0:
+                continue
+            if not math.isclose(
+                quantity_value,
+                round(quantity_value),
+                abs_tol=1e-6,
+            ):
+                raise ValueError(
+                    f"INSUMOS fila {sheet_row}: QUANTITY debe ser entera; "
+                    f"se recibió {quantity_value!r}."
+                )
+            if source != 444:
+                warnings.append(
+                    f"INSUMOS fila {sheet_row}: se omitió el origen {source}; "
+                    "los insumos solo pueden salir del warehouse 444."
+                )
+                continue
+
+            store = catalogs.stores.get(destination, {})
+            rows.append(
+                {
+                    "WAREHOUSE_DESTINATION": destination,
+                    "WAREHOUSE_SOURCE": 444,
+                    "RETAIL_ID": sku,
+                    "QUANTITY": int(round(quantity_value)),
+                    "PLANNED_DATE": "",
+                    "ROUTE": 1,
+                    "DELIVERY_PRIORITY": 1,
+                    "CITY": store.get("city", ""),
+                    "STORAGE": engine.source_storage_type(catalogs, 444, sku),
+                    "VALUE": engine.source_value_category(catalogs, 444, sku),
+                    PLANNING_REASON_COLUMN: PLANNING_REASON_INSUMOS,
+                }
+            )
+    finally:
+        workbook.close()
+    return rows, warnings
+
+
+def append_insumos_to_bulk_444(
+    local_files: list[Path],
+    result,
+    catalogs,
+    insumos_rows: list[dict[str, Any]],
+    origins: tuple[int, ...],
+    include_insumos: bool,
+) -> dict[str, Any]:
+    """Anexa insumos limitados por stock ajustado del 444 y por su MOQ."""
+    summary = {
+        "requested": include_insumos,
+        "enabled": include_insumos and 444 in origins,
+        "source_rows": len(insumos_rows),
+        "eligible_stores": 0,
+        "requested_units": 0,
+        "lines_added": 0,
+        "units_added": 0,
+        "stores_added": 0,
+        "units_cut_stock": 0,
+        "units_cut_moq": 0,
+        "lines_reduced": 0,
+        "lines_removed": 0,
+        "products_cut_stock": 0,
+        "lines_blocked_regional": 0,
+        "lines_blocked_schedule": 0,
+        "lines_blocked_city_restriction": 0,
+        "stock_detail": [],
+        "swa_ganado": 0.0,
+        "assigned_keys": set(),
+    }
+    if not summary["enabled"]:
+        return summary
+
+    regular_444_rows = [
+        row
+        for row in result.allocation_rows
+        if row["WAREHOUSE_SOURCE"] == 444 and row["QUANTITY"] > 0
+    ]
+    eligible_destinations = {
+        row["WAREHOUSE_DESTINATION"] for row in regular_444_rows
+    }
+    summary["eligible_stores"] = len(eligible_destinations)
+    selected_requested: list[dict[str, Any]] = []
+    for row in insumos_rows:
+        destination = int(row["WAREHOUSE_DESTINATION"])
+        sku = int(row["RETAIL_ID"])
+        if destination not in eligible_destinations:
+            continue
+        if sku in catalogs.excluded_products:
+            continue
+        store = catalogs.stores.get(destination, {})
+        city_norm = store.get("city_norm", "")
+        allowed_cities = INSUMO_CITY_RESTRICTIONS.get(sku)
+        if allowed_cities is not None and city_norm not in allowed_cities:
+            summary["lines_blocked_city_restriction"] += 1
+            continue
+        priority_profile = engine.product_priority_profile(
+            catalogs,
+            destination,
+            sku,
+        )
+        is_golden = priority_profile["is_golden"]
+        if engine.is_regional_block(
+            catalogs,
+            444,
+            destination,
+            sku,
+            city_norm,
+            is_golden,
+        ):
+            summary["lines_blocked_regional"] += 1
+            continue
+        if engine.is_schedule_blocked(catalogs, 444, destination):
+            summary["lines_blocked_schedule"] += 1
+            continue
+        selected_requested.append(row)
+    if not selected_requested:
+        return summary
+
+    summary["requested_units"] = sum(
+        int(row["QUANTITY"]) for row in selected_requested
+    )
+
+    consumed_by_normal_plan: Counter[int] = Counter()
+    for allocation in result.allocation_rows:
+        if int(allocation["WAREHOUSE_SOURCE"]) == 444:
+            consumed_by_normal_plan[int(allocation["RETAIL_ID"])] += int(
+                allocation["QUANTITY"]
+            )
+
+    selected_by_sku: dict[int, list[tuple[int, dict[str, Any]]]] = defaultdict(list)
+    for input_order, row in enumerate(selected_requested):
+        selected_by_sku[int(row["RETAIL_ID"])].append((input_order, row))
+
+    final_quantities: dict[int, int] = {}
+    for sku, indexed_rows in selected_by_sku.items():
+        rule = INSUMO_STOCK_RULES.get(sku)
+        if rule is None:
+            rule = {"name": f"INSUMO {sku}", "target_stock": 0, "moq": 1}
+            result.warnings.append(
+                f"INSUMOS: PRODUCT_ID {sku} no tiene MOQ configurado; se aplicó "
+                "MOQ 1 para respetar el stock del warehouse 444."
+            )
+        moq = int(rule["moq"])
+        stock_components = engine.source_stock_components(catalogs, 444, sku)
+        adjusted_stock = int(stock_components["adjusted"])
+        consumed_units = int(consumed_by_normal_plan.get(sku, 0))
+        available_stock = max(adjusted_stock - consumed_units, 0)
+        available_batches = available_stock // moq
+
+        prepared_rows: list[dict[str, Any]] = []
+        requested_rounded_units = 0
+        moq_cut_units = 0
+        for input_order, row in indexed_rows:
+            requested_quantity = int(row["QUANTITY"])
+            requested_batches = requested_quantity // moq
+            rounded_quantity = requested_batches * moq
+            requested_rounded_units += rounded_quantity
+            moq_cut_units += requested_quantity - rounded_quantity
+            prepared_rows.append(
+                {
+                    "input_order": input_order,
+                    "row": row,
+                    "requested_quantity": requested_quantity,
+                    "requested_batches": requested_batches,
+                    "priority": catalogs.store_priority.get(
+                        int(row["WAREHOUSE_DESTINATION"]),
+                        100,
+                    ),
+                }
+            )
+
+        prepared_rows.sort(
+            key=lambda item: (
+                item["priority"],
+                int(item["row"]["WAREHOUSE_DESTINATION"]),
+                item["input_order"],
+            )
+        )
+        shipped_units = 0
+        for item in prepared_rows:
+            allocated_batches = min(item["requested_batches"], available_batches)
+            final_quantity = allocated_batches * moq
+            available_batches -= allocated_batches
+            final_quantities[item["input_order"]] = final_quantity
+            shipped_units += final_quantity
+            if final_quantity < item["requested_quantity"]:
+                summary["lines_reduced"] += 1
+            if final_quantity <= 0:
+                summary["lines_removed"] += 1
+
+        stock_cut_units = max(requested_rounded_units - shipped_units, 0)
+        summary["units_cut_stock"] += stock_cut_units
+        summary["units_cut_moq"] += moq_cut_units
+        summary["products_cut_stock"] += int(stock_cut_units > 0)
+        summary["stock_detail"].append(
+            {
+                "PRODUCT_ID": sku,
+                "INSUMO": rule["name"],
+                "TARGET_STOCK": int(rule["target_stock"]),
+                "MOQ": moq,
+                "STOCK_AJUSTADO_444": adjusted_stock,
+                "CONSUMIDO_PLAN_NORMAL": consumed_units,
+                "STOCK_DISPONIBLE_INSUMOS": available_stock,
+                "SOLICITADO": sum(
+                    int(item["requested_quantity"]) for item in prepared_rows
+                ),
+                "ENVIADO": shipped_units,
+                "RECORTE_STOCK": stock_cut_units,
+                "SOBRANTE_NO_UTILIZABLE": max(
+                    available_stock - shipped_units,
+                    0,
+                ),
+            }
+        )
+
+        if stock_cut_units > 0:
+            result.warnings.append(
+                f"INSUMOS {sku} ({rule['name']}): se solicitaron "
+                f"{sum(int(item['requested_quantity']) for item in prepared_rows):,} "
+                f"unidades y se enviaron {shipped_units:,}; se recortaron "
+                f"{stock_cut_units:,} por stock del 444, respetando MOQ {moq:,}."
+            )
+        if moq_cut_units > 0:
+            result.warnings.append(
+                f"INSUMOS {sku} ({rule['name']}): se recortaron "
+                f"{moq_cut_units:,} unidades adicionales porque las cantidades de "
+                f"Aleph no eran múltiplos completos del MOQ {moq:,}."
+            )
+
+    selected: list[dict[str, Any]] = []
+    for input_order, row in enumerate(selected_requested):
+        final_quantity = final_quantities.get(input_order, 0)
+        if final_quantity <= 0:
+            continue
+        adjusted_row = dict(row)
+        adjusted_row["QUANTITY"] = final_quantity
+        selected.append(adjusted_row)
+
+    if not selected:
+        summary["stock_detail"].sort(key=lambda row: row["PRODUCT_ID"])
+        return summary
+
+    bulk_path = next(
+        (path for path in local_files if path.name.lower() == "bulkcd_444.csv"),
+        None,
+    )
+    if bulk_path is None:
+        raise RuntimeError(
+            "Se encontraron insumos elegibles, pero no se generó BulkCD_444.csv."
+        )
+
+    for row in selected:
+        row.setdefault("WAREHOUSE_SOURCE", 444)
+    engine.enrich_rows_with_product_info(selected, catalogs)
+    engine.write_csv(
+        bulk_path,
+        consolidate_bulk_rows(regular_444_rows + selected),
+        BULK_OUTPUT_COLUMNS,
+    )
+    # SWA de Insumos: se calcula desde sus propias filas (no pasan por
+    # allocation_rows); es independiente del reporte central.
+    swa_seen_keys: set[tuple[int, int]] = set()
+    swa_ganado_insumos = 0.0
+    assigned_keys: set[tuple[int, int]] = set()
+    for row in selected:
+        key = (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"])
+        if row.get("QUANTITY", 0) > 0:
+            assigned_keys.add(key)
+        if key in swa_seen_keys:
+            continue
+        swa_seen_keys.add(key)
+        swa_ganado_insumos += row.get("SWA_POTENTIAL_GAIN_COUNTRY", 0.0) or 0.0
+    summary.update(
+        {
+            "lines_added": len(selected),
+            "units_added": sum(row["QUANTITY"] for row in selected),
+            "stores_added": len(
+                {row["WAREHOUSE_DESTINATION"] for row in selected}
+            ),
+            "swa_ganado": round(swa_ganado_insumos, 4),
+            # (destino, SKU) cubiertos por Insumos; build_swa_report los
+            # necesita porque Insumos no pasa por allocation_rows.
+            "assigned_keys": assigned_keys,
+        }
+    )
+    summary["stock_detail"].sort(key=lambda row: row["PRODUCT_ID"])
+    return summary
+
+
+def consolidate_bulk_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """El sistema operativo acepta una sola ruta origen-destino-SKU."""
+    grouped: dict[tuple[int, int, int], dict[str, Any]] = {}
+    for row in rows:
+        key = (
+            int(row["WAREHOUSE_SOURCE"]),
+            int(row["WAREHOUSE_DESTINATION"]),
+            int(row["RETAIL_ID"]),
+        )
+        existing = grouped.get(key)
+        if existing is None:
+            grouped[key] = dict(row)
+            continue
+        existing["QUANTITY"] = int(existing.get("QUANTITY", 0) or 0) + int(
+            row.get("QUANTITY", 0) or 0
+        )
+        for column in ("PLANNED_DATE", "ROUTE", "DELIVERY_PRIORITY", "STORAGE", "OWNER_NAME"):
+            if str(existing.get(column, "")) != str(row.get(column, "")):
+                raise ValueError(f"Bulk incompatible en {key}: {column}")
+        reasons = {
+            reason for item in (existing, row)
+            for reason in str(item.get(PLANNING_REASON_COLUMN, "")).split(" + ") if reason
+        }
+        existing[PLANNING_REASON_COLUMN] = " + ".join(sorted(reasons))
+    return [grouped[key] for key in sorted(grouped)]
+
+
+
+def rewrite_bulk_csvs_with_planning_reason(
+    local_files: list[Path],
+    result,
+) -> None:
+    """Agrega el origen de planeación únicamente a los CSV operativos Bulk."""
+    rows_by_source: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    rows_by_source_owner: dict[tuple[int, str], list[dict[str, Any]]] = (
+        defaultdict(list)
+    )
+    for row in result.allocation_rows:
+        source = int(row["WAREHOUSE_SOURCE"])
+        rows_by_source[source].append(row)
+        owner = engine.safe_filename(
+            engine.normalize_header(row.get("OWNER_NAME"))
+        )
+        if owner:
+            rows_by_source_owner[(source, owner)].append(row)
+
+    for path in local_files:
+        match = re.fullmatch(
+            r"BulkCD_(\d+)(?:_(.+))?\.csv",
+            path.name,
+            flags=re.IGNORECASE,
+        )
+        if match is None:
+            continue
+        source = int(match.group(1))
+        owner = match.group(2)
+        rows = (
+            rows_by_source_owner.get((source, owner), [])
+            if owner
+            else rows_by_source.get(source, [])
+        )
+        engine.write_csv(
+            path,
+            consolidate_bulk_rows(rows),
+            BULK_OUTPUT_COLUMNS,
+        )
+
+
+def sort_health_rows_for_display(
+    rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Agrupa las tarjetas de salud por tipo — IMPORTRANGE/BACKEND primero, ALEPH
+    después — en vez del orden de REQUIRED_DATABASE_SHEETS, que los mezcla.
+    """
+    card_type_priority = {"IMPORTRANGE": 0, "BACKEND": 0, "ALEPH": 1}
+    return sorted(rows, key=lambda row: card_type_priority.get(row["TIPO"], 0))
+
+
+def render_database_health(health: dict[str, Any]) -> None:
+    online = health["online"]
+    css_class = "online" if online else "review"
+    status = "ONLINE" if online else "REVISAR"
+    st.markdown(
+        f"""
+        <div class="database-status {css_class}">
+            <div class="database-title">BASE DE DATOS — {status}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    rows = sort_health_rows_for_display(health["rows"])
+    for start in range(0, len(rows), 4):
+        columns = st.columns(4)
+        for column, row in zip(columns, rows[start : start + 4]):
+            card_class = "ok" if row["ESTADO"] == "OK" else "error"
+            if row["TIPO"] == "ALEPH":
+                card_meta = "ÚLTIMA ACTUALIZACIÓN"
+            elif row["TIPO"] == "BACKEND":
+                card_meta = "BLOQUEO PERMANENTE"
+            else:
+                card_meta = "CONEXIÓN IMPORTRANGE"
+            show_result = row["TIPO"] == "ALEPH" or row["ESTADO"] == "ERROR"
+            result_html = (
+                f'<div class="source-card-result">{html.escape(row["DETALLE"])}</div>'
+                if show_result
+                else ""
+            )
+            description = SHEET_DESCRIPTIONS.get(
+                row["HOJA"], "Fuente de información utilizada por el modelo de abasto."
+            )
+            card_html = (
+                f'<div class="source-card {card_class}">'
+                f'<div><div class="source-card-name">{html.escape(row["HOJA"])}</div>'
+                f'<div class="source-card-meta">{card_meta}</div></div>'
+                f'{result_html}'
+                f'<div class="source-card-tooltip"><strong>QUÉ CONTIENE</strong>'
+                f'{html.escape(description)}</div>'
+                '</div>'
+            )
+            with column:
+                st.markdown(card_html, unsafe_allow_html=True)
+
+    if not online:
+        st.error(
+            f"Se detectaron {health['error_count']} hojas con problemas. "
+            "Revísalas antes de ejecutar la planeación."
+        )
+
+
+def create_zip(paths: list[Path], destination: Path) -> Path:
+    with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path in paths:
+            archive.write(path, arcname=path.name)
+    return destination
+
+
+def ordered_breakdown_rows(
+    status_counts: dict[str, int] | Counter[str],
+    status_swa: dict[str, float] | None = None,
+) -> list[dict[str, Any]]:
+    """status_swa (opcional): SWA_POTENTIAL_GAIN_COUNTRY sumado por el mismo
+    TIPO_DE_CORTE que agrupa status_counts.
+    """
+    order = {label: index for index, label in enumerate(BREAKDOWN_ORDER)}
+    status_swa = status_swa or {}
+    return [
+        {
+            "BREAKDOWN": status,
+            "FILAS": int(count),
+            **({"SWA": round(status_swa.get(status, 0.0), 4)} if status_swa else {}),
+        }
+        for status, count in sorted(
+            status_counts.items(),
+            key=lambda item: (order.get(item[0], len(order)), item[0]),
+        )
+        if count
+    ]
+
+
+# TIPO_DE_CORTE que solo generan los engines de cobertura opcional. Cualquier
+# TIPO_DE_CORTE que NO aparezca aquí se le atribuye a la pasada base
+# Naked/Solidus (la cascada principal de plan_transfers).
+# --- Registro de engines (orden real de ejecución) -------------------------
+# Naked → Otacon → Solidus → Shalashaska → Liquid → Venom → Kazuhira.
+ENGINE_ORDER = (
+    "Naked", "Otacon", "Solidus", "Shalashaska", "Liquid", "Venom", "Kazuhira", "Insumos",
+)
+NO_COVERAGE = "—"
+COVERAGE_FOUNTAIN9 = "Fountain9"
+COVERAGE_MINIMUMS = "Mínimos (hardcode)"
+COVERAGE_AVL = "AVL"
+COVERAGE_PREVENTIVE = "Preventivo"
+COVERAGE_SPECIAL_DOH = "Refuerzo (Infaltable/Golden/Anchor/KVI)"
+COVERAGE_NO_FOUNTAIN9 = "Cobertura sin Fountain9"
+COVERAGE_ORDER: dict[str, tuple[str, ...]] = {
+    "Naked": (COVERAGE_FOUNTAIN9,),
+    "Otacon": (COVERAGE_FOUNTAIN9, COVERAGE_MINIMUMS),
+    "Solidus": (
+        COVERAGE_AVL, COVERAGE_PREVENTIVE, COVERAGE_SPECIAL_DOH,
+        COVERAGE_NO_FOUNTAIN9,
+    ),
+}
+ENGINE_COVERAGE_BY_CUT: dict[str, tuple[str, str]] = {
+    "ENVIADOS PARA CUBRIR AVL": ("Solidus", COVERAGE_AVL),
+    "ENVIADOS PARA PREVENIR QUIEBRE": ("Solidus", COVERAGE_PREVENTIVE),
+    SPECIAL_DOH_CUT: ("Solidus", COVERAGE_SPECIAL_DOH),
+    NO_FOUNTAIN9_CUT: ("Solidus", COVERAGE_NO_FOUNTAIN9),
+    SHALASHASKA_CUT: ("Shalashaska", NO_COVERAGE),
+    LIQUID_CUT: ("Liquid", NO_COVERAGE),
+    VENOM_CUT: ("Venom", NO_COVERAGE),
+    KAZUHIRA_CUT: ("Kazuhira", NO_COVERAGE),
+}
+ENGINE_COVERAGE_BY_REASON: dict[str, tuple[str, str]] = {
+    PLANNING_REASON_FOUNTAIN9: ("Naked", COVERAGE_FOUNTAIN9),
+    PLANNING_REASON_OTACON: ("Otacon", COVERAGE_FOUNTAIN9),
+    PLANNING_REASON_MANUAL_FORECAST_ZERO: ("Otacon", COVERAGE_MINIMUMS),
+    PLANNING_REASON_AVL: ("Solidus", COVERAGE_AVL),
+    PLANNING_REASON_PREVENTIVE: ("Solidus", COVERAGE_PREVENTIVE),
+    PLANNING_REASON_SPECIAL_DOH: ("Solidus", COVERAGE_SPECIAL_DOH),
+    PLANNING_REASON_NO_FOUNTAIN9: ("Solidus", COVERAGE_NO_FOUNTAIN9),
+    SHALASHASKA_REASON: ("Shalashaska", NO_COVERAGE),
+    LIQUID_REASON: ("Liquid", NO_COVERAGE),
+    VENOM_REASON: ("Venom", NO_COVERAGE),
+    PLANNING_REASON_KAZUHIRA: ("Kazuhira", NO_COVERAGE),
+}
+SWEEP_ONLY_ENGINE = "Barrido de catálogo"
+
+ENGINE_INFO: dict[str, dict[str, Any]] = {
+    "Naked": {
+        "stage": "Etapa 1",
+        "role": "Ejecuta fielmente Allocation (DOI Based) de Fountain9.",
+        "position": "Primera pasada, con Source Id Before Multi Source fijo y sin mínimo.",
+        "card": "Ejecuta Allocation (DOI Based) desde el origen exacto que Fountain9 indicó. Sin mínimo y sin cambiar de origen.",
+        "how": (
+            "Toma Allocation (DOI Based) y Source Id Before Multi Source.",
+            "Respeta stock ajustado, capacidad de la tienda, bloqueos y el presupuesto de tareas.",
+            "Si no logra ejecutar una parte, declara el corte; Otacon puede recuperarla después.",
+        ),
+        "coverages": {
+            COVERAGE_FOUNTAIN9: "Allocation DOI de Fountain9.",
+        },
+    },
+    "Otacon": {
+        "stage": "Etapa 2",
+        "role": "Reasigna el inventario residual para cubrir la necesidad propia.",
+        "position": "Después de Naked; puede elegir un origen alternativo.",
+        "card": "Completa el residual con el máximo de MOV y columnas configuradas, descontando lo que Naked ejecutó.",
+        "how": (
+            "Conserva mínimos y reglas hardcode de Mother Base.",
+            "Calcula el máximo de las columnas configuradas y descuenta Naked ejecutado.",
+            "Puede reasignar el origen con el stock, capacidad y tareas remanentes.",
+        ),
+        "coverages": {COVERAGE_FOUNTAIN9: "Residual tras Naked.", COVERAGE_MINIMUMS: "Mínimos (hardcode)."},
+    },
+    "Shalashaska": {
+        "stage": "Etapa 4",
+        "role": "Evacúa inventario próximo a caducar (POR_MERMAR).",
+        "position": "Después de Solidus.",
+        "card": (
+            "Evacúa inventario próximo a caducar (POR_MERMAR) hacia tiendas que ya "
+            "reciben del mismo origen mediante Naked, Otacon o Solidus. Solo viaja a las ciudades que "
+            "ese origen cubre (puedes sumar más) y puede enviar solo un % de la merma."
+        ),
+        "how": (
+            "Envía a tiendas activadas por Naked, Otacon o Solidus desde el mismo origen; los mínimos solos no activan una ruta.",
+            "Solo a las ciudades que cubre cada origen (444, 811, 831 y 834: CDMX; 425: Guadalajara; 856 y 49: Monterrey) más las que agregues.",
+            "Puede evacuar solo un porcentaje de la merma y excluir categorías sensibles (Huevo).",
+            "Reparte parejo por ADU y luego por SHARE_VENTAS; POR_MERMAR no sustituye al stock final.",
+        ),
+    },
+    "Solidus": {
+        "stage": "Etapa 3",
+        "role": "Coberturas tácticas de catálogo con el stock, la capacidad y las tareas que quedan.",
+        "position": "Después de Otacon. Sus coberturas corren en cadena: AVL → Preventivo → Refuerzo → Cobertura sin Fountain9.",
+        "card": (
+            "Cuatro coberturas de catálogo con lo que sobra: AVL (quiebres), Preventivo "
+            "(inventario bajo), Refuerzo por bucket (Infaltable, Golden, Anchor, KVI) y "
+            "Cobertura sin Fountain9. Nunca toca una recomendación de Fountain9; si "
+            "falta capacidad o tareas, prioriza por SWA."
+        ),
+        "how": (
+            "Cada cobertura actúa solo donde Fountain9 no pidió algo positivo; nunca modifica una recomendación de Fountain9.",
+            "Refuerzo: Infaltable, Golden, Anchor y KVI con toggle y DOH propios; si un SKU está en varios buckets, gana el DOH más alto.",
+            "Con poca capacidad o tareas atiende primero el mayor SWA (toggle).",
+            "Comparten stock, capacidad y presupuesto de tareas con Naked, Otacon, Shalashaska y Liquid.",
+        ),
+        "coverages": {
+            COVERAGE_AVL: "Quiebres (stock 0) del catálogo, hasta el DOH objetivo.",
+            COVERAGE_PREVENTIVE: "Inventario bajo (< 1 DOH o < 3 unidades) sin recomendación positiva.",
+            COVERAGE_SPECIAL_DOH: "Lleva Infaltable, Golden, Anchor y KVI a su DOH objetivo (toggle y DOH por bucket).",
+            COVERAGE_NO_FOUNTAIN9: "Quiebres sin recomendación positiva, con Duration y Lead Time por tienda.",
+        },
+    },
+    "Liquid": {
+        "stage": "Etapa 5",
+        "role": "Agota el stock remanente de origen.",
+        "position": "Después de Shalashaska, antes de Venom.",
+        "card": (
+            "Agota el stock remanente de origen: SKUs que tú indicas y saldos bajo un "
+            "umbral. Solo envía a tiendas que ya recibieron producto de otro engine, "
+            "repartiendo por share de ventas hasta 14 DOH con el ADU de CATALOGO."
+        ),
+        "how": (
+            "Candidatos: SKUs manuales por origen y remanentes bajo el umbral.",
+            "Solo envía a tiendas que ya recibieron unidades de otro engine en la corrida; no exige el SKU en CATALOGO.",
+            "Nivela con el ADU de CATALOGO hasta 14 DOH y reparte por SHARE_VENTAS sin rebasar stock, capacidad ni tareas.",
+        ),
+    },
+    "Venom": {
+        "stage": "Etapa 6",
+        "role": "Recompone buffers DDMRP sobre lo ya planeado.",
+        "position": "Después de Liquid, antes de Kazuhira.",
+        "card": (
+            "Recompone buffers DDMRP sobre lo ya planeado: si la posición neta cae bajo "
+            "el disparador, pide hasta el techo verde. Configuras LTF, VF, ciclo de "
+            "pedido, múltiplo y SKUs específicos; puede usar una capacidad propia, "
+            "aparte de la de los demás engines."
+        ),
+        "how": (
+            "Calcula zonas roja, amarilla y verde por tienda-SKU con ADU, lead time, LTF, VF, mínimo de orden y ciclo de pedido.",
+            "Si el NFP (on-hand + on-order, con incoming opcional) cae bajo el disparador, ordena hasta el techo verde, redondeado al múltiplo de envío.",
+            "Sus líneas quedan separadas de las de otros engines. Con su tope usa la capacidad completa de la tienda, sin sumarse a lo ya usado ni restarlo a Kazuhira.",
+            "Acepta SKUs específicos por origen, aunque no califiquen en ningún tipo de sección.",
+        ),
+    },
+    "Kazuhira": {
+        "stage": "Etapa 7",
+        "role": "Garantía final: cubre todo quiebre que aún sea posible resolver.",
+        "position": "Última pasada, antes de la partición OWNER. Solo Big Boss.",
+        "card": (
+            "Última red de seguridad: cubre todo quiebre posible de las tiendas que se "
+            "planean hoy, venga o no de Fountain9. Lo que no cubre queda declarado con "
+            "su motivo. Solo Big Boss; puede ignorar el presupuesto de tareas o la "
+            "capacidad."
+        ),
+        "how": (
+            "Universo: tiendas que se planean hoy (Bulk de Fountain9 + SCHEDULE).",
+            "Dispara con (stock + incoming + asignado) / ADU < 1 DOH; sin fila en STOCK cuenta como 0.",
+            "Lo que no cubre queda declarado con su motivo. Opcionales: ignorar presupuesto de tareas, ignorar capacidad, priorizar por SWA.",
+        ),
+    },
+    "Insumos": {
+        "stage": "Anexo",
+        "role": "Anexa insumos al BulkCD_444 sin consumir tareas.",
+        "position": "Después de la partición OWNER.",
+        "how": (
+            "Solo tiendas que ya reciben producto normal del 444.",
+            "Limitado por stock ajustado y MOQ por insumo.",
+            "No consume el presupuesto de tareas.",
+        ),
+    },
+}
+
+
+def attribute_row(row: dict[str, Any]) -> tuple[str, str]:
+    """(engine, cobertura) que generó esta fila de BASE_TRANSFERS."""
+    tipo = str(row.get("TIPO_DE_CORTE", ""))
+    hit = ENGINE_COVERAGE_BY_CUT.get(tipo)
+    if hit is not None:
+        return hit
+    rule = str(row.get("REGLA_DEMANDA", ""))
+    if rule.startswith("KAZUHIRA_") or tipo in KAZUHIRA_UNCOVERED_LABELS.values():
+        return ("Kazuhira", NO_COVERAGE)        # huecos que Kazuhira declara
+    if rule.startswith("CATALOGO_"):
+        if tipo == CATALOG_UNIVERSE_POST_KAZUHIRA_CUT:
+            return ("Kazuhira", NO_COVERAGE)
+        return (SWEEP_ONLY_ENGINE, NO_COVERAGE)
+    if rule == "FOUNTAIN9_DOI":
+        return ("Naked", COVERAGE_FOUNTAIN9)
+    if rule in MANUAL_FORECAST_ZERO_RULES:
+        return ("Otacon", COVERAGE_MINIMUMS)
+    return ("Otacon", COVERAGE_FOUNTAIN9)
+
+
+def attribute_engine(tipo_de_corte: str) -> str:
+    """Engine que generó una línea según su TIPO_DE_CORTE (Naked si no es de otro)."""
+    return ENGINE_COVERAGE_BY_CUT.get(tipo_de_corte, ("Naked", ""))[0]
+
+
+def annotate_base_rows_with_engine(base_rows: list[dict[str, Any]]) -> None:
+    """Agrega ENGINE y COBERTURA a cada fila de BASE_TRANSFERS."""
+    for row in base_rows:
+        row["ENGINE"], row["COBERTURA"] = attribute_row(row)
+
+
+def build_planned_by_engine_rows(
+    result, insumos_summary: dict[str, Any] | None = None
+) -> list[dict[str, Any]]:
+    """Tabla 1: lo efectivamente planeado (CANTIDAD_ASIGNADA > 0), por engine, cobertura y causal."""
+    keyed: dict[tuple[str, str, str], dict[str, float]] = {}
+
+    def bucket(engine_name: str, coverage: str, tipo: str) -> dict[str, float]:
+        return keyed.setdefault(
+            (engine_name, coverage, tipo), {"casos": 0, "unidades": 0, "swa": 0.0}
+        )
+
+    for row in result.base_rows:
+        assigned = int(row.get("CANTIDAD_ASIGNADA", 0) or 0)
+        if assigned <= 0:
+            continue
+        engine_name, coverage = attribute_row(row)
+        item = bucket(engine_name, coverage, str(row.get("TIPO_DE_CORTE", "")))
+        item["casos"] += 1
+        item["unidades"] += assigned
+        item["swa"] += float(row.get("SWA_POTENTIAL_GAIN_COUNTRY", 0.0) or 0.0)
+
+    if insumos_summary and insumos_summary.get("lines_added"):
+        item = bucket("Insumos", NO_COVERAGE, "INSUMOS")
+        item["casos"] += int(insumos_summary["lines_added"])
+        item["unidades"] += int(insumos_summary.get("units_added", 0))
+
+    cut_order = {label: index for index, label in enumerate(BREAKDOWN_ORDER)}
+
+    def sort_key(key: tuple[str, str, str]) -> tuple[int, int, int, str]:
+        engine_name, coverage, tipo = key
+        engine_index = (
+            ENGINE_ORDER.index(engine_name)
+            if engine_name in ENGINE_ORDER
+            else len(ENGINE_ORDER)
+        )
+        coverages = COVERAGE_ORDER.get(engine_name, ())
+        coverage_index = (
+            coverages.index(coverage) if coverage in coverages else len(coverages)
+        )
+        return (engine_index, coverage_index, cut_order.get(tipo, len(cut_order)), tipo)
+
+    return [
+        {
+            "ENGINE": engine_name,
+            "COBERTURA": coverage,
+            "CAUSAL": tipo,
+            "CASOS": int(item["casos"]),
+            "UNIDADES": int(item["unidades"]),
+            "SWA_GANADO": round(item["swa"], 4),
+        }
+        for (engine_name, coverage, tipo), item in sorted(
+            keyed.items(), key=lambda kv: sort_key(kv[0])
+        )
+        if item["casos"]
+    ]
+
+
+def build_engine_summary_rows(
+    result,
+    insumos_summary: dict[str, Any] | None = None,
+    enabled: dict[tuple[str, str], bool] | None = None,
+) -> list[dict[str, Any]]:
+    """Una fila por engine (Naked y Solidus también por cobertura, con su total).
+
+    Casos y SWA salen de base_rows; tareas y unidades, de las líneas reales
+    (allocation_rows) según su PLANNING_REASON. ``enabled`` marca el estado.
+    """
+    enabled = enabled or {}
+    cases: Counter[tuple[str, str]] = Counter()
+    swa: Counter[tuple[str, str]] = Counter()
+    tasks: Counter[tuple[str, str]] = Counter()
+    units: Counter[tuple[str, str]] = Counter()
+    for row in result.base_rows:
+        if int(row.get("CANTIDAD_ASIGNADA", 0) or 0) <= 0:
+            continue
+        key = attribute_row(row)
+        cases[key] += 1
+        swa[key] += float(row.get("SWA_POTENTIAL_GAIN_COUNTRY", 0.0) or 0.0)
+    seen_task_keys = set()
+    for index, line in enumerate(getattr(result, "allocation_rows", [])):
+        key = ENGINE_COVERAGE_BY_REASON.get(
+            str(line.get(PLANNING_REASON_COLUMN, "")), ("Naked", COVERAGE_FOUNTAIN9)
+        )
+        task_key = tuple(line.get(c) for c in ("WAREHOUSE_SOURCE", "WAREHOUSE_DESTINATION", "RETAIL_ID", "OWNER_NAME"))
+        if task_key[:3] == (None, None, None):
+            task_key = ("fixture", index)
+        if task_key not in seen_task_keys:
+            tasks[key] += 1
+            seen_task_keys.add(task_key)
+        units[key] += int(line.get("QUANTITY", 0) or 0)
+    insumos_key = ("Insumos", NO_COVERAGE)
+    if insumos_summary:
+        cases[insumos_key] += int(insumos_summary.get("lines_added", 0) or 0)
+        units[insumos_key] += int(insumos_summary.get("units_added", 0) or 0)
+
+    def status(key: tuple[str, str]) -> str:
+        return "ACTIVO" if enabled.get(key, True) else "APAGADO"
+
+    def make_row(engine_name: str, coverage: str, what: str, keys) -> dict[str, Any]:
+        info = ENGINE_INFO[engine_name]
+        return {
+            "ETAPA": info["stage"],
+            "ENGINE": engine_name,
+            "COBERTURA": coverage,
+            "QUÉ HACE": what,
+            "ESTADO": status(keys[0]) if len(keys) == 1 else (
+                "ACTIVO" if any(status(k) == "ACTIVO" for k in keys) else "APAGADO"
+            ),
+            "CASOS": sum(cases[k] for k in keys),
+            "TAREAS": sum(tasks[k] for k in keys),
+            "UNIDADES": sum(units[k] for k in keys),
+            "SWA_GANADO": round(sum(swa[k] for k in keys), 4),
+        }
+
+    rows: list[dict[str, Any]] = []
+    for engine_name in ENGINE_ORDER:
+        info = ENGINE_INFO[engine_name]
+        coverages = COVERAGE_ORDER.get(engine_name)
+        if coverages:
+            keys = [(engine_name, c) for c in coverages]
+            rows.append(make_row(engine_name, "Total", info["role"], keys))
+            for coverage in coverages:
+                rows.append(
+                    make_row(
+                        engine_name, coverage, info["coverages"][coverage],
+                        [(engine_name, coverage)],
+                    )
+                )
+        else:
+            rows.append(
+                make_row(engine_name, NO_COVERAGE, info["role"], [(engine_name, NO_COVERAGE)])
+            )
+    return rows
+
+
+BUCKET_DISPLAY = {"INFALTABLE": "Infaltable", "GOLDEN": "Golden", "ANCHOR": "Anchor", "KVI": "KVI"}
+
+
+def special_doh_text(summary: dict[str, Any]) -> str:
+    """"Infaltable 3 DOH, Golden 5 DOH" a partir del resumen del Refuerzo."""
+    buckets = summary.get("doh_by_bucket") or {}
+    if not buckets:
+        return f"{summary.get('doh', 0):g} DOH"
+    return ", ".join(
+        f"{BUCKET_DISPLAY[bucket]} {value:g} DOH" for bucket, value in buckets.items()
+    )
+
+
+def venom_parameters_text(summary: dict[str, Any]) -> str:
+    """Una línea con los parámetros DDMRP con los que corrió Venom."""
+    zone = {"yellow": "amarillo", "red": "rojo", "green": "verde"}.get(
+        summary.get("trigger_zone", "yellow"), "amarillo"
+    )
+    parts = [
+        f"Lead time {summary.get('lead_time_days', 0):g} d",
+        f"LTF {summary.get('ltf', 0):g}",
+        f"VF {summary.get('vf', 0):g}",
+        f"disparador techo {zone}",
+    ]
+    if summary.get("order_cycle_days"):
+        parts.append(f"ciclo de pedido {summary['order_cycle_days']:g} d")
+    if summary.get("shipping_multiple", 1) > 1:
+        parts.append(f"múltiplo {summary['shipping_multiple']}")
+    parts.append("con incoming" if summary.get("consider_incoming") else "sin incoming")
+    parts.append(
+        "tope de capacidad propio" if summary.get("cap_to_store_capacity") else "sin tope de capacidad"
+    )
+    if summary.get("manual_pairs"):
+        parts.append(f"{summary['manual_pairs']:,} tienda-SKU específicas")
+    return "Parámetros: " + " · ".join(parts) + "."
+
+
+def swa_card(engine_name: str, swa_by_engine: dict[str, float]) -> dict[str, Any]:
+    """Tarjeta KPI estándar de 'SWA ganado' para la sección de un engine
+    específico — mismo formato en las 9 secciones de REPORTE POR ENGINE."""
+    return {
+        "category": "SWA · GANADO",
+        "label": "SWA PAÍS CAPTURADO",
+        "value": f"{swa_by_engine.get(engine_name, 0.0):,.4f}",
+        "description": (
+            f"SWA país ganado específicamente por {engine_name} — tienda-SKU "
+            "que estaban en quiebre y este engine sacó del quiebre."
+        ),
+        "tone": "acid",
+    }
+
+
+def swa_ganado_by_engine(
+    planned_by_engine_rows: list[dict[str, Any]],
+) -> dict[str, float]:
+    """SWA ganado por engine y por cobertura (Solidus = suma de sus 4) — reusa lo
+    que ya calculó build_planned_by_engine_rows en vez de recorrer
+    base_rows otra vez por cada sección de engine en la UI."""
+    totals: dict[str, float] = defaultdict(float)
+    for row in planned_by_engine_rows:
+        totals[row["ENGINE"]] += row.get("SWA_GANADO", 0.0)
+        coverage = row.get("COBERTURA", NO_COVERAGE)
+        if coverage != NO_COVERAGE:
+            totals[coverage] += row.get("SWA_GANADO", 0.0)
+    return dict(totals)
+
+
+def build_cuts_detail_rows(
+    result,
+    closed_summary: dict[str, Any] | None = None,
+    block_summary: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Tabla 2: lo no enviado (CANTIDAD_ASIGNADA == 0), con motivo específico (incluye
+    sub-motivos de COPÉRNICO).
+    """
+    counts: Counter[str] = Counter()
+    units_missing: Counter[str] = Counter()
+    swa_perdido: Counter[str] = Counter()
+    for row in result.base_rows:
+        if int(row.get("CANTIDAD_ASIGNADA", 0) or 0) > 0:
+            continue
+        tipo = str(row.get("TIPO_DE_CORTE", ""))
+        if tipo in ("SIN RECOMENDACIÓN", CATALOG_UNIVERSE_HEALTHY_CUT):
+            continue  # ninguno de los dos es un corte real: no había nada que cubrir
+        counts[tipo] += 1
+        units_missing[tipo] += int(row.get("CANTIDAD_OBJETIVO", 0) or 0)
+        swa_perdido[tipo] += float(row.get("SWA_POTENTIAL_GAIN_COUNTRY", 0.0) or 0.0)
+
+    if closed_summary and closed_summary.get("requirements"):
+        counts["CORTE POR TIENDA CERRADA"] += int(closed_summary["requirements"])
+        units_missing["CORTE POR TIENDA CERRADA"] += int(
+            closed_summary.get("target_units", 0)
+        )
+    if block_summary and block_summary.get("requirements"):
+        counts["CORTE POR CIUDAD BLOQUEADA"] += int(block_summary["requirements"])
+        units_missing["CORTE POR CIUDAD BLOQUEADA"] += int(
+            block_summary.get("target_units", 0)
+        )
+
+    order = {label: index for index, label in enumerate(BREAKDOWN_ORDER)}
+    return [
+        {
+            "CAUSAL": tipo,
+            "CASOS": count,
+            "UNIDADES_SIN_CUBRIR": units_missing[tipo],
+            "SWA_PERDIDO": round(swa_perdido[tipo], 4),
+        }
+        for tipo, count in sorted(
+            counts.items(),
+            key=lambda item: (order.get(item[0], len(order)), item[0]),
+        )
+        if count
+    ]
+
+
+# Motivos de SIN RECOMENDACIÓN, solo con columnas del Bulk de Fountain9. Todo
+# SKU aquí cumple opening >= demanda: los motivos distinguen el tipo de
+# cobertura.
+NO_RECOMMENDATION_AMPLE_MARGIN_MULTIPLIER = 2.0
+
+NO_RECOMMENDATION_REASONS = (
+    "SIN DEMANDA PROYECTADA",
+    "TRANSFERENCIA ENTRE TIENDAS CUBRE LA NECESIDAD",
+    "INVENTARIO CON AMPLIO MARGEN",
+    "INVENTARIO SUFICIENTE CON MARGEN AJUSTADO",
+    "SIN MOTIVO IDENTIFICADO",
+)
+
+
+def classify_no_recommendation_reason(row: dict[str, Any]) -> str:
+    """Clasifica UNA fila SIN RECOMENDACIÓN en su motivo específico, usando solo
+    PREDICTED_DEMAND, PREDICTED_OPENING_INVENTORY y NET_INTER_STORE_TRANSFERS.
+    """
+    demand = float(row.get("PREDICTED_DEMAND", 0) or 0)
+    opening = float(row.get("PREDICTED_OPENING_INVENTORY", 0) or 0)
+    net_transfer = float(row.get("NET_INTER_STORE_TRANSFERS", 0) or 0)
+
+    if demand <= 0:
+        return "SIN DEMANDA PROYECTADA"
+    if net_transfer >= demand:
+        return "TRANSFERENCIA ENTRE TIENDAS CUBRE LA NECESIDAD"
+    if opening >= demand * NO_RECOMMENDATION_AMPLE_MARGIN_MULTIPLIER:
+        return "INVENTARIO CON AMPLIO MARGEN"
+    if opening >= demand:
+        return "INVENTARIO SUFICIENTE CON MARGEN AJUSTADO"
+    return "SIN MOTIVO IDENTIFICADO"
+
+
+def build_no_recommendation_breakdown(result) -> list[dict[str, Any]]:
+    """Tabla 3: por qué Fountain9 no pidió nada (TIPO_DE_CORTE = SIN RECOMENDACIÓN)."""
+    counts: Counter[str] = Counter()
+    swa_informativo: Counter[str] = Counter()
+    for row in result.base_rows:
+        if row.get("TIPO_DE_CORTE") != "SIN RECOMENDACIÓN":
+            continue
+        reason = classify_no_recommendation_reason(row)
+        counts[reason] += 1
+        swa_informativo[reason] += float(
+            row.get("SWA_POTENTIAL_GAIN_COUNTRY", 0.0) or 0.0
+        )
+
+    order = {label: index for index, label in enumerate(NO_RECOMMENDATION_REASONS)}
+    return [
+        {
+            "MOTIVO": reason,
+            "CASOS": count,
+            "SWA_INFORMATIVO": round(swa_informativo[reason], 4),
+        }
+        for reason, count in sorted(
+            counts.items(), key=lambda item: (order.get(item[0], len(order)), item[0])
+        )
+        if count
+    ]
+
+
+def _coverage_stats(keys_with_qty: list[tuple[tuple[int, int], float]]) -> dict[str, Any]:
+    """Productos/tiendas/piezas/tareas a partir de pares (llave, cantidad),
+    contando solo cantidades > 0."""
+    productos: set[int] = set()
+    tiendas: set[int] = set()
+    piezas = 0.0
+    tareas = 0
+    for (destination, sku), qty in keys_with_qty:
+        if qty > 0:
+            productos.add(sku)
+            tiendas.add(destination)
+            piezas += qty
+            tareas += 1
+    return {
+        "productos": len(productos),
+        "tiendas": len(tiendas),
+        "piezas": int(piezas),
+        "tareas": tareas,
+    }
+
+
+def scheduled_destinations_today(
+    catalogs, origins: Iterable[int]
+) -> set[int]:
+    """Tiendas con día válido hoy en SCHEDULE para algún origen seleccionado
+    (independiente del toggle de bloqueo).
+    """
+    origin_set = set(origins)
+    return {
+        destination
+        for (destination, source), days in catalogs.schedule_days.items()
+        if source in origin_set and catalogs.run_weekday_norm in days
+    }
+
+
+def build_planned_store_universe(
+    consolidated_keys: Iterable[tuple[int, int]],
+    catalogs,
+    origins: Iterable[int],
+) -> dict[str, set[int]]:
+    """Universo de tiendas "que se planean hoy": las que traen filas en el
+    Bulk de Fountain9 de esta corrida MÁS las que SCHEDULE marca con día
+    válido hoy aunque Fountain9 no las haya arrojado."""
+    from_fountain9 = {destination for destination, _sku in consolidated_keys}
+    from_schedule = scheduled_destinations_today(catalogs, origins)
+    return {
+        "stores": from_fountain9 | from_schedule,
+        "from_fountain9": from_fountain9,
+        "from_schedule": from_schedule,
+        "schedule_only": from_schedule - from_fountain9,
+    }
+
+
+def explain_store_sku(zip_path, store: int, sku: int) -> dict[str, Any]:
+    """Qué pasó con una tienda-SKU, leyendo el zip de la corrida: enviada, declarada,
+    sana o sin rastro.
+    """
+    result: dict[str, Any] = {
+        "store": store, "sku": sku, "sent": [], "declared": [],
+        "healthy": None, "verdict": "",
+    }
+    with zipfile.ZipFile(zip_path) as archive:
+        names = archive.namelist()
+        for name in names:
+            base = Path(name).name
+            if base.startswith("BulkCD_") and base.endswith(".csv"):
+                text = archive.read(name).decode("utf-8-sig", errors="replace")
+                for row in csv.DictReader(io.StringIO(text)):
+                    if (
+                        str(row.get("WAREHOUSE_DESTINATION", "")).strip() == str(store)
+                        and str(row.get("RETAIL_ID", "")).strip() == str(sku)
+                    ):
+                        result["sent"].append(
+                            {
+                                "ARCHIVO": base,
+                                "ORIGEN": row.get("WAREHOUSE_SOURCE"),
+                                "UNIDADES": row.get("QUANTITY"),
+                                "MOTIVO": row.get("PLANNING_REASON", ""),
+                            }
+                        )
+            elif base.startswith("Universo_Catalogo_Sin_Necesidad") and base.endswith(".csv"):
+                with archive.open(name) as handle:
+                    reader = csv.DictReader(
+                        io.TextIOWrapper(handle, encoding="utf-8-sig", newline="")
+                    )
+                    for row in reader:
+                        if (
+                            str(row.get("WAREHOUSE_DESTINATION", "")).strip() == str(store)
+                            and str(row.get("RETAIL_ID", "")).strip() == str(sku)
+                        ):
+                            result["healthy"] = {
+                                "STOCK": row.get("PREDICTED_OPENING_INVENTORY"),
+                                "ESTADO": row.get("TIPO_DE_CORTE"),
+                            }
+                            break
+            elif base.endswith(".xlsx"):
+                workbook = openpyxl.load_workbook(
+                    io.BytesIO(archive.read(name)), read_only=True, data_only=True
+                )
+                try:
+                    if "BASE_TRANSFERS" in workbook.sheetnames:
+                        rows = workbook["BASE_TRANSFERS"].iter_rows(values_only=True)
+                        headers = list(next(rows, ()) or ())
+                        position = {h: i for i, h in enumerate(headers)}
+                        wanted = (
+                            "TIPO_DE_CORTE", "DETALLE_MOTIVO", "MOTIVO_KAZUHIRA",
+                            "REGLA_DEMANDA", "CANTIDAD_OBJETIVO", "CANTIDAD_ASIGNADA",
+                        )
+                        d_idx = position.get("WAREHOUSE_DESTINATION")
+                        s_idx = position.get("RETAIL_ID")
+                        if d_idx is not None and s_idx is not None:
+                            for row in rows:
+                                if row[d_idx] == store and row[s_idx] == sku:
+                                    result["declared"].append(
+                                        {
+                                            h: row[position[h]]
+                                            for h in wanted
+                                            if h in position
+                                        }
+                                    )
+                finally:
+                    workbook.close()
+
+    if result["sent"]:
+        total = sum(int(float(item["UNIDADES"] or 0)) for item in result["sent"])
+        result["verdict"] = f"SE ENVIÓ: {total:,} unidades en {len(result['sent'])} línea(s)."
+    elif result["declared"]:
+        result["verdict"] = "NO SE ENVIÓ, y la corrida declara por qué (ver detalle)."
+    elif result["healthy"]:
+        result["verdict"] = "SANO: no necesitaba envío (ver stock)."
+    else:
+        result["verdict"] = (
+            "SIN RASTRO: no aparece enviado, declarado ni como sano. Es un "
+            "hueco sin declarar. Revisa, en este orden: (1) ¿Kazuhira o algún "
+            "engine de cobertura estaba activo? Sin ninguno, el barrido no "
+            "corre. (2) ¿La tienda está en el Bulk de Fountain9 o en SCHEDULE "
+            "con día válido hoy? (3) ¿La tienda-SKU está en la hoja CATALOGO? "
+            "(4) ¿La tienda está cerrada o en una ciudad bloqueada?"
+        )
+    return result
+
+
+def kazuhira_reason_text(reason: str | None) -> str:
+    """Texto corto del motivo por el que Kazuhira no cubrió una tienda-SKU
+    (vacío si no aplica o si era SANO — no es un hueco)."""
+    label = KAZUHIRA_UNCOVERED_LABELS.get(reason or "")
+    return label.split(" · ", 1)[1] if label else ""
+
+
+def annotate_base_rows_with_kazuhira_reasons(
+    base_rows: list[dict[str, Any]],
+    skip_reasons: dict[tuple[int, int], str],
+) -> None:
+    """Agrega MOTIVO_KAZUHIRA a TODAS las filas de base_rows (vacío si no
+    aplica) — todas, no solo las afectadas, porque el Excel toma sus
+    columnas de la primera fila."""
+    for row in base_rows:
+        reason = skip_reasons.get(
+            (row.get("WAREHOUSE_DESTINATION"), row.get("RETAIL_ID"))
+        )
+        row["MOTIVO_KAZUHIRA"] = row.get("MOTIVO_KAZUHIRA") or kazuhira_reason_text(
+            reason
+        )
+
+
+def resolve_duration_lead_time_with_city_fallback(
+    catalogs,
+    duration_mode_by_store: dict[int, float],
+    lead_time_mode_by_store: dict[int, float],
+) -> tuple[dict[int, float], dict[int, float], dict[int, str]]:
+    """Cascada de Duration/Lead Time por tienda: propia → promedio de la misma ciudad
+    (el promedio país lo aplica quien llama).
+    """
+    own = {
+        store: (duration_mode_by_store[store], lead_time_mode_by_store[store])
+        for store in duration_mode_by_store
+        if duration_mode_by_store.get(store) is not None
+        and lead_time_mode_by_store.get(store) is not None
+    }
+    by_city: dict[str, list[tuple[float, float]]] = defaultdict(list)
+    for store, values in own.items():
+        city = catalogs.stores.get(store, {}).get("city_norm", "")
+        if city:
+            by_city[city].append(values)
+
+    duration = {store: values[0] for store, values in own.items()}
+    lead_time = {store: values[1] for store, values in own.items()}
+    source = {store: "PROPIA" for store in own}
+    for store, info in catalogs.stores.items():
+        if store in own:
+            continue
+        samples = by_city.get(info.get("city_norm", ""))
+        if not samples:
+            continue
+        duration[store] = sum(v[0] for v in samples) / len(samples)
+        lead_time[store] = sum(v[1] for v in samples) / len(samples)
+        source[store] = "CIUDAD"
+    return duration, lead_time, source
+
+
+def compute_fallback_duration_and_lead_time(
+    duration_mode_by_store: dict[int, float],
+    lead_time_mode_by_store: dict[int, float],
+) -> tuple[float | None, float | None]:
+    """Promedio país de Duration y Lead Time entre las tiendas con moda propia."""
+    duration_values = [v for v in duration_mode_by_store.values() if v is not None]
+    lead_time_values = [v for v in lead_time_mode_by_store.values() if v is not None]
+    fallback_duration = (
+        sum(duration_values) / len(duration_values) if duration_values else None
+    )
+    fallback_lead_time = (
+        sum(lead_time_values) / len(lead_time_values) if lead_time_values else None
+    )
+    return fallback_duration, fallback_lead_time
+
+
+def build_assigned_totals_by_key(
+    result,
+    extra_assigned_keys: set[tuple[int, int]] | None = None,
+) -> dict[tuple[int, int], float]:
+    """Suma CANTIDAD/QUANTITY asignada por (destino, SKU) a través de TODOS los engines
+    de esta corrida.
+    """
+    totals: dict[tuple[int, int], float] = defaultdict(float)
+    for row in result.allocation_rows:
+        key = (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"])
+        totals[key] += row["QUANTITY"]
+    for key in extra_assigned_keys or set():
+        if totals[key] <= 0:
+            totals[key] = 1.0
+    return totals
+
+
+def get_swa_potential_gain(catalogs, destination: int, sku: int) -> float:
+    """SWA país que se ganaría si esta tienda-SKU sale del quiebre. 0 si
+    no aparece en la hoja SWA — nunca bloquea nada, es puramente
+    informativo."""
+    return catalogs.swa_potential_gain.get((destination, sku), 0.0)
+
+
+def iter_catalog_universe_sweep_rows(
+    catalog_rows: list[dict[str, Any]],
+    catalogs,
+    existing_keys: set[tuple[int, int]],
+    kazuhira_active: bool = False,
+    allowed_destinations: set[int] | None = None,
+    skip_reasons: dict[tuple[int, int], str] | None = None,
+    closed_store_ids: set[int] | None = None,
+    blocked_cities: tuple[str, ...] = (),
+) -> list[dict[str, Any]]:
+    """Filas de solo visibilidad: una por tienda-SKU de CATALOGO que ningún engine tocó
+    (etiquetas CATALOG_UNIVERSE_*).
+    """
+    seen_in_sweep: set[tuple[int, int]] = set()
+    blocked_city_set = set(blocked_cities)
+    for row in catalog_rows:
+        destination = row["WAREHOUSE_DESTINATION"]
+        sku = row["RETAIL_ID"]
+        key = (destination, sku)
+        if allowed_destinations is not None and destination not in allowed_destinations:
+            continue
+        # Tiendas cerradas, ciudades bloqueadas y productos excluidos ya se
+        # reportan por sus propios resúmenes: no son huecos de cobertura.
+        if closed_store_ids and destination in closed_store_ids:
+            continue
+        if blocked_city_set and (
+            catalogs.stores.get(destination, {}).get("city_norm", "")
+            in blocked_city_set
+        ):
+            continue
+        if key in existing_keys or key in seen_in_sweep:
+            continue
+
+        destination_stock = max(catalogs.stock_base.get(key, 0.0), 0.0)
+        store = catalogs.stores.get(destination, {})
+        # Con Kazuhira activo, él decide qué es "sano" (posición >= 1 DOH) y
+        # por qué no cubrió cada hueco; el criterio de stock > 0 solo aplica
+        # cuando no hay un motivo registrado.
+        kazuhira_reason = (
+            skip_reasons.get(key) if (kazuhira_active and skip_reasons) else None
+        )
+        if destination_stock <= 0 and sku in catalogs.excluded_products:
+            tipo_de_corte = CATALOG_UNIVERSE_EXCLUDED_PRODUCT_CUT
+            regla_demanda = CATALOG_UNIVERSE_EXCLUDED_PRODUCT_REGLA
+        elif destination_stock <= 0 and destination not in catalogs.stores:
+            tipo_de_corte = CATALOG_UNIVERSE_NO_STORE_CUT
+            regla_demanda = CATALOG_UNIVERSE_NO_STORE_REGLA
+        elif kazuhira_reason == KAZUHIRA_REASON_HEALTHY:
+            tipo_de_corte = CATALOG_UNIVERSE_HEALTHY_CUT
+            regla_demanda = CATALOG_UNIVERSE_HEALTHY_REGLA
+        elif kazuhira_reason is not None:
+            tipo_de_corte = KAZUHIRA_UNCOVERED_LABELS.get(
+                kazuhira_reason, CATALOG_UNIVERSE_POST_KAZUHIRA_CUT
+            )
+            regla_demanda = f"KAZUHIRA_{kazuhira_reason}"
+        elif destination_stock > 0:
+            tipo_de_corte = CATALOG_UNIVERSE_HEALTHY_CUT
+            regla_demanda = CATALOG_UNIVERSE_HEALTHY_REGLA
+        elif kazuhira_active:
+            tipo_de_corte = CATALOG_UNIVERSE_POST_KAZUHIRA_CUT
+            regla_demanda = CATALOG_UNIVERSE_POST_KAZUHIRA_REGLA
+        else:
+            tipo_de_corte = CATALOG_UNIVERSE_UNCOVERED_CUT
+            regla_demanda = CATALOG_UNIVERSE_UNCOVERED_REGLA
+
+        if tipo_de_corte != CATALOG_UNIVERSE_HEALTHY_CUT:
+            # Solo los huecos se recuerdan para deduplicar: guardar cada
+            # llave sana costaría cientos de MB en un catálogo grande, y
+            # load_avl_catalog_rows ya entrega una fila por tienda-SKU.
+            seen_in_sweep.add(key)
+        yield {
+                "WAREHOUSE_DESTINATION": destination,
+                "RETAIL_ID": sku,
+                "CITY": store.get("city", ""),
+                "CITY_NORMALIZED": store.get("city_norm", ""),
+                "WAREHOUSE_NAME": store.get("warehouse_name", ""),
+                "CANTIDAD_OBJETIVO": 0,
+                "CANTIDAD_ASIGNADA": 0,
+                "TIPO_DE_CORTE": tipo_de_corte,
+                "REGLA_DEMANDA": regla_demanda,
+                "MOTIVO_KAZUHIRA": kazuhira_reason_text(kazuhira_reason),
+                "PREDICTED_DEMAND": 0.0,
+                "PREDICTED_OPENING_INVENTORY": destination_stock,
+                "NET_INTER_STORE_TRANSFERS": 0.0,
+        }
+
+
+def build_catalog_universe_sweep_rows(
+    catalog_rows: list[dict[str, Any]],
+    catalogs,
+    existing_keys: set[tuple[int, int]],
+    **kwargs: Any,
+) -> list[dict[str, Any]]:
+    """Versión en lista de iter_catalog_universe_sweep_rows (tests y catálogos chicos)."""
+    return list(
+        iter_catalog_universe_sweep_rows(catalog_rows, catalogs, existing_keys, **kwargs)
+    )
+
+
+def build_swa_report(
+    catalog_rows: list[dict[str, Any]],
+    catalogs,
+    result,
+    insumos_summary: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """SWA ganado/perdido sobre todo el universo de quiebres del catálogo. Ganado es
+    binario: cualquier envío que saque la tienda-SKU del quiebre captura su
+    SWA_POTENTIAL_GAIN_COUNTRY completo.
+    """
+    extra_keys = (insumos_summary or {}).get("assigned_keys", set())
+    assigned_totals = build_assigned_totals_by_key(result, extra_keys)
+
+    swa_ganado = 0.0
+    swa_perdido = 0.0
+    casos_ganados = 0
+    casos_perdidos = 0
+    casos_sin_swa_registrado = 0
+
+    seen_keys: set[tuple[int, int]] = set()
+    for row in catalog_rows:
+        destination = row["WAREHOUSE_DESTINATION"]
+        sku = row["RETAIL_ID"]
+        key = (destination, sku)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+
+        stock_initial = max(catalogs.stock_base.get(key, 0.0), 0.0)
+        if stock_initial > 0:
+            continue  # no es quiebre, SWA no aplica aquí
+
+        swa_value = get_swa_potential_gain(catalogs, destination, sku)
+        total_assigned = assigned_totals.get(key, 0.0)
+        ganado = total_assigned > 0
+
+        if swa_value <= 0:
+            casos_sin_swa_registrado += 1
+
+        if ganado:
+            swa_ganado += swa_value
+            casos_ganados += 1
+        else:
+            swa_perdido += swa_value
+            casos_perdidos += 1
+
+
+    return {
+        "enabled": bool(catalogs.swa_potential_gain),
+        "swa_ganado": round(swa_ganado, 4),
+        "swa_perdido": round(swa_perdido, 4),
+        "casos_ganados": casos_ganados,
+        "casos_perdidos": casos_perdidos,
+        "casos_sin_swa_registrado": casos_sin_swa_registrado,
+        "universo_total": casos_ganados + casos_perdidos,
+    }
+
+
+def build_fountain9_comparison_report(
+    result,
+    catalogs,
+    consolidated: dict[tuple[int, int], dict[str, Any]],
+) -> dict[str, Any]:
+    """Compara 'Allocation (DOI Based)' de Fountain9 contra Mother Base en tres
+    bloques: mismo alcance, adicional (fuera del alcance de Fountain9) y total.
+    """
+    universe = [
+        (key, record)
+        for key, record in consolidated.items()
+        if record.get("FOUNTAIN9_ALLOCATION") is not None
+    ]
+    if not universe:
+        return {"enabled": False}
+
+    universe_keys = {key for key, _record in universe}
+    our_assigned: dict[tuple[int, int], float] = defaultdict(float)
+    for row in result.allocation_rows:
+        key = (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"])
+        our_assigned[key] += row["QUANTITY"]
+
+    f9_productos: set[int] = set()
+    f9_tiendas: set[int] = set()
+    f9_piezas = 0.0
+    f9_tareas = 0
+    mb_productos: set[int] = set()
+    mb_tiendas: set[int] = set()
+    mb_piezas = 0.0
+    mb_tareas = 0
+    total_rupturas = 0
+    f9_rupturas_cubiertas = 0
+    mb_rupturas_cubiertas = 0
+    ambos_cubrieron = 0
+    solo_f9 = 0
+    solo_mb = 0
+    ninguno_cubrio = 0
+    f9_swa_ganado = 0.0
+    mb_swa_ganado_mismo_alcance = 0.0
+
+    for key, record in universe:
+        destination, sku = key
+        f9_qty = record["FOUNTAIN9_ALLOCATION"] or 0.0
+        mb_qty = our_assigned.get(key, 0.0)
+        destination_stock = max(catalogs.stock_base.get(key, 0.0), 0.0)
+        is_stockout = destination_stock <= 0
+        f9_covered = f9_qty > 0
+        mb_covered = mb_qty > 0
+
+        if f9_covered:
+            f9_productos.add(sku)
+            f9_tiendas.add(destination)
+            f9_piezas += f9_qty
+            f9_tareas += 1
+        if mb_covered:
+            mb_productos.add(sku)
+            mb_tiendas.add(destination)
+            mb_piezas += mb_qty
+            mb_tareas += 1
+
+        if is_stockout:
+            total_rupturas += 1
+            swa_value = get_swa_potential_gain(catalogs, destination, sku)
+            if f9_covered:
+                f9_rupturas_cubiertas += 1
+                f9_swa_ganado += swa_value
+            if mb_covered:
+                mb_rupturas_cubiertas += 1
+                mb_swa_ganado_mismo_alcance += swa_value
+            if f9_covered and mb_covered:
+                ambos_cubrieron += 1
+            elif f9_covered:
+                solo_f9 += 1
+            elif mb_covered:
+                solo_mb += 1
+            else:
+                ninguno_cubrio += 1
+
+    # Bloque adicional: lo asignado a tienda-SKU que Fountain9 nunca evaluó.
+    # SWA exige stock = 0, igual que arriba.
+    additional_pairs = [
+        (key, qty)
+        for key, qty in our_assigned.items()
+        if key not in universe_keys
+    ]
+    mother_base_adicional = _coverage_stats(additional_pairs)
+    mb_swa_ganado_adicional = sum(
+        get_swa_potential_gain(catalogs, destination, sku)
+        for (destination, sku), qty in additional_pairs
+        if qty > 0 and max(catalogs.stock_base.get((destination, sku), 0.0), 0.0) <= 0
+    )
+    mother_base_adicional["swa_ganado"] = round(mb_swa_ganado_adicional, 4)
+
+    mother_base_mismo_alcance = {
+        "productos": len(mb_productos),
+        "tiendas": len(mb_tiendas),
+        "piezas": int(mb_piezas),
+        "tareas": mb_tareas,
+        "rupturas_cubiertas": mb_rupturas_cubiertas,
+        "swa_ganado": round(mb_swa_ganado_mismo_alcance, 4),
+    }
+    mother_base_total = {
+        "productos": len(mb_productos | {sku for (_d, sku), q in additional_pairs if q > 0}),
+        "tiendas": len(mb_tiendas | {d for (d, _sku), q in additional_pairs if q > 0}),
+        "piezas": mother_base_mismo_alcance["piezas"] + mother_base_adicional["piezas"],
+        "tareas": mother_base_mismo_alcance["tareas"] + mother_base_adicional["tareas"],
+        "swa_ganado": round(mb_swa_ganado_mismo_alcance + mb_swa_ganado_adicional, 4),
+    }
+
+    return {
+        "enabled": True,
+        "universo_total": len(universe),
+        "mother_base_adicional": mother_base_adicional,
+        "mother_base_total": mother_base_total,
+        "fountain9": {
+            "productos": len(f9_productos),
+            "tiendas": len(f9_tiendas),
+            "piezas": int(f9_piezas),
+            "tareas": f9_tareas,
+            "rupturas_cubiertas": f9_rupturas_cubiertas,
+            "swa_ganado": round(f9_swa_ganado, 4),
+        },
+        "mother_base_mismo_alcance": mother_base_mismo_alcance,
+        "total_rupturas": total_rupturas,
+        "ambos_cubrieron": ambos_cubrieron,
+        "solo_fountain9": solo_f9,
+        "solo_mother_base": solo_mb,
+        "ninguno_cubrio": ninguno_cubrio,
+    }
+
+
+def build_fountain9_audit(result, instructions, excluded=None, naked_enabled=True):
+    """Concilia DOI por origen F9 sin duplicar la recuperación entre instrucciones."""
+    excluded = excluded or {}
+    naked = Counter()
+    otacon = Counter()
+    other = Counter()
+    total = Counter()
+    for row in result.allocation_rows:
+        key = (int(row["WAREHOUSE_DESTINATION"]), int(row["RETAIL_ID"]))
+        qty = int(row["QUANTITY"])
+        reason = row.get(PLANNING_REASON_COLUMN, "")
+        total[key] += qty
+        if reason == PLANNING_REASON_FOUNTAIN9:
+            naked[(row["WAREHOUSE_SOURCE"], *key)] += qty
+        elif reason in (PLANNING_REASON_OTACON, PLANNING_REASON_MANUAL_FORECAST_ZERO):
+            otacon[key] += qty
+        else:
+            other[key] += qty
+    cuts = {}
+    final_cuts = defaultdict(set)
+    for row in result.base_rows:
+        key = (int(row["WAREHOUSE_DESTINATION"]), int(row["RETAIL_ID"]))
+        if row.get("REGLA_DEMANDA") == "FOUNTAIN9_DOI":
+            cuts[(row.get("F9_SOURCE"), *key)] = row.get("TIPO_DE_CORTE", "")
+        if int(row.get("CANTIDAD_FALTANTE", 0) or 0) > 0:
+            final_cuts[key].add(str(row.get("TIPO_DE_CORTE", "")))
+    rows = []
+    for instruction in instructions:
+        source = instruction.get("WAREHOUSE_SOURCE")
+        key = (int(instruction["WAREHOUSE_DESTINATION"]), int(instruction["RETAIL_ID"]))
+        requested = int(instruction["QUANTITY"])
+        literal = min(requested, naked[(source, *key)])
+        recovered = min(requested - literal, otacon[key])
+        otacon[key] -= recovered
+        later = min(requested - literal - recovered, other[key])
+        other[key] -= later
+        covered = literal + recovered + later
+        cause = "" if literal == requested else (
+            excluded.get(key) or ("NAKED_DESACTIVADO" if not naked_enabled else
+                                  cuts.get((source, *key), "SIN_ASIGNACION")))
+        rows.append({
+            "ORIGEN_F9": source if source is not None else "",
+            "WAREHOUSE_DESTINATION": key[0], "RETAIL_ID": key[1],
+            "DOI_SOLICITADO": requested, "NAKED_EJECUTADO": literal,
+            "CUMPLIMIENTO_NAKED_PCT": round(100 * literal / requested, 2),
+            "MOTIVO_CORTE_NAKED": cause,
+            "OTACON_RECUPERADO": recovered, "OTROS_ENGINES_RECUPERADO": later,
+            "COBERTURA_FINAL_MB": covered, "FALTANTE_FINAL": requested - covered,
+            "MOTIVO_FALTANTE_FINAL": (excluded.get(key) or " | ".join(sorted(final_cuts[key])) or cause) if covered < requested else "",
+            **instruction.get("REFERENCE", {}),
+        })
+    return rows
+
+
+def clear_previous_workspace() -> None:
+    previous = st.session_state.pop("last_workspace", "")
+    if not previous:
+        return
+    path = Path(previous)
+    temp_root = Path(tempfile.gettempdir()).resolve()
+    resolved = path.resolve()
+    if temp_root in resolved.parents and resolved.name.startswith("transfer_planner_"):
+        shutil.rmtree(resolved, ignore_errors=True)
+
+
+def percentage(numerator: float, denominator: float) -> float:
+    if denominator <= 0:
+        return 0.0
+    return round((numerator / denominator) * 100, 1)
+
+
+def resolved_storage(value: Any) -> str:
+    raw = engine.clean_text(value)
+    if raw.upper() in MISSING_STORAGE_VALUES:
+        return DEFAULT_STORAGE
+    return raw
+
+
+def is_fruver_storage(value: Any) -> bool:
+    normalized = engine.normalize_header(value)
+    return "FRUVER" in normalized
+
+
+def normalize_result_storage(result) -> None:
+    """Garantiza una clasificación operativa en reportes y archivos Bulk."""
+    for row in result.base_rows:
+        row["STORAGE"] = resolved_storage(row.get("STORAGE"))
+    for row in result.allocation_rows:
+        row["STORAGE"] = resolved_storage(row.get("STORAGE"))
+
+
+def apply_fruver_811_block(
+    catalogs,
+    origins: tuple[int, ...],
+    requested: bool,
+) -> dict[str, Any]:
+    """Vuelve no elegible el stock FRUVER del origen 811 antes de planear."""
+    summary = {
+        "requested": requested,
+        "enabled": requested and 811 in origins,
+        "products_identified": 0,
+        "products_with_stock_blocked": 0,
+        "units_blocked": 0.0,
+    }
+    if not summary["enabled"]:
+        return summary
+
+    fruver_skus = {
+        sku
+        for sku, storage_name in catalogs.storage.items()
+        if is_fruver_storage(storage_name)
+    }
+    summary["products_identified"] = len(fruver_skus)
+    for sku in fruver_skus:
+        key = (811, sku)
+        base_stock = max(float(catalogs.stock_base.get(key, 0.0)), 0.0)
+        already_unavailable = max(
+            float(catalogs.unavailable_stock.get(key, 0.0)),
+            0.0,
+        )
+        newly_blocked = max(base_stock - already_unavailable, 0.0)
+        if newly_blocked <= 0:
+            continue
+        catalogs.unavailable_stock[key] = max(already_unavailable, base_stock)
+        summary["products_with_stock_blocked"] += 1
+        summary["units_blocked"] += newly_blocked
+
+    summary["units_blocked"] = round(summary["units_blocked"], 3)
+    return summary
+
+
+def build_planning_analytics(
+    result,
+    configured_origins: tuple[int, ...] = (),
+) -> dict[str, Any]:
+    base_rows = result.base_rows
+    allocation_rows = result.allocation_rows
+
+    def original_roq_units(row: dict[str, Any]) -> int:
+        return max(int(math.ceil(max(float(row["MOV_ORIGINAL"]), 0.0))), 0)
+
+    eligible_rows = [row for row in base_rows if row["CANTIDAD_OBJETIVO"] > 0]
+    # "Requerido" en Planeación Lista debe reflejar SOLO la necesidad original
+    # de Naked/Solidus (la pasada base con Fountain9), nunca lo que los
+    # engines de cobertura agregan después como objetivo propio.
+    naked_eligible_rows = [
+        row
+        for row in eligible_rows
+        if row.get("REGLA_DEMANDA") not in ENGINE_TOPUP_REGLA_DEMANDA
+    ]
+    assigned_rows = [row for row in eligible_rows if row["CANTIDAD_ASIGNADA"] > 0]
+    fully_covered_rows = [
+        row
+        for row in eligible_rows
+        if row["CANTIDAD_ASIGNADA"] >= row["CANTIDAD_OBJETIVO"]
+    ]
+    partially_covered_rows = [
+        row
+        for row in eligible_rows
+        if 0 < row["CANTIDAD_ASIGNADA"] < row["CANTIDAD_OBJETIVO"]
+    ]
+    not_assigned_rows = [
+        row for row in eligible_rows if row["CANTIDAD_ASIGNADA"] <= 0
+    ]
+
+    city_accumulators: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {
+            "stores": set(),
+            "products": set(),
+            "units": 0,
+            "tasks": 0,
+            "m3": 0.0,
+        }
+    )
+    store_accumulators: dict[tuple[str, int, str], dict[str, Any]] = defaultdict(
+        lambda: {"products": set(), "units": 0, "tasks": 0, "m3": 0.0}
+    )
+
+    for row in assigned_rows:
+        city = row.get("CITY") or "SIN CIUDAD"
+        destination = row["WAREHOUSE_DESTINATION"]
+        warehouse_name = row.get("WAREHOUSE_NAME") or "SIN NOMBRE"
+        sku = row["RETAIL_ID"]
+        units = int(row["CANTIDAD_ASIGNADA"])
+        tasks = int(row["TAREAS_GENERADAS"])
+        assigned_m3 = float(row["M3_ASIGNADO"])
+
+        city_data = city_accumulators[city]
+        city_data["stores"].add(destination)
+        city_data["products"].add(sku)
+        city_data["units"] += units
+        city_data["tasks"] += tasks
+        city_data["m3"] += assigned_m3
+
+        store_data = store_accumulators[(city, destination, warehouse_name)]
+        store_data["products"].add(sku)
+        store_data["units"] += units
+        store_data["tasks"] += tasks
+        store_data["m3"] += assigned_m3
+
+    city_rows = [
+        {
+            "CIUDAD": city,
+            "TIENDAS_ATENDIDAS": len(data["stores"]),
+            "PRODUCTOS_DISTINTOS": len(data["products"]),
+            "UNIDADES": data["units"],
+            "M3": round(data["m3"], 2),
+            "TAREAS": data["tasks"],
+        }
+        for city, data in sorted(city_accumulators.items())
+    ]
+    store_rows = [
+        {
+            "CIUDAD": city,
+            "WAREHOUSE_ID": destination,
+            "TIENDA": warehouse_name,
+            "PRODUCTOS_DISTINTOS": len(data["products"]),
+            "UNIDADES": data["units"],
+            "M3": round(data["m3"], 2),
+            "TAREAS": data["tasks"],
+        }
+        for (city, destination, warehouse_name), data in store_accumulators.items()
+    ]
+    store_rows.sort(key=lambda row: (row["CIUDAD"], -row["UNIDADES"], row["WAREHOUSE_ID"]))
+
+    stockout_rows = [
+        row for row in eligible_rows if bool(row.get("ES_STOCKOUT", False))
+    ]
+    stockout_served = [row for row in stockout_rows if row["CANTIDAD_ASIGNADA"] > 0]
+    stockout_fully_covered = [
+        row
+        for row in stockout_rows
+        if row["CANTIDAD_ASIGNADA"] >= row["CANTIDAD_OBJETIVO"]
+    ]
+    forecast_zero_forced = [
+        row
+        for row in eligible_rows
+        if row["REGLA_DEMANDA"] == "HARDCODE_4_CERO_TOTAL"
+    ]
+    forecast_zero_served = [
+        row for row in forecast_zero_forced if row["CANTIDAD_ASIGNADA"] > 0
+    ]
+    deficit_forced = [
+        row
+        for row in eligible_rows
+        if row["REGLA_DEMANDA"] == "HARDCODE_3_INVENTARIO_MENOR_DEMANDA"
+    ]
+    net_transfer_forced = [
+        row
+        for row in eligible_rows
+        if row["REGLA_DEMANDA"] == "HARDCODE_3_NET_TRANSFER_BAJO"
+    ]
+    minimum_three_applied = [
+        row
+        for row in eligible_rows
+        if 0 < row["MOV_ORIGINAL"] < 3 and row["CANTIDAD_OBJETIVO"] == 3
+    ]
+    golden_rows = [
+        row
+        for row in eligible_rows
+        if row.get("TIPO_PRIORIDAD_PRODUCTO")
+        in {"INFALTABLE", "GOLDEN", "ANCHOR"}
+    ]
+
+    rule_accumulators: dict[str, dict[str, float]] = defaultdict(
+        lambda: {
+            "cases": 0,
+            "served": 0,
+            "full": 0,
+            "original_roq_units": 0,
+            "hardcode_target_units": 0,
+            "hardcode_assigned_units": 0,
+            "target_units": 0,
+            "assigned_units": 0,
+        }
+    )
+    for row in base_rows:
+        rule = row["REGLA_DEMANDA"]
+        data = rule_accumulators[rule]
+        target = int(row["CANTIDAD_OBJETIVO"])
+        assigned = int(row["CANTIDAD_ASIGNADA"])
+        original_roq = original_roq_units(row)
+        hardcode_target = max(target - original_roq, 0)
+        hardcode_assigned = max(assigned - original_roq, 0)
+        data["cases"] += 1
+        data["served"] += int(assigned > 0)
+        data["full"] += int(target > 0 and assigned >= target)
+        data["original_roq_units"] += original_roq
+        data["hardcode_target_units"] += hardcode_target
+        data["hardcode_assigned_units"] += hardcode_assigned
+        data["target_units"] += target
+        data["assigned_units"] += assigned
+
+    rule_order = {rule: index for index, rule in enumerate(DEMAND_RULE_LABELS)}
+    rule_rows = []
+    for rule, data in sorted(
+        rule_accumulators.items(), key=lambda item: rule_order.get(item[0], 999)
+    ):
+        rule_rows.append(
+            {
+                "REGLA": DEMAND_RULE_LABELS.get(rule, rule),
+                "CASOS": int(data["cases"]),
+                "CASOS_CON_ENVIO": int(data["served"]),
+                "COBERTURA_COMPLETA": int(data["full"]),
+                "UNIDADES_ROQ_ORIGINAL": int(data["original_roq_units"]),
+                "INCREMENTO_HARDCODE_OBJETIVO": int(
+                    data["hardcode_target_units"]
+                ),
+                "INCREMENTO_HARDCODE_ENVIADO": int(
+                    data["hardcode_assigned_units"]
+                ),
+                "UNIDADES_OBJETIVO": int(data["target_units"]),
+                "UNIDADES_ASIGNADAS": int(data["assigned_units"]),
+                "COMPLIANCE_UNIDADES_%": percentage(
+                    data["assigned_units"], data["target_units"]
+                ),
+            }
+        )
+
+    stockout_city_accumulators: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {
+            "cases": 0,
+            "served": 0,
+            "full": 0,
+            "products": set(),
+            "units": 0,
+        }
+    )
+    for row in stockout_rows:
+        city = row.get("CITY") or "SIN CIUDAD"
+        data = stockout_city_accumulators[city]
+        assigned = int(row["CANTIDAD_ASIGNADA"])
+        data["cases"] += 1
+        if assigned > 0:
+            data["served"] += 1
+            data["products"].add(row["RETAIL_ID"])
+            data["units"] += assigned
+        if assigned >= row["CANTIDAD_OBJETIVO"]:
+            data["full"] += 1
+
+    stockout_city_rows = [
+        {
+            "CIUDAD": city,
+            "CASOS_STOCKOUT": data["cases"],
+            "CASOS_CON_ENVIO": data["served"],
+            "COBERTURA_COMPLETA": data["full"],
+            "PRODUCTOS_DISTINTOS_ATENDIDOS": len(data["products"]),
+            "UNIDADES_ASIGNADAS": data["units"],
+            "ATENCION_%": percentage(data["served"], data["cases"]),
+        }
+        for city, data in sorted(stockout_city_accumulators.items())
+    ]
+
+    m3_by_destination_sku = {
+        (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"]): row["M3_POR_UNIDAD"]
+        for row in base_rows
+    }
+    base_by_destination_sku = {
+        (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"]): row
+        for row in base_rows
+    }
+    source_accumulators: dict[int, dict[str, Any]] = defaultdict(
+        lambda: {
+            "tasks": 0,
+            "units": 0,
+            "products": set(),
+            "stores": set(),
+            "m3": 0.0,
+        }
+    )
+    source_city_accumulators: dict[tuple[int, str], dict[str, Any]] = defaultdict(
+        lambda: {
+            "stores": set(),
+            "products": set(),
+            "tasks": 0,
+            "units": 0,
+            "m3": 0.0,
+        }
+    )
+    source_store_accumulators: dict[
+        tuple[int, str, int, str], dict[str, Any]
+    ] = defaultdict(
+        lambda: {"products": set(), "tasks": 0, "units": 0, "m3": 0.0}
+    )
+    source_storage_accumulators: dict[
+        tuple[int, str], dict[str, Any]
+    ] = defaultdict(
+        lambda: {
+            "products": set(),
+            "stores": set(),
+            "tasks": 0,
+            "units": 0,
+            "m3": 0.0,
+        }
+    )
+
+    source_order = list(dict.fromkeys(configured_origins))
+    for source in source_order:
+        source_accumulators[source]
+
+    for row in allocation_rows:
+        source = row["WAREHOUSE_SOURCE"]
+        if source not in source_order:
+            source_order.append(source)
+        data = source_accumulators[source]
+        quantity = int(row["QUANTITY"])
+        destination = row["WAREHOUSE_DESTINATION"]
+        sku = row["RETAIL_ID"]
+        base_row = base_by_destination_sku.get((destination, sku), {})
+        city = row.get("CITY") or base_row.get("CITY") or "SIN CIUDAD"
+        warehouse_name = (
+            base_row.get("WAREHOUSE_NAME") or f"WAREHOUSE {destination}"
+        )
+        storage = resolved_storage(row.get("STORAGE"))
+        line_m3 = quantity * float(
+            m3_by_destination_sku.get((destination, sku), 0.0)
+        )
+        data["tasks"] += 1
+        data["units"] += quantity
+        data["products"].add(sku)
+        data["stores"].add(destination)
+        data["m3"] += line_m3
+
+        city_data = source_city_accumulators[(source, city)]
+        city_data["stores"].add(destination)
+        city_data["products"].add(sku)
+        city_data["tasks"] += 1
+        city_data["units"] += quantity
+        city_data["m3"] += line_m3
+
+        store_data = source_store_accumulators[
+            (source, city, destination, warehouse_name)
+        ]
+        store_data["products"].add(sku)
+        store_data["tasks"] += 1
+        store_data["units"] += quantity
+        store_data["m3"] += line_m3
+
+        storage_data = source_storage_accumulators[(source, storage)]
+        storage_data["products"].add(sku)
+        storage_data["stores"].add(destination)
+        storage_data["tasks"] += 1
+        storage_data["units"] += quantity
+        storage_data["m3"] += line_m3
+
+    total_source_tasks = sum(
+        source_accumulators[source]["tasks"] for source in source_order
+    )
+    total_source_units = sum(
+        source_accumulators[source]["units"] for source in source_order
+    )
+    source_rows: list[dict[str, Any]] = []
+    for source in source_order:
+        data = source_accumulators[source]
+        source_rows.append(
+            {
+                "WAREHOUSE_SOURCE": source,
+                "NOMBRE": ORIGIN_WAREHOUSES.get(source, "ORIGEN CONFIGURADO"),
+                "TAREAS": data["tasks"],
+                "UNIDADES": data["units"],
+                "PRODUCTOS_DISTINTOS": len(data["products"]),
+                "TIENDAS_ATENDIDAS": len(data["stores"]),
+                "M3": round(data["m3"], 2),
+                "UNIDADES_POR_TAREA": round(
+                    data["units"] / data["tasks"], 2
+                )
+                if data["tasks"]
+                else 0.0,
+                "PARTICIPACION_TAREAS_%": percentage(
+                    data["tasks"], total_source_tasks
+                ),
+                "PARTICIPACION_UNIDADES_%": percentage(
+                    data["units"], total_source_units
+                ),
+            }
+        )
+
+    source_details: list[dict[str, Any]] = []
+    for source, source_summary in zip(source_order, source_rows):
+        city_detail_rows = [
+            {
+                "CIUDAD": city,
+                "TIENDAS_ATENDIDAS": len(data["stores"]),
+                "PRODUCTOS_DISTINTOS": len(data["products"]),
+                "TAREAS": data["tasks"],
+                "UNIDADES": data["units"],
+                "M3": round(data["m3"], 2),
+            }
+            for (row_source, city), data in source_city_accumulators.items()
+            if row_source == source
+        ]
+        city_detail_rows.sort(key=lambda row: (-row["UNIDADES"], row["CIUDAD"]))
+
+        store_detail_rows = [
+            {
+                "CIUDAD": city,
+                "WAREHOUSE_ID": destination,
+                "TIENDA": warehouse_name,
+                "PRODUCTOS_DISTINTOS": len(data["products"]),
+                "TAREAS": data["tasks"],
+                "UNIDADES": data["units"],
+                "M3": round(data["m3"], 2),
+            }
+            for (
+                row_source,
+                city,
+                destination,
+                warehouse_name,
+            ), data in source_store_accumulators.items()
+            if row_source == source
+        ]
+        store_detail_rows.sort(
+            key=lambda row: (-row["UNIDADES"], row["WAREHOUSE_ID"])
+        )
+
+        storage_detail_rows = [
+            {
+                "STORAGE": storage,
+                "PRODUCTOS_DISTINTOS": len(data["products"]),
+                "TIENDAS_ATENDIDAS": len(data["stores"]),
+                "TAREAS": data["tasks"],
+                "UNIDADES": data["units"],
+                "M3": round(data["m3"], 2),
+            }
+            for (
+                row_source,
+                storage,
+            ), data in source_storage_accumulators.items()
+            if row_source == source
+        ]
+        storage_detail_rows.sort(
+            key=lambda row: (-row["UNIDADES"], row["STORAGE"])
+        )
+
+        source_details.append(
+            {
+                "warehouse_source": source,
+                "name": ORIGIN_WAREHOUSES.get(source, "ORIGEN CONFIGURADO"),
+                "summary": source_summary,
+                "city_rows": city_detail_rows,
+                "store_rows": store_detail_rows,
+                "storage_rows": storage_detail_rows,
+            }
+        )
+
+    target_units, target_m3 = engine.planning_target_totals(eligible_rows)
+    assigned_units = sum(int(row["CANTIDAD_ASIGNADA"]) for row in eligible_rows)
+    # Solo Naked/Solidus (necesidad original de Fountain9) — para las
+    # tarjetas "Requerido" de Planeación Lista, que nunca deben incluir lo
+    # que AVL/Shalashaska/Liquid/Venom agregan como su propia cobertura.
+    need_by_key = {}
+    doi_by_key = Counter()
+    volume_by_key = {}
+    for row in naked_eligible_rows:
+        key = (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"])
+        target = int(row["CANTIDAD_OBJETIVO"])
+        if row.get("REGLA_DEMANDA") == "FOUNTAIN9_DOI":
+            doi_by_key[key] += target
+        else:
+            need_by_key[key] = max(need_by_key.get(key, 0), int(row.get("MB_TOTAL_TARGET", 0) or target))
+        volume_by_key[key] = float(row["M3_OBJETIVO"]) / target if target else 0
+    for key, qty in doi_by_key.items():
+        need_by_key[key] = max(need_by_key.get(key, 0), qty)
+    naked_eligible_cases = len(need_by_key)
+    naked_target_units = sum(need_by_key.values())
+    naked_target_m3 = sum(qty * volume_by_key[key] for key, qty in need_by_key.items())
+    original_roq_total = sum(original_roq_units(row) for row in eligible_rows)
+    original_roq_fulfilled = sum(
+        min(int(row["CANTIDAD_ASIGNADA"]), original_roq_units(row))
+        for row in eligible_rows
+    )
+    hardcode_target_units = sum(
+        max(int(row["CANTIDAD_OBJETIVO"]) - original_roq_units(row), 0)
+        for row in eligible_rows
+    )
+    hardcode_assigned_units = sum(
+        max(int(row["CANTIDAD_ASIGNADA"]) - original_roq_units(row), 0)
+        for row in eligible_rows
+    )
+    hardcode_cases = sum(
+        int(row["CANTIDAD_OBJETIVO"]) > original_roq_units(row)
+        for row in eligible_rows
+    )
+    return {
+        "city_rows": city_rows,
+        "store_rows": store_rows,
+        "rule_rows": rule_rows,
+        "stockout_city_rows": stockout_city_rows,
+        "source_rows": source_rows,
+        "source_details": source_details,
+        "summary": {
+            "eligible_cases": len(eligible_rows),
+            "fully_covered_cases": len(fully_covered_rows),
+            "partial_cases": len(partially_covered_rows),
+            "not_assigned_cases": len(not_assigned_rows),
+            "target_units": target_units,
+            "assigned_units": assigned_units,
+            "target_m3": round(target_m3, 2),
+            "naked_eligible_cases": naked_eligible_cases,
+            "naked_target_units": naked_target_units,
+            "naked_target_m3": round(naked_target_m3, 2),
+            "case_compliance_pct": percentage(
+                len(fully_covered_rows), len(eligible_rows)
+            ),
+            "case_service_pct": percentage(len(assigned_rows), len(eligible_rows)),
+            "unit_compliance_pct": percentage(assigned_units, target_units),
+            "original_roq_units": original_roq_total,
+            "original_roq_fulfilled_units": original_roq_fulfilled,
+            "original_roq_compliance_pct": percentage(
+                original_roq_fulfilled, original_roq_total
+            ),
+            "hardcode_cases": hardcode_cases,
+            "hardcode_target_units": hardcode_target_units,
+            "hardcode_assigned_units": hardcode_assigned_units,
+            "m3_assigned": round(
+                sum(float(row["M3_ASIGNADO"]) for row in assigned_rows), 3
+            ),
+            "cities_served": len(city_rows),
+            "stores_served": len(store_rows),
+            "products_served": len({row["RETAIL_ID"] for row in assigned_rows}),
+            "stockout_cases": len(stockout_rows),
+            "stockout_cases_served": len(stockout_served),
+            "stockout_cases_full": len(stockout_fully_covered),
+            "stockout_products_served": len(
+                {row["RETAIL_ID"] for row in stockout_served}
+            ),
+            "stockout_stores_served": len(
+                {row["WAREHOUSE_DESTINATION"] for row in stockout_served}
+            ),
+            "stockout_attention_pct": percentage(
+                len(stockout_served), len(stockout_rows)
+            ),
+            "forecast_zero_forced_cases": len(forecast_zero_forced),
+            "forecast_zero_served_cases": len(forecast_zero_served),
+            "forecast_zero_target_units": sum(
+                int(row["CANTIDAD_OBJETIVO"]) for row in forecast_zero_forced
+            ),
+            "forecast_zero_assigned_units": sum(
+                int(row["CANTIDAD_ASIGNADA"]) for row in forecast_zero_forced
+            ),
+            "deficit_forced_cases": len(deficit_forced),
+            "deficit_forced_served_cases": sum(
+                row["CANTIDAD_ASIGNADA"] > 0 for row in deficit_forced
+            ),
+            "net_transfer_forced_cases": len(net_transfer_forced),
+            "net_transfer_forced_served_cases": sum(
+                row["CANTIDAD_ASIGNADA"] > 0 for row in net_transfer_forced
+            ),
+            "minimum_three_cases": len(minimum_three_applied),
+            "golden_cases": len(golden_rows),
+            "golden_served_cases": sum(
+                row["CANTIDAD_ASIGNADA"] > 0 for row in golden_rows
+            ),
+        },
+    }
+
+
+def apply_reporting_labels(result) -> None:
+    """Cambia únicamente etiquetas de salida; las reglas internas no se alteran."""
+    for row in result.base_rows:
+        cut_type = str(row.get("TIPO_DE_CORTE", ""))
+        assigned = int(row.get("CANTIDAD_ASIGNADA", 0) or 0)
+        target = int(row.get("CANTIDAD_OBJETIVO", 0) or 0)
+        stock_excluded_by_rack_444 = max(
+            float(row.get("STOCK_BASE_444", 0) or 0)
+            - float(row.get("NO_DISPONIBLE_444", 0) or 0)
+            - float(row.get("COPERNICO_NO_USABLE_444", 0) or 0),
+            0.0,
+        )
+        row["STOCK_EXCLUIDO_RACKEADO_444"] = stock_excluded_by_rack_444
+        if (
+            bool(row.get("RACKEADO_444", False))
+            and (row.get("REGLA_DEMANDA") != "FOUNTAIN9_DOI" or row.get("F9_SOURCE") == 444)
+            and stock_excluded_by_rack_444 > 0
+            and assigned < target
+            and "CORTE POR STOCK" in cut_type
+        ):
+            if assigned > 0:
+                row["TIPO_DE_CORTE"] = (
+                    "OK PARCIAL - CORTE POR PRODUCTO RACKEADO 444"
+                )
+                row["DETALLE_MOTIVO"] = (
+                    f"Asignadas {assigned} de {target}; el SKU está excluido al "
+                    "100% del stock utilizable del warehouse 444 por RACKEADOS."
+                )
+            else:
+                row["TIPO_DE_CORTE"] = "CORTE POR PRODUCTO RACKEADO 444"
+                row["DETALLE_MOTIVO"] = (
+                    "El SKU está excluido al 100% del stock utilizable del "
+                    "warehouse 444 por RACKEADOS."
+                )
+
+        if row.get("TIPO_DE_CORTE") == "SIN DEMANDA":
+            row["TIPO_DE_CORTE"] = "SIN RECOMENDACIÓN"
+
+        demand_rule = row.get("REGLA_DEMANDA")
+        cut_label_map = {
+            "SIN RUTA DE COSTOS": "CORTE POR RUTA DE COSTOS",
+            "BLOQUEO REGIONAL": "CORTE POR BLOQUEO REGIONAL",
+            "OK PARCIAL - BLOQUEO REGIONAL": (
+                "OK PARCIAL - CORTE POR BLOQUEO REGIONAL"
+            ),
+            "BLOQUEO POR FRECUENCIA": "CORTE POR FRECUENCIA DE ENVÍO",
+            "OK PARCIAL - BLOQUEO POR FRECUENCIA": (
+                "OK PARCIAL - CORTE POR FRECUENCIA DE ENVÍO"
+            ),
+        }
+        current_cut = row.get("TIPO_DE_CORTE")
+        if current_cut == "OK":
+            row["TIPO_DE_CORTE"] = HARDCODE_CUT_LABELS.get(
+                demand_rule, "OK COMPLETO POR FOUNTAIN9"
+            )
+        elif (
+            current_cut == "OK PARCIAL - CORTE POR CAPACIDAD DE TAREAS"
+            and demand_rule in MANUAL_FORECAST_ZERO_RULES
+        ):
+            row["TIPO_DE_CORTE"] = (
+                "OK MANUAL PARCIAL POR CUPO DE TAREAS"
+            )
+        elif current_cut in cut_label_map:
+            row["TIPO_DE_CORTE"] = cut_label_map[current_cut]
+
+        detail = row.get("DETALLE_MOTIVO")
+        if isinstance(detail, str):
+            row["DETALLE_MOTIVO"] = detail.replace("MOV", "ROQ").replace(
+                "Sin demanda", "Sin recomendación"
+            )
+
+        if isinstance(demand_rule, str):
+            row["REGLA_DEMANDA"] = demand_rule.replace(
+                "SIN_DEMANDA", "SIN_RECOMENDACION"
+            ).replace("MOV", "ROQ")
+
+        if "MOV_ORIGINAL" in row:
+            renamed_row: dict[str, Any] = {}
+            for key, value in row.items():
+                renamed_row["ROQ_ORIGINAL" if key == "MOV_ORIGINAL" else key] = value
+            row.clear()
+            row.update(renamed_row)
+
+
+SCHEDULE_CUT_LABELS = {
+    "CORTE POR FRECUENCIA DE ENVÍO",
+    "OK PARCIAL - CORTE POR FRECUENCIA DE ENVÍO",
+}
+
+def is_copernico_cut_label(tipo_de_corte: str) -> bool:
+    """True si el TIPO_DE_CORTE es cualquier variante de corte por COPÉRNICO,
+    con o sin el motivo específico como sufijo (LOST, CANCELADOS,
+    ZONA 856, OTRO)."""
+    return tipo_de_corte.startswith("CORTE POR COPÉRNICO") or tipo_de_corte.startswith(
+        "OK PARCIAL - CORTE POR COPÉRNICO"
+    )
+
+
+def copernico_cut_summary(result) -> dict[str, Any]:
+    """Cuantifica cuánta demanda no se planificó por exclusiones de COPÉRNICO (ubicación
+    no usable, LOST, etc.).
+    """
+    affected_rows = [
+        row
+        for row in result.base_rows
+        if is_copernico_cut_label(str(row.get("TIPO_DE_CORTE", "")))
+    ]
+    summary: dict[str, Any] = {
+        "requirements_full_cut": 0,
+        "requirements_partial_cut": 0,
+        "stores": 0,
+        "products": 0,
+        "units_missing": 0,
+    }
+    if not affected_rows:
+        return summary
+
+    stores: set[int] = set()
+    products: set[int] = set()
+    units_missing = 0
+    full_cut = 0
+    partial_cut = 0
+    for row in affected_rows:
+        stores.add(row["WAREHOUSE_DESTINATION"])
+        products.add(row["RETAIL_ID"])
+        target = int(row.get("CANTIDAD_OBJETIVO", 0) or 0)
+        assigned = int(row.get("CANTIDAD_ASIGNADA", 0) or 0)
+        units_missing += max(target - assigned, 0)
+        if str(row.get("TIPO_DE_CORTE", "")).startswith("OK PARCIAL"):
+            partial_cut += 1
+        else:
+            full_cut += 1
+
+    summary.update(
+        {
+            "requirements_full_cut": full_cut,
+            "requirements_partial_cut": partial_cut,
+            "stores": len(stores),
+            "products": len(products),
+            "units_missing": units_missing,
+        }
+    )
+    return summary
+
+
+def schedule_block_summary(result, catalogs) -> dict[str, Any]:
+    """Resume el efecto del toggle 'Bloquear envíos fuera de frecuencia'."""
+    weekday_display = engine.WEEKDAY_DISPLAY_NAMES.get(
+        catalogs.run_weekday_norm, catalogs.run_weekday_norm
+    )
+    summary: dict[str, Any] = {
+        "enabled": bool(catalogs.schedule_block_enabled),
+        "weekday": weekday_display,
+        "pairs_configured": len(catalogs.schedule_days),
+        "requirements_full_cut": 0,
+        "requirements_partial_cut": 0,
+        "stores": 0,
+        "products": 0,
+        "units_missing": 0,
+    }
+    if not summary["enabled"]:
+        return summary
+
+    affected_rows = [
+        row
+        for row in result.base_rows
+        if row.get("TIPO_DE_CORTE") in SCHEDULE_CUT_LABELS
+    ]
+    stores: set[int] = set()
+    products: set[int] = set()
+    units_missing = 0
+    full_cut = 0
+    partial_cut = 0
+    for row in affected_rows:
+        stores.add(row["WAREHOUSE_DESTINATION"])
+        products.add(row["RETAIL_ID"])
+        target = int(row.get("CANTIDAD_OBJETIVO", 0) or 0)
+        assigned = int(row.get("CANTIDAD_ASIGNADA", 0) or 0)
+        units_missing += max(target - assigned, 0)
+        if str(row.get("TIPO_DE_CORTE", "")).startswith("OK PARCIAL"):
+            partial_cut += 1
+        else:
+            full_cut += 1
+
+    summary.update(
+        {
+            "requirements_full_cut": full_cut,
+            "requirements_partial_cut": partial_cut,
+            "stores": len(stores),
+            "products": len(products),
+            "units_missing": units_missing,
+        }
+    )
+    return summary
+
+
+def build_golden_analytics(result) -> dict[str, Any]:
+    """Construye el reporte de Infaltables, Golden y Anchor por tienda-SKU."""
+    golden_rows = [
+        row
+        for row in result.base_rows
+        if row.get("TIPO_PRIORIDAD_PRODUCTO")
+        in {"INFALTABLE", "GOLDEN", "ANCHOR"}
+        and int(row.get("CANTIDAD_OBJETIVO", 0) or 0) > 0
+    ]
+    type_data: dict[str, dict[str, int]] = defaultdict(
+        lambda: {"cases": 0, "served": 0, "full": 0, "target": 0, "assigned": 0}
+    )
+    city_data: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {
+            "cases": 0,
+            "served": 0,
+            "full": 0,
+            "products": set(),
+            "stores": set(),
+            "target": 0,
+            "assigned": 0,
+        }
+    )
+    store_data: dict[tuple[str, int, str], dict[str, Any]] = defaultdict(
+        lambda: {
+            "cases": 0,
+            "served": 0,
+            "full": 0,
+            "products": set(),
+            "target": 0,
+            "assigned": 0,
+        }
+    )
+    origin_data: dict[int, dict[str, Any]] = defaultdict(
+        lambda: {
+            "cases": 0,
+            "products": set(),
+            "stores": set(),
+            "units": 0,
+        }
+    )
+    detail_rows: list[dict[str, Any]] = []
+    for row in golden_rows:
+        city = row.get("CITY") or "SIN CIUDAD"
+        destination = int(row["WAREHOUSE_DESTINATION"])
+        warehouse_name = row.get("WAREHOUSE_NAME") or "SIN NOMBRE"
+        sku = int(row["RETAIL_ID"])
+        sku_name = engine.clean_text(row.get("SKU_NAME"))
+        target = int(row.get("CANTIDAD_OBJETIVO", 0) or 0)
+        assigned = int(row.get("CANTIDAD_ASIGNADA", 0) or 0)
+        product_type = row.get("TIPO_PRIORIDAD_PRODUCTO", "REGULAR")
+        type_bucket = type_data[product_type]
+        type_bucket["cases"] += 1
+        type_bucket["served"] += int(assigned > 0)
+        type_bucket["full"] += int(assigned >= target)
+        type_bucket["target"] += target
+        type_bucket["assigned"] += assigned
+
+        city_bucket = city_data[city]
+        city_bucket["cases"] += 1
+        city_bucket["served"] += int(assigned > 0)
+        city_bucket["full"] += int(assigned >= target)
+        city_bucket["products"].add(sku)
+        city_bucket["stores"].add(destination)
+        city_bucket["target"] += target
+        city_bucket["assigned"] += assigned
+
+        store_bucket = store_data[(city, destination, warehouse_name)]
+        store_bucket["cases"] += 1
+        store_bucket["served"] += int(assigned > 0)
+        store_bucket["full"] += int(assigned >= target)
+        store_bucket["products"].add(sku)
+        store_bucket["target"] += target
+        store_bucket["assigned"] += assigned
+
+        for key, value in row.items():
+            if not key.startswith("ASIGNADO_"):
+                continue
+            source_text = key.removeprefix("ASIGNADO_")
+            if not source_text.isdigit():
+                continue
+            source_units = int(value or 0)
+            if source_units <= 0:
+                continue
+            source = int(source_text)
+            origin_bucket = origin_data[source]
+            origin_bucket["cases"] += 1
+            origin_bucket["products"].add(sku)
+            origin_bucket["stores"].add(destination)
+            origin_bucket["units"] += source_units
+
+        detail_rows.append(
+            {
+                "CIUDAD": city,
+                "TIENDA": f"{destination} · {warehouse_name}",
+                "SKU": f"{sku} · {sku_name}" if sku_name else str(sku),
+                "TIPO": product_type,
+                "OBJETIVO": target,
+                "ASIGNADO": assigned,
+                "FALTANTE": max(target - assigned, 0),
+                "ORÍGENES": row.get("ORIGENES_USADOS", ""),
+                "BREAKDOWN": row.get("TIPO_DE_CORTE", ""),
+            }
+        )
+
+    city_rows = [
+        {
+            "CIUDAD": city,
+            "CASOS": data["cases"],
+            "CON_ENVÍO": data["served"],
+            "COMPLETOS": data["full"],
+            "TIENDAS": len(data["stores"]),
+            "PRODUCTOS": len(data["products"]),
+            "OBJETIVO": data["target"],
+            "ASIGNADO": data["assigned"],
+            "COMPLIANCE_%": percentage(data["assigned"], data["target"]),
+        }
+        for city, data in sorted(city_data.items())
+    ]
+    store_rows = [
+        {
+            "CIUDAD": city,
+            "TIENDA": f"{destination} · {warehouse_name}",
+            "CASOS": data["cases"],
+            "CON_ENVÍO": data["served"],
+            "COMPLETOS": data["full"],
+            "PRODUCTOS": len(data["products"]),
+            "OBJETIVO": data["target"],
+            "ASIGNADO": data["assigned"],
+            "FALTANTE": max(data["target"] - data["assigned"], 0),
+            "COMPLIANCE_%": percentage(data["assigned"], data["target"]),
+        }
+        for (city, destination, warehouse_name), data in store_data.items()
+    ]
+    store_rows.sort(key=lambda row: (-row["FALTANTE"], row["TIENDA"]))
+    origin_rows = [
+        {
+            "ORIGEN": source,
+            "NOMBRE": ORIGIN_WAREHOUSES.get(source, "ORIGEN CONFIGURADO"),
+            "CASOS_CON_APORTE": data["cases"],
+            "PRODUCTOS": len(data["products"]),
+            "TIENDAS": len(data["stores"]),
+            "UNIDADES": data["units"],
+        }
+        for source, data in sorted(origin_data.items())
+    ]
+    detail_rows.sort(
+        key=lambda row: (
+            {"INFALTABLE": 0, "GOLDEN": 1, "ANCHOR": 2}.get(row["TIPO"], 9),
+            -row["FALTANTE"],
+            row["CIUDAD"],
+            row["TIENDA"],
+            row["SKU"],
+        )
+    )
+    type_rows = [
+        {
+            "TIPO": product_type,
+            "CASOS": data["cases"],
+            "CON_ENVÍO": data["served"],
+            "COMPLETOS": data["full"],
+            "OBJETIVO": data["target"],
+            "ASIGNADO": data["assigned"],
+            "FALTANTE": max(data["target"] - data["assigned"], 0),
+            "COMPLIANCE_%": percentage(data["assigned"], data["target"]),
+        }
+        for product_type, data in sorted(
+            type_data.items(),
+            key=lambda item: {"INFALTABLE": 0, "GOLDEN": 1, "ANCHOR": 2}.get(
+                item[0], 9
+            ),
+        )
+    ]
+
+    target_units = sum(int(row["CANTIDAD_OBJETIVO"]) for row in golden_rows)
+    assigned_units = sum(int(row["CANTIDAD_ASIGNADA"]) for row in golden_rows)
+    served_rows = [row for row in golden_rows if row["CANTIDAD_ASIGNADA"] > 0]
+    full_rows = [
+        row
+        for row in golden_rows
+        if row["CANTIDAD_ASIGNADA"] >= row["CANTIDAD_OBJETIVO"]
+    ]
+    partial_rows = [
+        row
+        for row in golden_rows
+        if 0 < row["CANTIDAD_ASIGNADA"] < row["CANTIDAD_OBJETIVO"]
+    ]
+    return {
+        "summary": {
+            "cases": len(golden_rows),
+            "served_cases": len(served_rows),
+            "full_cases": len(full_rows),
+            "partial_cases": len(partial_rows),
+            "not_served_cases": len(golden_rows) - len(served_rows),
+            "products": len({row["RETAIL_ID"] for row in golden_rows}),
+            "stores": len({row["WAREHOUSE_DESTINATION"] for row in golden_rows}),
+            "cities": len({row.get("CITY") or "SIN CIUDAD" for row in golden_rows}),
+            "target_units": target_units,
+            "assigned_units": assigned_units,
+            "missing_units": max(target_units - assigned_units, 0),
+            "case_compliance_pct": percentage(len(full_rows), len(golden_rows)),
+            "unit_compliance_pct": percentage(assigned_units, target_units),
+            "m3_assigned": round(
+                sum(float(row.get("M3_ASIGNADO", 0) or 0) for row in golden_rows),
+                3,
+            ),
+        },
+        "city_rows": city_rows,
+        "store_rows": store_rows,
+        "origin_rows": origin_rows,
+        "detail_rows": detail_rows,
+        "type_rows": type_rows,
+    }
+
+
+def split_plan_rows_by_closed_store(
+    plan_rows: list[dict[str, Any]],
+    closed_store_ids: set[int],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    active_rows: list[dict[str, Any]] = []
+    blocked_rows: list[dict[str, Any]] = []
+    for row in plan_rows:
+        if row["WAREHOUSE_DESTINATION"] in closed_store_ids:
+            blocked_rows.append(row)
+        else:
+            active_rows.append(row)
+    return active_rows, blocked_rows
+
+
+def closed_store_summary(
+    blocked_rows: list[dict[str, Any]],
+    closed_store_ids: set[int],
+    config: engine.Config,
+) -> dict[str, Any]:
+    impacted_stores = {
+        row["WAREHOUSE_DESTINATION"] for row in blocked_rows
+    }
+    products = {row["RETAIL_ID"] for row in blocked_rows}
+    target_units = sum(
+        engine.calculate_target_quantity(row, config)[0] for row in blocked_rows
+    )
+    return {
+        "configured_stores": len(closed_store_ids),
+        "requirements": len(blocked_rows),
+        "stores": len(impacted_stores),
+        "store_ids": sorted(impacted_stores),
+        "products": len(products),
+        "target_units": target_units,
+    }
+
+
+FOUNTAIN9_ZERO_REPORT_COLUMNS = [
+    "WAREHOUSE_ID",
+    "WAREHOUSE_NAME",
+    "CITY",
+    "PRODUCT_ID",
+    "PREDICTED_DEMAND_FOR_SELECTED_DURATION",
+    "PREDICTED_OPENING_INVENTORY",
+    "ROQ_FOUNTAIN9",
+    "NET_INTER_STORE_TRANSFERS",
+    "INVENTARIO_ACTUAL_TIENDA",
+    "CANTIDAD_MANUAL_OBJETIVO",
+    "CANTIDAD_ENVIADA",
+    "RESULTADO_MODELO",
+    "MOTIVO_PLANEACION",
+    "TIENDA_EXCLUIDA_MANUALMENTE",
+    "ARCHIVOS_INPUT",
+    "FILAS_CONSOLIDADAS",
+]
+
+
+def build_fountain9_zero_report(
+    consolidated: dict[tuple[int, int], dict[str, Any]],
+    catalogs,
+    result,
+    manually_excluded_store_ids: set[int],
+) -> list[dict[str, Any]]:
+    """Reporta casos donde demanda, opening y ROQ originales son exactamente 0."""
+    assigned_by_key: Counter[tuple[int, int]] = Counter()
+    reasons_by_key: dict[tuple[int, int], set[str]] = defaultdict(set)
+    for allocation in result.allocation_rows:
+        key = (
+            int(allocation["WAREHOUSE_DESTINATION"]),
+            int(allocation["RETAIL_ID"]),
+        )
+        assigned_by_key[key] += int(allocation.get("QUANTITY", 0) or 0)
+        reason = engine.clean_text(allocation.get(PLANNING_REASON_COLUMN))
+        if reason:
+            reasons_by_key[key].add(reason)
+
+    statuses_by_key: dict[tuple[int, int], set[str]] = defaultdict(set)
+    for row in result.base_rows:
+        key = (
+            int(row["WAREHOUSE_DESTINATION"]),
+            int(row["RETAIL_ID"]),
+        )
+        status = engine.clean_text(row.get("TIPO_DE_CORTE"))
+        if status:
+            statuses_by_key[key].add(status)
+
+    report_rows: list[dict[str, Any]] = []
+    for key, record in consolidated.items():
+        demand = float(record["PREDICTED_DEMAND"])
+        opening = float(record["PREDICTED_OPENING_INVENTORY"])
+        roq = float(record["ROQ_INPUT"])
+        if not (
+            math.isclose(demand, 0.0, abs_tol=1e-9)
+            and math.isclose(opening, 0.0, abs_tol=1e-9)
+            and math.isclose(roq, 0.0, abs_tol=1e-9)
+        ):
+            continue
+        destination, sku = key
+        store = catalogs.stores.get(destination, {})
+        report_rows.append(
+            {
+                "WAREHOUSE_ID": destination,
+                "WAREHOUSE_NAME": store.get("warehouse_name", ""),
+                "CITY": store.get("city", ""),
+                "PRODUCT_ID": sku,
+                "PREDICTED_DEMAND_FOR_SELECTED_DURATION": demand,
+                "PREDICTED_OPENING_INVENTORY": opening,
+                "ROQ_FOUNTAIN9": roq,
+                "NET_INTER_STORE_TRANSFERS": record[
+                    "NET_INTER_STORE_TRANSFERS"
+                ],
+                "INVENTARIO_ACTUAL_TIENDA": max(
+                    float(catalogs.stock_base.get((destination, sku), 0.0)),
+                    0.0,
+                ),
+                "CANTIDAD_MANUAL_OBJETIVO": 4,
+                "CANTIDAD_ENVIADA": int(assigned_by_key.get(key, 0)),
+                "RESULTADO_MODELO": (
+                    "EXCLUIDA MANUALMENTE DESDE CODEC"
+                    if destination in manually_excluded_store_ids
+                    else " | ".join(
+                        sorted(statuses_by_key.get(key, {"NO EVALUADO"}))
+                    )
+                ),
+                "MOTIVO_PLANEACION": " | ".join(
+                    sorted(reasons_by_key.get(key, set()))
+                ),
+                "TIENDA_EXCLUIDA_MANUALMENTE": (
+                    destination in manually_excluded_store_ids
+                ),
+                "ARCHIVOS_INPUT": " | ".join(sorted(record["SOURCE_FILES"])),
+                "FILAS_CONSOLIDADAS": int(record["SOURCE_ROWS"]),
+            }
+        )
+    report_rows.sort(key=lambda row: (row["CITY"], row["WAREHOUSE_ID"], row["PRODUCT_ID"]))
+    return report_rows
+
+
+def split_plan_rows_by_blocked_city(
+    plan_rows: list[dict[str, Any]],
+    catalogs,
+    blocked_cities: tuple[str, ...],
+    config: engine.Config,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Bloquea solo necesidades positivas; los ceros conservan SIN RECOMENDACIÓN."""
+    blocked_city_set = set(blocked_cities)
+    active_rows: list[dict[str, Any]] = []
+    blocked_rows: list[dict[str, Any]] = []
+    for row in plan_rows:
+        store = catalogs.stores.get(row["WAREHOUSE_DESTINATION"], {})
+        target_quantity, _ = engine.calculate_target_quantity(row, config)
+        if (
+            store.get("city_norm", "") in blocked_city_set
+            and target_quantity > 0
+        ):
+            blocked_rows.append(row)
+        else:
+            active_rows.append(row)
+    return active_rows, blocked_rows
+
+
+def city_block_summary(
+    blocked_rows: list[dict[str, Any]],
+    catalogs,
+    config: engine.Config,
+    blocked_cities: tuple[str, ...],
+) -> dict[str, Any]:
+    rows_by_city: Counter[str] = Counter()
+    city_names: dict[str, str] = {}
+    for store in catalogs.stores.values():
+        city_norm = store.get("city_norm", "")
+        if city_norm in blocked_cities and city_norm not in city_names:
+            city_names[city_norm] = CITY_DISPLAY_NAMES.get(
+                city_norm,
+                store.get("city") or city_norm,
+            )
+    target_units = 0
+    stores: set[int] = set()
+    products: set[int] = set()
+    for row in blocked_rows:
+        destination = row["WAREHOUSE_DESTINATION"]
+        store = catalogs.stores.get(destination, {})
+        city_norm = store.get("city_norm", "")
+        rows_by_city[city_norm] += 1
+        stores.add(destination)
+        products.add(row["RETAIL_ID"])
+        target, _ = engine.calculate_target_quantity(row, config)
+        target_units += target
+
+    return {
+        "cities": [
+            {
+                "code": city,
+                "name": city_names.get(city, CITY_DISPLAY_NAMES.get(city, city)),
+                "requirements": rows_by_city.get(city, 0),
+            }
+            for city in blocked_cities
+        ],
+        "requirements": len(blocked_rows),
+        "stores": len(stores),
+        "products": len(products),
+        "target_units": target_units,
+    }
+
+
+def empty_avl_summary(enabled: bool, doh: float) -> dict[str, Any]:
+    return {
+        "enabled": enabled,
+        "doh": float(doh),
+        "catalog_rows": 0,
+        "stockout_candidates": 0,
+        "preventive_candidates": 0,
+        "special_candidates": 0,
+        "special_candidates_no_adu": 0,
+        "cases_sent": 0,
+        "cases_full": 0,
+        "cases_partial": 0,
+        "tasks_added": 0,
+        "units_added": 0,
+        "m3_added": 0.0,
+        "stores": 0,
+        "products": 0,
+        "task_slots_before": 0,
+        "task_slots_after": 0,
+        "skipped_closed_store": 0,
+        "skipped_blocked_city": 0,
+        "skipped_missing_stock": 0,  # obsoleto: se conserva en 0 por compatibilidad
+        "skipped_not_stockout": 0,
+        "skipped_not_special": 0,
+        "skipped_doh_sufficient": 0,
+        "skipped_already_served": 0,
+        "skipped_route_cost": 0,
+        "skipped_capacity": 0,
+        "skipped_no_source_stock": 0,
+    }
+
+
+def apply_avl_fill(
+    result,
+    catalog_rows: list[dict[str, Any]],
+    catalogs,
+    config: engine.Config,
+    closed_store_ids: set[int],
+    blocked_cities: tuple[str, ...],
+    doh: float,
+    *,
+    candidate_mode: str = "stockout",
+    excluded_keys: set[tuple[int, int]] | None = None,
+    duration_mode_by_store: dict[int, float] | None = None,
+    lead_time_mode_by_store: dict[int, float] | None = None,
+    fallback_duration: float | None = None,
+    fallback_lead_time: float | None = None,
+    ignore_task_budget: bool = False,
+    ignore_store_capacity: bool = False,
+    allowed_destinations: set[int] | None = None,
+    duration_source_by_store: dict[int, str] | None = None,
+    skip_reasons: dict[tuple[int, int], str] | None = None,
+    swa_priority: bool = False,
+    special_doh_targets: dict[str, float] | None = None,
+) -> dict[str, Any]:
+    """Cobertura de catálogo con las tareas remanentes. candidate_mode: stockout (AVL),
+    preventive, special_doh (Refuerzo), no_fountain9_coverage o kazuhira. Solo
+    Kazuhira usa fallback_duration, fallback_lead_time, ignore_task_budget,
+    ignore_store_capacity. swa_priority sirve a todos los modos: ante escasez de
+    capacidad o tareas atiende primero el mayor SWA. special_doh_targets
+    ({bucket: DOH}, buckets INFALTABLE/GOLDEN/ANCHOR/KVI) define el universo y el
+    DOH de cada bucket del Refuerzo; si una tienda-SKU está en varios, gana el
+    DOH más alto. skip_reasons recibe el motivo de cada tienda-SKU no cubierta.
+    """
+    if candidate_mode not in {
+        "stockout", "preventive", "special_doh", "no_fountain9_coverage",
+        "kazuhira",
+    }:
+        raise ValueError(f"Modo de cobertura de catálogo inválido: {candidate_mode}")
+    duration_mode_by_store = duration_mode_by_store or {}
+    lead_time_mode_by_store = lead_time_mode_by_store or {}
+    duration_source_by_store = duration_source_by_store or {}
+    # El bypass global de CODEC aplica a todas las coberturas, no solo a Kazuhira.
+    ignore_store_capacity = ignore_store_capacity or bool(config.ignore_store_capacity)
+    summary = empty_avl_summary(True, doh)
+
+    def log_skip(skip_key: tuple[int, int], reason: str) -> None:
+        if skip_reasons is not None:
+            skip_reasons[skip_key] = reason
+
+    summary["mode"] = candidate_mode
+    summary["catalog_rows"] = len(catalog_rows)
+    summary["task_slots_before"] = max(config.max_tasks - result.tasks_used, 0)
+    for base_row in result.base_rows:
+        base_row.setdefault("ADU_CATALOGO", "")
+        base_row.setdefault("DOH_AVL", "")
+    # Con skip_reasons activo (Kazuhira) NO se corta aquí aunque el
+    # presupuesto ya esté agotado: hay que evaluar los candidatos para
+    # distinguir lo sano de lo que queda sin cubrir por falta de tareas.
+    if candidate_mode == "special_doh" and special_doh_targets is not None:
+        doh = max(special_doh_targets.values(), default=0.0)
+        summary["doh"] = float(doh)
+    if doh <= 0 or (
+        not ignore_task_budget
+        and summary["task_slots_before"] <= 0
+        and skip_reasons is None
+    ):
+        summary["task_slots_after"] = summary["task_slots_before"]
+        return summary
+
+    blocked_city_set = set(blocked_cities)
+    assigned_keys = {
+        (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"])
+        for row in result.allocation_rows
+        if int(row.get("QUANTITY", 0) or 0) > 0
+    }
+    excluded_key_set = set(excluded_keys or ())
+    base_row_by_key = {
+        (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"]): row
+        for row in result.base_rows
+    }
+
+    consumed_stock: Counter[tuple[int, int]] = Counter()
+    for allocation in result.allocation_rows:
+        consumed_stock[
+            (allocation["WAREHOUSE_SOURCE"], allocation["RETAIL_ID"])
+        ] += int(allocation["QUANTITY"])
+
+    stock_info_cache: dict[tuple[int, int], dict[str, Any]] = {}
+    stock_remaining: dict[tuple[int, int], int] = {}
+
+    def get_source_stock(source: int, sku: int) -> tuple[dict[str, Any], int]:
+        key = (source, sku)
+        if key not in stock_info_cache:
+            info = engine.source_stock_components(catalogs, source, sku)
+            stock_info_cache[key] = info
+            stock_remaining[key] = max(
+                int(info["adjusted"]) - consumed_stock.get(key, 0),
+                0,
+            )
+        return stock_info_cache[key], stock_remaining[key]
+
+    capacity_by_store = {
+        row["WAREHOUSE_DESTINATION"]: row for row in result.capacity_rows
+    }
+
+    # Unidades ya asignadas por tienda-SKU en esta corrida (engines
+    # anteriores).
+    assigned_units_by_key: Counter[tuple[int, int]] = Counter()
+    for allocation in result.allocation_rows:
+        assigned_units_by_key[
+            (allocation["WAREHOUSE_DESTINATION"], allocation["RETAIL_ID"])
+        ] += int(allocation.get("QUANTITY", 0) or 0)
+
+    special_target_by_key: dict[tuple[int, int], float] = {}
+    if candidate_mode == "special_doh":
+        # Universo: los buckets activos de GOLDEN_INFALTABLES_ANCHOR (y KVI), no
+        # CATALOGO. Cada bucket trae su DOH; el más alto gana si hay traslape.
+        bucket_keys = {
+            "INFALTABLE": catalogs.infaltable_products,
+            "GOLDEN": catalogs.golden_products,
+            "ANCHOR": catalogs.anchor_products,
+            "KVI": catalogs.kvi_products,
+        }
+        targets = (
+            dict(special_doh_targets)
+            if special_doh_targets is not None
+            else {bucket: doh for bucket in ("INFALTABLE", "GOLDEN", "ANCHOR")}
+        )
+        for bucket, bucket_doh in targets.items():
+            for bucket_key in bucket_keys[bucket]:
+                special_target_by_key[bucket_key] = max(
+                    special_target_by_key.get(bucket_key, 0.0), float(bucket_doh)
+                )
+        summary["doh_by_bucket"] = {b: float(v) for b, v in targets.items()}
+        iteration_keys = set(special_target_by_key)
+        iteration_rows = [
+            {"WAREHOUSE_DESTINATION": destination, "RETAIL_ID": sku}
+            for destination, sku in iteration_keys
+        ]
+        adu_by_key, adu_source_by_key = resolve_adu_with_city_fallback(
+            catalog_rows, catalogs, keys_to_resolve=iteration_keys
+        )
+    else:
+        iteration_rows = catalog_rows
+        # Cascada de ADU: propio -> promedio de la misma ciudad -> sin dato.
+        adu_by_key, adu_source_by_key = resolve_adu_with_city_fallback(
+            catalog_rows, catalogs
+        )
+
+    candidates: list[dict[str, Any]] = []
+    for catalog_row in iteration_rows:
+        destination = catalog_row["WAREHOUSE_DESTINATION"]
+        sku = catalog_row["RETAIL_ID"]
+        key = (destination, sku)
+        key_doh = special_target_by_key.get(key, doh)
+        if allowed_destinations is not None and destination not in allowed_destinations:
+            summary["skipped_outside_universe"] = (
+                summary.get("skipped_outside_universe", 0) + 1
+            )
+            continue
+        if sku in catalogs.excluded_products:
+            summary["skipped_excluded_product"] = (
+                summary.get("skipped_excluded_product", 0) + 1
+            )
+            continue
+        if destination in closed_store_ids:
+            summary["skipped_closed_store"] += 1
+            continue
+        store = catalogs.stores.get(destination)
+        if not store:
+            summary["skipped_store_not_registered"] = (
+                summary.get("skipped_store_not_registered", 0) + 1
+            )
+            continue
+        city_norm = store.get("city_norm", "")
+        if city_norm in blocked_city_set:
+            summary["skipped_blocked_city"] += 1
+            continue
+        if key not in catalogs.stock_base:
+            # Combinación de CATALOGO sin fila en STOCK: stock 0 e incoming 0,
+            # en todos los modos.
+            summary["missing_stock_treated_as_zero"] = (
+                summary.get("missing_stock_treated_as_zero", 0) + 1
+            )
+        destination_stock = max(float(catalogs.stock_base.get(key, 0.0)), 0.0)
+        adu = adu_by_key.get(key, 0.0)
+        current_doh = destination_stock / adu if adu > 0 else math.inf
+        priority_profile = engine.product_priority_profile(
+            catalogs,
+            destination,
+            sku,
+        )
+        is_golden = priority_profile["is_golden"]
+        is_kvi = priority_profile["is_kvi"]
+        no_adu_anywhere = False
+        if candidate_mode == "stockout":
+            if destination_stock > 0:
+                summary["skipped_not_stockout"] += 1
+                continue
+            target = max(
+                int(math.ceil(adu * doh)), config.minimum_positive_quantity
+            )
+            summary["stockout_candidates"] += 1
+        elif candidate_mode == "preventive":
+            if destination_stock <= 0 or not (
+                destination_stock < 3 or current_doh < 1
+            ):
+                summary["skipped_not_stockout"] += 1
+                continue
+            target = max(
+                int(math.ceil(max((adu * doh) - destination_stock, 0.0))),
+                config.minimum_positive_quantity,
+            )
+            summary["preventive_candidates"] += 1
+        elif candidate_mode in ("no_fountain9_coverage", "kazuhira"):
+            # Quebrado (stock = 0) y fuera de excluded_keys; quien llama define
+            # qué cuenta como ya cubierto.
+            effective_adu = adu if adu > 0 else FICTITIOUS_ADU_NO_FOUNTAIN9
+            incoming = max(catalogs.incoming_stock.get(key, 0.0), 0.0)
+            assigned_now = 0
+            if candidate_mode == "kazuhira":
+                # Kazuhira dispara por posición: (stock + incoming + asignado)
+                # / ADU < 1 DOH.
+                assigned_now = assigned_units_by_key.get(key, 0)
+                current_doh = (
+                    destination_stock + incoming + assigned_now
+                ) / effective_adu
+                if current_doh >= 1.0:
+                    summary["skipped_doh_sufficient"] += 1
+                    # Solo se registra si el stock es 0 (lo cubren incoming
+                    # o lo ya asignado): con stock > 0 el barrido ya lo
+                    # trata como sano sin necesidad de una entrada por
+                    # cada SKU sano del catálogo (cientos de miles).
+                    if destination_stock <= 0:
+                        log_skip(key, KAZUHIRA_REASON_HEALTHY)
+                    continue
+            elif destination_stock > 0:
+                summary["skipped_not_stockout"] += 1
+                continue
+            duration_mode = duration_mode_by_store.get(destination)
+            lead_time_mode = lead_time_mode_by_store.get(destination)
+            duration_source = duration_source_by_store.get(destination, "PROPIA")
+            used_fallback_duration = False
+            if (
+                (duration_mode is None or lead_time_mode is None)
+                and candidate_mode == "kazuhira"
+                and fallback_duration is not None
+                and fallback_lead_time is not None
+            ):
+                # Tienda sin fila en el Bulk de Fountain9 (sin moda propia):
+                # Kazuhira usa el fallback en vez de saltarla.
+                duration_mode = fallback_duration
+                lead_time_mode = fallback_lead_time
+                used_fallback_duration = True
+                duration_source = "PAIS"
+            if duration_mode is None or lead_time_mode is None:
+                summary["skipped_no_duration_data"] = (
+                    summary.get("skipped_no_duration_data", 0) + 1
+                )
+                log_skip(key, "SIN_DURATION")
+                continue
+            raw_target = (
+                effective_adu * (duration_mode + lead_time_mode)
+                - destination_stock
+                - incoming
+                - assigned_now
+            )
+            raw_target = max(raw_target, 0.0)
+            if raw_target <= 0:
+                summary["skipped_covered_by_incoming"] = (
+                    summary.get("skipped_covered_by_incoming", 0) + 1
+                )
+                log_skip(key, "INCOMING")
+                continue
+            target = max(
+                int(math.ceil(raw_target)), config.minimum_positive_quantity
+            )
+            summary["no_fountain9_candidates"] = (
+                summary.get("no_fountain9_candidates", 0) + 1
+            )
+        else:  # special_doh — refuerzo de Golden/Infaltable/Anchor
+            if key in excluded_key_set:
+                # Fountain9 sí pidió algo para esta tienda-SKU: el refuerzo
+                # nunca hace on-top a Fountain9, sin importar si se cubrió.
+                summary["skipped_already_served"] += 1
+                continue
+            already_assigned = assigned_units_by_key.get(key, 0)
+            current_position = destination_stock + already_assigned
+            if adu > 0:
+                current_doh = current_position / adu
+                if current_doh >= key_doh:
+                    summary["skipped_doh_sufficient"] += 1
+                    continue
+                target_position = int(math.ceil(adu * key_doh))
+                target = max(target_position - current_position, 0)
+                if target <= 0:
+                    summary["skipped_doh_sufficient"] += 1
+                    continue
+            else:
+                # Sin ADU propio ni de ninguna tienda de la misma ciudad: no
+                # hay forma de calcular un DOH objetivo.
+                no_adu_anywhere = True
+                target = max(
+                    config.minimum_positive_quantity - already_assigned, 0
+                )
+                if target <= 0:
+                    summary["skipped_doh_sufficient"] += 1
+                    continue
+                summary["special_candidates_no_adu"] = (
+                    summary.get("special_candidates_no_adu", 0) + 1
+                )
+            summary["special_candidates"] += 1
+        if candidate_mode == "kazuhira":
+            # Lo ya asignado cuenta como posición (ver arriba), no como
+            # exclusión: una sola unidad enviada no garantiza 1 DOH.
+            if key in excluded_key_set:
+                summary["skipped_already_served"] += 1
+                continue
+        elif candidate_mode != "special_doh" and (
+            key in assigned_keys or key in excluded_key_set
+        ):
+            summary["skipped_already_served"] += 1
+            continue
+        if key in catalogs.route_cost_blocks:
+            summary["skipped_route_cost"] += 1
+            log_skip(key, "RUTA_COSTOS")
+            continue
+
+        candidates.append(
+            {
+                "WAREHOUSE_DESTINATION": destination,
+                "RETAIL_ID": sku,
+                "ADU": adu,
+                "ADU_SOURCE": adu_source_by_key.get(key, "SIN_DATO"),
+                "NO_ADU_ANYWHERE": no_adu_anywhere,
+                "DESTINATION_STOCK": destination_stock,
+                "CURRENT_DOH": current_doh,
+                "TARGET_DOH": key_doh,
+                "TARGET": target,
+                "STORE": store,
+                "IS_GOLDEN": is_golden,
+                "IS_INFALTABLE": priority_profile["is_infaltable"],
+                "IS_ANCHOR": priority_profile["is_anchor"],
+                "IS_KVI": is_kvi,
+                "PRODUCT_PRIORITY_TYPE": priority_profile["type"],
+                "PRODUCT_PRIORITY_RANK": priority_profile["rank"],
+                "PRIORITY": catalogs.store_priority.get(destination, 100),
+                "DURATION_MODE": (
+                    duration_mode
+                    if candidate_mode in ("no_fountain9_coverage", "kazuhira")
+                    else None
+                ),
+                "LEAD_TIME_MODE": (
+                    lead_time_mode
+                    if candidate_mode in ("no_fountain9_coverage", "kazuhira")
+                    else None
+                ),
+                "INCOMING": (
+                    max(catalogs.incoming_stock.get(key, 0.0), 0.0)
+                    if candidate_mode in ("no_fountain9_coverage", "kazuhira")
+                    else 0.0
+                ),
+                "USED_FICTITIOUS_ADU": (
+                    candidate_mode in ("no_fountain9_coverage", "kazuhira")
+                    and adu <= 0
+                ),
+                "USED_FALLBACK_DURATION": (
+                    candidate_mode == "kazuhira" and used_fallback_duration
+                ),
+                "DURATION_SOURCE": (
+                    duration_source
+                    if candidate_mode in ("no_fountain9_coverage", "kazuhira")
+                    else None
+                ),
+            }
+        )
+
+    candidates.sort(
+        key=lambda row: (
+            (
+                -catalogs.swa_potential_gain.get(
+                    (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"]), 0.0
+                )
+                if swa_priority
+                else 0.0
+            ),
+            row["PRODUCT_PRIORITY_RANK"],
+            row["PRIORITY"],
+            row["CURRENT_DOH"],
+            row["DESTINATION_STOCK"],
+            row["WAREHOUSE_DESTINATION"],
+            row["RETAIL_ID"],
+        )
+    )
+
+    stores_sent: set[int] = set()
+    products_sent: set[int] = set()
+    next_order = len(result.base_rows) + 1
+    for candidate_position, candidate in enumerate(candidates):
+        if not ignore_task_budget and result.tasks_used >= config.max_tasks:
+            # El presupuesto se agotó: todo lo que quedaba sin procesar
+            # queda declarado, no solo cortado en silencio.
+            for pending in candidates[candidate_position:]:
+                log_skip(
+                    (pending["WAREHOUSE_DESTINATION"], pending["RETAIL_ID"]),
+                    "SIN_TAREAS",
+                )
+            break
+
+        destination = candidate["WAREHOUSE_DESTINATION"]
+        sku = candidate["RETAIL_ID"]
+        store = candidate["STORE"]
+        city = store.get("city", "")
+        city_norm = store.get("city_norm", "")
+        is_golden = candidate["IS_GOLDEN"]
+        is_infaltable = candidate["IS_INFALTABLE"]
+        is_anchor = candidate["IS_ANCHOR"]
+        is_kvi = candidate["IS_KVI"]
+        m3_per_unit = catalogs.volume_m3.get(
+            sku,
+            config.default_m3_per_unit,
+        )
+        capacity = catalogs.store_capacity.get(
+            destination,
+            config.default_store_capacity_m3,
+        )
+        capacity_row = capacity_by_store.get(destination)
+        if capacity_row is None:
+            capacity_row = {
+                "WAREHOUSE_DESTINATION": destination,
+                "WAREHOUSE_NAME": store.get("warehouse_name", ""),
+                "CITY": city,
+                "CAPACIDAD_M3": capacity,
+                "M3_CONTABILIZADO_CAPACIDAD": 0.0,
+                "M3_TOTAL_ASIGNADO_INCLUYE_GOLDEN": 0.0,
+                "CAPACIDAD_CERRADA": False,
+                "CAPACIDAD_SUPERADA_POR_LINEA": False,
+            }
+            result.capacity_rows.append(capacity_row)
+            capacity_by_store[destination] = capacity_row
+
+        cap_before = float(capacity_row["M3_CONTABILIZADO_CAPACIDAD"])
+        if not ignore_store_capacity and bool(capacity_row["CAPACIDAD_CERRADA"]):
+            summary["skipped_capacity"] += 1
+            log_skip((destination, sku), "CAPACIDAD")
+            continue
+
+        original_target = int(candidate["TARGET"])
+        if ignore_store_capacity:
+            # Garantía total de Kazuhira: el objetivo no se recorta por
+            # espacio disponible — se sigue REGISTRANDO el uso de
+            # capacidad para que el reporte muestre la excepción, pero no
+            # limita la cantidad enviada.
+            target = original_target
+        else:
+            remaining_capacity_m3 = max(capacity - cap_before, 0.0)
+            capacity_units = (
+                int(math.floor((remaining_capacity_m3 / m3_per_unit) + 1e-9))
+                if m3_per_unit > 0
+                else original_target
+            )
+            target = min(original_target, max(capacity_units, 0))
+        if target <= 0:
+            summary["skipped_capacity"] += 1
+            log_skip((destination, sku), "CAPACIDAD")
+            continue
+        origin_info: dict[int, dict[str, Any]] = {}
+        origin_before: dict[int, int] = {}
+        regional_blocks: dict[int, bool] = {}
+        schedule_blocks: dict[int, bool] = {}
+        candidate_allocations: list[tuple[int, int]] = []
+        remaining_target = target
+        for source in config.origin_warehouses:
+            info, available = get_source_stock(source, sku)
+            origin_info[source] = info
+            origin_before[source] = available
+            regional_block = engine.is_regional_block(
+                catalogs,
+                source,
+                destination,
+                sku,
+                city_norm,
+                is_golden,
+            )
+            schedule_block = engine.is_schedule_blocked(catalogs, source, destination)
+            regional_blocks[source] = regional_block
+            schedule_blocks[source] = schedule_block
+            if regional_block or schedule_block:
+                continue
+            quantity = min(remaining_target, available)
+            if quantity > 0:
+                candidate_allocations.append((source, quantity))
+                remaining_target -= quantity
+            if remaining_target <= 0:
+                break
+
+        for source in config.origin_warehouses:
+            if source in origin_info:
+                continue
+            info, available = get_source_stock(source, sku)
+            origin_info[source] = info
+            origin_before[source] = available
+            regional_blocks[source] = engine.is_regional_block(
+                catalogs,
+                source,
+                destination,
+                sku,
+                city_norm,
+                is_golden,
+            )
+            schedule_blocks[source] = engine.is_schedule_blocked(
+                catalogs, source, destination
+            )
+
+        available_task_slots = (
+            len(candidate_allocations)
+            if ignore_task_budget
+            else max(config.max_tasks - result.tasks_used, 0)
+        )
+        allocations = candidate_allocations[:available_task_slots]
+        assigned = sum(quantity for _, quantity in allocations)
+        if assigned <= 0:
+            summary["skipped_no_source_stock"] += 1
+            # ¿Había stock en algún CEDI pero bloqueado por ruta/schedule, o
+            # de plano no había stock elegible?
+            blocked_with_stock = any(
+                origin_before.get(source, 0) > 0
+                and (regional_blocks.get(source) or schedule_blocks.get(source))
+                for source in config.origin_warehouses
+            )
+            log_skip(
+                (destination, sku),
+                "BLOQUEO_ORIGEN" if blocked_with_stock else "SIN_STOCK_ORIGEN",
+            )
+            continue
+
+        task_before = result.tasks_used
+        assigned_by_origin = {
+            source: 0 for source in config.origin_warehouses
+        }
+        for source, quantity in allocations:
+            stock_remaining[(source, sku)] -= quantity
+            assigned_by_origin[source] += quantity
+            result.tasks_used += 1
+            result.allocation_rows.append(
+                {
+                    "WAREHOUSE_DESTINATION": destination,
+                    "WAREHOUSE_SOURCE": source,
+                    "RETAIL_ID": sku,
+                    "QUANTITY": int(quantity),
+                    "PLANNED_DATE": "",
+                    "ROUTE": 1,
+                    "DELIVERY_PRIORITY": 1,
+                    "CITY": city,
+                    "STORAGE": engine.source_storage_type(catalogs, source, sku),
+                    "VALUE": engine.source_value_category(catalogs, source, sku),
+                    "TASK_BYPASS": ignore_task_budget,
+                    PLANNING_REASON_COLUMN: (
+                        PLANNING_REASON_AVL
+                        if candidate_mode == "stockout"
+                        else (
+                            PLANNING_REASON_PREVENTIVE
+                            if candidate_mode == "preventive"
+                            else (
+                                PLANNING_REASON_NO_FOUNTAIN9
+                                if candidate_mode == "no_fountain9_coverage"
+                                else (
+                                    PLANNING_REASON_KAZUHIRA
+                                    if candidate_mode == "kazuhira"
+                                    else PLANNING_REASON_SPECIAL_DOH
+                                )
+                            )
+                        )
+                    ),
+                }
+            )
+
+        assigned_m3 = assigned * m3_per_unit
+        capacity_row["M3_TOTAL_ASIGNADO_INCLUYE_GOLDEN"] = (
+            float(capacity_row["M3_TOTAL_ASIGNADO_INCLUYE_GOLDEN"])
+            + assigned_m3
+        )
+        cap_after = cap_before + assigned_m3
+        capacity_row["M3_CONTABILIZADO_CAPACIDAD"] = cap_after
+        if cap_after >= capacity - 1e-9:
+            capacity_row["CAPACIDAD_CERRADA"] = True
+
+        previous_row = base_row_by_key.get((destination, sku))
+        report_row: dict[str, Any] = {
+            "ORDEN_PLANIFICACION": next_order,
+            "FILA_INPUT": previous_row.get("FILA_INPUT", "CATALOGO")
+            if previous_row
+            else "CATALOGO",
+            "FILAS_INPUT_CONSOLIDADAS": previous_row.get(
+                "FILAS_INPUT_CONSOLIDADAS", "CATALOGO"
+            )
+            if previous_row
+            else "CATALOGO",
+            "CANTIDAD_FILAS_INPUT": previous_row.get("CANTIDAD_FILAS_INPUT", 0)
+            if previous_row
+            else 0,
+            "DUPLICADO_CONFLICTIVO": False,
+            "WAREHOUSE_DESTINATION": destination,
+            "WAREHOUSE_NAME": store.get("warehouse_name", ""),
+            "CITY": city,
+            "RETAIL_ID": sku,
+            "SKU_NAME": previous_row.get("SKU_NAME", "") if previous_row else "",
+            "PREDICTED_OPENING_INVENTORY": previous_row.get(
+                "PREDICTED_OPENING_INVENTORY", 0
+            )
+            if previous_row
+            else 0,
+            "PREDICTED_DEMAND": previous_row.get("PREDICTED_DEMAND", 0)
+            if previous_row
+            else 0,
+            "CURRENT_INVENTORY": candidate["DESTINATION_STOCK"],
+            "MOV_ORIGINAL": 0,
+            "REGLA_DEMANDA": (
+                "AVL_DOH"
+                if candidate_mode == "stockout"
+                else (
+                    "PREVENTIVO_DOH"
+                    if candidate_mode == "preventive"
+                    else (
+                        "COBERTURA_SIN_FOUNTAIN9"
+                        if candidate_mode == "no_fountain9_coverage"
+                        else (
+                            KAZUHIRA_REGLA_DEMANDA
+                            if candidate_mode == "kazuhira"
+                            else "REFUERZO_ESPECIALES_DOH"
+                        )
+                    )
+                )
+            ),
+            "ADU_CATALOGO": (
+                FICTITIOUS_ADU_NO_FOUNTAIN9
+                if candidate.get("USED_FICTITIOUS_ADU")
+                else candidate["ADU"]
+            ),
+            "DOH_AVL": (
+                (candidate["DURATION_MODE"] or 0) + (candidate["LEAD_TIME_MODE"] or 0)
+                if candidate_mode in ("no_fountain9_coverage", "kazuhira")
+                else candidate["TARGET_DOH"]
+            ),
+            "DOH_DESTINO_ANTES": (
+                round(candidate["CURRENT_DOH"], 3)
+                if math.isfinite(candidate["CURRENT_DOH"])
+                else ""
+            ),
+            "CANTIDAD_OBJETIVO": original_target,
+            "CANTIDAD_ASIGNADA": assigned,
+            "CANTIDAD_FALTANTE": max(original_target - assigned, 0),
+            "ES_INFALTABLE": is_infaltable,
+            "ES_GOLDEN": is_golden,
+            "ES_ANCHOR": is_anchor,
+            "TIPO_PRIORIDAD_PRODUCTO": candidate["PRODUCT_PRIORITY_TYPE"],
+            "RANGO_PRIORIDAD_PRODUCTO": candidate["PRODUCT_PRIORITY_RANK"],
+            "ES_GOLDEN_INFALTABLE": is_infaltable or is_golden,
+            "ES_KVI": is_kvi,
+            "PRIORIDAD_TIENDA": candidate["PRIORITY"],
+            "ES_STOCKOUT": candidate["DESTINATION_STOCK"] <= 0,
+            "SIN_RUTA_COSTOS": False,
+            "M3_POR_UNIDAD": m3_per_unit,
+            "M3_OBJETIVO": original_target * m3_per_unit,
+            "M3_ASIGNADO": assigned_m3,
+            "CAPACIDAD_TIENDA_M3": capacity,
+            "M3_CAPACIDAD_ANTES": cap_before,
+            "M3_CAPACIDAD_DESPUES": cap_after,
+            "EXCEDE_CAPACIDAD_EN_ESTA_LINEA": (
+                cap_after > capacity + 1e-9
+            ),
+            "PASA_CAPACIDAD": True,
+            "TAREAS_ANTES": task_before,
+            "TAREAS_GENERADAS": len(allocations),
+            "TAREAS_ACUMULADAS": result.tasks_used,
+            "PASA_TAREAS": len(allocations) == len(candidate_allocations),
+            "ORIGENES_USADOS": " | ".join(
+                f"{source}:{quantity}" for source, quantity in allocations
+            ),
+            "STORAGE": engine.allocation_storage_summary(
+                catalogs,
+                allocations,
+                sku,
+            ),
+            "VALUE": engine.allocation_value_summary(catalogs, allocations, sku),
+            "TIPO_DE_CORTE": (
+                "ENVIADOS PARA CUBRIR AVL"
+                if candidate_mode == "stockout"
+                else (
+                    "ENVIADOS PARA PREVENIR QUIEBRE"
+                    if candidate_mode == "preventive"
+                    else (
+                        NO_FOUNTAIN9_CUT
+                        if candidate_mode == "no_fountain9_coverage"
+                        else (
+                            KAZUHIRA_CUT
+                            if candidate_mode == "kazuhira"
+                            else SPECIAL_DOH_CUT
+                        )
+                    )
+                )
+            ),
+            "DETALLE_MOTIVO": (
+                (
+                    "Quiebre en destino"
+                    if candidate_mode == "stockout"
+                    else (
+                        f"Inventario preventivo: {candidate['DESTINATION_STOCK']:g} "
+                        f"unidades y {candidate['CURRENT_DOH']:.3f} DOH antes del envío"
+                        if candidate_mode == "preventive"
+                        else (
+                            (
+                                f"{'Kazuhira · garantía total: quebrado' if candidate_mode == 'kazuhira' else 'Quebrado sin fila de Fountain9'}: ADU "
+                                f"{'ficticio ' if candidate['USED_FICTITIOUS_ADU'] else ''}"
+                                f"{(FICTITIOUS_ADU_NO_FOUNTAIN9 if candidate['USED_FICTITIOUS_ADU'] else candidate['ADU']):.4f} "
+                                f"× (Duration {candidate['DURATION_MODE']:g} + Lead "
+                                f"Time {candidate['LEAD_TIME_MODE']:g} "
+                                f"{ {'PAIS': 'promedio país, sin dato propio ni de la ciudad', 'CIUDAD': 'promedio de la ciudad, sin dato propio de tienda'}.get(candidate.get('DURATION_SOURCE'), 'moda de la tienda') }"
+                                f") − {candidate['INCOMING']:g} incoming"
+                            )
+                            if candidate_mode in ("no_fountain9_coverage", "kazuhira")
+                            else (
+                                (
+                                    "Refuerzo SIN ADU "
+                                    "(ni propio ni de la ciudad): mínimo operativo "
+                                    "de 3 unidades, sin piso de DOH."
+                                )
+                                if candidate["NO_ADU_ANYWHERE"]
+                                else (
+                                    "Refuerzo: "
+                                    f"{candidate['DESTINATION_STOCK']:g} unidades en "
+                                    "stock + lo ya asignado por otros engines de "
+                                    "cobertura en esta corrida = "
+                                    f"{candidate['CURRENT_DOH']:.3f} DOH antes de este "
+                                    f"envío (ADU {candidate['ADU_SOURCE'].lower()})"
+                                )
+                            )
+                        )
+                    )
+                )
+                + (
+                    "; "
+                    if candidate_mode in ("no_fountain9_coverage", "kazuhira")
+                    else (
+                        f"; objetivo de cobertura {candidate['TARGET_DOH']:g} DOH con ADU "
+                        f"{candidate['ADU']:.4f}. "
+                        if not (
+                            candidate_mode == "special_doh"
+                            and candidate["NO_ADU_ANYWHERE"]
+                        )
+                        else "; "
+                    )
+                )
+                + (
+                    f"Asignadas {assigned} de {original_target}"
+                    + (
+                        " (presupuesto de tareas y/o capacidad de tienda "
+                        "ignorados por configuración de Kazuhira)."
+                        if candidate_mode == "kazuhira"
+                        and (ignore_task_budget or ignore_store_capacity)
+                        else " sin exceder capacidad."
+                    )
+                )
+            ),
+        }
+        for source in config.origin_warehouses:
+            info = origin_info[source]
+            report_row.update(
+                {
+                    f"STOCK_BASE_{source}": info["base"],
+                    f"NO_DISPONIBLE_{source}": info["unavailable"],
+                    f"COPERNICO_NO_USABLE_{source}": info[
+                        "copernico_unusable"
+                    ],
+                    f"RACKEADO_{source}": info["rackeado"],
+                    f"STOCK_INICIAL_AJUSTADO_{source}": info["adjusted"],
+                    f"STOCK_ANTES_{source}": origin_before[source],
+                    f"BLOQUEO_REGIONAL_{source}": regional_blocks[source],
+                    f"BLOQUEO_FRECUENCIA_{source}": schedule_blocks[source],
+                    f"VALUE_{source}": engine.source_value_category(
+                        catalogs,
+                        source,
+                        sku,
+                    ),
+                    f"STORAGE_{source}": engine.source_storage_type(
+                        catalogs,
+                        source,
+                        sku,
+                    ),
+                    f"ASIGNADO_{source}": assigned_by_origin[source],
+                    f"STOCK_REMANENTE_{source}": stock_remaining[(source, sku)],
+                }
+            )
+        result.base_rows.append(report_row)
+        base_row_by_key[(destination, sku)] = report_row
+        next_order += 1
+        summary["cases_sent"] += 1
+        summary["cases_full"] += int(assigned >= original_target)
+        summary["cases_partial"] += int(assigned < original_target)
+        summary["tasks_added"] += len(allocations)
+        summary["units_added"] += assigned
+        summary["m3_added"] += assigned_m3
+        stores_sent.add(destination)
+        products_sent.add(sku)
+
+    result.capacity_rows.sort(key=lambda row: row["WAREHOUSE_DESTINATION"])
+    summary["m3_added"] = round(summary["m3_added"], 2)
+    summary["stores"] = len(stores_sent)
+    summary["products"] = len(products_sent)
+    summary["task_slots_after"] = max(config.max_tasks - result.tasks_used, 0)
+    return summary
+
+
+def write_executive_pdf(
+    path: Path,
+    *,
+    run_date: date,
+    origins: tuple[int, ...],
+    analytics: dict[str, Any],
+    status_counts: dict[str, int] | Counter[str],
+    status_swa: dict[str, float] | None = None,
+    swa_report: dict[str, Any] | None = None,
+    engine_summary_rows: list[dict[str, Any]] | None = None,
+    input_requirements: int,
+    evaluated_requirements: int,
+    tasks: int,
+    max_tasks: int,
+    units: int,
+    city_block: dict[str, Any],
+    closed_stores: dict[str, Any],
+    insumos: dict[str, Any],
+    avl: dict[str, Any],
+    preventive: dict[str, Any],
+    special_doh: dict[str, Any],
+    liquid: dict[str, Any],
+    shalashaska: dict[str, Any],
+    fruver_811: dict[str, Any],
+    schedule_block: dict[str, Any],
+    venom: dict[str, Any],
+    input_consolidation: dict[str, Any],
+    outliers_f9: dict[str, Any],
+    fountain9_audit: list[dict[str, Any]] | None = None,
+) -> None:
+    """Genera un reporte PDF ejecutivo, legible y listo para compartir."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    page_width, page_height = landscape(A4)
+    black = pdf_colors.HexColor("#111111")
+    paper = pdf_colors.HexColor("#F6F2E8")
+    acid = pdf_colors.HexColor("#CFFF2E")
+    coral = pdf_colors.HexColor("#FF5B4D")
+    blue = pdf_colors.HexColor("#5577FF")
+    pale_green = pdf_colors.HexColor("#E6F7DF")
+    pale_blue = pdf_colors.HexColor("#E9EEFF")
+    grid = pdf_colors.HexColor("#D8D3C9")
+    grey = pdf_colors.HexColor("#5A5A5A")
+
+    base_styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "PdfTitle",
+        parent=base_styles["Title"],
+        fontName="Helvetica-Bold",
+        fontSize=25,
+        leading=27,
+        textColor=black,
+        alignment=TA_LEFT,
+        spaceAfter=3 * mm,
+    )
+    subtitle_style = ParagraphStyle(
+        "PdfSubtitle",
+        parent=base_styles["Normal"],
+        fontName="Helvetica",
+        fontSize=8.5,
+        leading=11,
+        textColor=grey,
+    )
+    section_style = ParagraphStyle(
+        "PdfSection",
+        parent=base_styles["Heading2"],
+        fontName="Helvetica-Bold",
+        fontSize=12,
+        leading=14,
+        textColor=paper,
+        backColor=black,
+        borderPadding=(4, 7, 4, 7),
+        spaceBefore=4 * mm,
+        spaceAfter=2.5 * mm,
+    )
+    body_style = ParagraphStyle(
+        "PdfBody",
+        parent=base_styles["BodyText"],
+        fontName="Helvetica",
+        fontSize=8,
+        leading=10.5,
+        textColor=black,
+    )
+    small_style = ParagraphStyle(
+        "PdfSmall",
+        parent=body_style,
+        fontSize=6.8,
+        leading=8.4,
+    )
+    table_header_style = ParagraphStyle(
+        "PdfTableHeader",
+        parent=small_style,
+        fontName="Helvetica-Bold",
+        textColor=paper,
+        alignment=TA_LEFT,
+    )
+    table_cell_style = ParagraphStyle(
+        "PdfTableCell",
+        parent=small_style,
+        textColor=black,
+    )
+    card_label_style = ParagraphStyle(
+        "PdfCardLabel",
+        parent=small_style,
+        fontName="Helvetica-Bold",
+        fontSize=6.6,
+        leading=8,
+        textColor=black,
+        alignment=TA_LEFT,
+    )
+    card_value_style = ParagraphStyle(
+        "PdfCardValue",
+        parent=body_style,
+        fontName="Helvetica-Bold",
+        fontSize=16,
+        leading=18,
+        textColor=black,
+        alignment=TA_LEFT,
+    )
+
+    def para(value: Any, style=table_cell_style) -> Paragraph:
+        return Paragraph(html.escape(str(value)), style)
+
+    def fmt_int(value: Any) -> str:
+        return f"{int(value or 0):,}"
+
+    def fmt_pct(value: Any) -> str:
+        return f"{float(value or 0):,.1f}%"
+
+    def fmt_m3(value: Any) -> str:
+        return f"{float(value or 0):,.2f}"
+
+    def fmt_float(value: Any) -> str:
+        return f"{float(value or 0):,.4f}"
+
+    def report_table_pdf(
+        rows: list[dict[str, Any]],
+        columns: list[tuple[str, str, Any]],
+        widths: list[float],
+        *,
+        max_rows: int | None = None,
+    ) -> Table:
+        selected = rows if max_rows is None else rows[:max_rows]
+        data: list[list[Any]] = [
+            [para(label, table_header_style) for _, label, _ in columns]
+        ]
+        for row in selected:
+            data.append(
+                [
+                    para(formatter(row.get(key, "")), table_cell_style)
+                    for key, _, formatter in columns
+                ]
+            )
+        if not selected:
+            data.append(
+                [para("Sin registros", table_cell_style)]
+                + [para("", table_cell_style) for _ in columns[1:]]
+            )
+        table = Table(data, colWidths=widths, repeatRows=1, hAlign="LEFT")
+        table.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), black),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), paper),
+                    ("GRID", (0, 0), (-1, -1), 0.35, grid),
+                    ("BACKGROUND", (0, 1), (-1, -1), pdf_colors.white),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                    ("TOPPADDING", (0, 0), (-1, -1), 3.5),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 3.5),
+                ]
+            )
+        )
+        return table
+
+    def kpi_cards(cards: list[tuple[str, str, Any]]) -> Table:
+        cells = [
+            [
+                para(label.upper(), card_label_style),
+                Spacer(1, 1.2 * mm),
+                para(value, card_value_style),
+            ]
+            for label, value, _ in cards
+        ]
+        table = Table(
+            [cells],
+            colWidths=[(page_width - 28 * mm) / len(cells)] * len(cells),
+        )
+        style_commands: list[tuple[Any, ...]] = [
+            ("BOX", (0, 0), (-1, -1), 1.2, black),
+            ("INNERGRID", (0, 0), (-1, -1), 1.2, black),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 6),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+            ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ]
+        for column, (_, _, background) in enumerate(cards):
+            style_commands.append(
+                ("BACKGROUND", (column, 0), (column, 0), background)
+            )
+        table.setStyle(TableStyle(style_commands))
+        return table
+
+    summary = analytics["summary"]
+    origin_text = " · ".join(
+        f"{source} {ORIGIN_WAREHOUSES.get(source, '')}".strip()
+        for source in origins
+    )
+    story: list[Any] = [
+        Paragraph("REPORTE EJECUTIVO DE PLANEACIÓN", title_style),
+        Paragraph(
+            f"Fecha: {run_date:%d-%m-%Y} &nbsp;&nbsp;|&nbsp;&nbsp; "
+            f"Orígenes: {html.escape(origin_text)}",
+            subtitle_style,
+        ),
+        Spacer(1, 4 * mm),
+        kpi_cards(
+            [
+                ("Tareas de producto", fmt_int(tasks), acid),
+                ("Unidades de producto", fmt_int(units), paper),
+                ("Compliance de casos", fmt_pct(summary["case_compliance_pct"]), blue),
+                ("Compliance de unidades", fmt_pct(summary["unit_compliance_pct"]), coral),
+            ]
+        ),
+        Spacer(1, 3 * mm),
+        kpi_cards(
+            [
+                ("Tiendas atendidas", fmt_int(summary["stores_served"]), paper),
+                ("Productos distintos", fmt_int(summary["products_served"]), pale_blue),
+                ("Volumen asignado m3", fmt_m3(summary["m3_assigned"]), pale_green),
+                ("Uso del límite de tareas", f"{tasks:,} / {max_tasks:,}", paper),
+            ]
+        ),
+        Paragraph("LECTURA EJECUTIVA", section_style),
+    ]
+
+    executive_rows = [
+        [
+            para("Demanda Fountain9", table_header_style),
+            para("Quiebres", table_header_style),
+            para("Coberturas de catálogo", table_header_style),
+            para("Exclusiones y extras", table_header_style),
+        ],
+        [
+            para(
+                f"{input_consolidation.get('files', 1):,} archivo(s) y "
+                f"{input_consolidation.get('source_rows', input_requirements):,} "
+                f"filas consolidadas en {input_requirements:,} casos únicos; "
+                f"{evaluated_requirements:,} evaluados. "
+                f"{summary['fully_covered_cases']:,} quedaron completos y "
+                f"{summary['partial_cases']:,} parciales.",
+                body_style,
+            ),
+            para(
+                f"{summary['stockout_cases_served']:,} de "
+                f"{summary['stockout_cases']:,} casos en quiebre recibieron envío; "
+                f"{summary['stockout_cases_full']:,} se cubrieron completamente.",
+                body_style,
+            ),
+            para(
+                (
+                    (
+                        f"AVL (quiebres) a {avl['doh']:g} DOH: "
+                        f"{avl['cases_sent']:,} casos y {avl['units_added']:,} unidades. "
+                    )
+                    if avl.get("enabled")
+                    else "AVL desactivado. "
+                )
+                + (
+                    (
+                        f"Preventivo: {preventive['cases_sent']:,} casos, "
+                        f"{preventive['tasks_added']:,} tareas y "
+                        f"{preventive['units_added']:,} unidades."
+                    )
+                    if preventive.get("enabled")
+                    else "Blindaje preventivo desactivado."
+                )
+                + (
+                    (
+                        f" Refuerzo ({special_doh_text(special_doh)}): "
+                        f"{special_doh['cases_sent']:,} casos y "
+                        f"{special_doh['units_added']:,} unidades."
+                    )
+                    if special_doh.get("enabled")
+                    else " Refuerzo desactivado."
+                )
+                + (
+                    (
+                        f" Shalashaska: {shalashaska['units_evacuated']:,} de "
+                        f"{shalashaska['units_at_risk']:,} unidades próximas a "
+                        f"caducar evacuadas con {shalashaska['tasks_added']:,} "
+                        "tareas nuevas."
+                    )
+                    if shalashaska.get("enabled")
+                    else " Shalashaska Engine desactivado."
+                )
+                + (
+                    (
+                        f" Liquid Engine: {liquid['tasks_added']:,} tareas nuevas, "
+                        f"{liquid['units_added']:,} unidades y "
+                        f"{liquid['stock_exhausted_cases']:,} saldos agotados."
+                    )
+                    if liquid.get("enabled")
+                    else " Liquid Engine desactivado."
+                )
+                + (
+                    (
+                        f" Venom Engine (DDMRP, LT {venom.get('lead_time_days', 0):g}d): "
+                        f"{venom.get('lines_sent_ddmrp', 0):,} líneas DDMRP + "
+                        f"{venom.get('lines_sent_oowl', 0):,} OOWL, "
+                        f"{venom.get('units_sent', 0):,} unidades adicionales en "
+                        f"{venom.get('tasks_added', 0):,} tareas nuevas."
+                    )
+                    if venom.get("enabled")
+                    else " Venom Engine desactivado."
+                ),
+                body_style,
+            ),
+            para(
+                f"{closed_stores.get('requirements', 0):,} casos por tienda cerrada; "
+                f"{city_block.get('requirements', 0):,} por ciudad bloqueada; "
+                f"{outliers_f9.get('requirements_excluded', 0):,} combinaciones "
+                f"de {outliers_f9.get('stores_excluded', 0):,} tiendas excluidas "
+                "como outlier Fountain9; "
+                f"{insumos.get('lines_added', 0):,} líneas y "
+                f"{insumos.get('units_added', 0):,} unidades de insumos; "
+                f"{insumos.get('units_cut_stock', 0):,} unidades recortadas por "
+                "stock del 444. "
+                + (
+                    f"FRUVER 811 bloqueado: "
+                    f"{fruver_811.get('products_with_stock_blocked', 0):,} productos."
+                    if fruver_811.get("enabled")
+                    else "FRUVER 811 sin bloqueo manual."
+                )
+                + " "
+                + (
+                    (
+                        f"Frecuencia SCHEDULE ({schedule_block.get('weekday', '')}): "
+                        f"{schedule_block.get('requirements_full_cut', 0):,} casos "
+                        "cortados por completo y "
+                        f"{schedule_block.get('requirements_partial_cut', 0):,} "
+                        f"parciales; {schedule_block.get('units_missing', 0):,} "
+                        f"unidades sin cubrir en "
+                        f"{schedule_block.get('stores', 0):,} tiendas."
+                    )
+                    if schedule_block.get("enabled")
+                    else "Bloqueo por frecuencia SCHEDULE desactivado."
+                ),
+                body_style,
+            ),
+        ],
+    ]
+    executive_table = Table(
+        executive_rows,
+        colWidths=[(page_width - 28 * mm) / 4] * 4,
+    )
+    executive_table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), black),
+                ("BACKGROUND", (0, 1), (-1, 1), pdf_colors.white),
+                ("GRID", (0, 0), (-1, -1), 0.6, black),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                ("TOPPADDING", (0, 0), (-1, -1), 6),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+            ]
+        )
+    )
+    swa_summary_block: list[Any] = []
+    if swa_report and swa_report.get("enabled"):
+        swa_summary_block = [
+            Paragraph("SWA · SALES WEIGHTED AVAILABILITY", section_style),
+            report_table_pdf(
+                [
+                    {
+                        "METRICA": "SWA GANADO (tienda-SKU sacadas del quiebre)",
+                        "VALOR": f"{swa_report.get('swa_ganado', 0.0):,.4f}",
+                    },
+                    {
+                        "METRICA": "SWA PERDIDO (siguen en quiebre)",
+                        "VALOR": f"{swa_report.get('swa_perdido', 0.0):,.4f}",
+                    },
+                    {
+                        "METRICA": "Universo total de quiebres evaluados",
+                        "VALOR": f"{swa_report.get('universo_total', 0):,}",
+                    },
+                ],
+                [
+                    ("METRICA", "MÉTRICA", str),
+                    ("VALOR", "VALOR", str),
+                ],
+                [220 * mm, 45 * mm],
+            ),
+        ]
+    engine_summary_block: list[Any] = []
+    if engine_summary_rows:
+        swa_on = bool(swa_report and swa_report.get("enabled"))
+        engine_columns: list[tuple[str, str, Any]] = [
+            ("ETAPA", "ETAPA", str),
+            ("ENGINE", "ENGINE", str),
+            ("COBERTURA", "COBERTURA", str),
+            ("ESTADO", "ESTADO", str),
+            ("CASOS", "CASOS", fmt_int),
+            ("TAREAS", "TAREAS", fmt_int),
+            ("UNIDADES", "UNIDADES", fmt_int),
+        ]
+        engine_widths = [22 * mm, 34 * mm, 62 * mm, 24 * mm, 28 * mm, 28 * mm, 32 * mm]
+        if swa_on:
+            engine_columns.append(("SWA_GANADO", "SWA GANADO", fmt_float))
+            engine_widths.append(30 * mm)
+        engine_summary_block = [
+            Paragraph("RESUMEN POR ENGINE", section_style),
+            report_table_pdf(engine_summary_rows, engine_columns, engine_widths),
+        ]
+    story.extend(
+        [
+            executive_table,
+            *swa_summary_block,
+            *engine_summary_block,
+            Paragraph("BREAKDOWN DE LA PLANEACIÓN", section_style),
+            report_table_pdf(
+                ordered_breakdown_rows(status_counts, status_swa),
+                [
+                    ("BREAKDOWN", "BREAKDOWN", str),
+                    ("FILAS", "CASOS / LÍNEAS", fmt_int),
+                    *([("SWA", "SWA PAÍS", fmt_float)] if status_swa else []),
+                ],
+                [220 * mm, 45 * mm] + ([40 * mm] if status_swa else []),
+            ),
+            PageBreak(),
+            Paragraph("ANÁLISIS GENERAL", title_style),
+            Paragraph("RESULTADO POR CIUDAD", section_style),
+            report_table_pdf(
+                analytics["city_rows"],
+                [
+                    ("CIUDAD", "CIUDAD", str),
+                    ("TIENDAS_ATENDIDAS", "TIENDAS", fmt_int),
+                    ("PRODUCTOS_DISTINTOS", "PRODUCTOS", fmt_int),
+                    ("TAREAS", "TAREAS", fmt_int),
+                    ("UNIDADES", "UNIDADES", fmt_int),
+                    ("M3", "M3", fmt_m3),
+                ],
+                [80 * mm, 34 * mm, 38 * mm, 30 * mm, 37 * mm, 35 * mm],
+            ),
+            Paragraph("RESULTADO POR ORIGEN", section_style),
+            report_table_pdf(
+                analytics["source_rows"],
+                [
+                    ("WAREHOUSE_SOURCE", "ORIGEN", str),
+                    ("NOMBRE", "NOMBRE", str),
+                    ("TAREAS", "TAREAS", fmt_int),
+                    ("UNIDADES", "UNIDADES", fmt_int),
+                    ("PRODUCTOS_DISTINTOS", "PRODUCTOS", fmt_int),
+                    ("TIENDAS_ATENDIDAS", "TIENDAS", fmt_int),
+                    ("M3", "M3", fmt_m3),
+                ],
+                [25 * mm, 62 * mm, 28 * mm, 34 * mm, 33 * mm, 30 * mm, 32 * mm],
+            ),
+            Paragraph("TOP 15 TIENDAS POR UNIDADES", section_style),
+            report_table_pdf(
+                sorted(
+                    analytics["store_rows"],
+                    key=lambda row: (-row["UNIDADES"], row["WAREHOUSE_ID"]),
+                ),
+                [
+                    ("CIUDAD", "CIUDAD", str),
+                    ("WAREHOUSE_ID", "WH", str),
+                    ("TIENDA", "TIENDA", str),
+                    ("PRODUCTOS_DISTINTOS", "PRODUCTOS", fmt_int),
+                    ("TAREAS", "TAREAS", fmt_int),
+                    ("UNIDADES", "UNIDADES", fmt_int),
+                    ("M3", "M3", fmt_m3),
+                ],
+                [48 * mm, 22 * mm, 75 * mm, 32 * mm, 26 * mm, 30 * mm, 28 * mm],
+                max_rows=15,
+            ),
+        ]
+    )
+
+    golden = analytics.get("golden", {})
+    golden_summary = golden.get("summary", {})
+    if golden_summary:
+        story.extend(
+            [
+                PageBreak(),
+                Paragraph("INFALTABLES · GOLDEN · ANCHOR", title_style),
+                Paragraph(
+                    "Seguimiento por tienda-SKU con jerarquía estricta: Infaltable, "
+                    "Golden y Anchor. Se conserva una sola clasificación mandante.",
+                    subtitle_style,
+                ),
+                Spacer(1, 3 * mm),
+                kpi_cards(
+                    [
+                        ("Casos prioritarios", fmt_int(golden_summary["cases"]), blue),
+                        ("Casos completos", fmt_int(golden_summary["full_cases"]), acid),
+                        (
+                            "Compliance de casos",
+                            fmt_pct(golden_summary["case_compliance_pct"]),
+                            paper,
+                        ),
+                        (
+                            "Compliance de unidades",
+                            fmt_pct(golden_summary["unit_compliance_pct"]),
+                            coral,
+                        ),
+                    ]
+                ),
+                Paragraph("RESULTADO POR CLASIFICACIÓN", section_style),
+                report_table_pdf(
+                    golden.get("type_rows", []),
+                    [
+                        ("TIPO", "TIPO", str),
+                        ("CASOS", "CASOS", fmt_int),
+                        ("CON_ENVÍO", "CON ENVÍO", fmt_int),
+                        ("COMPLETOS", "COMPLETOS", fmt_int),
+                        ("OBJETIVO", "OBJETIVO", fmt_int),
+                        ("ASIGNADO", "ASIGNADO", fmt_int),
+                        ("FALTANTE", "FALTANTE", fmt_int),
+                        ("COMPLIANCE_%", "COMPLIANCE", fmt_pct),
+                    ],
+                    [40 * mm, 25 * mm, 28 * mm, 30 * mm, 31 * mm, 31 * mm, 28 * mm, 35 * mm],
+                ),
+                Paragraph("PRIORITARIOS POR CIUDAD", section_style),
+                report_table_pdf(
+                    golden.get("city_rows", []),
+                    [
+                        ("CIUDAD", "CIUDAD", str),
+                        ("CASOS", "CASOS", fmt_int),
+                        ("COMPLETOS", "COMPLETOS", fmt_int),
+                        ("TIENDAS", "TIENDAS", fmt_int),
+                        ("OBJETIVO", "OBJETIVO", fmt_int),
+                        ("ASIGNADO", "ASIGNADO", fmt_int),
+                        ("COMPLIANCE_%", "COMPLIANCE", fmt_pct),
+                    ],
+                    [55 * mm, 27 * mm, 31 * mm, 28 * mm, 32 * mm, 32 * mm, 34 * mm],
+                ),
+                Paragraph("PRIORITARIOS POR ORIGEN", section_style),
+                report_table_pdf(
+                    golden.get("origin_rows", []),
+                    [
+                        ("ORIGEN", "ORIGEN", str),
+                        ("NOMBRE", "NOMBRE", str),
+                        ("CASOS_CON_APORTE", "CASOS CON APORTE", fmt_int),
+                        ("PRODUCTOS", "PRODUCTOS", fmt_int),
+                        ("TIENDAS", "TIENDAS", fmt_int),
+                        ("UNIDADES", "UNIDADES", fmt_int),
+                    ],
+                    [30 * mm, 85 * mm, 31 * mm, 35 * mm, 34 * mm, 38 * mm],
+                ),
+                Paragraph("TOP 15 TIENDAS PRIORITARIAS POR FALTANTE", section_style),
+                report_table_pdf(
+                    golden.get("store_rows", []),
+                    [
+                        ("CIUDAD", "CIUDAD", str),
+                        ("TIENDA", "TIENDA", str),
+                        ("CASOS", "CASOS", fmt_int),
+                        ("PRODUCTOS", "PRODUCTOS", fmt_int),
+                        ("OBJETIVO", "OBJETIVO", fmt_int),
+                        ("ASIGNADO", "ASIGNADO", fmt_int),
+                        ("FALTANTE", "FALTANTE", fmt_int),
+                        ("COMPLIANCE_%", "COMPLIANCE", fmt_pct),
+                    ],
+                    [34 * mm, 76 * mm, 22 * mm, 28 * mm, 27 * mm, 27 * mm, 26 * mm, 30 * mm],
+                    max_rows=15,
+                ),
+                PageBreak(),
+                Paragraph("DETALLE PRIORITARIO TIENDA-SKU", title_style),
+                Paragraph(
+                    "Casos ordenados por unidades faltantes para facilitar la "
+                    "gestión de excepciones prioritarias.",
+                    subtitle_style,
+                ),
+                Spacer(1, 3 * mm),
+                report_table_pdf(
+                    golden.get("detail_rows", []),
+                    [
+                        ("CIUDAD", "CIUDAD", str),
+                        ("TIENDA", "TIENDA", str),
+                        ("SKU", "SKU", str),
+                        ("TIPO", "TIPO", str),
+                        ("OBJETIVO", "OBJ.", fmt_int),
+                        ("ASIGNADO", "ASIG.", fmt_int),
+                        ("FALTANTE", "FALT.", fmt_int),
+                        ("BREAKDOWN", "BREAKDOWN", str),
+                    ],
+                    [27 * mm, 51 * mm, 55 * mm, 25 * mm, 20 * mm, 20 * mm, 20 * mm, 40 * mm],
+                    max_rows=20,
+                ),
+            ]
+        )
+
+    for detail in analytics.get("source_details", []):
+        source = detail["warehouse_source"]
+        source_summary = detail["summary"]
+        story.extend(
+            [
+                PageBreak(),
+                Paragraph(
+                    f"ANÁLISIS DEL ORIGEN {source}",
+                    title_style,
+                ),
+                Paragraph(html.escape(detail["name"]), subtitle_style),
+                Spacer(1, 3 * mm),
+                kpi_cards(
+                    [
+                        ("Tareas", fmt_int(source_summary["TAREAS"]), acid),
+                        ("Unidades", fmt_int(source_summary["UNIDADES"]), paper),
+                        ("Tiendas", fmt_int(source_summary["TIENDAS_ATENDIDAS"]), blue),
+                        ("Volumen m3", fmt_m3(source_summary["M3"]), coral),
+                    ]
+                ),
+                Paragraph("DISTRIBUCIÓN POR CIUDAD", section_style),
+                report_table_pdf(
+                    detail["city_rows"],
+                    [
+                        ("CIUDAD", "CIUDAD", str),
+                        ("TIENDAS_ATENDIDAS", "TIENDAS", fmt_int),
+                        ("PRODUCTOS_DISTINTOS", "PRODUCTOS", fmt_int),
+                        ("TAREAS", "TAREAS", fmt_int),
+                        ("UNIDADES", "UNIDADES", fmt_int),
+                        ("M3", "M3", fmt_m3),
+                    ],
+                    [76 * mm, 36 * mm, 40 * mm, 32 * mm, 38 * mm, 35 * mm],
+                ),
+                Paragraph("DISTRIBUCIÓN POR STORAGE", section_style),
+                report_table_pdf(
+                    detail["storage_rows"],
+                    [
+                        ("STORAGE", "STORAGE", str),
+                        ("PRODUCTOS_DISTINTOS", "PRODUCTOS", fmt_int),
+                        ("TIENDAS_ATENDIDAS", "TIENDAS", fmt_int),
+                        ("TAREAS", "TAREAS", fmt_int),
+                        ("UNIDADES", "UNIDADES", fmt_int),
+                        ("M3", "M3", fmt_m3),
+                    ],
+                    [82 * mm, 40 * mm, 38 * mm, 32 * mm, 38 * mm, 34 * mm],
+                ),
+                Paragraph("TOP 12 TIENDAS DEL ORIGEN", section_style),
+                report_table_pdf(
+                    detail["store_rows"],
+                    [
+                        ("CIUDAD", "CIUDAD", str),
+                        ("WAREHOUSE_ID", "WH", str),
+                        ("TIENDA", "TIENDA", str),
+                        ("PRODUCTOS_DISTINTOS", "PRODUCTOS", fmt_int),
+                        ("TAREAS", "TAREAS", fmt_int),
+                        ("UNIDADES", "UNIDADES", fmt_int),
+                        ("M3", "M3", fmt_m3),
+                    ],
+                    [45 * mm, 22 * mm, 78 * mm, 34 * mm, 28 * mm, 30 * mm, 28 * mm],
+                    max_rows=12,
+                ),
+            ]
+        )
+
+    def decorate_page(canvas, document) -> None:
+        canvas.saveState()
+        canvas.setFillColor(paper)
+        canvas.rect(0, 0, page_width, page_height, fill=1, stroke=0)
+        canvas.setFont("Helvetica", 6.5)
+        canvas.setFillColor(grey)
+        canvas.drawString(13 * mm, 6 * mm, f"Planeación {run_date:%d-%m-%Y}")
+        canvas.drawRightString(
+            page_width - 13 * mm,
+            6 * mm,
+            f"Página {document.page}",
+        )
+        canvas.restoreState()
+
+    document = SimpleDocTemplate(
+        str(path),
+        pagesize=landscape(A4),
+        rightMargin=13 * mm,
+        leftMargin=13 * mm,
+        topMargin=13 * mm,
+        bottomMargin=11 * mm,
+        title=f"Reporte Ejecutivo de Planeación {run_date:%d-%m-%Y}",
+        author="Mother Base Supply Command",
+        subject="Planeación ejecutiva de abasto y transferencias",
+    )
+    if fountain9_audit:
+        story.append(PageBreak())
+        story.append(Paragraph("Fountain9 DOI: cumplimiento y recuperación", title_style))
+        data = [["Métrica", "Unidades"]]
+        for label, column in (
+            ("Fountain9 solicitado", "DOI_SOLICITADO"),
+            ("Naked ejecutado literalmente", "NAKED_EJECUTADO"),
+            ("Otacon recuperado", "OTACON_RECUPERADO"),
+            ("Cobertura final de DOI", "COBERTURA_FINAL_MB"),
+            ("Faltante final", "FALTANTE_FINAL"),
+        ):
+            data.append([label, str(sum(row[column] for row in fountain9_audit))])
+        story.append(Table(data, colWidths=[300, 100]))
+    document.build(story, onFirstPage=decorate_page, onLaterPages=decorate_page)
+
+
+def execute_planning(
+    uploaded_copernico,
+    uploaded_plans,
+    database_bytes: bytes,
+    origins: tuple[int, ...],
+    max_tasks: int,
+    run_date,
+    blocked_cities: tuple[str, ...] = (),
+    include_insumos: bool = True,
+    include_avl_fill: bool = False,
+    avl_doh: float = 3.0,
+    block_fruver_811: bool = True,
+    block_off_schedule_shipments: bool = True,
+    enable_rackeados_rule: bool = True,
+    enable_closed_stores_rule: bool = True,
+    enable_regional_block_rule: bool = True,
+    enable_global_blocks_rule: bool = True,
+    ignore_store_capacity: bool = False,
+    enable_route_cost_block_rule: bool = True,
+    simulation_mode: bool = False,
+    minimum_positive_quantity: int = 3,
+    include_preventive_fill: bool = False,
+    include_special_doh_fill: bool = False,
+    include_no_fountain9_coverage: bool = False,
+    special_doh_target: float = 3.0,
+    special_doh_targets: dict[str, float] | None = None,
+    solidus_swa_priority: bool = True,
+    include_naked_engine: bool = True,
+    cover_fountain9_hardcodes: bool = True,
+    hardcode_zero_total: bool = True,
+    hardcode_inventory_below_demand: bool = True,
+    hardcode_low_net_transfer: bool = True,
+    net_transfer_max: float = 3.0,
+    destination_stock_below: float = 3.0,
+    raise_small_roq_to_minimum: bool = True,
+    use_extra_mov_columns: bool = True,
+    include_solidus_engine: bool = True,
+    include_shalashaska_engine: bool = False,
+    shalashaska_extra_cities: tuple[str, ...] = (),
+    shalashaska_allow_sensitive: bool = False,
+    shalashaska_evacuation_fraction: float = 1.0,
+    shalashaska_target_doh: float = 7.0,
+    include_liquid_engine: bool = False,
+    liquid_automatic_tail: bool = True,
+    liquid_automatic_tail_origins: set[int] | None = None,
+    liquid_tail_threshold: int = 10,
+    liquid_manual_skus_by_origin: dict[int, set[int]] | None = None,
+    forecast_horizon_days: int = 7,
+    excluded_skus: set[int] | None = None,
+    excluded_store_ids: set[int] | None = None,
+    apply_origin_storage_override: bool = False,
+    exclude_fountain9_outlier_stores: bool = True,
+    include_venom_engine: bool = False,
+    include_kazuhira_engine: bool = False,
+    kazuhira_ignore_task_budget: bool = False,
+    kazuhira_ignore_store_capacity: bool = False,
+    kazuhira_swa_priority: bool = False,
+    venom_origins: tuple[int, ...] = (),
+    venom_destinations: tuple[int, ...] = (),
+    venom_section_types: frozenset[str] = frozenset(),
+    venom_lead_time_days: float = 2.0,
+    venom_consider_current_planning: bool = True,
+    venom_ltf: float = 0.5,
+    venom_vf: float = 0.5,
+    venom_min_green_units: float | None = None,
+    venom_order_cycle_days: float = 0.0,
+    venom_trigger_zone: str = "yellow",
+    venom_subtract_lead_time_demand: bool = True,
+    venom_consider_incoming: bool = False,
+    venom_shipping_multiple: int = 1,
+    venom_cap_to_store_capacity: bool = False,
+    venom_manual_skus_by_origin: dict[int, set[int]] | None = None,
+    venom_only_manual_skus: bool = False,
+) -> dict[str, Any]:
+    clear_previous_workspace()
+    workspace = Path(tempfile.mkdtemp(prefix="transfer_planner_"))
+    st.session_state["last_workspace"] = str(workspace)
+    input_dir = workspace / "input"
+    data_path = input_dir / "DATA_TRANSFERS.xlsx"
+    canonical_plan_path = input_dir / (
+        f"Plan_Consolidado_{run_date:%d-%m-%Y}.csv"
+    )
+
+    uploaded_copernico_list = list(uploaded_copernico or [])
+    copernico_paths: list[Path] = []
+    copernico_used_names: Counter[str] = Counter()
+    for index, uploaded_file in enumerate(uploaded_copernico_list, start=1):
+        raw_name = engine.safe_filename(Path(uploaded_file.name).name) or (
+            f"copernico_{index}.csv"
+        )
+        copernico_used_names[raw_name] += 1
+        saved_name = (
+            raw_name
+            if copernico_used_names[raw_name] == 1
+            else f"{index:02d}_{raw_name}"
+        )
+        copernico_path = input_dir / saved_name
+        save_uploaded_file(uploaded_file, copernico_path)
+        copernico_paths.append(copernico_path)
+
+    uploaded_plan_list = list(uploaded_plans or [])
+    plan_paths: list[Path] = []
+    used_names: Counter[str] = Counter()
+    for index, uploaded_plan in enumerate(uploaded_plan_list, start=1):
+        raw_name = engine.safe_filename(Path(uploaded_plan.name).name) or (
+            f"plan_{index}.csv"
+        )
+        used_names[raw_name] += 1
+        saved_name = (
+            raw_name
+            if used_names[raw_name] == 1
+            else f"{index:02d}_{raw_name}"
+        )
+        plan_path = input_dir / saved_name
+        save_uploaded_file(uploaded_plan, plan_path)
+        plan_paths.append(plan_path)
+    save_database(database_bytes, data_path)
+
+    config = engine.Config(
+        origin_warehouses=origins,
+        max_tasks=max_tasks,
+        run_date_override=run_date.strftime("%d-%m-%Y"),
+        default_store_capacity_m3=engine.CONFIG.default_store_capacity_m3,
+        default_m3_per_unit=engine.CONFIG.default_m3_per_unit,
+        minimum_positive_quantity=minimum_positive_quantity,
+        raise_small_roq_to_minimum=bool(raise_small_roq_to_minimum),
+        ignore_store_capacity=bool(ignore_store_capacity),
+        local_work_dir=str(workspace / "engine"),
+    )
+
+    captured = io.StringIO()
+    with redirect_stdout(captured):
+        catalogs = engine.load_catalogs(
+            data_path,
+            config,
+            copernico_csv_path=copernico_paths,
+        )
+        catalogs.origin_storage_override_enabled = bool(
+            apply_origin_storage_override
+        )
+        catalogs.schedule_block_enabled = bool(block_off_schedule_shipments)
+        catalogs.regional_block_enabled = bool(enable_regional_block_rule)
+        if not catalogs.regional_block_enabled:
+            catalogs.warnings.append(
+                "Bloqueo regional (BLOQUEOS_FORANEAS) desactivado para esta "
+                "corrida desde CODEC."
+            )
+        if not enable_rackeados_rule:
+            catalogs.warnings.append(
+                f"Regla RACKEADOS desactivada para esta corrida desde CODEC: "
+                f"{len(catalogs.rackeados_444):,} SKUs dejaron de tratarse "
+                "como rackeados en 444."
+            )
+            catalogs.rackeados_444 = set()
+        if not enable_route_cost_block_rule:
+            catalogs.warnings.append(
+                "Regla RUTA_COSTOS desactivada para esta corrida desde "
+                f"CODEC: {len(catalogs.route_cost_blocks):,} combinaciones "
+                "tienda-SKU dejaron de bloquearse por ruta."
+            )
+            catalogs.route_cost_blocks = set()
+        if catalogs.schedule_block_enabled:
+            weekday_display = engine.WEEKDAY_DISPLAY_NAMES.get(
+                catalogs.run_weekday_norm, catalogs.run_weekday_norm
+            )
+            catalogs.warnings.append(
+                "Bloqueo por frecuencia de envío activo: hoy es "
+                f"{weekday_display}; se omitirán los envíos origen-destino "
+                f"fuera de los días definidos en SCHEDULE "
+                f"({len(catalogs.schedule_days):,} combinaciones configuradas)."
+            )
+        if not enable_global_blocks_rule:
+            catalogs.warnings.append(
+                "Regla BLOQUEOS desactivada para esta corrida desde CODEC: "
+                f"{len(catalogs.globally_blocked_skus):,} SKUs de la hoja dejaron "
+                "de bloquearse (la exclusión manual de SKUs sigue aplicando)."
+            )
+            catalogs.globally_blocked_skus = set()
+        if ignore_store_capacity:
+            catalogs.warnings.append(
+                "Capacidad de tienda ignorada en todos los engines desde CODEC: "
+                "el uso de m³ se sigue registrando en los reportes, pero ninguna "
+                "línea se corta por capacidad."
+            )
+        excluded_sku_set = set(excluded_skus or ()) | catalogs.globally_blocked_skus
+        manually_excluded_store_ids = set(excluded_store_ids or ())
+        catalogs.excluded_products = excluded_sku_set
+        if excluded_sku_set:
+            user_excluded_count = len(set(excluded_skus or ()))
+            sheet_excluded_count = len(catalogs.globally_blocked_skus)
+            catalogs.warnings.append(
+                "Exclusión general: se bloquearon completamente "
+                f"{len(excluded_sku_set):,} SKUs ("
+                f"{user_excluded_count:,} ingresados en CODEC + "
+                f"{sheet_excluded_count:,} de la hoja BLOQUEOS de "
+                "DATA_TRANSFERS)."
+            )
+        fruver_811_summary = apply_fruver_811_block(
+            catalogs,
+            origins,
+            block_fruver_811,
+        )
+        if fruver_811_summary["enabled"]:
+            catalogs.warnings.append(
+                "Bloqueo FRUVER 811: se volvió no elegible el stock de "
+                f"{fruver_811_summary['products_with_stock_blocked']:,} productos "
+                f"({fruver_811_summary['units_blocked']:,.0f} unidades) antes de "
+                "la asignación. Los demás orígenes permanecieron disponibles."
+            )
+        closed_store_ids = (
+            load_closed_store_ids(data_path) if enable_closed_stores_rule else set()
+        )
+        if not enable_closed_stores_rule:
+            catalogs.warnings.append(
+                "Regla TIENDAS_CERRADAS desactivada para esta corrida desde "
+                "CODEC: ninguna tienda se excluye por este bloqueo permanente."
+            )
+        insumos_rows: list[dict[str, Any]] = []
+        if include_insumos and 444 in origins:
+            insumos_rows, insumos_warnings = load_insumos_rows(
+                data_path,
+                catalogs,
+            )
+            insumos_rows = [
+                row
+                for row in insumos_rows
+                if row["RETAIL_ID"] not in excluded_sku_set
+            ]
+            catalogs.warnings.extend(insumos_warnings)
+        plan_path, consolidated_input, consolidation_summary = (
+            consolidate_plan_files(
+                plan_paths,
+                catalogs,
+                config,
+                canonical_plan_path,
+                use_extra_mov_columns=use_extra_mov_columns,
+                net_transfer_rule_enabled=(
+                    cover_fountain9_hardcodes and hardcode_low_net_transfer
+                ),
+                net_transfer_max=net_transfer_max,
+                destination_stock_below=destination_stock_below,
+            )
+        )
+        plan_read = engine.read_plan_csv(plan_path, config)
+        enrich_consolidated_plan_read(
+            plan_read,
+            consolidated_input,
+            consolidation_summary,
+        )
+        outlier_summary = engine.detect_fountain9_store_outliers(
+            consolidated_input,
+            catalogs,
+        )
+        outlier_summary["exclusion_enabled"] = bool(
+            exclude_fountain9_outlier_stores
+        )
+        outlier_summary["detection_enabled"] = bool(
+            outlier_summary.get("enabled")
+        )
+        if not exclude_fountain9_outlier_stores:
+            outlier_summary["detected_store_ids"] = list(
+                outlier_summary.get("store_ids", [])
+            )
+            outlier_summary["stores_detected"] = int(
+                outlier_summary.get("stores_excluded", 0)
+            )
+            outlier_summary["requirements_detected"] = int(
+                outlier_summary.get("requirements_excluded", 0)
+            )
+            outlier_summary.update(
+                {
+                    "enabled": False,
+                    "store_ids": [],
+                    "stores": [],
+                    "details": [],
+                    "stores_excluded": 0,
+                    "requirements_excluded": 0,
+                }
+            )
+        outlier_store_ids = set(outlier_summary["store_ids"])
+        engine_blocked_store_ids = (
+            set(closed_store_ids)
+            | outlier_store_ids
+            | manually_excluded_store_ids
+        )
+        if outlier_store_ids:
+            plan_read.rows = [
+                row
+                for row in plan_read.rows
+                if row["WAREHOUSE_DESTINATION"] not in outlier_store_ids
+            ]
+            catalogs.warnings.append(
+                "Control de outliers Fountain9: se excluyeron "
+                f"{outlier_summary['stores_excluded']:,} tiendas y "
+                f"{outlier_summary['requirements_excluded']:,} combinaciones "
+                "tienda-SKU por tener 50% o menos de las líneas de la tienda "
+                f"mediana ({outlier_summary['median_lines']:g})."
+            )
+        excluded_plan_rows = [
+            row
+            for row in plan_read.rows
+            if row["RETAIL_ID"] in excluded_sku_set
+        ]
+        plan_read.rows = [
+            row
+            for row in plan_read.rows
+            if row["RETAIL_ID"] not in excluded_sku_set
+        ]
+        rows_after_manual_stores, manually_excluded_plan_rows = (
+            split_plan_rows_by_closed_store(
+                plan_read.rows,
+                manually_excluded_store_ids,
+            )
+        )
+        rows_after_closed_stores, closed_plan_rows = (
+            split_plan_rows_by_closed_store(
+                rows_after_manual_stores,
+                set(closed_store_ids) | outlier_store_ids,
+            )
+        )
+        active_plan_rows, blocked_plan_rows = split_plan_rows_by_blocked_city(
+            rows_after_closed_stores,
+            catalogs,
+            blocked_cities,
+            config,
+        )
+        daily_plan_rows = list(active_plan_rows)
+        # 1) Naked ejecuta la decisión ya tomada por Fountain9. No usa MOV,
+        # mínimos ni reasignación: Allocation DOI + Source Before Multi Source.
+        naked_rows = build_naked_fountain9_rows(
+            consolidation_summary.get("fountain9_instructions", []),
+            daily_plan_rows,
+        ) if include_naked_engine else []
+        naked_result = engine.plan_transfers(naked_rows, catalogs, config)
+        for allocation in naked_result.allocation_rows:
+            allocation[PLANNING_REASON_COLUMN] = PLANNING_REASON_FOUNTAIN9
+
+        naked_executed: dict[tuple[int, int], int] = defaultdict(int)
+        for allocation in naked_result.allocation_rows:
+            naked_executed[(
+                int(allocation["WAREHOUSE_DESTINATION"]),
+                int(allocation["RETAIL_ID"]),
+            )] += int(allocation.get("QUANTITY", 0) or 0)
+
+        # 2) Otacon conserva la lógica histórica, pero sólo para el residual
+        # que Naked no logró ejecutar. Reasignar origen es válido aquí.
+        engine_plan_rows, engine_selection = select_engine_rows(
+            daily_plan_rows,
+            config,
+            include_naked=True,
+            include_hardcodes=cover_fountain9_hardcodes,
+            hardcode_rules=frozenset(
+                rule
+                for rule, enabled in (
+                    ("HARDCODE_4_CERO_TOTAL", hardcode_zero_total),
+                    ("HARDCODE_3_INVENTARIO_MENOR_DEMANDA", hardcode_inventory_below_demand),
+                    ("HARDCODE_3_NET_TRANSFER_BAJO", hardcode_low_net_transfer),
+                )
+                if enabled
+            ),
+        )
+        for row in engine_plan_rows:
+            base_target, base_rule = engine.calculate_target_quantity(row, config)
+            executed = naked_executed.get(
+                (int(row["WAREHOUSE_DESTINATION"]), int(row["RETAIL_ID"])), 0
+            )
+            row["MB_TOTAL_TARGET"] = base_target
+            row["FORCED_TARGET"] = max(base_target - executed, 0)
+            row["FORCED_RULE"] = base_rule if row.get("ES_MANUAL_FORECAST_ZERO") else "OTACON_RESIDUAL"
+            row["ALLOW_PARTIAL"] = True
+
+        engine_plan_rows = [row for row in engine_plan_rows if row["FORCED_TARGET"] > 0 or
+                            not naked_executed.get((row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"]))]
+        result = engine.plan_transfers(
+            engine_plan_rows, catalogs, config, initial_result=naked_result
+        )
+        for allocation in result.allocation_rows[len(naked_result.allocation_rows):]:
+            allocation[PLANNING_REASON_COLUMN] = PLANNING_REASON_OTACON
+        result.warnings.extend(plan_read.warnings)
+        fountain_recommended_keys = {
+            (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"])
+            for row in result.base_rows
+            if int(row.get("CANTIDAD_OBJETIVO", 0) or 0) > 0
+        }
+        closed_summary = closed_store_summary(
+            closed_plan_rows,
+            closed_store_ids,
+            config,
+        )
+        if closed_plan_rows:
+            closed_ids_text = ", ".join(map(str, closed_summary["store_ids"]))
+            result.warnings.append(
+                "Bloqueo permanente TIENDAS_CERRADAS: se excluyeron "
+                f"{len(closed_plan_rows):,} requerimientos de las tiendas "
+                f"{closed_ids_text} antes de asignar stock."
+            )
+        manual_store_summary = closed_store_summary(
+            manually_excluded_plan_rows,
+            manually_excluded_store_ids,
+            config,
+        )
+        if manually_excluded_plan_rows:
+            manual_ids_text = ", ".join(
+                map(str, manual_store_summary["store_ids"])
+            )
+            result.warnings.append(
+                "Exclusión temporal desde CODEC: se omitieron "
+                f"{len(manually_excluded_plan_rows):,} requerimientos de las "
+                f"tiendas {manual_ids_text} antes de ejecutar los engines."
+            )
+        block_summary = city_block_summary(
+            blocked_plan_rows,
+            catalogs,
+            config,
+            blocked_cities,
+        )
+        if blocked_plan_rows:
+            blocked_names = ", ".join(
+                item["name"] for item in block_summary["cities"]
+            )
+            result.warnings.append(
+                f"Bloqueo manual de ciudad: {blocked_names}. Se excluyeron "
+                f"{len(blocked_plan_rows):,} requerimientos antes de asignar stock."
+            )
+
+        store_shares_cache: dict[int, float] | None = None
+        catalog_fill_rows_cache: list[dict[str, Any]] | None = None
+
+        def ensure_catalog_rows() -> list[dict[str, Any]]:
+            """CATALOGO se carga UNA sola vez por corrida y se reutiliza en
+            AVL/Preventivo/Refuerzo, Kazuhira, el barrido, el chequeo de
+            salud y SWA. Antes cada uno cargaba su propia copia completa y
+            todas seguían vivas hasta el final de la función: con un
+            catálogo grande eso multiplica memoria y tiempo."""
+            nonlocal catalog_fill_rows_cache
+            if catalog_fill_rows_cache is None:
+                loaded_rows, loaded_warnings = load_avl_catalog_rows(data_path)
+                result.warnings.extend(loaded_warnings)
+                catalog_fill_rows_cache = loaded_rows
+            return catalog_fill_rows_cache
+        shalashaska_summary = empty_shalashaska_summary(
+            include_shalashaska_engine
+        )
+        catalog_fill_rows: list[dict[str, Any]] = []
+        include_avl_fill = include_solidus_engine and include_avl_fill
+        include_preventive_fill = (
+            include_solidus_engine and include_preventive_fill
+        )
+        include_special_doh_fill = (
+            include_solidus_engine and include_special_doh_fill
+        )
+        # DOH por bucket del Refuerzo; sin dict se conserva el criterio anterior
+        # (un solo DOH para Infaltable, Golden y Anchor; sin KVI).
+        effective_special_targets = (
+            {b: float(v) for b, v in special_doh_targets.items()}
+            if special_doh_targets is not None
+            else {b: float(special_doh_target) for b in ("INFALTABLE", "GOLDEN", "ANCHOR")}
+        )
+        include_no_fountain9_coverage = (
+            include_solidus_engine and include_no_fountain9_coverage
+        )
+        if (
+            include_avl_fill
+            or include_preventive_fill
+            or include_special_doh_fill
+            or include_no_fountain9_coverage
+        ):
+            avl_catalog_rows = ensure_catalog_rows()
+            catalog_fill_rows = [
+                row
+                for row in avl_catalog_rows
+                if row["RETAIL_ID"] not in excluded_sku_set
+            ]
+
+        avl_summary = empty_avl_summary(include_avl_fill, avl_doh)
+        if include_avl_fill:
+            avl_summary = apply_avl_fill(
+                result,
+                catalog_fill_rows,
+                catalogs,
+                config,
+                engine_blocked_store_ids,
+                blocked_cities,
+                avl_doh,
+                swa_priority=solidus_swa_priority,
+            )
+            result.warnings.append(
+                f"Cobertura AVL ({avl_doh:g} DOH): se agregaron "
+                f"{avl_summary['cases_sent']:,} casos, "
+                f"{avl_summary['tasks_added']:,} tareas y "
+                f"{avl_summary['units_added']:,} unidades usando exclusivamente "
+                "tareas remanentes."
+            )
+
+        preventive_summary = empty_avl_summary(
+            include_preventive_fill,
+            avl_doh,
+        )
+        preventive_summary["mode"] = "preventive"
+        if include_preventive_fill:
+            preventive_summary = apply_avl_fill(
+                result,
+                catalog_fill_rows,
+                catalogs,
+                config,
+                engine_blocked_store_ids,
+                blocked_cities,
+                avl_doh,
+                candidate_mode="preventive",
+                excluded_keys=fountain_recommended_keys,
+                swa_priority=solidus_swa_priority,
+            )
+            result.warnings.append(
+                f"Blindaje preventivo ({avl_doh:g} DOH): se agregaron "
+                f"{preventive_summary['cases_sent']:,} casos, "
+                f"{preventive_summary['tasks_added']:,} tareas y "
+                f"{preventive_summary['units_added']:,} unidades para inventarios "
+                "con menos de 1 DOH o menos de 3 unidades, sin recomendación "
+                "positiva de Fountain9."
+            )
+
+        special_doh_summary = empty_avl_summary(
+            include_special_doh_fill,
+            special_doh_target,
+        )
+        special_doh_summary["mode"] = "special_doh"
+        if include_special_doh_fill:
+            special_doh_summary = apply_avl_fill(
+                result,
+                catalog_fill_rows,
+                catalogs,
+                config,
+                engine_blocked_store_ids,
+                blocked_cities,
+                max(effective_special_targets.values(), default=0.0),
+                candidate_mode="special_doh",
+                excluded_keys=fountain_recommended_keys,
+                swa_priority=solidus_swa_priority,
+                special_doh_targets=effective_special_targets,
+            )
+            special_doh_summary["buckets"] = sorted(effective_special_targets)
+            result.warnings.append(
+                "Refuerzo ("
+                + ", ".join(
+                    f"{bucket.title()} {value:g} DOH"
+                    for bucket, value in effective_special_targets.items()
+                )
+                + f"): se agregaron {special_doh_summary['cases_sent']:,} casos, "
+                f"{special_doh_summary['tasks_added']:,} tareas y "
+                f"{special_doh_summary['units_added']:,} unidades para subir los "
+                "productos de esos buckets por debajo de su DOH objetivo, sin "
+                "recomendación positiva de Fountain9."
+            )
+
+        no_fountain9_summary = empty_avl_summary(include_no_fountain9_coverage, 1.0)
+        no_fountain9_summary["mode"] = "no_fountain9_coverage"
+        if include_no_fountain9_coverage:
+            no_fountain9_summary = apply_avl_fill(
+                result,
+                catalog_fill_rows,
+                catalogs,
+                config,
+                engine_blocked_store_ids,
+                blocked_cities,
+                1.0,  # dummy: este modo no usa un DOH fijo de CODEC
+                candidate_mode="no_fountain9_coverage",
+                # Solo se excluye la recomendación positiva de Fountain9; un
+                # 'sin recomendación' con stock real 0 sigue siendo candidato.
+                excluded_keys=fountain_recommended_keys,
+                duration_mode_by_store=consolidation_summary.get(
+                    "duration_mode_by_store", {}
+                ),
+                lead_time_mode_by_store=consolidation_summary.get(
+                    "lead_time_mode_by_store", {}
+                ),
+                swa_priority=solidus_swa_priority,
+            )
+            result.warnings.append(
+                "Cobertura sin Fountain9: se agregaron "
+                f"{no_fountain9_summary['cases_sent']:,} casos, "
+                f"{no_fountain9_summary['tasks_added']:,} tareas y "
+                f"{no_fountain9_summary['units_added']:,} unidades para SKUs "
+                "de catálogo quebrados sin recomendación positiva de "
+                "Fountain9 (ausentes del archivo o con sin recomendación "
+                "pero quiebre real), usando la moda de Duration/Lead Time "
+                "por tienda de su propio Bulk."
+            )
+
+        # Shalashaska corre después de Solidus: puede evacuar merma hacia las
+        # tiendas que las coberturas tácticas ya activaron en esta corrida.
+        if include_shalashaska_engine:
+            shalashaska_allowed_cities: set[str] | None = shalashaska_forced_cities(
+                origins
+            ) | {engine.normalize_city(city) for city in shalashaska_extra_cities}
+            if not shalashaska_allowed_cities:
+                shalashaska_allowed_cities = None
+            shalashaska_non_natural_keys = {
+                (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"])
+                for row in result.base_rows
+                if row.get("REGLA_DEMANDA") in MANUAL_FORECAST_ZERO_RULES
+            } | {
+                key for key, record in consolidated_input.items()
+                if record.get("NET_TRANSFER_HARDCODE_3")
+            }
+            expiring_rows = load_expiring_inventory(data_path)
+            store_shares_cache = load_store_shares(data_path)
+            catalog_adu = {
+                (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"]): row["ADU"]
+                for row in ensure_catalog_rows()
+                if row["RETAIL_ID"] not in excluded_sku_set
+            }
+            shalashaska_summary = apply_shalashaska_engine(
+                result, catalogs, config, expiring_rows, catalog_adu,
+                engine_blocked_store_ids, blocked_cities, store_shares_cache,
+                run_date=run_date, target_doh=shalashaska_target_doh,
+                reason_column=PLANNING_REASON_COLUMN,
+                allowed_cities=shalashaska_allowed_cities,
+                non_natural_keys=shalashaska_non_natural_keys,
+                evacuation_fraction=shalashaska_evacuation_fraction,
+                excluded_categories=(
+                    frozenset() if shalashaska_allow_sensitive else SENSITIVE_CATEGORIES
+                ),
+            )
+            if shalashaska_summary["sensitive_unclassified"]:
+                result.warnings.append(
+                    f"Shalashaska: {shalashaska_summary['sensitive_unclassified']:,} "
+                    "SKUs sin CATEGORY_NAME; no se pudo validar categoría sensible."
+                )
+            result.warnings.append(
+                "Shalashaska Engine: se evacuaron "
+                f"{shalashaska_summary['units_evacuated']:,} de "
+                f"{shalashaska_summary['units_at_risk']:,} unidades próximas a caducar."
+            )
+
+        attach_consolidated_input_to_result(result, consolidated_input)
+        omit_unexecuted_manual_task_rows(result)
+        liquid_summary = empty_liquid_summary(include_liquid_engine)
+        if include_liquid_engine:
+            store_shares = store_shares_cache or load_store_shares(data_path)
+            liquid_summary = apply_liquid_engine(
+                result,
+                catalogs,
+                config,
+                daily_plan_rows,
+                engine_blocked_store_ids,
+                blocked_cities,
+                store_shares,
+                {
+                    int(source): set(skus) - excluded_sku_set
+                    for source, skus in (
+                        liquid_manual_skus_by_origin or {}
+                    ).items()
+                },
+                automatic_tail=liquid_automatic_tail,
+                automatic_tail_origins=set(
+                    liquid_automatic_tail_origins
+                    if liquid_automatic_tail_origins is not None
+                    else origins
+                ),
+                forecast_horizon_days=forecast_horizon_days,
+                catalog_adu={
+                    (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"]): row["ADU"]
+                    for row in ensure_catalog_rows()
+                    if row["RETAIL_ID"] not in excluded_sku_set
+                },
+                duration_by_store=consolidation_summary.get("duration_mode_by_store", {}),
+                max_doh=14.0,
+                tail_threshold=int(liquid_tail_threshold),
+                reason_column=PLANNING_REASON_COLUMN,
+            )
+            result.warnings.append(
+                "Liquid Engine: se agregaron "
+                f"{liquid_summary['tasks_added']:,} tareas y "
+                f"{liquid_summary['units_added']:,} unidades; "
+                f"{liquid_summary['stock_exhausted_cases']:,} saldos de "
+                "origen-SKU quedaron agotados."
+            )
+            liquid_not_sent = (
+                liquid_summary["candidate_origin_skus"]
+                - liquid_summary["origin_skus_sent"]
+            )
+            if liquid_not_sent > 0:
+                result.warnings.append(
+                    "Liquid Engine: de "
+                    f"{liquid_summary['candidate_origin_skus']:,} candidatos "
+                    f"(remanente < {liquid_summary['tail_threshold']:,} unidades o "
+                    f"SKU manual), {liquid_not_sent:,} no se enviaron. Motivo: "
+                    f"{liquid_summary['skipped_no_destination_eligible']:,} sin "
+                    "ningún destino elegible ese día (BLOQUEOS/RUTA_COSTOS/"
+                    "SCHEDULE/ciudad bloqueada/tienda cerrada), "
+                    f"{liquid_summary['skipped_capacity_full']:,} con destinos "
+                    "elegibles pero sin capacidad de recibo disponible, "
+                    f"{liquid_summary['skipped_task_limit']:,} sin presupuesto de "
+                    "tareas restante."
+                )
+        venom_summary = empty_venom_summary(include_venom_engine)
+        if include_venom_engine:
+            venom_catalog_lookup, venom_catalog_warnings = load_venom_catalog_lookup(
+                data_path
+            )
+            catalogs.warnings.extend(venom_catalog_warnings)
+            effective_venom_origins = tuple(
+                source for source in venom_origins if source in origins
+            )
+            effective_venom_destinations = tuple(
+                destination
+                for destination in venom_destinations
+                if destination not in engine_blocked_store_ids
+            )
+            if not effective_venom_origins:
+                result.warnings.append(
+                    "Venom Engine: activo, pero sin orígenes válidos "
+                    "seleccionados (deben estar entre los orígenes de CODEC). "
+                    "No se generaron líneas."
+                )
+            elif not effective_venom_destinations:
+                result.warnings.append(
+                    "Venom Engine: activo, pero ninguna tienda destino "
+                    "seleccionada quedó disponible (revisa exclusiones y "
+                    "ciudades bloqueadas). No se generaron líneas."
+                )
+            elif not venom_section_types and not any(
+                (venom_manual_skus_by_origin or {}).values()
+            ):
+                result.warnings.append(
+                    "Venom Engine: activo, pero no se seleccionó ningún tipo "
+                    "de sección ni SKUs específicos. No se generaron líneas."
+                )
+            else:
+                venom_summary = apply_venom_engine(
+                    result,
+                    catalogs,
+                    config,
+                    venom_origins=effective_venom_origins,
+                    venom_destinations=effective_venom_destinations,
+                    section_types=set(venom_section_types),
+                    lead_time_days=float(venom_lead_time_days),
+                    consider_current_planning=venom_consider_current_planning,
+                    catalog_lookup=venom_catalog_lookup,
+                    closed_or_excluded_store_ids=engine_blocked_store_ids,
+                    blocked_cities=blocked_cities,
+                    reason_column=PLANNING_REASON_COLUMN,
+                    ltf=float(venom_ltf),
+                    vf=float(venom_vf),
+                    min_green_units=venom_min_green_units,
+                    order_cycle_days=float(venom_order_cycle_days),
+                    trigger_zone=venom_trigger_zone,
+                    subtract_lead_time_demand=venom_subtract_lead_time_demand,
+                    consider_incoming=venom_consider_incoming,
+                    shipping_multiple=int(venom_shipping_multiple),
+                    cap_to_store_capacity=venom_cap_to_store_capacity,
+                    manual_skus_by_origin={
+                        int(source): set(skus) - excluded_sku_set
+                        for source, skus in (venom_manual_skus_by_origin or {}).items()
+                    },
+                    only_manual_skus=venom_only_manual_skus,
+                )
+                result.warnings.append(
+                    "Venom Engine (DDMRP post-planeación, lead time "
+                    f"{venom_lead_time_days:g}d): "
+                    f"{venom_summary['lines_sent_ddmrp']:,} líneas DDMRP y "
+                    f"{venom_summary['lines_sent_oowl']:,} líneas OOWL; "
+                    f"{venom_summary['units_sent']:,} unidades adicionales en "
+                    f"{venom_summary['tasks_added']:,} tareas nuevas del "
+                    "presupuesto compartido."
+                )
+
+        # Tiendas que se planean hoy: Bulk de Fountain9 + SCHEDULE con día
+        # válido.
+        planned_store_universe = build_planned_store_universe(
+            consolidated_input.keys(), catalogs, config.origin_warehouses
+        )
+
+        kazuhira_skip_reasons: dict[tuple[int, int], str] = {}
+        kazuhira_summary = empty_avl_summary(include_kazuhira_engine, 1.0)
+        kazuhira_summary["mode"] = "kazuhira"
+        if include_kazuhira_engine:
+            # Independiente de los 4 toggles de Solidus: puede estar
+            # activo aunque todos ellos estén apagados, así que el
+            # catálogo puede no estar cargado todavía en esta corrida.
+            kazuhira_catalog_rows = ensure_catalog_rows()
+            kazuhira_duration_by_store = consolidation_summary.get(
+                "duration_mode_by_store", {}
+            )
+            kazuhira_lead_time_by_store = consolidation_summary.get(
+                "lead_time_mode_by_store", {}
+            )
+            (
+                kazuhira_duration_by_store,
+                kazuhira_lead_time_by_store,
+                kazuhira_duration_source,
+            ) = resolve_duration_lead_time_with_city_fallback(
+                catalogs, kazuhira_duration_by_store, kazuhira_lead_time_by_store
+            )
+            # Último escalón: promedio país, solo sobre modas PROPIAS (no
+            # sobre las ya derivadas de ciudad, para no promediar promedios).
+            kazuhira_fallback_duration, kazuhira_fallback_lead_time = (
+                compute_fallback_duration_and_lead_time(
+                    {
+                        store: value
+                        for store, value in kazuhira_duration_by_store.items()
+                        if kazuhira_duration_source.get(store) == "PROPIA"
+                    },
+                    {
+                        store: value
+                        for store, value in kazuhira_lead_time_by_store.items()
+                        if kazuhira_duration_source.get(store) == "PROPIA"
+                    },
+                )
+            )
+            kazuhira_summary = apply_avl_fill(
+                result,
+                kazuhira_catalog_rows,
+                catalogs,
+                config,
+                engine_blocked_store_ids,
+                blocked_cities,
+                1.0,  # dummy: este modo no usa un DOH fijo de CODEC
+                candidate_mode="kazuhira",
+                # Sin excluded_keys: Kazuhira cubre todo quiebre del universo,
+                # venga o no de Fountain9.
+                excluded_keys=set(),
+                duration_mode_by_store=kazuhira_duration_by_store,
+                lead_time_mode_by_store=kazuhira_lead_time_by_store,
+                fallback_duration=kazuhira_fallback_duration,
+                fallback_lead_time=kazuhira_fallback_lead_time,
+                ignore_task_budget=kazuhira_ignore_task_budget,
+                ignore_store_capacity=kazuhira_ignore_store_capacity,
+                allowed_destinations=planned_store_universe["stores"],
+                duration_source_by_store=kazuhira_duration_source,
+                skip_reasons=kazuhira_skip_reasons,
+                swa_priority=kazuhira_swa_priority,
+            )
+            annotate_base_rows_with_kazuhira_reasons(
+                result.base_rows, kazuhira_skip_reasons
+            )
+            reason_counts = Counter(
+                reason
+                for reason in kazuhira_skip_reasons.values()
+                if reason != KAZUHIRA_REASON_HEALTHY
+            )
+            kazuhira_summary["skip_reason_counts"] = {
+                kazuhira_reason_text(reason): count
+                for reason, count in reason_counts.most_common()
+            }
+            kazuhira_summary["universe_stores"] = len(
+                planned_store_universe["stores"]
+            )
+            kazuhira_summary["universe_from_fountain9"] = len(
+                planned_store_universe["from_fountain9"]
+            )
+            kazuhira_summary["universe_schedule_only"] = len(
+                planned_store_universe["schedule_only"]
+            )
+            result.warnings.append(
+                "Kazuhira Engine (garantía total): se agregaron "
+                f"{kazuhira_summary['cases_sent']:,} casos, "
+                f"{kazuhira_summary['tasks_added']:,} tareas y "
+                f"{kazuhira_summary['units_added']:,} unidades para cerrar "
+                "quiebres del catálogo sin importar origen de la "
+                "recomendación"
+                + (
+                    " (presupuesto de tareas ignorado)"
+                    if kazuhira_ignore_task_budget
+                    else ""
+                )
+                + (
+                    " (capacidad de tienda ignorada)"
+                    if kazuhira_ignore_store_capacity
+                    else ""
+                )
+                + "."
+            )
+
+        result.warnings.insert(0, f"Versión del motor: {APP_BUILD}.")
+        missing_stock_by_engine = {
+            label: summary_item.get("missing_stock_treated_as_zero", 0)
+            for label, summary_item in (
+                ("AVL", avl_summary),
+                ("Preventivo", preventive_summary),
+                ("Refuerzo", special_doh_summary),
+                ("Cobertura sin Fountain9", no_fountain9_summary),
+                ("Kazuhira", kazuhira_summary),
+            )
+            if summary_item.get("missing_stock_treated_as_zero", 0)
+        }
+        if missing_stock_by_engine:
+            result.warnings.append(
+                "Tienda-SKU de CATALOGO sin fila en STOCK: se tomaron con "
+                "stock 0 e incoming 0 ("
+                + ", ".join(
+                    f"{label}: {count:,}"
+                    for label, count in missing_stock_by_engine.items()
+                )
+                + ")."
+            )
+
+        owner_summary = engine.apply_owner_inventory_partition(
+            result,
+            catalogs,
+            config,
+        )
+        health_check_catalog_rows = ensure_catalog_rows()
+        golden_health_check = build_golden_infaltable_anchor_health_check(
+            result,
+            catalogs,
+            special_doh_target,
+            health_check_catalog_rows,
+            targets_by_bucket=effective_special_targets or None,
+        )
+        if golden_health_check["below_target"]:
+            affected = len(golden_health_check["below_target"])
+            result.warnings.append(
+                "Check de salud del Refuerzo (Infaltable/Golden/Anchor/KVI): "
+                f"{affected:,} tienda-SKU terminaron esta corrida por debajo "
+                f"de su DOH objetivo (de {golden_health_check['checked']:,} "
+                "evaluadas). Es probable que un engine posterior al Refuerzo "
+                "(Shalashaska, Liquid o Venom) haya consumido stock del mismo "
+                "origen después de que se les aseguró su cobertura. Revisa el "
+                "detalle antes de entregar esta planeación."
+            )
+
+        golden_universe_report = build_bucket_universe_report(
+            catalogs.golden_products,
+            result,
+            catalogs,
+            config,
+            closed_store_ids,
+            blocked_cities,
+            health_check_catalog_rows,
+            target_doh=effective_special_targets.get(
+                "GOLDEN", GOLDEN_INFALTABLE_ANCHOR_RISK_DOH
+            ),
+        )
+        infaltable_universe_report = build_bucket_universe_report(
+            catalogs.infaltable_products,
+            result,
+            catalogs,
+            config,
+            closed_store_ids,
+            blocked_cities,
+            health_check_catalog_rows,
+            target_doh=effective_special_targets.get(
+                "INFALTABLE", GOLDEN_INFALTABLE_ANCHOR_RISK_DOH
+            ),
+        )
+        anchor_universe_report = build_bucket_universe_report(
+            catalogs.anchor_products,
+            result,
+            catalogs,
+            config,
+            closed_store_ids,
+            blocked_cities,
+            health_check_catalog_rows,
+            target_doh=effective_special_targets.get(
+                "ANCHOR", GOLDEN_INFALTABLE_ANCHOR_RISK_DOH
+            ),
+        )
+        kvi_universe_report = build_bucket_universe_report(
+            catalogs.kvi_products if "KVI" in effective_special_targets else set(),
+            result,
+            catalogs,
+            config,
+            closed_store_ids,
+            blocked_cities,
+            health_check_catalog_rows,
+            target_doh=effective_special_targets.get("KVI", GOLDEN_INFALTABLE_ANCHOR_RISK_DOH),
+        )
+        for bucket_label, bucket_report in (
+            ("KVI", kvi_universe_report),
+            ("Golden", golden_universe_report),
+            ("Infaltable", infaltable_universe_report),
+            ("Anchor", anchor_universe_report),
+        ):
+            if bucket_report["enabled"] and bucket_report["summary"]["no_cubierto"]:
+                result.warnings.append(
+                    f"Universo {bucket_label}: "
+                    f"{bucket_report['summary']['no_cubierto']:,} de "
+                    f"{bucket_report['universe_size']:,} tienda-SKU siguen sin "
+                    f"cubrirse por debajo de {bucket_report['target_doh']:g} DOH. "
+                    "Ver el reporte de universo completo para el motivo "
+                    "detallado de cada caso."
+                )
+
+        normalize_result_storage(result)
+        analytics = build_planning_analytics(result, origins)
+        apply_reporting_labels(result)
+        schedule_block = schedule_block_summary(result, catalogs)
+        copernico_cuts = copernico_cut_summary(result)
+        if copernico_cuts["requirements_full_cut"] or copernico_cuts["requirements_partial_cut"]:
+            result.warnings.append(
+                "COPÉRNICO como motivo de corte: "
+                f"{copernico_cuts['requirements_full_cut']:,} requerimientos "
+                "quedaron sin ninguna unidad y "
+                f"{copernico_cuts['requirements_partial_cut']:,} quedaron "
+                "parciales por ubicaciones excluidas (LOST, no usable, etc.) — "
+                f"{copernico_cuts['units_missing']:,} unidades sin cubrir en "
+                f"{copernico_cuts['stores']:,} tiendas y "
+                f"{copernico_cuts['products']:,} SKUs distintos. Sin esa "
+                "exclusión, esas líneas habrían tenido stock elegible."
+            )
+        analytics["golden"] = build_golden_analytics(result)
+        naked_allocation_rows = [
+            row
+            for row in result.allocation_rows
+            if row.get(PLANNING_REASON_COLUMN) == PLANNING_REASON_FOUNTAIN9
+        ]
+        naked_summary = {
+            "enabled": include_naked_engine,
+            "units": sum(int(row["QUANTITY"]) for row in naked_allocation_rows),
+            "tasks": len(naked_allocation_rows),
+            "stores": len(
+                {row["WAREHOUSE_DESTINATION"] for row in naked_allocation_rows}
+            ),
+            "products": len({row["RETAIL_ID"] for row in naked_allocation_rows}),
+            "m3": round(
+                sum(
+                    int(row["QUANTITY"])
+                    * catalogs.volume_m3.get(
+                        int(row["RETAIL_ID"]), config.default_m3_per_unit
+                    )
+                    for row in naked_allocation_rows
+                ),
+                3,
+            ),
+        }
+        fountain9_zero_rows = build_fountain9_zero_report(
+            consolidated_input,
+            catalogs,
+            result,
+            manually_excluded_store_ids,
+        )
+        output_dir = (
+            Path(config.local_work_dir)
+            / "outputs"
+            / run_date.strftime("%d-%m-%Y")
+        )
+        # Barrido de universo: solo con algún engine de cobertura activo; reusa
+        # el catálogo ya cargado.
+        sweep_healthy_count = 0
+        sweep_healthy_path: Path | None = None
+        if (
+            include_avl_fill
+            or include_preventive_fill
+            or include_special_doh_fill
+            or include_no_fountain9_coverage
+            or include_kazuhira_engine
+        ):
+            sweep_catalog_rows = ensure_catalog_rows()
+            existing_keys = {
+                (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"])
+                for row in result.base_rows
+            }
+            # Los huecos (quiebres sin cubrir) van a base_rows; las filas
+            # sanas, a un CSV en streaming (no a memoria ni al Excel).
+            output_dir.mkdir(parents=True, exist_ok=True)
+            sweep_healthy_path = output_dir / (
+                f"Universo_Catalogo_Sin_Necesidad_{run_date:%d-%m-%Y}.csv"
+            )
+            sweep_gap_rows: list[dict[str, Any]] = []
+            with sweep_healthy_path.open(
+                "w", newline="", encoding="utf-8-sig"
+            ) as healthy_handle:
+                healthy_writer = csv.DictWriter(
+                    healthy_handle,
+                    fieldnames=HEALTHY_UNIVERSE_COLUMNS,
+                    extrasaction="ignore",
+                )
+                healthy_writer.writeheader()
+                for sweep_row in iter_catalog_universe_sweep_rows(
+                    sweep_catalog_rows,
+                    catalogs,
+                    existing_keys,
+                    kazuhira_active=include_kazuhira_engine,
+                    allowed_destinations=planned_store_universe["stores"],
+                    skip_reasons=kazuhira_skip_reasons,
+                    closed_store_ids=engine_blocked_store_ids,
+                    blocked_cities=blocked_cities,
+                ):
+                    if sweep_row["TIPO_DE_CORTE"] == CATALOG_UNIVERSE_HEALTHY_CUT:
+                        product_info = catalogs.product_catalog.get(
+                            sweep_row["RETAIL_ID"], {}
+                        )
+                        sweep_row["PRODUCT_NAME"] = product_info.get(
+                            "PRODUCT_NAME", ""
+                        )
+                        sweep_row["CATEGORY_NAME"] = product_info.get(
+                            "CATEGORY_NAME", ""
+                        )
+                        healthy_writer.writerow(sweep_row)
+                        sweep_healthy_count += 1
+                    else:
+                        sweep_gap_rows.append(sweep_row)
+            result.base_rows.extend(sweep_gap_rows)
+            del sweep_gap_rows
+
+        # PRODUCT_NAME, CATEGORY_NAME y SWA en todos los entregables: una sola
+        # pasada antes de escribir archivos.
+        annotate_base_rows_with_engine(result.base_rows)
+        engine.enrich_rows_with_product_info(result.base_rows, catalogs)
+        engine.enrich_rows_with_product_info(result.allocation_rows, catalogs)
+        excluded_f9 = {}
+        for instruction in consolidation_summary.get("fountain9_instructions", []):
+            destination, sku = instruction["WAREHOUSE_DESTINATION"], instruction["RETAIL_ID"]
+            if sku in excluded_sku_set:
+                excluded_f9[(destination, sku)] = "SKU_BLOQUEADO"
+            elif destination in engine_blocked_store_ids:
+                excluded_f9[(destination, sku)] = (
+                    "TIENDA_CERRADA" if destination in closed_store_ids else
+                    "OUTLIER_F9" if destination in outlier_store_ids else "TIENDA_EXCLUIDA")
+            elif catalogs.stores.get(destination, {}).get("city_norm") in blocked_cities:
+                excluded_f9[(destination, sku)] = "CIUDAD_BLOQUEADA"
+        fountain9_audit = build_fountain9_audit(
+            result, consolidation_summary.get("fountain9_instructions", []),
+            excluded_f9, include_naked_engine,
+        )
+        result.fountain9_audit = fountain9_audit
+        result.build = APP_BUILD
+        local_files = engine.create_output_files(
+            result,
+            config,
+            run_date,
+            plan_path.name,
+            output_dir,
+        )
+        local_files = [Path(path) for path in local_files]
+        if fountain9_audit:
+            audit_path = output_dir / f"Auditoria_Fountain9_{run_date:%d-%m-%Y}.csv"
+            audit_columns = list(dict.fromkeys(k for row in fountain9_audit for k in row))
+            engine.write_csv(audit_path, fountain9_audit, audit_columns)
+            local_files.append(audit_path)
+        if sweep_healthy_path is not None and sweep_healthy_count:
+            local_files.append(sweep_healthy_path)
+        elif sweep_healthy_path is not None:
+            sweep_healthy_path.unlink(missing_ok=True)
+        fountain9_zero_path = output_dir / (
+            f"Fountain9_Sin_Recomendacion_{run_date:%d-%m-%Y}.csv"
+        )
+        engine.write_csv(
+            fountain9_zero_path,
+            fountain9_zero_rows,
+            FOUNTAIN9_ZERO_REPORT_COLUMNS,
+        )
+        local_files.append(fountain9_zero_path)
+        if outlier_summary["details"]:
+            outlier_path = output_dir / (
+                f"Outliers_Fountain9_Excluidos_{run_date:%d-%m-%Y}.csv"
+            )
+            outlier_columns = list(outlier_summary["details"][0])
+            engine.write_csv(
+                outlier_path,
+                outlier_summary["details"],
+                outlier_columns,
+            )
+            local_files.append(outlier_path)
+        rewrite_bulk_csvs_with_planning_reason(local_files, result)
+        insumos_summary = append_insumos_to_bulk_444(
+            local_files,
+            result,
+            catalogs,
+            insumos_rows,
+            origins,
+            include_insumos,
+        )
+
+        status_counts = Counter(
+            row["TIPO_DE_CORTE"] for row in result.base_rows
+        )
+        status_swa: Counter[str] = Counter()
+        for row in result.base_rows:
+            status_swa[row["TIPO_DE_CORTE"]] += float(
+                row.get("SWA_POTENTIAL_GAIN_COUNTRY", 0.0) or 0.0
+            )
+        planned_by_engine_rows = build_planned_by_engine_rows(
+            result, insumos_summary
+        )
+        engine_enabled = {
+            ("Naked", COVERAGE_FOUNTAIN9): include_naked_engine,
+            ("Otacon", COVERAGE_FOUNTAIN9): True,
+            ("Otacon", COVERAGE_MINIMUMS): (
+                cover_fountain9_hardcodes
+                and (hardcode_zero_total or hardcode_inventory_below_demand or hardcode_low_net_transfer)
+            ),
+            ("Shalashaska", NO_COVERAGE): include_shalashaska_engine,
+            ("Solidus", COVERAGE_AVL): include_solidus_engine and include_avl_fill,
+            ("Solidus", COVERAGE_PREVENTIVE): include_solidus_engine and include_preventive_fill,
+            ("Solidus", COVERAGE_SPECIAL_DOH): include_solidus_engine and include_special_doh_fill,
+            ("Solidus", COVERAGE_NO_FOUNTAIN9): include_solidus_engine and include_no_fountain9_coverage,
+            ("Liquid", NO_COVERAGE): include_liquid_engine,
+            ("Venom", NO_COVERAGE): include_venom_engine,
+            ("Kazuhira", NO_COVERAGE): include_kazuhira_engine,
+            ("Insumos", NO_COVERAGE): include_insumos,
+        }
+        engine_summary_rows = build_engine_summary_rows(
+            result, insumos_summary, engine_enabled
+        )
+        cuts_detail_rows = build_cuts_detail_rows(
+            result, closed_summary, block_summary
+        )
+        no_recommendation_rows = build_no_recommendation_breakdown(result)
+        fountain9_comparison = build_fountain9_comparison_report(
+            result, catalogs, consolidated_input
+        )
+        # SWA necesita el catálogo completo aunque ningún engine de cobertura
+        # esté activo.
+        swa_catalog_rows = ensure_catalog_rows()
+        swa_report = build_swa_report(
+            swa_catalog_rows, catalogs, result, insumos_summary
+        )
+        if sweep_healthy_count:
+            status_counts[CATALOG_UNIVERSE_HEALTHY_CUT] += sweep_healthy_count
+        if closed_summary["requirements"]:
+            status_counts["CORTE POR TIENDA CERRADA"] += closed_summary[
+                "requirements"
+            ]
+        if block_summary["requirements"]:
+            status_counts["CORTE POR CIUDAD BLOQUEADA"] += block_summary[
+                "requirements"
+            ]
+        if insumos_summary["lines_added"]:
+            status_counts["INSUMOS"] += insumos_summary["lines_added"]
+
+        units = sum(row["QUANTITY"] for row in result.allocation_rows)
+        requirements = len(result.base_rows)
+        pdf_path = output_dir / (
+            f"Reporte_Ejecutivo_Planeacion_{run_date:%d-%m-%Y}.pdf"
+        )
+        write_executive_pdf(
+            pdf_path,
+            run_date=run_date,
+            origins=origins,
+            analytics=analytics,
+            status_counts=status_counts,
+            status_swa=status_swa,
+            swa_report=swa_report,
+            engine_summary_rows=engine_summary_rows,
+            input_requirements=consolidation_summary["unique_requirements"],
+            evaluated_requirements=requirements,
+            tasks=result.tasks_used,
+            max_tasks=config.max_tasks,
+            units=units,
+            city_block=block_summary,
+            closed_stores=closed_summary,
+            insumos=insumos_summary,
+            avl=avl_summary,
+            preventive=preventive_summary,
+            special_doh=special_doh_summary,
+            liquid=liquid_summary,
+            shalashaska=shalashaska_summary,
+            fruver_811=fruver_811_summary,
+            schedule_block=schedule_block,
+            venom=venom_summary,
+            input_consolidation=consolidation_summary,
+            outliers_f9=outlier_summary,
+            fountain9_audit=fountain9_audit,
+        )
+        local_files.append(pdf_path)
+        print(
+            "Requerimientos únicos del input: "
+            f"{consolidation_summary['unique_requirements']:,}"
+        )
+        print(
+            f"Archivos consolidados: {consolidation_summary['files']:,} / "
+            f"filas sumadas: {consolidation_summary['source_rows']:,}"
+        )
+        print(f"Requerimientos activos del día: {len(daily_plan_rows):,}")
+        print(f"Requerimientos enviados a Otacon: {len(engine_plan_rows):,}")
+        print(
+            "Otacon — MOV: "
+            f"{engine_selection['naked_requirements']:,} / mínimos: "
+            f"{engine_selection['solidus_requirements']:,} / omitidos: "
+            f"{engine_selection['omitted_by_loadout']:,}"
+        )
+        print(
+            "Requerimientos excluidos por tiendas cerradas: "
+            f"{len(closed_plan_rows):,}"
+        )
+        print(
+            "Requerimientos excluidos temporalmente desde CODEC: "
+            f"{len(manually_excluded_plan_rows):,}"
+        )
+        print(f"Requerimientos excluidos por ciudad: {len(blocked_plan_rows):,}")
+        print(
+            "Requerimientos excluidos por SKU general: "
+            f"{len(excluded_plan_rows):,}"
+        )
+        print(
+            "Outliers Fountain9 excluidos: "
+            f"{outlier_summary['stores_excluded']:,} tiendas / "
+            f"{outlier_summary['requirements_excluded']:,} combinaciones"
+        )
+        print(
+            "Casos Fountain9 con demanda, opening y ROQ en cero: "
+            f"{len(fountain9_zero_rows):,}"
+        )
+        print(f"Tareas generadas: {result.tasks_used:,}")
+        if avl_summary["enabled"]:
+            print(
+                f"Cobertura AVL: {avl_summary['cases_sent']:,} casos / "
+                f"{avl_summary['tasks_added']:,} tareas / "
+                f"{avl_summary['units_added']:,} unidades"
+            )
+        if preventive_summary["enabled"]:
+            print(
+                "Blindaje preventivo: "
+                f"{preventive_summary['cases_sent']:,} casos / "
+                f"{preventive_summary['tasks_added']:,} tareas / "
+                f"{preventive_summary['units_added']:,} unidades"
+            )
+        if liquid_summary["enabled"]:
+            print(
+                "Liquid Engine: "
+                f"{liquid_summary['tasks_added']:,} tareas / "
+                f"{liquid_summary['units_added']:,} unidades / "
+                f"{liquid_summary['stock_exhausted_cases']:,} saldos agotados"
+            )
+        if shalashaska_summary["enabled"]:
+            print(
+                "Shalashaska Engine: "
+                f"{shalashaska_summary['tasks_added']:,} tareas / "
+                f"{shalashaska_summary['units_evacuated']:,} unidades / "
+                f"${shalashaska_summary['value_protected']:,.2f} de valor protegido"
+            )
+        if insumos_summary["enabled"]:
+            print(
+                "Insumos agregados a BulkCD_444: "
+                f"{insumos_summary['lines_added']:,} líneas / "
+                f"{insumos_summary['units_added']:,} unidades / "
+                f"{insumos_summary['stores_added']:,} tiendas"
+            )
+            print(
+                "Insumos recortados: "
+                f"{insumos_summary['units_cut_stock']:,} unidades por stock / "
+                f"{insumos_summary['units_cut_moq']:,} unidades por MOQ"
+            )
+
+    zip_path = create_zip(
+        local_files,
+        workspace / f"Planeacion_{run_date:%d-%m-%Y}.zip",
+    )
+    if simulation_mode:
+        # Modo simulación: se corrió todo el pipeline real (para que los
+        # números sean exactos), pero no debe quedar ningún archivo persistido
+        # como si fuera una entrega real.
+        for path in local_files:
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError:
+                pass
+        try:
+            Path(zip_path).unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            output_dir.rmdir()
+        except OSError:
+            pass
+        files_for_run: list[str] = []
+        zip_for_run = ""
+    else:
+        files_for_run = [str(path) for path in local_files]
+        zip_for_run = str(zip_path)
+    return {
+        "workspace": str(workspace),
+        "simulation": bool(simulation_mode),
+        "files": files_for_run,
+        "zip": zip_for_run,
+        "tasks": result.tasks_used,
+        "units": units,
+        "requirements": requirements,
+        "input_requirements": consolidation_summary["unique_requirements"],
+        "status_counts": dict(status_counts),
+        "status_swa": dict(status_swa),
+        "planned_by_engine_rows": planned_by_engine_rows,
+        "engine_summary_rows": engine_summary_rows,
+        "cuts_detail_rows": cuts_detail_rows,
+        "no_recommendation_rows": no_recommendation_rows,
+        "fountain9_comparison": fountain9_comparison,
+        "fountain9_audit": fountain9_audit,
+        "swa_report": swa_report,
+        "warnings": list(result.warnings),
+        "logs": captured.getvalue(),
+        "origins": list(origins),
+        "analytics": analytics,
+        "city_block": block_summary,
+        "closed_stores": closed_summary,
+        "manually_excluded_stores": manual_store_summary,
+        "insumos": insumos_summary,
+        "avl": avl_summary,
+        "preventive": preventive_summary,
+        "special_doh": special_doh_summary,
+        "no_fountain9_coverage": no_fountain9_summary,
+        "liquid": liquid_summary,
+        "shalashaska": shalashaska_summary,
+        "fruver_811": fruver_811_summary,
+        "schedule_block": schedule_block,
+        "naked": naked_summary,
+        "golden_health_check": golden_health_check,
+        "golden_universe_report": golden_universe_report,
+        "infaltable_universe_report": infaltable_universe_report,
+        "anchor_universe_report": anchor_universe_report,
+        "kvi_universe_report": kvi_universe_report,
+        "copernico_cuts": copernico_cuts,
+        "venom": venom_summary,
+        "kazuhira": kazuhira_summary,
+        "build": APP_BUILD,
+        "run_date": run_date.isoformat(),
+        "copernico_inputs": [
+            {
+                "path": str(path),
+                "warehouses": sorted(
+                    copernico_warehouses_from_text(
+                        path.read_text(encoding="utf-8-sig", errors="replace")
+                    )
+                ),
+            }
+            for path in copernico_paths
+        ],
+        "input_consolidation": consolidation_summary,
+        "engine_selection": engine_selection,
+        "excluded_skus": sorted(excluded_sku_set),
+        "excluded_requirements": len(excluded_plan_rows),
+        "fountain9_zero_cases": len(fountain9_zero_rows),
+        "outliers_f9": outlier_summary,
+        "origin_storage_override": {
+            "enabled": bool(apply_origin_storage_override),
+            "configured_pairs": len(catalogs.storage_override_by_origin),
+        },
+        "owner_partition": owner_summary,
+    }
+
+
+MAX_DISPLAY_ROWS = 100
+
+
+def rows_to_csv_bytes(rows: list[dict[str, Any]]) -> bytes:
+    """Serializa una lista de dicts a CSV (con BOM, igual que el resto de la
+    app) para ofrecer descarga completa de tablas truncadas en pantalla."""
+    if not rows:
+        return b""
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=list(rows[0].keys()))
+    writer.writeheader()
+    writer.writerows(rows)
+    return buffer.getvalue().encode("utf-8-sig")
+
+
+def render_capped_dataframe(
+    rows: list[dict[str, Any]],
+    *,
+    key: str,
+    offer_download: bool = False,
+    file_label: str = "",
+    column_config: dict[str, Any] | None = None,
+    max_display: int = MAX_DISPLAY_ROWS,
+) -> None:
+    """Renderiza una tabla potencialmente grande sin arriesgar el navegador: nunca manda
+    más de ``max_display`` filas al frontend.
+    """
+    if not rows:
+        st.info("No existen registros para mostrar en esta sección.")
+        return
+    total = len(rows)
+    visible = min(total, max_display)
+    display_rows = rows[:max_display]
+    height = (visible + 1) * 36 + 4
+    st.dataframe(
+        display_rows,
+        use_container_width=True,
+        hide_index=True,
+        height=height,
+        column_config=column_config or {},
+    )
+    if total > max_display:
+        st.caption(
+            f"Mostrando {max_display:,} de {total:,} filas."
+            + (" Descarga el CSV para ver el detalle completo." if offer_download else "")
+        )
+    if offer_download:
+        st.download_button(
+            f"Descargar {(file_label or 'detalle').replace('_', ' ')} completo (.csv)",
+            data=rows_to_csv_bytes(rows),
+            file_name=f"{(file_label or 'detalle').replace(' ', '_')}.csv",
+            mime="text/csv",
+            key=f"download_{key}",
+        )
+
+
+def report_table(
+    rows: list[dict[str, Any]],
+    *,
+    column_config: dict[str, Any] | None = None,
+    max_height: int = 560,
+) -> None:
+    if not rows:
+        st.info("No existen registros para mostrar en esta sección.")
+        return
+    total = len(rows)
+    display_rows = rows[:MAX_DISPLAY_ROWS]
+    # Se limita el número de filas enviadas al navegador, no solo la altura del
+    # contenedor.
+    height = min(max(150, 36 * (len(display_rows) + 1)), max_height)
+    st.dataframe(
+        display_rows,
+        use_container_width=True,
+        hide_index=True,
+        height=height,
+        column_config=column_config or {},
+    )
+    if total > MAX_DISPLAY_ROWS:
+        st.caption(f"Mostrando {MAX_DISPLAY_ROWS:,} de {total:,} filas.")
+
+
+def render_source_analysis(analytics: dict[str, Any]) -> None:
+    source_details = analytics.get("source_details", [])
+    if not source_details:
+        return
+
+    st.markdown(
+        '<div class="report-title">ANÁLISIS POR ORIGEN.</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        """
+        <div class="report-note">
+            Un bloque por origen seleccionado. TAREAS = líneas del Bulk; UNIDADES = suma de QUANTITY; PRODUCTOS = SKUs distintos. Solo abasto normal (sin insumos). Definiciones en el tooltip de cada tarjeta.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    for detail in source_details:
+        source = detail["warehouse_source"]
+        name = detail["name"]
+        summary = detail["summary"]
+        st.markdown(
+            f'<div class="origin-banner">{source} — {html.escape(str(name))}</div>',
+            unsafe_allow_html=True,
+        )
+        render_kpi_cards(
+            [
+                {
+                    "category": "TAREAS · ORIGEN",
+                    "label": "LÍNEAS DE ABASTO",
+                    "value": f"{summary['TAREAS']:,}",
+                    "description": (
+                        "Número de filas de transferencia generadas desde este origen. "
+                        "Una misma tienda-SKU puede crear una tarea en más de un origen. "
+                        "No incluye líneas de insumos."
+                    ),
+                    "tone": "blue",
+                },
+                {
+                    "category": "UNIDADES · ORIGEN",
+                    "label": "PRODUCTO ASIGNADO",
+                    "value": f"{summary['UNIDADES']:,}",
+                    "description": (
+                        "Suma de QUANTITY de producto normal que saldrá desde este "
+                        "warehouse origen. No incluye insumos."
+                    ),
+                    "tone": "acid",
+                },
+                {
+                    "category": "SKUs · ORIGEN",
+                    "label": "PRODUCTOS DISTINTOS",
+                    "value": f"{summary['PRODUCTOS_DISTINTOS']:,}",
+                    "description": (
+                        "Cantidad de RETAIL_ID diferentes asignados desde este origen. "
+                        "No es un conteo de tareas ni de unidades."
+                    ),
+                },
+                {
+                    "category": "TIENDAS · ORIGEN",
+                    "label": "DESTINOS ATENDIDOS",
+                    "value": f"{summary['TIENDAS_ATENDIDAS']:,}",
+                    "description": (
+                        "Número de warehouses destino diferentes que reciben producto "
+                        "normal desde este origen."
+                    ),
+                },
+                {
+                    "category": "M³ · ORIGEN",
+                    "label": "VOLUMEN PLANEADO",
+                    "value": f"{summary['M3']:,.2f}",
+                    "description": (
+                        "Volumen de producto normal asignado desde este origen: unidades "
+                        "por metros cúbicos por unidad."
+                    ),
+                },
+                {
+                    "category": "UNIDADES / TAREA",
+                    "label": "PROMEDIO POR LÍNEA",
+                    "value": f"{summary['UNIDADES_POR_TAREA']:,.2f}",
+                    "description": (
+                        "Unidades asignadas desde este origen divididas entre sus tareas. "
+                        "Sirve para entender el tamaño promedio de cada línea operativa."
+                    ),
+                },
+                {
+                    "category": "PARTICIPACIÓN · TAREAS",
+                    "label": "PESO OPERATIVO",
+                    "value": f"{summary['PARTICIPACION_TAREAS_%']:,.1f}%",
+                    "description": (
+                        "Porcentaje de todas las tareas de abasto que salen desde este "
+                        "origen. No utiliza unidades como denominador."
+                    ),
+                    "tone": "blue",
+                },
+                {
+                    "category": "PARTICIPACIÓN · UNIDADES",
+                    "label": "PESO EN UNIDADES",
+                    "value": f"{summary['PARTICIPACION_UNIDADES_%']:,.1f}%",
+                    "description": (
+                        "Porcentaje de todas las unidades de abasto asignadas a este "
+                        "origen. No utiliza tareas como denominador."
+                    ),
+                    "tone": "acid",
+                },
+            ]
+        )
+
+        left, right = st.columns(2)
+        with left:
+            st.markdown(
+                '<span class="section-label">POR CIUDAD</span>',
+                unsafe_allow_html=True,
+            )
+            compact_city_rows = [
+                {
+                    "CIUDAD": row["CIUDAD"],
+                    "TAREAS": row["TAREAS"],
+                    "UNIDADES": row["UNIDADES"],
+                    "M3": row["M3"],
+                }
+                for row in detail["city_rows"]
+            ]
+            report_table(
+                compact_city_rows,
+                column_config={
+                    "CIUDAD": st.column_config.TextColumn("CIUDAD", width="medium"),
+                    "TAREAS": st.column_config.NumberColumn(
+                        "TAREAS", format="%d", width="small"
+                    ),
+                    "UNIDADES": st.column_config.NumberColumn(
+                        "UNIDADES", format="%d", width="small"
+                    ),
+                    "M3": st.column_config.NumberColumn(
+                        "M³", format="%.2f", width="small"
+                    ),
+                },
+                max_height=340,
+            )
+        with right:
+            st.markdown(
+                '<span class="section-label">POR STORAGE</span>',
+                unsafe_allow_html=True,
+            )
+            compact_storage_rows = [
+                {
+                    "STORAGE": resolved_storage(row["STORAGE"]),
+                    "TAREAS": row["TAREAS"],
+                    "UNIDADES": row["UNIDADES"],
+                    "M3": row["M3"],
+                }
+                for row in detail["storage_rows"]
+            ]
+            report_table(
+                compact_storage_rows,
+                column_config={
+                    "STORAGE": st.column_config.TextColumn(
+                        "STORAGE", width="medium"
+                    ),
+                    "TAREAS": st.column_config.NumberColumn(
+                        "TAREAS", format="%d", width="small"
+                    ),
+                    "UNIDADES": st.column_config.NumberColumn(
+                        "UNIDADES", format="%d", width="small"
+                    ),
+                    "M3": st.column_config.NumberColumn(
+                        "M³", format="%.2f", width="small"
+                    ),
+                },
+                max_height=340,
+            )
+
+        st.markdown(
+            '<span class="section-label">TIENDAS ATENDIDAS DESDE ESTE ORIGEN</span>',
+            unsafe_allow_html=True,
+        )
+        report_table(
+            detail["store_rows"],
+            column_config={
+                "WAREHOUSE_ID": st.column_config.NumberColumn(
+                    "WAREHOUSE ID", format="%d"
+                ),
+                "M3": st.column_config.NumberColumn("M³", format="%.2f"),
+            },
+            max_height=520,
+        )
+
+
+def render_golden_report(analytics: dict[str, Any]) -> None:
+    golden = analytics.get("golden", {})
+    summary = golden.get("summary", {})
+    if not summary:
+        return
+
+    st.markdown(
+        '<div class="report-title">INFALTABLES · GOLDEN · ANCHOR.</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        """
+        <div class="report-note">
+            Casos por tienda-SKU. Prioridad de clasificación: INFALTABLE, GOLDEN, ANCHOR (una combinación se reporta bajo su mayor jerarquía). COMPLIANCE DE CASOS exige el objetivo completo; COMPLIANCE DE UNIDADES compara asignado vs objetivo.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    render_kpi_cards(
+        [
+            {
+                "category": "CASOS · PRIORITARIOS",
+                "label": "REQUERIMIENTOS",
+                "value": f"{summary['cases']:,}",
+                "description": (
+                    "Combinaciones tienda-SKU Infaltable, Golden o Anchor con objetivo mayor "
+                    "a cero evaluadas por el motor."
+                ),
+                "tone": "blue",
+            },
+            {
+                "category": "CASOS · PRIORITARIOS",
+                "label": "CON ENVÍO",
+                "value": f"{summary['served_cases']:,}",
+                "description": (
+                    "Casos prioritarios que recibieron al menos una unidad, aunque la "
+                    "cobertura haya quedado parcial."
+                ),
+                "tone": "acid",
+            },
+            {
+                "category": "CASOS · PRIORITARIOS",
+                "label": "CUBIERTOS AL 100%",
+                "value": f"{summary['full_cases']:,}",
+                "description": (
+                    "Casos prioritarios cuya cantidad asignada alcanzó completamente su "
+                    "cantidad objetivo."
+                ),
+                "tone": "acid",
+            },
+            {
+                "category": "CASOS · PRIORITARIOS",
+                "label": "SIN ENVÍO",
+                "value": f"{summary['not_served_cases']:,}",
+                "description": (
+                    "Casos prioritarios con objetivo positivo que no recibieron ninguna "
+                    "unidad por alguna regla de corte."
+                ),
+                "tone": "coral",
+            },
+            {
+                "category": "UNIDADES · PRIORITARIAS",
+                "label": "OBJETIVO",
+                "value": f"{summary['target_units']:,}",
+                "description": (
+                    "Suma de unidades objetivo de Infaltables, Golden y Anchor. No es "
+                    "un conteo de tareas."
+                ),
+            },
+            {
+                "category": "UNIDADES · PRIORITARIAS",
+                "label": "ASIGNADAS",
+                "value": f"{summary['assigned_units']:,}",
+                "description": (
+                    "Unidades realmente asignadas a casos prioritarios desde "
+                    "todos los orígenes."
+                ),
+                "tone": "acid",
+            },
+            {
+                "category": "COMPLIANCE · CASOS",
+                "label": "CASOS COMPLETOS",
+                "value": f"{summary['case_compliance_pct']:,.1f}%",
+                "description": (
+                    "Casos prioritarios cubiertos al 100% divididos entre todos los "
+                    "casos Infaltable, Golden y Anchor con objetivo positivo."
+                ),
+                "tone": "blue",
+            },
+            {
+                "category": "COMPLIANCE · UNIDADES",
+                "label": "UNIDADES CUBIERTAS",
+                "value": f"{summary['unit_compliance_pct']:,.1f}%",
+                "description": (
+                    "Unidades prioritarias asignadas divididas entre sus unidades "
+                    "objetivo. Puede diferir del compliance de casos."
+                ),
+                "tone": "blue",
+            },
+        ]
+    )
+
+    st.markdown(
+        '<span class="section-label">RESULTADO POR CLASIFICACIÓN</span>',
+        unsafe_allow_html=True,
+    )
+    report_table(
+        golden.get("type_rows", []),
+        column_config={
+            "COMPLIANCE_%": st.column_config.NumberColumn(
+                "COMPLIANCE %", format="%.1f%%", width="small"
+            ),
+        },
+        max_height=260,
+    )
+
+    st.markdown('<span class="section-label">PRIORITARIOS POR CIUDAD</span>', unsafe_allow_html=True)
+    compact_city = [
+        {
+            "CIUDAD": row["CIUDAD"],
+            "CASOS": row["CASOS"],
+            "COMPLETOS": row["COMPLETOS"],
+            "TIENDAS": row["TIENDAS"],
+            "OBJETIVO": row["OBJETIVO"],
+            "ASIGNADO": row["ASIGNADO"],
+            "COMPLIANCE_%": row["COMPLIANCE_%"],
+        }
+        for row in golden.get("city_rows", [])
+    ]
+    report_table(
+        compact_city,
+        column_config={
+            "COMPLIANCE_%": st.column_config.NumberColumn(
+                "COMPLIANCE %", format="%.1f%%", width="small"
+            ),
+        },
+        max_height=360,
+    )
+
+    st.markdown('<span class="section-label">PRIORITARIOS POR ORIGEN</span>', unsafe_allow_html=True)
+    report_table(golden.get("origin_rows", []), max_height=300)
+
+    st.markdown('<span class="section-label">PRIORITARIOS POR TIENDA</span>', unsafe_allow_html=True)
+    report_table(
+        golden.get("store_rows", []),
+        column_config={
+            "TIENDA": st.column_config.TextColumn("TIENDA", width="large"),
+            "COMPLIANCE_%": st.column_config.NumberColumn(
+                "COMPLIANCE %", format="%.1f%%", width="small"
+            ),
+        },
+        max_height=520,
+    )
+
+    st.markdown(
+        '<span class="section-label">DETALLE TIENDA-SKU PRIORITARIO</span>',
+        unsafe_allow_html=True,
+    )
+    report_table(
+        golden.get("detail_rows", []),
+        column_config={
+            "CIUDAD": st.column_config.TextColumn("CIUDAD", width="small"),
+            "TIENDA": st.column_config.TextColumn("TIENDA", width="medium"),
+            "SKU": st.column_config.TextColumn("SKU", width="medium"),
+            "OBJETIVO": st.column_config.NumberColumn(
+                "OBJETIVO", format="%d", width="small"
+            ),
+            "ASIGNADO": st.column_config.NumberColumn(
+                "ASIGNADO", format="%d", width="small"
+            ),
+            "FALTANTE": st.column_config.NumberColumn(
+                "FALTANTE", format="%d", width="small"
+            ),
+            "ORÍGENES": st.column_config.TextColumn("ORÍGENES", width="small"),
+            "BREAKDOWN": st.column_config.TextColumn(
+                "BREAKDOWN", width="medium"
+            ),
+        },
+        max_height=650,
+    )
+
+
+def render_planning_analytics(analytics: dict[str, Any], run: dict[str, Any]) -> None:
+    summary = analytics["summary"]
+
+    st.markdown(
+        '<div class="report-title">DETALLE DE PLANEACIÓN.</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        """
+        <div class="report-note">
+            PRODUCTOS = SKUs distintos con unidades asignadas · M³/PALLETS = volumen planeado · TAREAS = líneas por origen · UNIDADES = CANTIDAD_ASIGNADA.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    render_kpi_cards(
+        [
+            {
+                "category": "COBERTURA · GEOGRAFÍA",
+                "label": "CIUDADES ATENDIDAS",
+                "value": f"{summary['cities_served']:,}",
+                "description": (
+                    "Número de ciudades distintas con al menos una unidad de producto "
+                    "asignada. No incluye insumos."
+                ),
+            },
+            {
+                "category": "COBERTURA · TIENDAS",
+                "label": "TIENDAS ATENDIDAS",
+                "value": f"{summary['stores_served']:,}",
+                "description": (
+                    "Warehouses destino distintos que reciben al menos una unidad de "
+                    "producto normal."
+                ),
+                "tone": "acid",
+            },
+            {
+                "category": "COBERTURA · SKUs",
+                "label": "PRODUCTOS DISTINTOS",
+                "value": f"{summary['products_served']:,}",
+                "description": (
+                    "RETAIL_ID distintos con al menos una unidad asignada en toda la "
+                    "planeación. No equivale al número de tareas."
+                ),
+            },
+            {
+                "category": "TAREAS",
+                "label": "TAREAS GENERADAS",
+                "value": f"{run.get('tasks', 0):,}",
+                "description": (
+                    "Líneas operativas de transferencia generadas por el modelo. "
+                    "Las líneas de insumos no cuentan aquí."
+                ),
+                "tone": "blue",
+            },
+            {
+                "category": "VOLUMEN · PRODUCTO",
+                "label": "M³ PLANEADOS",
+                "value": f"{summary['m3_assigned']:,.2f}",
+                "description": (
+                    "Suma del volumen de producto normal asignado: QUANTITY por metros "
+                    "cúbicos por unidad. No incluye insumos."
+                ),
+                "tone": "blue",
+            },
+            {
+                "category": "VOLUMEN · PRODUCTO",
+                "label": "PALLETS PLANEADOS",
+                "value": f"{summary['m3_assigned']:,.2f}",
+                "description": (
+                    "Mismo dato que M³ PLANEADOS (columna PALLETS de VOLUMETRIA), "
+                    "mostrado aparte."
+                ),
+                "tone": "blue",
+            },
+            {
+                "category": "UNIDADES",
+                "label": "UNIDADES ASIGNADAS",
+                "value": f"{summary['assigned_units']:,}",
+                "description": "Suma de CANTIDAD_ASIGNADA de todos los requerimientos evaluados.",
+                "tone": "acid",
+            },
+        ],
+        columns_count=4,
+    )
+
+    st.markdown('<span class="section-label">RESUMEN POR CIUDAD</span>', unsafe_allow_html=True)
+    report_table(
+        analytics["city_rows"],
+        column_config={
+            "M3": st.column_config.NumberColumn("M³", format="%.2f"),
+        },
+        max_height=360,
+    )
+
+    st.markdown('<span class="section-label">RESUMEN POR TIENDA</span>', unsafe_allow_html=True)
+    report_table(
+        analytics["store_rows"],
+        column_config={
+            "WAREHOUSE_ID": st.column_config.NumberColumn(
+                "WAREHOUSE ID", format="%d"
+            ),
+            "M3": st.column_config.NumberColumn("M³", format="%.2f"),
+        },
+        max_height=600,
+    )
+
+    st.markdown(
+        '<div class="report-title">REPORTE DE REABASTO.</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        """
+        <div class="report-note">
+            Un caso = una tienda-SKU. COMPLIANCE DE CASOS = casos cubiertos al 100%; COMPLIANCE DE UNIDADES = asignado vs objetivo final. El incremento por hardcode se muestra aparte del ROQ original. Definiciones en el tooltip de cada tarjeta.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown('<span class="section-label">CASOS TIENDA-SKU</span>', unsafe_allow_html=True)
+    render_kpi_cards(
+        [
+            {
+                "category": "CASOS · BASE",
+                "label": "CON RECOMENDACIÓN",
+                "value": f"{summary['eligible_cases']:,}",
+                "description": (
+                    "Combinaciones tienda-SKU con CANTIDAD_OBJETIVO mayor a cero "
+                    "después de aplicar ROQ y hardcodes."
+                ),
+            },
+            {
+                "category": "CASOS · COMPLETOS",
+                "label": "CUBIERTOS AL 100%",
+                "value": f"{summary['fully_covered_cases']:,}",
+                "description": (
+                    "Casos cuya cantidad asignada alcanzó completamente la cantidad "
+                    "objetivo. Un caso no es lo mismo que una tarea."
+                ),
+                "tone": "acid",
+            },
+            {
+                "category": "CASOS · PARCIALES",
+                "label": "COBERTURA PARCIAL",
+                "value": f"{summary['partial_cases']:,}",
+                "description": (
+                    "Casos que reciben al menos una unidad, pero no cubren la cantidad "
+                    "objetivo completa."
+                ),
+                "tone": "coral",
+            },
+            {
+                "category": "CASOS · SIN SALIDA",
+                "label": "SIN ENVÍO",
+                "value": f"{summary['not_assigned_cases']:,}",
+                "description": (
+                    "Casos con recomendación positiva a los que no se asignó ninguna "
+                    "unidad por las reglas de corte."
+                ),
+                "tone": "coral",
+            },
+        ]
+    )
+
+    st.markdown('<span class="section-label">COMPLIANCE</span>', unsafe_allow_html=True)
+    render_kpi_cards(
+        [
+            {
+                "category": "PORCENTAJE · CASOS",
+                "label": "COMPLIANCE DE CASOS",
+                "value": f"{summary['case_compliance_pct']:,.1f}%",
+                "description": (
+                    "Casos tienda-SKU cubiertos al 100% dividido entre casos con "
+                    "recomendación. Mide cumplimiento completo, no tareas generadas."
+                ),
+                "tone": "acid",
+            },
+            {
+                "category": "PORCENTAJE · CASOS",
+                "label": "ATENCIÓN DE CASOS",
+                "value": f"{summary['case_service_pct']:,.1f}%",
+                "description": (
+                    "Casos tienda-SKU con al menos una unidad asignada dividido entre "
+                    "casos con recomendación. Incluye coberturas parciales."
+                ),
+            },
+            {
+                "category": "PORCENTAJE · UNIDADES",
+                "label": "COMPLIANCE DE UNIDADES",
+                "value": f"{summary['unit_compliance_pct']:,.1f}%",
+                "description": (
+                    "Unidades asignadas dividido entre el objetivo final del modelo, "
+                    "incluidos los incrementos de hardcode."
+                ),
+                "tone": "blue",
+            },
+            {
+                "category": "PORCENTAJE · UNIDADES",
+                "label": "COMPLIANCE DEL ROQ ORIGINAL",
+                "value": f"{summary['original_roq_compliance_pct']:,.1f}%",
+                "description": (
+                    "Unidades del ROQ original cubiertas dividido entre las unidades "
+                    "del ROQ antes de aplicar mínimos y hardcodes."
+                ),
+                "tone": "blue",
+            },
+        ]
+    )
+
+    st.markdown('<span class="section-label">UNIDADES</span>', unsafe_allow_html=True)
+    render_kpi_cards(
+        [
+            {
+                "category": "UNIDADES · ORIGINALES",
+                "label": "ROQ ORIGINAL",
+                "value": f"{summary['original_roq_units']:,}",
+                "description": (
+                    "Suma del ROQ original positivo antes de aplicar el mínimo de tres "
+                    "o cualquier hardcode."
+                ),
+            },
+            {
+                "category": "UNIDADES · OBJETIVO",
+                "label": "OBJETIVO FINAL",
+                "value": f"{summary['target_units']:,}",
+                "description": (
+                    "Unidades solicitadas finalmente por el modelo después de ROQ, "
+                    "mínimos y hardcodes."
+                ),
+                "tone": "acid",
+            },
+            {
+                "category": "UNIDADES · ASIGNADAS",
+                "label": "PRODUCTO PLANEADO",
+                "value": f"{summary['assigned_units']:,}",
+                "description": (
+                    "Unidades de producto normal que efectivamente fueron asignadas. "
+                    "No incluye insumos."
+                ),
+                "tone": "blue",
+            },
+            {
+                "category": "UNIDADES · INCREMENTALES",
+                "label": "HARDCODE ENVIADO",
+                "value": f"{summary['hardcode_assigned_units']:,}",
+                "description": (
+                    "Unidades realmente asignadas por encima del ROQ original debido "
+                    "a las reglas de hardcode."
+                ),
+                "tone": "coral",
+            },
+        ]
+    )
+
+    st.markdown('<span class="section-label">REGLAS ESPECIALES</span>', unsafe_allow_html=True)
+    render_kpi_cards(
+        [
+            {
+                "category": "CASOS · HARDCODE",
+                "label": "CASOS CON HARDCODE",
+                "value": f"{summary['hardcode_cases']:,}",
+                "description": (
+                    "Casos donde la cantidad objetivo quedó por encima del ROQ "
+                    "original por una regla de negocio."
+                ),
+            },
+            {
+                "category": "UNIDADES · HARDCODE",
+                "label": "OBJETIVO AÑADIDO",
+                "value": f"{summary['hardcode_target_units']:,}",
+                "description": (
+                    "Diferencia total entre el objetivo final y el ROQ original. "
+                    "Representa lo solicitado adicionalmente por hardcodes."
+                ),
+                "tone": "coral",
+            },
+            {
+                "category": "CASOS · FORECAST 0",
+                "label": "FORZADOS A 4",
+                "value": f"{summary['forecast_zero_forced_cases']:,}",
+                "description": (
+                    "Casos con forecast, inventario de apertura y ROQ en cero cuyo "
+                    "objetivo fue forzado a cuatro unidades."
+                ),
+            },
+            {
+                "category": "CASOS · DÉFICIT",
+                "label": "FORZADOS A 3",
+                "value": f"{summary['deficit_forced_cases']:,}",
+                "description": (
+                    "Casos con inventario de apertura menor a la demanda y ROQ cero "
+                    "cuyo objetivo fue forzado a tres unidades."
+                ),
+            },
+            {
+                "category": "CASOS · NET TRANSFER",
+                "label": "RIESGO BAJO · FORZADO A 3",
+                "value": f"{summary.get('net_transfer_forced_cases', 0):,}",
+                "description": (
+                    "Casos sin ROQ positivo, con Net Inter-Store Transfers menor o "
+                    "igual a 3 e inventario final en tienda menor a 3 unidades cuyo "
+                    "objetivo fue forzado a tres."
+                ),
+                "tone": "coral",
+            },
+            {
+                "category": "CASOS · ROQ POSITIVO",
+                "label": "MÍNIMO DE 3 APLICADO",
+                "value": f"{summary['minimum_three_cases']:,}",
+                "description": (
+                    "Casos cuyo ROQ original era positivo pero menor a tres y se "
+                    "elevó al mínimo operativo de tres unidades."
+                ),
+            },
+        ],
+        columns_count=3,
+    )
+
+    st.markdown('<span class="section-label">QUIEBRES + PRIORIDADES</span>', unsafe_allow_html=True)
+    render_kpi_cards(
+        [
+            {
+                "category": "CASOS · QUIEBRE",
+                "label": "QUIEBRES CON ENVÍO",
+                "value": f"{summary['stockout_cases_served']:,}",
+                "description": (
+                    "Casos tienda-SKU que iniciaron en quiebre y reciben al menos "
+                    "una unidad."
+                ),
+                "tone": "acid",
+            },
+            {
+                "category": "SKUs · QUIEBRE",
+                "label": "PRODUCTOS DISTINTOS ATENDIDOS",
+                "value": f"{summary['stockout_products_served']:,}",
+                "description": (
+                    "RETAIL_ID distintos en quiebre atendidos en al menos una tienda. "
+                    "No es un conteo de tareas."
+                ),
+            },
+            {
+                "category": "CASOS · QUIEBRE",
+                "label": "CUBIERTOS AL 100%",
+                "value": f"{summary['stockout_cases_full']:,}",
+                "description": (
+                    "Casos tienda-SKU en quiebre cuya cantidad objetivo fue cubierta "
+                    "completamente."
+                ),
+                "tone": "acid",
+            },
+            {
+                "category": "CASOS · PRIORITARIOS",
+                "label": "PRIORITARIOS CON ENVÍO",
+                "value": f"{summary['golden_served_cases']:,}",
+                "description": (
+                    "Casos Infaltable, Golden o Anchor que reciben al menos una unidad, sin "
+                    "importar cuántas tareas se generaron."
+                ),
+                "tone": "acid",
+            },
+        ]
+    )
+
+    render_golden_report(analytics)
+
+    st.markdown('<span class="section-label">REGLAS DE DEMANDA</span>', unsafe_allow_html=True)
+    report_table(
+        analytics["rule_rows"],
+        column_config={
+            "COMPLIANCE_UNIDADES_%": st.column_config.NumberColumn(
+                "COMPLIANCE UNIDADES %", format="%.1f%%"
+            ),
+        },
+        max_height=360,
+    )
+
+    st.markdown('<span class="section-label">QUIEBRES POR CIUDAD</span>', unsafe_allow_html=True)
+    report_table(
+        analytics["stockout_city_rows"],
+        column_config={
+            "ATENCION_%": st.column_config.NumberColumn(
+                "ATENCIÓN %", format="%.1f%%"
+            ),
+        },
+        max_height=400,
+    )
+
+    st.markdown('<span class="section-label">ASIGNACIÓN POR ORIGEN</span>', unsafe_allow_html=True)
+    report_table(
+        analytics["source_rows"],
+        column_config={
+            "WAREHOUSE_SOURCE": st.column_config.NumberColumn(
+                "WAREHOUSE SOURCE", format="%d"
+            ),
+            "M3": st.column_config.NumberColumn("M³", format="%.2f"),
+            "UNIDADES_POR_TAREA": st.column_config.NumberColumn(
+                "UNIDADES / TAREA", format="%.2f"
+            ),
+            "PARTICIPACION_TAREAS_%": st.column_config.NumberColumn(
+                "% DE TAREAS", format="%.1f%%"
+            ),
+            "PARTICIPACION_UNIDADES_%": st.column_config.NumberColumn(
+                "% DE UNIDADES", format="%.1f%%"
+            ),
+        },
+        max_height=360,
+    )
+
+    render_source_analysis(analytics)
+
+
+CATEGORIA_DISPLAY_LABELS = {
+    "SIN_PROBLEMA": "Sin problema",
+    "IBA_A_QUEBRAR_Y_SE_SALVO": "Iba a quebrar y se salvó",
+    "QUEBRADO_Y_SE_SALVO": "Quebrado y se salvó",
+    "NO_CUBIERTO": "No cubierto",
+}
+
+
+# Identidad visual de cada bucket en el reporte de universo — un color fijo por
+# bucket para reconocerlos de un vistazo.
+UNIVERSE_BUCKET_BADGE_COLORS = {
+    "GOLDEN": "#FFF000",
+    "INFALTABLE": "#BD00FF",
+    "ANCHOR": "#FF007F",
+    "KVI": "#D9FF3F",
+}
+
+
+def render_bucket_universe_report(bucket_label: str, report: dict[str, Any]) -> None:
+    """Renderiza los 3 niveles del reporte de universo completo de un
+    bucket (Golden, Infaltable o Anchor): general, general con detalle, y
+    micro-detalle para lo que sigue sin cubrirse."""
+    if not report or not report.get("enabled"):
+        return
+
+    badge_color = UNIVERSE_BUCKET_BADGE_COLORS.get(bucket_label.upper(), "#5e7cff")
+    st.markdown(
+        f'<div class="report-title">'
+        f'<span style="display:inline-block; width:22px; height:22px; '
+        f'background:{badge_color}; border:2px solid #111111; '
+        f'border-radius:4px; margin-right:10px; vertical-align:middle;">'
+        f"</span>"
+        f"UNIVERSO {bucket_label}."
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f"""
+        <div class="report-note">
+            {report['universe_size']:,} combinaciones tienda-SKU {bucket_label} en GOLDEN_INFALTABLES_ANCHOR, evaluadas completas aunque ningún engine las tocara hoy. Objetivo: {report['target_doh']:g} DOH.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    summary = report["summary"]
+    render_kpi_cards(
+        [
+            {
+                "category": f"{bucket_label} · SIN RIESGO",
+                "label": "SIN PROBLEMA",
+                "value": f"{summary['sin_problema']:,}",
+                "description": (
+                    f"Nunca bajaron de {report['target_doh']:g} DOH — no "
+                    "necesitaron ayuda de ningún engine."
+                ),
+                "tone": "blue",
+            },
+            {
+                "category": f"{bucket_label} · SE SALVÓ",
+                "label": "IBA A QUEBRAR Y SE SALVÓ",
+                "value": f"{summary['iba_a_quebrar_y_se_salvo']:,}",
+                "description": (
+                    "Arrancaron con stock > 0 pero por debajo del objetivo; "
+                    "algún engine las llevó de vuelta al objetivo."
+                ),
+                "tone": "acid",
+            },
+            {
+                "category": f"{bucket_label} · SE SALVÓ",
+                "label": "QUEBRADO Y SE SALVÓ",
+                "value": f"{summary['quebrado_y_se_salvo']:,}",
+                "description": (
+                    "Arrancaron en 0 unidades; algún engine las llevó al "
+                    "objetivo de DOH."
+                ),
+                "tone": "acid",
+            },
+            {
+                "category": f"{bucket_label} · SIN CUBRIR",
+                "label": "NO CUBIERTO",
+                "value": f"{summary['no_cubierto']:,}",
+                "description": (
+                    "Siguen por debajo del objetivo al final de la corrida. "
+                    "Ver el detalle de motivo más abajo."
+                ),
+                "tone": "coral",
+            },
+        ],
+        columns_count=4,
+    )
+
+    rows = report.get("rows", [])
+    with st.expander(
+        f"{bucket_label} (general con detalle, {len(rows):,} tienda-SKU)"
+    ):
+        display_rows = [
+            {**row, "CATEGORIA": CATEGORIA_DISPLAY_LABELS.get(
+                row["CATEGORIA"], row["CATEGORIA"]
+            )}
+            for row in rows
+        ]
+        render_capped_dataframe(
+            display_rows,
+            key=f"{bucket_label.lower()}_universe_detail",
+            offer_download=True,
+            file_label=f"universo_{bucket_label.lower()}_detalle",
+            column_config={
+                "MOTIVO_NO_CUBIERTO": st.column_config.TextColumn(
+                    "MOTIVO NO CUBIERTO", width="large"
+                ),
+            },
+        )
+
+    no_cubierto_rows = [row for row in rows if row["CATEGORIA"] == "NO_CUBIERTO"]
+    if no_cubierto_rows:
+        st.markdown(f"###### {bucket_label} — micro-detalle: por qué no se cubrió")
+        render_capped_dataframe(
+            [
+                {
+                    "WAREHOUSE_DESTINATION": row["WAREHOUSE_DESTINATION"],
+                    "WAREHOUSE_NAME": row["WAREHOUSE_NAME"],
+                    "RETAIL_ID": row["RETAIL_ID"],
+                    "PRODUCT_NAME": row["PRODUCT_NAME"],
+                    "CATEGORY_NAME": row["CATEGORY_NAME"],
+                    "SWA_POTENTIAL_GAIN_COUNTRY": row["SWA_POTENTIAL_GAIN_COUNTRY"],
+                    "DOH_FINAL": row["DOH_FINAL"],
+                    "MOTIVO_NO_CUBIERTO": row["MOTIVO_NO_CUBIERTO"],
+                }
+                for row in no_cubierto_rows
+            ],
+            key=f"{bucket_label.lower()}_universe_no_cubierto",
+            offer_download=True,
+            file_label=f"universo_{bucket_label.lower()}_no_cubierto",
+            column_config={
+                "MOTIVO_NO_CUBIERTO": st.column_config.TextColumn(
+                    "MOTIVO NO CUBIERTO", width="large"
+                ),
+            },
+        )
+
+
+ENGINE_CSS_CLASS = {
+    "Naked": "naked", "Otacon": "otacon", "Shalashaska": "shalashaska", "Solidus": "solidus",
+    "Liquid": "liquid", "Venom": "venom", "Kazuhira": "kazuhira",
+    "Insumos": "insumos",
+}
+
+ENGINE_PANEL_INLINE_STYLE = {
+    "Naked": "background-color:#d9ff3f;color:#111111;",
+    "Otacon": "background-color:#8a3ffc;color:#fffdf7;",
+    "Solidus": "background-color:#5e7cff;color:#fffdf7;",
+    "Shalashaska": "background-color:#ffb000;color:#111111;",
+    "Liquid": "background-color:#ff5a47;color:#111111;",
+    "Venom": "background-color:#8a3ffc;color:#fffdf7;",
+    "Kazuhira": "background-color:#111111;color:#d9ff3f;",
+    "Insumos": "background-color:#fff000;color:#111111;",
+}
+
+
+def render_engine_header(
+    engine_name: str,
+    summary_rows: list[dict[str, Any]],
+    swa_enabled: bool = False,
+) -> None:
+    """Encabezado estándar de cada engine: etapa, qué hace y cómo funciona.
+
+    Naked y Solidus, que agrupan varias coberturas, muestran además sus totales.
+    """
+    info = ENGINE_INFO[engine_name]
+    st.markdown(
+        f'<div class="engine-panel {ENGINE_CSS_CLASS[engine_name]}" '
+        f'style="{ENGINE_PANEL_INLINE_STYLE[engine_name]}">'
+        f'<div class="stage">{html.escape(info["stage"].upper())}</div>'
+        f"<h4>{html.escape(engine_name.upper())}</h4>"
+        f'<p>{html.escape(info["role"])}</p>'
+        "</div>",
+        unsafe_allow_html=True,
+    )
+    with st.expander(f"Cómo funciona {engine_name}"):
+        lines = [f"**Posición:** {info['position']}", "", "**Cómo funciona**"]
+        lines += [f"- {item}" for item in info["how"]]
+        if info.get("coverages"):
+            lines += ["", "**Coberturas**"]
+            lines += [f"- **{name}:** {text}" for name, text in info["coverages"].items()]
+        st.markdown("\n".join(lines))
+    if engine_name not in COVERAGE_ORDER:
+        return
+    totals = next(
+        (r for r in summary_rows if r["ENGINE"] == engine_name and r["COBERTURA"] == "Total"),
+        None,
+    )
+    if totals is None:
+        return
+    scope = {"Naked": "DOI literal de Fountain9", "Otacon": "residual y mínimos"}.get(engine_name, "sus 4 coberturas")
+    tone = "blue" if engine_name == "Solidus" else "acid"
+    category = f"{engine_name.upper()} · TOTAL"
+    cards = [
+        {"category": category, "label": "CASOS", "value": f"{totals['CASOS']:,}",
+         "description": f"Casos tienda-SKU con al menos una unidad ({scope}).", "tone": tone},
+        {"category": category, "label": "TAREAS", "value": f"{totals['TAREAS']:,}",
+         "description": f"Líneas de asignación generadas ({scope}).", "tone": tone},
+        {"category": category, "label": "UNIDADES", "value": f"{totals['UNIDADES']:,}",
+         "description": f"Unidades asignadas ({scope}).", "tone": tone},
+    ]
+    if swa_enabled:
+        cards.append(
+            {"category": category, "label": "SWA GANADO", "value": f"{totals['SWA_GANADO']:,.4f}",
+             "description": f"SWA país capturado ({scope}).", "tone": tone}
+        )
+    render_kpi_cards(cards, columns_count=4)
+
+
+def render_mail_section(run: dict[str, Any]) -> None:
+    """Un solo botón: manda por correo COPÉRNICO, BASE_TRANSFERS, Sin recomendación y
+    OVERVIEW de la corrida a una lista editable de destinatarios."""
+    st.markdown('<span class="section-label">ENVIAR POR MAIL</span>', unsafe_allow_html=True)
+    if run.get("simulation"):
+        st.caption("Modo simulación: la corrida no generó archivos que enviar.")
+        return
+    st.caption("Un solo correo con " + ", ".join(mail_sender.preview_names(run)) + ".")
+    recipients_text = st.text_area(
+        "Destinatarios (uno por línea)",
+        value="\n".join(mail_sender.DEFAULT_RECIPIENTS),
+        key="mb_mail_recipients",
+        height=100,
+        help="También acepta comas o punto y coma. Se envía desde la cuenta de Google autorizada en Secrets.",
+    )
+    recipients, invalid = mail_sender.parse_recipients(recipients_text)
+    if invalid:
+        st.warning("Direcciones no válidas: " + ", ".join(invalid))
+    if st.button(
+        "Enviar por mail",
+        key="mb_mail_send",
+        disabled=bool(invalid) or not recipients,
+    ):
+        with st.spinner("Armando y enviando el correo…"):
+            try:
+                result = mail_sender.send_run_package(run, recipients)
+            except mail_sender.MailError as error:
+                st.error(str(error))
+            except Exception as error:  # nunca debe tumbar la pantalla de resultados
+                st.error(f"No se pudo enviar el correo: {error}")
+            else:
+                st.session_state["mb_mail_last"] = {
+                    "run": str(run.get("zip")),
+                    "recipients": result.recipients,
+                    "attachments": result.attachments,
+                    "notes": result.notes,
+                }
+    last = st.session_state.get("mb_mail_last")
+    if last and last.get("run") == str(run.get("zip")):
+        sent = ", ".join(
+            f"{name} ({size / 1024 / 1024:,.1f} MB)" for name, size in last["attachments"]
+        )
+        st.success(
+            f"Correo enviado a {len(last['recipients'])} destinatario(s): "
+            + ", ".join(last["recipients"])
+            + f". Adjuntos: {sent}."
+        )
+        for note in last.get("notes", []):
+            st.caption(note)
+
+
+def render_engine_summary_table(
+    summary_rows: list[dict[str, Any]], swa_enabled: bool
+) -> None:
+    """Tabla resumen: todos los engines en orden de ejecución, con su estado."""
+    columns = ["ETAPA", "ENGINE", "COBERTURA", "QUÉ HACE", "ESTADO",
+               "CASOS", "TAREAS", "UNIDADES"]
+    if swa_enabled:
+        columns.append("SWA_GANADO")
+    render_capped_dataframe(
+        [{column: row[column] for column in columns} for row in summary_rows],
+        key="engine_summary",
+        offer_download=True,
+        file_label="resumen_por_engine",
+    )
+
+
+def render_results(run: dict[str, Any]) -> None:
+    planning_summary = run.get("analytics", {}).get("summary", {})
+    st.markdown('<div class="result-title">PLANEACIÓN LISTA.</div>', unsafe_allow_html=True)
+    run_build = run.get("build")
+    if run_build == APP_BUILD:
+        st.caption(f"Versión del motor: {APP_BUILD}")
+    else:
+        st.warning(
+            f"Esta corrida se generó con la versión: "
+            f"{run_build or 'sin sello (anterior a kazuhira-v9)'}. "
+            f"El código actual es {APP_BUILD}."
+        )
+    st.markdown(
+        """
+        <div class="report-note">
+            REQUERIDO = necesidad original de Naked y Otacon (DOI y residual), sin la cobertura de Shalashaska, Solidus, Liquid, Venom ni Kazuhira · PLANEACIÓN FINAL = todo lo asignado, con todos los engines · PALLETS = mismo dato que M³ (VOLUMETRIA).
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    swa_report = run.get("swa_report", {})
+    if swa_report.get("enabled"):
+        st.markdown(
+            '<div class="report-title">SWA · SALES WEIGHTED AVAILABILITY.</div>',
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            "Universo: todo quiebre del catálogo (stock = 0). 'Ganado' es binario: "
+            "cualquier envío que saque la tienda-SKU del quiebre captura su SWA "
+            "completo. Sin dato en la hoja SWA = 0."
+        )
+        render_kpi_cards(
+            [
+                {
+                    "category": "SWA · GANADO",
+                    "label": "SWA GANADO ESTA CORRIDA",
+                    "value": f"{swa_report['swa_ganado']:,.4f}",
+                    "description": (
+                        f"{swa_report['casos_ganados']:,} tienda-SKU que estaban "
+                        "en quiebre y recibieron envío — SWA país capturado."
+                    ),
+                    "tone": "acid",
+                },
+                {
+                    "category": "SWA · PERDIDO",
+                    "label": "SWA EN RIESGO (NO GANADO)",
+                    "value": f"{swa_report['swa_perdido']:,.4f}",
+                    "description": (
+                        f"{swa_report['casos_perdidos']:,} tienda-SKU que "
+                        "siguen en quiebre al final de la corrida, con o sin "
+                        "intento de cobertura — SWA país que se sigue "
+                        "perdiendo."
+                    ),
+                    "tone": "coral",
+                },
+                {
+                    "category": "SWA · UNIVERSO",
+                    "label": "TOTAL DE QUIEBRES EVALUADOS",
+                    "value": f"{swa_report['universo_total']:,}",
+                    "description": (
+                        "Toda tienda-SKU del catálogo con stock inicial en "
+                        "cero, sin importar si tenía SWA registrado o si "
+                        "algún engine la tocó."
+                    ),
+                    "tone": "blue",
+                },
+                {
+                    "category": "SWA · SIN DATO",
+                    "label": "QUIEBRES SIN SWA EN LA HOJA",
+                    "value": f"{swa_report['casos_sin_swa_registrado']:,}",
+                    "description": (
+                        "Tienda-SKU en quiebre que no aparecen en la hoja "
+                        "SWA — se cuentan en el universo con SWA=0 por "
+                        "descarte, no se excluyen."
+                    ),
+                    "tone": "blue",
+                },
+            ],
+            columns_count=4,
+        )
+    elif "swa_report" in run:
+        st.caption(
+            "ℹ️ La hoja SWA no está en este DATA_TRANSFERS: sin SWA ganado/perdido."
+        )
+
+    # Lookup de SWA por engine para las secciones de REPORTE POR ENGINE.
+    swa_by_engine = swa_ganado_by_engine(run.get("planned_by_engine_rows", []))
+    engine_summary_rows = run.get("engine_summary_rows", [])
+    swa_enabled = bool(swa_report.get("enabled"))
+
+    render_kpi_cards(
+        [
+            {
+                "category": "REQUERIDO · NAKED",
+                "label": "UNIDADES",
+                "value": f"{planning_summary.get('naked_target_units', 0):,}",
+                "description": (
+                    "Necesidad de Naked y Otacon consolidada una vez por tienda-SKU "
+                    "(necesidad original de Fountain9). No incluye lo que AVL, "
+                    "Shalashaska, Liquid o Venom agregan como cobertura propia."
+                ),
+                "tone": "blue",
+            },
+            {
+                "category": "REQUERIDO · NAKED",
+                "label": "TAREAS",
+                "value": f"{planning_summary.get('naked_eligible_cases', 0):,}",
+                "description": (
+                    "Casos tienda-SKU evaluados por Naked y Otacon; el máximo de "
+                    "tareas si cada caso se cubriera con una sola línea."
+                ),
+                "tone": "blue",
+            },
+            {
+                "category": "REQUERIDO · NAKED",
+                "label": "PALLETS",
+                "value": f"{planning_summary.get('naked_target_m3', 0):,.2f}",
+                "description": (
+                    "m³ de la necesidad consolidada de Naked y Otacon, sin duplicar el residual."
+                ),
+                "tone": "blue",
+            },
+        ],
+        columns_count=3,
+    )
+    render_kpi_cards(
+        [
+            {
+                "category": "PLANEACIÓN FINAL",
+                "label": "UNIDADES",
+                "value": f"{run['units']:,}",
+                "description": (
+                    "Suma de QUANTITY de las transferencias normales de producto. "
+                    "No incluye insumos."
+                ),
+                "tone": "acid",
+            },
+            {
+                "category": "PLANEACIÓN FINAL",
+                "label": "TAREAS",
+                "value": f"{run['tasks']:,}",
+                "description": (
+                    "Líneas operativas de transferencia generadas por el modelo. "
+                    "Un caso puede crear dos tareas si se divide entre dos orígenes. "
+                    "Las líneas de insumos no cuentan aquí."
+                ),
+                "tone": "acid",
+            },
+            {
+                "category": "PLANEACIÓN FINAL",
+                "label": "PALLETS",
+                "value": f"{planning_summary.get('m3_assigned', 0):,.2f}",
+                "description": "Suma de M3_ASIGNADO realmente planeado.",
+                "tone": "acid",
+            },
+        ],
+        columns_count=3,
+    )
+    render_kpi_cards(
+        [
+            {
+                "category": "CASOS · INPUT",
+                "label": "REQUERIMIENTOS ÚNICOS RECIBIDOS",
+                "value": f"{run.get('input_requirements', run['requirements']):,}",
+                "description": (
+                    "Combinaciones tienda-SKU únicas obtenidas después de sumar todos "
+                    "los CSV cargados. Incluye tiendas cerradas y ciudades "
+                    "bloqueadas, antes de aplicar exclusiones."
+                ),
+                "tone": "acid",
+            },
+            {
+                "category": "LÍNEAS · INSUMOS",
+                "label": "LÍNEAS DE INSUMOS",
+                "value": f"{run.get('insumos', {}).get('lines_added', 0):,}",
+                "description": (
+                    "Filas de INSUMOS anexadas al BulkCD_444 para tiendas que ya "
+                    "reciben producto normal desde 444. No consumen tareas, pero "
+                    "sí están limitadas por stock ajustado y MOQ."
+                ),
+                "tone": "blue",
+            },
+            {
+                "category": "UNIDADES · INSUMOS",
+                "label": "UNIDADES DE INSUMOS",
+                "value": f"{run.get('insumos', {}).get('units_added', 0):,}",
+                "description": (
+                    "Suma de QUANTITY de las líneas de insumos agregadas. Se muestra "
+                    "separada para no mezclarla con unidades de producto y ya refleja "
+                    "cualquier recorte por stock del 444."
+                ),
+                "tone": "acid",
+            },
+        ],
+        columns_count=3,
+    )
+
+    render_mail_section(run)
+
+    st.markdown(
+        '<div class="result-title">CIUDADES + TIENDAS ATENDIDAS.</div>',
+        unsafe_allow_html=True,
+    )
+    render_kpi_cards(
+        [
+            {
+                "category": "COBERTURA · GEOGRAFÍA",
+                "label": "CIUDADES ATENDIDAS",
+                "value": f"{planning_summary.get('cities_served', 0):,}",
+                "description": (
+                    "Número de ciudades distintas con al menos una unidad de producto "
+                    "asignada. No incluye insumos."
+                ),
+                "tone": "blue",
+            },
+            {
+                "category": "COBERTURA · TIENDAS",
+                "label": "TIENDAS ATENDIDAS",
+                "value": f"{planning_summary.get('stores_served', 0):,}",
+                "description": (
+                    "Warehouses destino distintos que reciben al menos una unidad de "
+                    "producto normal."
+                ),
+                "tone": "acid",
+            },
+        ],
+        columns_count=2,
+    )
+
+    storage_override = run.get("origin_storage_override", {})
+    if storage_override.get("enabled"):
+        st.info(
+            "Override de storage por origen aplicado: "
+            f"{storage_override.get('configured_pairs', 0):,} combinaciones "
+            "warehouse origen–SKU disponibles en OVER_ORIGEN_STORAGE."
+        )
+
+    consolidation = run.get("input_consolidation", {})
+    if consolidation:
+        st.markdown(
+            '<span class="section-label">CONSOLIDACIÓN DE ARCHIVOS</span>',
+            unsafe_allow_html=True,
+        )
+        render_kpi_cards(
+            [
+                {
+                    "category": "ARCHIVOS · INPUT",
+                    "label": "CSV CARGADOS",
+                    "value": f"{consolidation.get('files', 0):,}",
+                    "description": (
+                        "Número de archivos cargados en esta corrida. Cada uno puede "
+                        "usar Warehouseid o Node_Store para identificar la tienda."
+                    ),
+                    "tone": "blue",
+                },
+                {
+                    "category": "FILAS · INPUT",
+                    "label": "FILAS LEÍDAS",
+                    "value": f"{consolidation.get('source_rows', 0):,}",
+                    "description": (
+                        "Filas no vacías leídas entre todos los CSV antes de consolidar."
+                    ),
+                },
+                {
+                    "category": "CASOS · CONSOLIDADOS",
+                    "label": "TIENDA-SKU ÚNICOS",
+                    "value": f"{consolidation.get('unique_requirements', 0):,}",
+                    "description": (
+                        "Combinaciones únicas de tienda y SKU resultantes. Las métricas "
+                        "de demanda, apertura, ROQ y Net Transfers se suman por caso."
+                    ),
+                    "tone": "acid",
+                },
+                {
+                    "category": "FILAS · SUMADAS",
+                    "label": "FILAS CONSOLIDADAS",
+                    "value": f"{consolidation.get('rows_consolidated', 0):,}",
+                    "description": (
+                        "Filas adicionales absorbidas al coincidir en Warehouse–SKU. "
+                        "No se duplican como requerimientos separados."
+                    ),
+                    "tone": "blue",
+                },
+            ],
+            columns_count=4,
+        )
+
+    city_block = run.get("city_block", {})
+    if city_block.get("requirements", 0) > 0:
+        city_names = ", ".join(
+            item["name"] for item in city_block.get("cities", [])
+        )
+        st.warning(
+            f"Bloqueo de ciudad aplicado: {city_names}. Se excluyeron "
+            f"{city_block['requirements']:,} requerimientos, "
+            f"{city_block['stores']:,} tiendas y "
+            f"{city_block['products']:,} productos antes de asignar stock."
+        )
+    if run.get("simulation"):
+        st.markdown(
+            '<span class="section-label">DESCARGAR TODO</span>', unsafe_allow_html=True
+        )
+        st.info(
+            "MODO SIMULACIÓN: no se generaron archivos descargables. Corre sin "
+            "simulación para obtener CSV, Excel, PDF y ZIP."
+        )
+    else:
+        st.markdown('<span class="section-label">DESCARGAR TODO</span>', unsafe_allow_html=True)
+        zip_path = Path(run["zip"])
+        st.download_button(
+            "Descargar planeación completa (.zip)",
+            data=zip_path.read_bytes(),
+            file_name=zip_path.name,
+            mime="application/zip",
+            use_container_width=True,
+        )
+
+        with st.expander("¿Por qué no salió este SKU en esta tienda? (consulta puntual)"):
+            st.caption(
+                "Busca la tienda-SKU en el zip de esta corrida: enviada, declarada "
+                "(con motivo), sana o sin rastro."
+            )
+            query_store_col, query_sku_col = st.columns(2)
+            with query_store_col:
+                query_store = st.number_input(
+                    "ID de tienda", min_value=0, step=1, value=0,
+                    key="explain_store_id",
+                )
+            with query_sku_col:
+                query_sku = st.number_input(
+                    "ID de SKU", min_value=0, step=1, value=0,
+                    key="explain_sku_id",
+                )
+            if st.button("Consultar", key="explain_store_sku_button") and query_store and query_sku:
+                with st.spinner("Buscando en los archivos de la corrida…"):
+                    explanation = explain_store_sku(zip_path, int(query_store), int(query_sku))
+                if explanation["sent"]:
+                    st.success(explanation["verdict"])
+                    st.dataframe(explanation["sent"], use_container_width=True)
+                elif explanation["declared"] or explanation["healthy"]:
+                    st.info(explanation["verdict"])
+                else:
+                    st.error(explanation["verdict"])
+                if explanation["declared"]:
+                    st.markdown("**Declarado en BASE_TRANSFERS:**")
+                    st.dataframe(explanation["declared"], use_container_width=True)
+                if explanation["healthy"]:
+                    st.markdown("**Universo sano:**")
+                    st.json(explanation["healthy"])
+
+        st.markdown('<span class="section-label">ARCHIVOS INDIVIDUALES</span>', unsafe_allow_html=True)
+
+        def _download_button(path: Path, label: str, key: str) -> None:
+            mime = (
+                "text/csv"
+                if path.suffix.lower() == ".csv"
+                else "application/pdf"
+                if path.suffix.lower() == ".pdf"
+                else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+            st.markdown(f'<span class="file-pill">{path.name}</span>', unsafe_allow_html=True)
+            st.download_button(
+                label,
+                data=path.read_bytes(),
+                file_name=path.name,
+                mime=mime,
+                key=key,
+                use_container_width=True,
+            )
+
+        all_paths = [Path(raw_path) for raw_path in run["files"]]
+        bulk_pattern = re.compile(r"^BulkCD_(\d+)(?:_(.+))?\.csv$")
+        report_paths = [p for p in all_paths if p.name.startswith("Reporte_Planeacion_")]
+        bulk_paths = sorted(
+            (p for p in all_paths if bulk_pattern.match(p.name)),
+            key=lambda p: (
+                int(bulk_pattern.match(p.name).group(1)),
+                bulk_pattern.match(p.name).group(2) or "",
+            ),
+        )
+        fountain9_zero_paths = [
+            p for p in all_paths if p.name.startswith("Fountain9_Sin_Recomendacion_")
+        ]
+        outlier_paths = [
+            p for p in all_paths if p.name.startswith("Outliers_Fountain9_Excluidos_")
+        ]
+        pdf_paths = [
+            p for p in all_paths if p.name.startswith("Reporte_Ejecutivo_Planeacion_")
+        ]
+        categorized = (
+            set(report_paths)
+            | set(bulk_paths)
+            | set(fountain9_zero_paths)
+            | set(outlier_paths)
+            | set(pdf_paths)
+        )
+        other_paths = [p for p in all_paths if p not in categorized]
+
+        if report_paths:
+            st.caption("Reporte de planeación (Excel)")
+            for index, path in enumerate(report_paths):
+                _download_button(
+                    path, "Descargar reporte de planeación", f"download_report_{index}"
+                )
+
+        if bulk_paths:
+            # No asumas una cantidad fija: hay tantos Bulk como orígenes
+            # seleccionados hayan generado al menos una línea (más owner splits
+            # de 425/856), así que esto siempre se acomoda al número real.
+            st.caption(f"Bulk por origen ({len(bulk_paths):,})")
+            bulk_columns = st.columns(min(max(len(bulk_paths), 1), 3))
+            for index, path in enumerate(bulk_paths):
+                match = bulk_pattern.match(path.name)
+                origin_label = match.group(1) if match else ""
+                owner_label = f" · {match.group(2)}" if match and match.group(2) else ""
+                with bulk_columns[index % len(bulk_columns)]:
+                    _download_button(
+                        path,
+                        f"Descargar Bulk {origin_label}{owner_label}",
+                        f"download_bulk_{index}",
+                    )
+
+        if fountain9_zero_paths:
+            st.caption("Sin recomendación Fountain9")
+            for index, path in enumerate(fountain9_zero_paths):
+                _download_button(
+                    path,
+                    "Descargar sin recomendación Fountain9",
+                    f"download_f9zero_{index}",
+                )
+
+        if outlier_paths:
+            st.caption("Outliers Fountain9")
+            for index, path in enumerate(outlier_paths):
+                _download_button(
+                    path, "Descargar outliers Fountain9", f"download_outliers_{index}"
+                )
+
+        if pdf_paths:
+            st.caption("Reporte ejecutivo de planeación (PDF)")
+            for index, path in enumerate(pdf_paths):
+                _download_button(
+                    path,
+                    "Descargar reporte ejecutivo de planeación",
+                    f"download_pdf_{index}",
+                )
+
+        if other_paths:
+            st.caption("Otros archivos")
+            other_columns = st.columns(min(max(len(other_paths), 1), 3))
+            for index, path in enumerate(other_paths):
+                with other_columns[index % len(other_columns)]:
+                    _download_button(
+                        path, f"Descargar {path.name}", f"download_other_{index}"
+                    )
+
+    st.markdown('<span class="section-label">BREAKDOWN</span>', unsafe_allow_html=True)
+    st.markdown(
+        """
+        <div class="report-note">
+            PLANEADO = casos con al menos una unidad, por engine y causal · CORTES = lo no enviado, con motivo (COPÉRNICO desglosado) · SIN RECOMENDACIÓN = por qué Fountain9 no pidió nada (no es un corte) · OVERVIEW = planeado + cortes.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("##### Efectivamente planeado — por engine y causal")
+    planned_by_engine_rows = run.get("planned_by_engine_rows", [])
+    render_capped_dataframe(
+        planned_by_engine_rows,
+        key="planned_by_engine",
+        offer_download=True,
+        file_label="planeado_por_engine",
+    )
+
+    st.markdown("##### Cortes — todo lo que no se mandó, por motivo")
+    cuts_detail_rows = run.get("cuts_detail_rows", [])
+    render_capped_dataframe(
+        cuts_detail_rows,
+        key="cuts_detail",
+        offer_download=True,
+        file_label="cortes_por_motivo",
+    )
+
+    st.markdown("##### Sin recomendación — por qué Fountain9 no pidió nada")
+    st.caption(
+        "Otacon: Fountain9 no pidió nada para estas tienda-SKU. Los motivos usan "
+        "solo columnas del Bulk (demanda, opening, net transfer). SWA_INFORMATIVO no "
+        "es 'perdido': suele ser un desfase entre el opening predicho y el stock "
+        "real."
+    )
+    no_recommendation_rows = run.get("no_recommendation_rows", [])
+    render_capped_dataframe(
+        no_recommendation_rows,
+        key="no_recommendation_breakdown",
+        offer_download=True,
+        file_label="sin_recomendacion_por_motivo",
+    )
+
+    st.markdown("##### Overview general")
+    breakdown = ordered_breakdown_rows(
+        run["status_counts"], run.get("status_swa")
+    )
+    render_capped_dataframe(
+        breakdown,
+        key="breakdown_overview",
+        offer_download=True,
+        file_label="breakdown_overview",
+    )
+
+    audit = run.get("fountain9_audit", [])
+    if audit:
+        st.markdown("### Auditoría Fountain9 DOI")
+        st.caption("Una fila por origen F9, tienda y SKU. La recuperación se distribuye una sola vez entre las instrucciones pendientes.")
+        render_capped_dataframe(audit, key="fountain9_doi_audit")
+
+    fountain9_comparison = run.get("fountain9_comparison", {})
+    if fountain9_comparison.get("enabled"):
+        st.markdown(
+            '<div class="report-title">FOUNTAIN9 VS MOTHER BASE.</div>',
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            "Cuánto más cubre Mother Base de lo que Fountain9 evalúa. 'Allocation "
+            "(DOI Based)' es la instrucción ejecutable de Fountain9."
+        )
+        f9 = fountain9_comparison["fountain9"]
+        mb_mismo = fountain9_comparison["mother_base_mismo_alcance"]
+        mb_adicional = fountain9_comparison["mother_base_adicional"]
+        mb_total = fountain9_comparison["mother_base_total"]
+
+        st.markdown(
+            f"###### Cara a cara — mismas "
+            f"{fountain9_comparison['universo_total']:,} tienda-SKU que "
+            "Fountain9 sí evaluó"
+        )
+        render_kpi_cards(
+            [
+                {
+                    "category": "FOUNTAIN9 · PRODUCTOS",
+                    "label": "SKUs CON ASIGNACIÓN",
+                    "value": f"{f9['productos']:,}",
+                    "description": "SKUs distintos que Fountain9 asignó a al menos una tienda.",
+                    "tone": "blue",
+                },
+                {
+                    "category": "MOTHER BASE · PRODUCTOS",
+                    "label": "SKUs CON ASIGNACIÓN",
+                    "value": f"{mb_mismo['productos']:,}",
+                    "description": "Mismo universo — SKUs que nosotros asignamos.",
+                    "tone": "acid",
+                },
+                {
+                    "category": "FOUNTAIN9 · TIENDAS",
+                    "label": "TIENDAS CON ASIGNACIÓN",
+                    "value": f"{f9['tiendas']:,}",
+                    "description": "Tiendas distintas que recibieron algo según Fountain9.",
+                    "tone": "blue",
+                },
+                {
+                    "category": "MOTHER BASE · TIENDAS",
+                    "label": "TIENDAS CON ASIGNACIÓN",
+                    "value": f"{mb_mismo['tiendas']:,}",
+                    "description": "Mismo universo — tiendas que nosotros cubrimos.",
+                    "tone": "acid",
+                },
+                {
+                    "category": "FOUNTAIN9 · PIEZAS",
+                    "label": "UNIDADES ASIGNADAS",
+                    "value": f"{f9['piezas']:,}",
+                    "description": "Suma de 'Allocation (DOI Based)' en el universo compartido.",
+                    "tone": "blue",
+                },
+                {
+                    "category": "MOTHER BASE · PIEZAS",
+                    "label": "UNIDADES ASIGNADAS",
+                    "value": f"{mb_mismo['piezas']:,}",
+                    "description": "Mismo universo — unidades que nosotros asignamos.",
+                    "tone": "acid",
+                },
+                {
+                    "category": "FOUNTAIN9 · TAREAS",
+                    "label": "LÍNEAS TIENDA-SKU",
+                    "value": f"{f9['tareas']:,}",
+                    "description": "Una tienda-SKU con asignación > 0 = una tarea.",
+                    "tone": "blue",
+                },
+                {
+                    "category": "MOTHER BASE · TAREAS",
+                    "label": "LÍNEAS TIENDA-SKU",
+                    "value": f"{mb_mismo['tareas']:,}",
+                    "description": "Mismo universo — tareas que nosotros generamos.",
+                    "tone": "acid",
+                },
+                {
+                    "category": "FOUNTAIN9 · SWA",
+                    "label": "SWA PAÍS GANADO",
+                    "value": f"{f9['swa_ganado']:,.4f}",
+                    "description": "SWA capturado por Fountain9 sobre quiebres (stock = 0) en el mismo universo.",
+                    "tone": "blue",
+                },
+                {
+                    "category": "MOTHER BASE · SWA",
+                    "label": "SWA PAÍS GANADO",
+                    "value": f"{mb_mismo['swa_ganado']:,.4f}",
+                    "description": "SWA capturado por nosotros sobre los mismos quiebres.",
+                    "tone": "acid",
+                },
+            ],
+            columns_count=4,
+        )
+
+        st.markdown("###### Lo que desbloqueamos — fuera del alcance de Fountain9")
+        st.caption(
+            "Tienda-SKU sin ninguna fila en el Bulk de Fountain9: lo que Mother Base "
+            "ve y Fountain9 no."
+        )
+        render_kpi_cards(
+            [
+                {
+                    "category": "ADICIONAL · PRODUCTOS",
+                    "label": "SKUs FUERA DEL ALCANCE DE F9",
+                    "value": f"{mb_adicional['productos']:,}",
+                    "description": "SKUs que Mother Base cubrió y Fountain9 nunca vio.",
+                    "tone": "violet",
+                },
+                {
+                    "category": "ADICIONAL · TIENDAS",
+                    "label": "TIENDAS FUERA DEL ALCANCE DE F9",
+                    "value": f"{mb_adicional['tiendas']:,}",
+                    "description": "Tiendas que recibieron algo fuera de lo que Fountain9 evaluó.",
+                    "tone": "violet",
+                },
+                {
+                    "category": "ADICIONAL · PIEZAS",
+                    "label": "UNIDADES FUERA DEL ALCANCE DE F9",
+                    "value": f"{mb_adicional['piezas']:,}",
+                    "description": "Unidades que Mother Base entrega sin que Fountain9 las haya pedido.",
+                    "tone": "violet",
+                },
+                {
+                    "category": "ADICIONAL · TAREAS",
+                    "label": "TAREAS FUERA DEL ALCANCE DE F9",
+                    "value": f"{mb_adicional['tareas']:,}",
+                    "description": "Líneas operativas que no existirían si solo siguiéramos a Fountain9.",
+                    "tone": "violet",
+                },
+                {
+                    "category": "ADICIONAL · SWA",
+                    "label": "SWA PAÍS GANADO FUERA DE F9",
+                    "value": f"{mb_adicional['swa_ganado']:,.4f}",
+                    "description": "SWA capturado en quiebres que Fountain9 nunca evaluó — invisible para ellos.",
+                    "tone": "violet",
+                },
+            ],
+            columns_count=4,
+        )
+
+        st.markdown("###### Mother Base — total real (mismo alcance + adicional)")
+        render_kpi_cards(
+            [
+                {
+                    "category": "TOTAL · PRODUCTOS",
+                    "label": "SKUs CON ASIGNACIÓN",
+                    "value": f"{mb_total['productos']:,}",
+                    "description": "Todo lo que Mother Base cubrió, dentro y fuera del alcance de Fountain9.",
+                    "tone": "acid",
+                },
+                {
+                    "category": "TOTAL · TIENDAS",
+                    "label": "TIENDAS CON ASIGNACIÓN",
+                    "value": f"{mb_total['tiendas']:,}",
+                    "description": "Todas las tiendas cubiertas, dentro y fuera del alcance de Fountain9.",
+                    "tone": "acid",
+                },
+                {
+                    "category": "TOTAL · PIEZAS",
+                    "label": "UNIDADES ASIGNADAS",
+                    "value": f"{mb_total['piezas']:,}",
+                    "description": "Todas las unidades, dentro y fuera del alcance de Fountain9.",
+                    "tone": "acid",
+                },
+                {
+                    "category": "TOTAL · TAREAS",
+                    "label": "LÍNEAS TIENDA-SKU",
+                    "value": f"{mb_total['tareas']:,}",
+                    "description": "Todas las tareas generadas, dentro y fuera del alcance de Fountain9.",
+                    "tone": "acid",
+                },
+                {
+                    "category": "TOTAL · SWA",
+                    "label": "SWA PAÍS GANADO",
+                    "value": f"{mb_total['swa_ganado']:,.4f}",
+                    "description": "Todo el SWA país que capturamos, dentro y fuera del alcance de Fountain9.",
+                    "tone": "acid",
+                },
+            ],
+            columns_count=4,
+        )
+
+        st.markdown("###### Cobertura de quiebres (stock = 0 en destino)")
+        st.caption(
+            "'Cubrió' = asignó algo > 0 a una tienda-SKU con stock 0 (stock propio, "
+            "catalogs.stock_base, para ambos lados)."
+        )
+        render_kpi_cards(
+            [
+                {
+                    "category": "QUIEBRES · UNIVERSO",
+                    "label": "TOTAL CON STOCK EN CERO",
+                    "value": f"{fountain9_comparison['total_rupturas']:,}",
+                    "description": "Tienda-SKU con stock=0 dentro del universo comparado.",
+                    "tone": "blue",
+                },
+                {
+                    "category": "QUIEBRES · AMBOS",
+                    "label": "CUBIERTAS POR LOS DOS",
+                    "value": f"{fountain9_comparison['ambos_cubrieron']:,}",
+                    "description": "Fountain9 y Mother Base asignaron algo.",
+                    "tone": "acid",
+                },
+                {
+                    "category": "QUIEBRES · SOLO FOUNTAIN9",
+                    "label": "SOLO FOUNTAIN9 CUBRIÓ",
+                    "value": f"{fountain9_comparison['solo_fountain9']:,}",
+                    "description": "Fountain9 asignó algo; nosotros no.",
+                    "tone": "coral",
+                },
+                {
+                    "category": "QUIEBRES · SOLO MOTHER BASE",
+                    "label": "SOLO MOTHER BASE CUBRIÓ",
+                    "value": f"{fountain9_comparison['solo_mother_base']:,}",
+                    "description": "Nosotros asignamos algo; Fountain9 no.",
+                    "tone": "acid",
+                },
+                {
+                    "category": "QUIEBRES · NINGUNO",
+                    "label": "NINGUNO CUBRIÓ",
+                    "value": f"{fountain9_comparison['ninguno_cubrio']:,}",
+                    "description": "Ni Fountain9 ni nosotros asignamos nada — sin stock en ningún origen, probablemente.",
+                    "tone": "coral",
+                },
+            ],
+            columns_count=5,
+        )
+    elif run.get("fountain9_comparison") is not None:
+        st.caption(
+            "ℹ️ El Bulk de esta corrida no trae 'Allocation (DOI Based)': no hay "
+            "con qué comparar."
+        )
+
+    if run.get("analytics"):
+        render_planning_analytics(run["analytics"], run)
+
+    golden_health_check = run.get("golden_health_check", {})
+    if golden_health_check.get("enabled"):
+        st.markdown(
+            '<div class="report-title">CHECK DE SALUD GOLDEN/INFALTABLE/ANCHOR.</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            """
+            <div class="report-note">
+                Verificación final tras todos los engines: DOH real de cada Golden/Infaltable/Anchor vs el objetivo del Refuerzo. No mueve nada; revisa antes de entregar.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        below_target = golden_health_check.get("below_target", [])
+        if below_target:
+            st.error(
+                f"{len(below_target):,} de {golden_health_check['checked']:,} "
+                "tienda-SKU Golden/Infaltable/Anchor terminaron por debajo del "
+                "DOH objetivo."
+            )
+            render_capped_dataframe(
+                below_target,
+                key="golden_health_below_target",
+                offer_download=True,
+                file_label="check_salud_golden_infaltable_anchor",
+            )
+        else:
+            st.success(
+                f"Las {golden_health_check['checked']:,} combinaciones "
+                "Golden/Infaltable/Anchor evaluadas terminaron en o por "
+                "encima del DOH objetivo."
+            )
+        if golden_health_check.get("no_adu"):
+            st.caption(
+                f"{golden_health_check['no_adu']:,} combinaciones no se "
+                "evaluaron por falta de ADU (ni propio ni de la ciudad)."
+            )
+
+    render_bucket_universe_report(
+        "GOLDEN", run.get("golden_universe_report", {})
+    )
+    render_bucket_universe_report(
+        "INFALTABLE", run.get("infaltable_universe_report", {})
+    )
+    render_bucket_universe_report(
+        "ANCHOR", run.get("anchor_universe_report", {})
+    )
+    render_bucket_universe_report("KVI", run.get("kvi_universe_report", {}))
+
+    st.markdown(
+        '<div class="report-title">REPORTE POR ENGINE.</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        """
+        <div class="report-note">
+            Un bloque por engine, en orden de ejecución: Naked → Otacon → Solidus → Shalashaska → Liquid → Venom → Kazuhira, más Insumos como anexo. Solidus agrupa 4 coberturas de catálogo (AVL, Preventivo, Refuerzo y Cobertura sin Fountain9); los mínimos (hardcode) son de Otacon.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    if engine_summary_rows:
+        st.markdown('<span class="section-label">RESUMEN POR ENGINE</span>', unsafe_allow_html=True)
+        render_engine_summary_table(engine_summary_rows, swa_enabled)
+
+    naked = run.get("naked", {})
+    if naked.get("enabled"):
+        render_engine_header("Naked", engine_summary_rows, swa_enabled)
+        st.markdown(
+            '<span class="section-label">REPORTE NAKED · DEMANDA NATURAL FOUNTAIN9</span>',
+            unsafe_allow_html=True,
+        )
+        render_kpi_cards(
+            [
+                {
+                    "category": "TAREAS · NAKED",
+                    "label": "TAREAS GENERADAS",
+                    "value": f"{naked.get('tasks', 0):,}",
+                    "description": (
+                        "Líneas con PLANNING_REASON = 'FOUNTAIN9 · NAKED ENGINE': "
+                        "solo demanda natural, sin mínimos (hardcode) ni otros "
+                        "engines."
+                    ),
+                    "tone": "acid",
+                },
+                {
+                    "category": "UNIDADES · NAKED",
+                    "label": "UNIDADES ASIGNADAS",
+                    "value": f"{naked.get('units', 0):,}",
+                    "description": "Suma de QUANTITY de esas líneas.",
+                },
+                {
+                    "category": "COBERTURA · NAKED",
+                    "label": "TIENDAS / SKUS",
+                    "value": f"{naked.get('stores', 0):,} / {naked.get('products', 0):,}",
+                    "description": "Tiendas y productos distintos atendidos solo por Naked.",
+                },
+                {
+                    "category": "VOLUMEN · NAKED",
+                    "label": "M³ / PALLETS",
+                    "value": f"{naked.get('m3', 0):,.2f}",
+                    "description": "Volumen de esas líneas (mismo dato que pallets).",
+                    "tone": "blue",
+                },
+                *([swa_card("Naked", swa_by_engine)] if swa_enabled else []),
+            ],
+            columns_count=4,
+        )
+
+    render_engine_header("Otacon", engine_summary_rows, swa_enabled)
+
+    if any(
+        run.get(key, {}).get("enabled")
+        for key in ("avl", "preventive", "special_doh", "no_fountain9_coverage")
+    ):
+        render_engine_header("Solidus", engine_summary_rows, swa_enabled)
+
+    avl = run.get("avl", {})
+    if avl.get("enabled"):
+        st.markdown(
+            '<span class="section-label">SOLIDUS · COBERTURA AVL</span>',
+            unsafe_allow_html=True,
+        )
+        render_kpi_cards(
+            [
+                {
+                    "category": "CASOS · AVL",
+                    "label": "QUIEBRES CON ENVÍO AVL",
+                    "value": f"{avl.get('cases_sent', 0):,}",
+                    "description": (
+                        "Combinaciones tienda-SKU del CATALOGO con stock final "
+                        "igual a cero que recibieron producto después de terminar "
+                        "la recomendación Fountain9."
+                    ),
+                    "tone": "acid",
+                },
+                {
+                    "category": "TAREAS · AVL",
+                    "label": "TAREAS SOBRANTES UTILIZADAS",
+                    "value": f"{avl.get('tasks_added', 0):,}",
+                    "description": (
+                        "Líneas operativas adicionales utilizadas por AVL. Solo "
+                        "consume el remanente entre el máximo configurado y las "
+                        "tareas que ya ocupó Fountain9."
+                    ),
+                    "tone": "blue",
+                },
+                {
+                    "category": "UNIDADES · AVL",
+                    "label": "UNIDADES ADICIONALES AVL",
+                    "value": f"{avl.get('units_added', 0):,}",
+                    "description": (
+                        f"Unidades enviadas para cubrir {avl.get('doh', 0):g} DOH "
+                        "según ADU. El objetivo mínimo es 3, salvo que el stock "
+                        "permitido disponible sea menor."
+                    ),
+                    "tone": "acid",
+                },
+                *([swa_card("AVL", swa_by_engine)] if swa_enabled else []),
+            ],
+            columns_count=4 if swa_enabled else 3,
+        )
+        st.success(
+            f"Cobertura AVL a {avl.get('doh', 0):g} DOH: "
+            f"{avl.get('cases_sent', 0):,} casos, "
+            f"{avl.get('tasks_added', 0):,} tareas y "
+            f"{avl.get('units_added', 0):,} unidades adicionales."
+        )
+
+    preventive = run.get("preventive", {})
+    if preventive.get("enabled"):
+        st.markdown(
+            '<span class="section-label">SOLIDUS · BLINDAJE PREVENTIVO</span>',
+            unsafe_allow_html=True,
+        )
+        render_kpi_cards(
+            [
+                {
+                    "category": "CASOS · PREVENTIVOS",
+                    "label": "POSIBLES QUIEBRES ATENDIDOS",
+                    "value": f"{preventive.get('cases_sent', 0):,}",
+                    "description": (
+                        "Combinaciones tienda-SKU del catálogo con inventario positivo, "
+                        "pero menor a 1 DOH o menor a 3 unidades, que recibieron envío. "
+                        "No tenían recomendación positiva de Fountain9."
+                    ),
+                    "tone": "acid",
+                },
+                {
+                    "category": "TAREAS · PREVENTIVAS",
+                    "label": "TAREAS SOBRANTES UTILIZADAS",
+                    "value": f"{preventive.get('tasks_added', 0):,}",
+                    "description": (
+                        "Líneas operativas adicionales creadas por el blindaje. Solo "
+                        "utiliza las tareas que quedaron disponibles después de "
+                        "Fountain9 y, si está activo, de AVL."
+                    ),
+                    "tone": "blue",
+                },
+                {
+                    "category": "UNIDADES · PREVENTIVAS",
+                    "label": "UNIDADES DE BLINDAJE",
+                    "value": f"{preventive.get('units_added', 0):,}",
+                    "description": (
+                        f"Unidades adicionales para acercar los casos a "
+                        f"{preventive.get('doh', 0):g} DOH. El envío mínimo es 3 "
+                        "unidades, salvo que el stock permitido disponible sea menor."
+                    ),
+                    "tone": "acid",
+                },
+                {
+                    "category": "CASOS · CANDIDATOS",
+                    "label": "RIESGOS DETECTADOS",
+                    "value": f"{preventive.get('preventive_candidates', 0):,}",
+                    "description": (
+                        "Casos del catálogo que cumplieron el umbral de riesgo antes "
+                        "de revisar si ya fueron atendidos, rutas, capacidad, stock de "
+                        "origen y tareas disponibles."
+                    ),
+                },
+                *([swa_card("Preventivo", swa_by_engine)] if swa_enabled else []),
+            ],
+            columns_count=4,
+        )
+        st.success(
+            f"Blindaje preventivo a {preventive.get('doh', 0):g} DOH: "
+            f"{preventive.get('cases_sent', 0):,} casos, "
+            f"{preventive.get('tasks_added', 0):,} tareas y "
+            f"{preventive.get('units_added', 0):,} unidades adicionales."
+        )
+
+    special_doh = run.get("special_doh", {})
+    if special_doh.get("enabled"):
+        st.markdown(
+            '<span class="section-label">SOLIDUS · REFUERZO GOLDEN / INFALTABLE / '
+            'ANCHOR</span>',
+            unsafe_allow_html=True,
+        )
+        render_kpi_cards(
+            [
+                {
+                    "category": "CASOS · REFUERZO",
+                    "label": "TIENDA-SKU REFORZADOS",
+                    "value": f"{special_doh.get('cases_sent', 0):,}",
+                    "description": (
+                        "Combinaciones tienda-SKU marcadas Golden, Infaltable o "
+                        "Anchor con DOH por debajo del objetivo, que recibieron "
+                        "envío adicional. No tenían recomendación positiva de "
+                        "Fountain9."
+                    ),
+                    "tone": "acid",
+                },
+                {
+                    "category": "TAREAS · REFUERZO",
+                    "label": "TAREAS SOBRANTES UTILIZADAS",
+                    "value": f"{special_doh.get('tasks_added', 0):,}",
+                    "description": (
+                        "Líneas operativas adicionales creadas por este refuerzo. "
+                        "Solo utiliza las tareas que quedaron disponibles después "
+                        "de Fountain9, AVL y el blindaje preventivo."
+                    ),
+                    "tone": "blue",
+                },
+                {
+                    "category": "UNIDADES · REFUERZO",
+                    "label": "UNIDADES DE REFUERZO",
+                    "value": f"{special_doh.get('units_added', 0):,}",
+                    "description": (
+                        f"Unidades adicionales para subir Golden/Infaltable/Anchor "
+                        f"hasta su DOH por bucket, sin mínimo "
+                        "forzado de 3 unidades (a diferencia de AVL/preventivo)."
+                    ),
+                    "tone": "acid",
+                },
+                {
+                    "category": "CASOS · CANDIDATOS",
+                    "label": "CANDIDATOS DETECTADOS",
+                    "value": f"{special_doh.get('special_candidates', 0):,}",
+                    "description": (
+                        "Tienda-SKU Golden/Infaltable/Anchor por debajo del DOH "
+                        "objetivo antes de revisar si ya fueron atendidos, rutas, "
+                        "capacidad, stock de origen y tareas disponibles."
+                    ),
+                },
+                *(
+                    [swa_card(COVERAGE_SPECIAL_DOH, swa_by_engine)]
+                    if swa_enabled
+                    else []
+                ),
+            ],
+            columns_count=4,
+        )
+        st.success(
+            f"Refuerzo ({special_doh_text(special_doh)}): "
+            f"{special_doh.get('cases_sent', 0):,} casos, "
+            f"{special_doh.get('tasks_added', 0):,} tareas y "
+            f"{special_doh.get('units_added', 0):,} unidades adicionales."
+        )
+
+    no_fountain9 = run.get("no_fountain9_coverage", {})
+    if no_fountain9.get("enabled"):
+        st.markdown(
+            '<span class="section-label">SOLIDUS · COBERTURA SIN FOUNTAIN9</span>',
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            "Quiebres de catálogo (stock 0) sin recomendación positiva de Fountain9 "
+            "(sin fila o con 'sin recomendación'). Usa la moda de Duration/Lead Time "
+            "por tienda y resta STOCK.INCOMING."
+        )
+        render_kpi_cards(
+            [
+                {
+                    "category": "CASOS · SIN FOUNTAIN9",
+                    "label": "TIENDA-SKU CUBIERTOS",
+                    "value": f"{no_fountain9.get('cases_sent', 0):,}",
+                    "description": (
+                        "Combinaciones tienda-SKU quebradas (stock=0) sin fila "
+                        "de Fountain9 que recibieron envío en esta corrida."
+                    ),
+                    "tone": "acid",
+                },
+                {
+                    "category": "TAREAS · SIN FOUNTAIN9",
+                    "label": "TAREAS SOBRANTES UTILIZADAS",
+                    "value": f"{no_fountain9.get('tasks_added', 0):,}",
+                    "description": (
+                        "Líneas operativas adicionales. Solo usa tareas que "
+                        "quedaron disponibles después de todo lo demás en "
+                        "Solidus (AVL, preventivo y refuerzo)."
+                    ),
+                    "tone": "blue",
+                },
+                {
+                    "category": "UNIDADES · SIN FOUNTAIN9",
+                    "label": "UNIDADES AGREGADAS",
+                    "value": f"{no_fountain9.get('units_added', 0):,}",
+                    "description": (
+                        "Unidades: ADU (propio, de ciudad, o ficticio de "
+                        f"{FICTITIOUS_ADU_NO_FOUNTAIN9:g}/día) × (Duration + "
+                        "Lead Time moda de la tienda), menos stock e incoming, "
+                        "con el mínimo de unidades a enviar aplicado."
+                    ),
+                    "tone": "acid",
+                },
+                {
+                    "category": "CASOS · SIN DATO",
+                    "label": "SIN MODA DE DURATION/LEAD TIME",
+                    "value": f"{no_fountain9.get('skipped_no_duration_data', 0):,}",
+                    "description": (
+                        "Tiendas quebradas sin fila de Fountain9, pero cuya "
+                        "tienda no tiene ninguna fila con Duration/Lead Time "
+                        "válidos en el Bulk — no hay base para calcular, no se "
+                        "intentó cubrir."
+                    ),
+                    "tone": "coral",
+                },
+                *(
+                    [swa_card("Cobertura sin Fountain9", swa_by_engine)]
+                    if swa_enabled
+                    else []
+                ),
+            ],
+            columns_count=4,
+        )
+        st.success(
+            "Cobertura sin Fountain9: "
+            f"{no_fountain9.get('cases_sent', 0):,} casos, "
+            f"{no_fountain9.get('tasks_added', 0):,} tareas y "
+            f"{no_fountain9.get('units_added', 0):,} unidades adicionales."
+        )
+
+    shalashaska = run.get("shalashaska", {})
+    if shalashaska.get("enabled"):
+        render_engine_header("Shalashaska", engine_summary_rows, swa_enabled)
+        st.markdown(
+            '<span class="section-label">SHALASHASKA ENGINE · EVACUACIÓN</span>',
+            unsafe_allow_html=True,
+        )
+        render_kpi_cards(
+            [
+                {
+                    "category": "TAREAS · SHALASHASKA",
+                    "label": "TAREAS NUEVAS UTILIZADAS",
+                    "value": f"{shalashaska.get('tasks_added', 0):,}",
+                    "description": (
+                        "Nuevas combinaciones origen–destino–SKU creadas para "
+                        "evacuar inventario próximo a caducar. Comparten el mismo "
+                        "límite global con los demás engines."
+                    ),
+                    "tone": "blue",
+                },
+                {
+                    "category": "UNIDADES · RIESGO",
+                    "label": "UNIDADES POR MERMAR",
+                    "value": f"{shalashaska.get('units_at_risk', 0):,}",
+                    "description": (
+                        "Unidades informadas por POR_MERMAR para los orígenes "
+                        "seleccionados y sin SKUs excluidos, antes de aplicar el "
+                        "stock final mandante, bloqueos y capacidad."
+                    ),
+                    "tone": "coral",
+                },
+                {
+                    "category": "UNIDADES · EVACUADAS",
+                    "label": "UNIDADES REUBICADAS",
+                    "value": f"{shalashaska.get('units_evacuated', 0):,}",
+                    "description": (
+                        "Unidades próximas a caducar que sí fueron distribuidas. "
+                        "Primero se nivelan por necesidad y DOH; el sobrante se "
+                        "diversifica mediante share de ventas."
+                    ),
+                    "tone": "acid",
+                },
+                {
+                    "category": "VALOR · PROTEGIDO",
+                    "label": "VALOR REUBICADO",
+                    "value": f"${shalashaska.get('value_protected', 0):,.2f}",
+                    "description": (
+                        "Valor proporcional del inventario por mermar que fue "
+                        "reubicado en tiendas con oportunidad de venta. No representa "
+                        "venta garantizada ni ahorro contable realizado."
+                    ),
+                },
+                *([swa_card("Shalashaska", swa_by_engine)] if swa_enabled else []),
+            ],
+            columns_count=4,
+        )
+        if shalashaska.get("units_not_evacuated", 0) > 0:
+            st.warning(
+                f"Quedaron {shalashaska['units_not_evacuated']:,} unidades sin "
+                "evacuar por stock mandante, falta de ADU o ruta natural, "
+                "restricciones, capacidad o límite compartido de tareas."
+            )
+
+    liquid = run.get("liquid", {})
+    if liquid.get("enabled"):
+        render_engine_header("Liquid", engine_summary_rows, swa_enabled)
+        st.markdown(
+            '<span class="section-label">LIQUID ENGINE · AGOTAMIENTO</span>',
+            unsafe_allow_html=True,
+        )
+        render_kpi_cards(
+            [
+                {
+                    "category": "TAREAS · LIQUID",
+                    "label": "TAREAS NUEVAS UTILIZADAS",
+                    "value": f"{liquid.get('tasks_added', 0):,}",
+                    "description": (
+                        "Nuevas combinaciones origen–destino–SKU creadas por Liquid. "
+                        "Nunca rebasan el límite global compartido con Naked y Solidus."
+                    ),
+                    "tone": "blue",
+                },
+                {
+                    "category": "UNIDADES · LIQUID",
+                    "label": "UNIDADES LIQUIDADAS",
+                    "value": f"{liquid.get('units_added', 0):,}",
+                    "description": (
+                        "Unidades adicionales distribuidas primero para nivelar DOH "
+                        "hasta 14 y después mediante el share general de las tiendas."
+                    ),
+                    "tone": "acid",
+                },
+                {
+                    "category": "SALDOS · ORIGEN-SKU",
+                    "label": "SALDOS AGOTADOS",
+                    "value": f"{liquid.get('stock_exhausted_cases', 0):,}",
+                    "description": (
+                        "Combinaciones warehouse origen–SKU cuyo stock remanente quedó "
+                        "en cero después de Liquid Engine. No es un conteo de tareas."
+                    ),
+                    "tone": "acid",
+                },
+                {
+                    "category": "PRODUCTOS · LIQUID",
+                    "label": "SKUS DISTINTOS ENVIADOS",
+                    "value": f"{liquid.get('products', 0):,}",
+                    "description": (
+                        "Productos diferentes intervenidos por Liquid, ya sea por "
+                        "selección manual o por remanente automático menor al "
+                        f"umbral configurado ({liquid.get('tail_threshold', 10):,} "
+                        "unidades)."
+                    ),
+                },
+                *([swa_card("Liquid", swa_by_engine)] if swa_enabled else []),
+            ],
+            columns_count=4,
+        )
+        liquid_not_sent = (
+            liquid.get("candidate_origin_skus", 0) - liquid.get("origin_skus_sent", 0)
+        )
+        if liquid_not_sent > 0:
+            st.warning(
+                f"{liquid_not_sent:,} de {liquid.get('candidate_origin_skus', 0):,} "
+                "candidatos de Liquid no se enviaron: "
+                f"{liquid.get('skipped_no_destination_eligible', 0):,} sin destino "
+                "elegible ese día, "
+                f"{liquid.get('skipped_capacity_full', 0):,} con destinos "
+                "elegibles pero sin capacidad de recibo, "
+                f"{liquid.get('skipped_task_limit', 0):,} sin presupuesto de "
+                "tareas restante."
+            )
+
+    venom = run.get("venom", {})
+    if venom.get("enabled"):
+        render_engine_header("Venom", engine_summary_rows, swa_enabled)
+        st.markdown(
+            '<span class="section-label">VENOM ENGINE · DDMRP POST-PLANEACIÓN'
+            '</span>',
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            "Corre al final, sobre los remanentes. Sus líneas no se consolidan con lo "
+            f"ya planeado; van separadas y marcadas con '{VENOM_CUT}'."
+        )
+        st.caption(venom_parameters_text(venom))
+        if venom.get("units_cut_by_capacity"):
+            st.warning(
+                f"El tope de capacidad de Venom recortó {venom['units_cut_by_capacity']:,} "
+                f"unidades y dejó {venom.get('skipped_capacity_cap', 0):,} tienda-SKU sin "
+                "enviar por falta de espacio propio."
+            )
+        render_kpi_cards(
+            [
+                {
+                    "category": "TAREAS · VENOM",
+                    "label": "TAREAS NUEVAS UTILIZADAS",
+                    "value": f"{venom.get('tasks_added', 0):,}",
+                    "description": (
+                        "Nuevas líneas de Venom, del mismo presupuesto compartido "
+                        "de tareas que Naked/Otacon/Solidus/Shalashaska/Liquid. Cuentan "
+                        "aunque dupliquen un trío origen-destino-SKU ya usado."
+                    ),
+                    "tone": "blue",
+                },
+                {
+                    "category": "UNIDADES · DDMRP",
+                    "label": "UNIDADES POR BUFFER DDMRP",
+                    "value": f"{venom.get('units_sent_ddmrp', 0):,}",
+                    "description": (
+                        "Unidades enviadas para subir el Net Flow Position hasta "
+                        "el techo de la zona verde (Top of Green), calculado con "
+                        "factores medios (LTF=0.5, VF=0.5) y el lead time "
+                        f"capturado ({venom.get('lead_time_days', 0):g} días)."
+                    ),
+                    "tone": "acid",
+                },
+                {
+                    "category": "UNIDADES · OOWL",
+                    "label": "UNIDADES POR MÍNIMO OOWL",
+                    "value": f"{venom.get('units_sent_oowl', 0):,}",
+                    "description": (
+                        "Tienda-SKU con stock en origen, cero stock/incoming en "
+                        "destino y sin ADU en CATALOGO: se manda el mínimo "
+                        "operativo directo, sin calcular buffer."
+                    ),
+                    "tone": "coral",
+                },
+                {
+                    "category": "TIENDAS Y SKUS",
+                    "label": "TIENDAS / SKUS DISTINTOS",
+                    "value": f"{venom.get('stores', 0):,} / {venom.get('products', 0):,}",
+                    "description": (
+                        "Tiendas y productos distintos que recibieron una línea de "
+                        "Venom en esta corrida."
+                    ),
+                },
+                *([swa_card("Venom", swa_by_engine)] if swa_enabled else []),
+            ],
+            columns_count=4,
+        )
+        skipped_total = sum(
+            venom.get(key, 0)
+            for key in (
+                "skipped_no_adu",
+                "skipped_no_stock",
+                "skipped_no_capacity",
+                "skipped_task_limit",
+                "skipped_regional_block",
+                "skipped_schedule_block",
+                "skipped_closed_store",
+                "skipped_blocked_city",
+                "skipped_route_cost",
+                "skipped_excluded_sku",
+            )
+        )
+        if skipped_total > 0:
+            st.warning(
+                f"Venom evaluó {venom.get('candidates_ddmrp', 0):,} candidatos "
+                f"DDMRP y {venom.get('candidates_oowl', 0):,} candidatos OOWL, "
+                f"pero {skipped_total:,} quedaron sin línea por stock "
+                "insuficiente, capacidad, tareas, bloqueos o falta de ADU "
+                "(ver advertencias para el detalle)."
+            )
+
+    kazuhira = run.get("kazuhira", {})
+    if kazuhira.get("enabled"):
+        render_engine_header("Kazuhira", engine_summary_rows, swa_enabled)
+        st.markdown(
+            '<span class="section-label">KAZUHIRA ENGINE · GARANTÍA TOTAL</span>',
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            f"Universo: {kazuhira.get('universe_stores', 0):,} tiendas que se planean "
+            f"hoy ({kazuhira.get('universe_from_fountain9', 0):,} del Bulk + "
+            f"{kazuhira.get('universe_schedule_only', 0):,} solo por SCHEDULE). Cubre "
+            "toda tienda-SKU con posición (stock + incoming + asignado) < 1 DOH; sin "
+            f"fila en STOCK = 0 ({kazuhira.get('missing_stock_treated_as_zero', 0):,} "
+            "esta corrida). Lo no cubierto se explica abajo."
+        )
+        render_kpi_cards(
+            [
+                {
+                    "category": "CASOS · KAZUHIRA",
+                    "label": "TIENDA-SKU CUBIERTOS",
+                    "value": f"{kazuhira.get('cases_sent', 0):,}",
+                    "description": (
+                        "Quiebres que ningún engine anterior cerró y que "
+                        "Kazuhira cubrió con stock disponible en CEDIS."
+                    ),
+                    "tone": "acid",
+                },
+                {
+                    "category": "TAREAS · KAZUHIRA",
+                    "label": "TAREAS GENERADAS",
+                    "value": f"{kazuhira.get('tasks_added', 0):,}",
+                    "description": (
+                        "Líneas operativas adicionales. Pueden exceder el "
+                        "presupuesto compartido solo si activaste 'Ignorar "
+                        "presupuesto de tareas'."
+                    ),
+                    "tone": "blue",
+                },
+                {
+                    "category": "UNIDADES · KAZUHIRA",
+                    "label": "UNIDADES AGREGADAS",
+                    "value": f"{kazuhira.get('units_added', 0):,}",
+                    "description": (
+                        "ADU (propio, de ciudad o ficticio) × (Duration + "
+                        "Lead Time), menos stock e incoming, con el mínimo "
+                        "de unidades a enviar aplicado."
+                    ),
+                    "tone": "acid",
+                },
+                {
+                    "category": "SIN STOCK · KAZUHIRA",
+                    "label": "SIN STOCK EN NINGÚN ORIGEN",
+                    "value": f"{kazuhira.get('skipped_no_source_stock', 0):,}",
+                    "description": (
+                        "Quiebres que Kazuhira intentó cubrir pero ningún "
+                        "CEDI elegible tenía stock (o estaba bloqueado por "
+                        "ruta/schedule). Único motivo legítimo para que "
+                        "quede un quiebre sin cubrir con los bypass activos."
+                    ),
+                    "tone": "coral",
+                },
+                {
+                    "category": "CAPACIDAD · KAZUHIRA",
+                    "label": "OMITIDOS POR CAPACIDAD",
+                    "value": f"{kazuhira.get('skipped_capacity', 0):,}",
+                    "description": (
+                        "Quiebres no cubiertos porque la tienda no tenía "
+                        "espacio. Debe ser 0 si activaste 'Ignorar "
+                        "capacidad de tienda'."
+                    ),
+                    "tone": "coral",
+                },
+                {
+                    "category": "SIN DATO · KAZUHIRA",
+                    "label": "SIN DURATION/LEAD TIME",
+                    "value": f"{kazuhira.get('skipped_no_duration_data', 0):,}",
+                    "description": (
+                        "Solo ocurre si NINGUNA tienda del Bulk tiene "
+                        "Duration/Lead Time (no hay ni promedio país para "
+                        "usar de respaldo)."
+                    ),
+                    "tone": "coral",
+                },
+                *(
+                    [swa_card("Kazuhira", swa_by_engine)]
+                    if swa_enabled
+                    else []
+                ),
+            ],
+            columns_count=4,
+        )
+        reason_counts_ui = kazuhira.get("skip_reason_counts", {})
+        if reason_counts_ui:
+            st.markdown("###### Quiebres que Kazuhira evaluó y no pudo cubrir — por motivo")
+            render_capped_dataframe(
+                [
+                    {"MOTIVO": reason, "TIENDA-SKU": count}
+                    for reason, count in reason_counts_ui.items()
+                ],
+                key="kazuhira_skip_reasons",
+                offer_download=True,
+                file_label="kazuhira_motivos_no_cubierto",
+            )
+        st.success(
+            "Kazuhira: "
+            f"{kazuhira.get('cases_sent', 0):,} casos, "
+            f"{kazuhira.get('tasks_added', 0):,} tareas y "
+            f"{kazuhira.get('units_added', 0):,} unidades adicionales."
+        )
+
+    insumos = run.get("insumos", {})
+    if insumos.get("enabled"):
+        render_engine_header("Insumos", engine_summary_rows, swa_enabled)
+        st.markdown(
+            '<span class="section-label">INSUMOS · ANEXO SIN TAREAS</span>',
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            "Se anexa a BulkCD_444.csv sin consumir tareas del presupuesto "
+            "compartido."
+        )
+        render_kpi_cards(
+            [
+                {
+                    "category": "LÍNEAS · INSUMOS",
+                    "label": "LÍNEAS AGREGADAS",
+                    "value": f"{insumos.get('lines_added', 0):,}",
+                    "description": (
+                        "Filas de INSUMOS anexadas al Bulk del 444 para "
+                        "tiendas que ya recibían producto normal desde ahí."
+                    ),
+                    "tone": "blue",
+                },
+                {
+                    "category": "UNIDADES · RECORTADAS",
+                    "label": "UNIDADES CORTADAS POR STOCK/MOQ",
+                    "value": (
+                        f"{insumos.get('units_cut_stock', 0) + insumos.get('units_cut_moq', 0):,}"
+                    ),
+                    "description": (
+                        "Unidades que se pidieron pero no se pudieron mandar "
+                        "completas por límite de stock ajustado del 444 o por "
+                        "no alcanzar el múltiplo de MOQ del insumo."
+                    ),
+                    "tone": "coral",
+                },
+                {
+                    "category": "UNIDADES · INSUMOS",
+                    "label": "UNIDADES AGREGADAS",
+                    "value": f"{insumos.get('units_added', 0):,}",
+                    "description": "Unidades de insumos efectivamente anexadas.",
+                    "tone": "acid",
+                },
+                {
+                    "category": "TIENDAS · INSUMOS",
+                    "label": "TIENDAS CUBIERTAS",
+                    "value": f"{insumos.get('stores_added', 0):,}",
+                    "description": (
+                        "Tiendas distintas que recibieron al menos una línea "
+                        "de insumos en esta corrida."
+                    ),
+                    "tone": "blue",
+                },
+                *(
+                    [
+                        {
+                            "category": "SWA · GANADO",
+                            "label": "SWA PAÍS CAPTURADO",
+                            "value": f"{insumos.get('swa_ganado', 0.0):,.4f}",
+                            "description": (
+                                "Calculado aparte del reporte central de SWA "
+                                "(Insumos no pasa por la asignación regular) "
+                                "— tienda-SKU con SWA registrado que recibieron "
+                                "una línea de insumos."
+                            ),
+                            "tone": "acid",
+                        }
+                    ]
+                    if swa_enabled
+                    else []
+                ),
+            ],
+            columns_count=4,
+        )
+        blocked_total = (
+            insumos.get("lines_blocked_regional", 0)
+            + insumos.get("lines_blocked_schedule", 0)
+            + insumos.get("lines_blocked_city_restriction", 0)
+        )
+        if blocked_total > 0:
+            st.warning(
+                f"{blocked_total:,} líneas de insumos se descartaron por "
+                "bloqueo regional, frecuencia (SCHEDULE) o restricción de "
+                "ciudad específica del SKU."
+            )
+
+    fruver_811 = run.get("fruver_811", {})
+    if fruver_811.get("enabled"):
+        st.warning(
+            "Bloqueo FRUVER 811 aplicado: "
+            f"{fruver_811.get('products_with_stock_blocked', 0):,} productos y "
+            f"{fruver_811.get('units_blocked', 0):,.0f} unidades de stock del 811 "
+            "quedaron fuera de la asignación; los demás orígenes siguieron activos."
+        )
+
+    schedule_block = run.get("schedule_block", {})
+    if schedule_block.get("enabled"):
+        total_cases = schedule_block.get(
+            "requirements_full_cut", 0
+        ) + schedule_block.get("requirements_partial_cut", 0)
+        if total_cases > 0:
+            st.warning(
+                f"Bloqueo por frecuencia (hoy es {schedule_block.get('weekday', '')}): "
+                f"{schedule_block.get('requirements_full_cut', 0):,} casos cortados y "
+                f"{schedule_block.get('requirements_partial_cut', 0):,} parciales por "
+                "origen fuera de frecuencia; "
+                f"{schedule_block.get('units_missing', 0):,} unidades sin cubrir en "
+                f"{schedule_block.get('stores', 0):,} tiendas y "
+                f"{schedule_block.get('products', 0):,} SKUs "
+                f"({schedule_block.get('pairs_configured', 0):,} combinaciones en "
+                "SCHEDULE)."
+            )
+        else:
+            st.caption(
+                "Bloqueo por frecuencia activo (hoy es "
+                f"{schedule_block.get('weekday', '')}), pero ningún envío quedó fuera "
+                "de los días de SCHEDULE."
+            )
+
+    copernico_cuts = run.get("copernico_cuts", {})
+    copernico_cut_total = copernico_cuts.get(
+        "requirements_full_cut", 0
+    ) + copernico_cuts.get("requirements_partial_cut", 0)
+    if copernico_cut_total > 0:
+        st.warning(
+            "COPÉRNICO como motivo de corte: "
+            f"{copernico_cuts.get('requirements_full_cut', 0):,} requerimientos sin "
+            f"ninguna unidad y {copernico_cuts.get('requirements_partial_cut', 0):,} "
+            "parciales por ubicaciones excluidas (LOST, no usable, etc.) — "
+            f"{copernico_cuts.get('units_missing', 0):,} unidades sin cubrir en "
+            f"{copernico_cuts.get('stores', 0):,} tiendas y "
+            f"{copernico_cuts.get('products', 0):,} SKUs."
+        )
+
+    insumos = run.get("insumos", {})
+    if insumos.get("lines_added", 0) > 0:
+        st.success(
+            f"Insumos anexados a BulkCD_444: {insumos['lines_added']:,} líneas, "
+            f"{insumos['units_added']:,} unidades y "
+            f"{insumos['stores_added']:,} tiendas. No consumen tareas del modelo."
+        )
+    if insumos.get("units_cut_stock", 0) > 0 or insumos.get("units_cut_moq", 0) > 0:
+        st.warning(
+            "Recorte de insumos aplicado: "
+            f"{insumos.get('requested_units', 0):,} unidades solicitadas, "
+            f"{insumos.get('units_added', 0):,} enviadas, "
+            f"{insumos.get('units_cut_stock', 0):,} recortadas por stock del 444 y "
+            f"{insumos.get('units_cut_moq', 0):,} por ajuste a múltiplos de MOQ."
+        )
+    if insumos.get("stock_detail"):
+        with st.expander("Ver stock y recorte por insumo"):
+            compact_insumo_stock = [
+                {
+                    "PRODUCT_ID": row["PRODUCT_ID"],
+                    "INSUMO": row["INSUMO"],
+                    "TARGET_STOCK": row["TARGET_STOCK"],
+                    "MOQ": row["MOQ"],
+                    "STOCK_DISPONIBLE_444": row["STOCK_DISPONIBLE_INSUMOS"],
+                    "SOLICITADO": row["SOLICITADO"],
+                    "ENVIADO": row["ENVIADO"],
+                    "RECORTE_STOCK": row["RECORTE_STOCK"],
+                }
+                for row in insumos["stock_detail"]
+            ]
+            report_table(
+                compact_insumo_stock,
+                column_config={
+                    "PRODUCT_ID": st.column_config.NumberColumn(
+                        "PRODUCT ID", format="%d"
+                    ),
+                    "TARGET_STOCK": st.column_config.NumberColumn(
+                        "TARGET STOCK", format="%d"
+                    ),
+                    "MOQ": st.column_config.NumberColumn("MOQ", format="%d"),
+                },
+                max_height=280,
+            )
+
+    if run["warnings"]:
+        with st.expander(f"Advertencias de calidad ({len(run['warnings'])})"):
+            for warning in run["warnings"]:
+                st.warning(warning)
+    with st.expander("Log técnico de la ejecución"):
+        st.code(run["logs"] or "Ejecución completada sin mensajes adicionales.")
+
+
+RAIDEN_PROTECTED_CITIES: frozenset[str] = frozenset(
+    {"CDMX", "GDL", "MTY", "PUEBLA", "QUERETARO", "SALTILLO"}
+)
+RAIDEN_DEFAULT_ORIGINS: tuple[int, ...] = (444, 831)
+# Orígenes por default al abrir el módulo, para ambos perfiles.
+DEFAULT_ORIGINS: tuple[int, ...] = (444, 831)
+
+
+@st.dialog("Confirmación antes de ejecutar")
+def render_pre_run_confirmation_dialog() -> None:
+    st.markdown(
+        "**CONFIRMA QUE SE VALIDÓ LA CAPACIDAD DE RECIBO Y SE TIENEN EN "
+        "CUENTA LAS TIENDAS QUE SE ENCUENTRAN EN RESGUARDO**"
+    )
+    confirm_col, cancel_col = st.columns(2)
+    with confirm_col:
+        if st.button(
+            "Confirmar y ejecutar",
+            type="primary",
+            use_container_width=True,
+            key="mb_confirm_run_btn",
+        ):
+            st.session_state["mb_pending_confirmation"] = False
+            st.session_state["mb_run_confirmed"] = True
+            st.rerun()
+    with cancel_col:
+        if st.button(
+            "Cancelar",
+            use_container_width=True,
+            key="mb_cancel_run_btn",
+        ):
+            st.session_state["mb_pending_confirmation"] = False
+            st.rerun()
+
+
+def render() -> None:
+    inject_styles()
+    inject_mother_base_theme()
+    render_system_stamp("MODULE 01 / OUTER HEAVEN")
+    is_raiden = st.session_state.get("mb_profile") == "RAIDEN"
+
+    st.markdown(
+        """
+        <section class="hero">
+            <span class="hero-kicker">LES ENFANTS TERRIBLES / MOTHER BASE</span>
+            <h1>OUTER<br>HEAVEN.</h1>
+            <p>Configura la misión y ejecuta los engines sobre un mismo presupuesto de stock, capacidad y tareas.</p>
+        </section>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown('<span class="section-label">01 — BASE DE DATOS</span>', unsafe_allow_html=True)
+    database_state = load_database_resource()
+    database_bytes = database_state["workbook_bytes"]
+    database_health = database_state["health"]
+    city_labels = database_state["city_labels"]
+    store_labels = database_state["store_labels"]
+    database_error = database_state["error"]
+
+    if database_health is not None:
+        render_database_health(database_health)
+    else:
+        st.markdown(
+            """
+            <div class="database-status review">
+                <div class="database-title">BASE DE DATOS — OFFLINE</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.error(f"No fue posible validar la base de datos: {database_error}")
+
+    if st.button("Volver a validar la base", use_container_width=False):
+        fetch_public_database.clear()
+        load_database_resource.clear()
+        st.rerun()
+
+    st.markdown(
+        '<span class="section-label">02 — INVENTARIO COPÉRNICO</span>',
+        unsafe_allow_html=True,
+    )
+    uploaded_copernico = st.file_uploader(
+        "Archivos de COPÉRNICO (.csv, opcional)",
+        type=["csv"],
+        accept_multiple_files=True,
+        max_upload_size=MAX_UPLOAD_MB,
+        key="copernico_csv_upload",
+        help=(
+            "Si cargas uno o más archivos, sustituyen completamente la hoja "
+            "COPERNICO de la base; sus filas se combinan como si fuera un solo "
+            "archivo. "
+            "Se utiliza para descontar las ubicaciones no usables del warehouse "
+            "indicado en la columna Bodega. Si no cargas ninguno, la planeación "
+            "continúa sin realizar este descuento."
+        ),
+    )
+    with st.expander("Columnas requeridas del CSV de COPÉRNICO"):
+        st.markdown(
+            """
+            - `Bodega`: warehouse al que pertenece el inventario.
+            - `EAN`: identificador interno del producto (`PRODUCT_ID`).
+            - `Ubicacion`: ubicación física utilizada para determinar si el saldo es usable.
+            - `Saldo`: unidades disponibles en esa ubicación.
+
+            Cada saldo no usable se descuenta únicamente de la combinación
+            **Bodega + EAN** correspondiente. Por ejemplo, una fila con Bodega 856
+            afectará al origen 856 y no al 444. El archivo se lee en streaming al
+            ejecutar para soportar archivos grandes. La hoja `COPERNICO` de
+            `DATA_TRANSFERS` ya no participa en el cálculo. Si no cargas ningún
+            archivo, no se aplicará ningún descuento por ubicaciones no pickeables.
+
+            **Reglas especiales para Bodega 856 usando `ZonaPiso`:**
+
+            - `E`: inventario usable y `STORAGE_TYPE = Room Temperature`.
+            - `RCC`: inventario usable y `STORAGE_TYPE = Freezer`.
+            - `RR`: inventario usable y `STORAGE_TYPE = Refrigerated`.
+            - `BIN`, `DIF` y `RC`: inventario no usable; su saldo se descuenta.
+            - `MRM`: se ignora porque ya está descontado en el stock de la base.
+
+            El override derivado de COPÉRNICO 856 se aplica automáticamente y
+            tiene prioridad sobre el storage general y el override manual por origen.
+            """
+        )
+    if uploaded_copernico:
+        total_mb = sum(file.size for file in uploaded_copernico) / (1024 ** 2)
+        if len(uploaded_copernico) == 1:
+            st.success(
+                f"COPÉRNICO listo · {uploaded_copernico[0].name} · "
+                f"{total_mb:,.1f} MB"
+            )
+        else:
+            names = ", ".join(file.name for file in uploaded_copernico)
+            st.success(
+                f"COPÉRNICO listo · {len(uploaded_copernico)} archivos "
+                f"({total_mb:,.1f} MB en total): {names}"
+            )
+
+    st.markdown(
+        '<span class="section-label">03 — ARCHIVOS FOUNTAIN9</span>',
+        unsafe_allow_html=True,
+    )
+    uploaded_plans = st.file_uploader(
+        "Archivos de planeación de Fountain9 (.csv)",
+        type=["csv"],
+        accept_multiple_files=True,
+        max_upload_size=MAX_UPLOAD_MB,
+        help=(
+            "Puedes cargar uno o varios CSV. La tienda puede venir como Warehouseid "
+            "o Node_Store; el sistema suma los archivos y consolida cada combinación "
+            "tienda-SKU antes de planear. Las demás dimensiones se obtienen de la "
+            "base de datos."
+        ),
+    )
+    with st.expander("Columnas que realmente se leen de cada CSV"):
+        st.markdown(
+            """
+            - **Tienda:** `Warehouseid` o `Node_Store` — cualquiera de los dos funciona.
+              Si ambos vienen informados en una fila, deben coincidir.
+            - **Producto:** `SKU ID`.
+            - **Planeación:** `Predicted Demand for selected duration`,
+              `Predicted Opening Inventory`,
+              `Replenishment Quantity for Plan Duration (MOV)` y
+              `Net Inter-Store Transfers`.
+
+            Todos los demás campos del CSV se ignoran. Inventario actual, ciudad,
+            nombre de tienda, storage, valor, volumen y reglas operativas se toman
+            directamente de la base de datos. Cuando una tienda-SKU aparece más de
+            una vez, esas cuatro métricas de planeación se **suman** antes de ejecutar.
+            """
+        )
+    if uploaded_plans:
+        total_upload_mb = sum(file.size for file in uploaded_plans) / (1024 ** 2)
+        st.success(
+            f"{len(uploaded_plans):,} archivo(s) listo(s) · "
+            f"{total_upload_mb:,.1f} MB en total"
+        )
+        with st.expander("Ver archivos cargados"):
+            for uploaded_file in uploaded_plans:
+                st.write(
+                    f"{uploaded_file.name} · "
+                    f"{uploaded_file.size / (1024 ** 2):,.1f} MB"
+                )
+
+    st.markdown('<span class="section-label">04 — VARIABLES</span>', unsafe_allow_html=True)
+    run_date = datetime.now(ZoneInfo("America/Mexico_City")).date()
+    default_origins = [
+        origin for origin in DEFAULT_ORIGINS if origin in ORIGIN_WAREHOUSES
+    ]
+
+    blockable_city_options = list(city_labels)
+    if is_raiden:
+        blockable_city_options = [
+            city for city in blockable_city_options
+            if city not in RAIDEN_PROTECTED_CITIES
+        ]
+
+    with st.container(border=True, key="mission_control_shared"):
+        st.markdown(
+            '<span class="mission-control-marker" aria-hidden="true"></span>',
+            unsafe_allow_html=True,
+        )
+        st.markdown("### Variables compartidas (CODEC)")
+        left, right = st.columns([2, 1])
+        with left:
+            selected_origins = st.multiselect(
+                "Orígenes (en orden de prioridad)",
+                options=list(ORIGIN_WAREHOUSES),
+                default=default_origins,
+                format_func=format_origin,
+                help=(
+                    "El motor consumirá stock en el orden seleccionado. Para cambiar "
+                    "la prioridad, elimina las opciones y vuelve a elegirlas."
+                ),
+            )
+        with right:
+            max_tasks = st.number_input(
+                "Máximo de tareas",
+                min_value=0,
+                max_value=1_000_000,
+                value=int(engine.CONFIG.max_tasks),
+                step=500,
+            )
+
+        selected_blocked_cities = st.multiselect(
+            "Bloquear ciudades completas (opcional)",
+            options=blockable_city_options,
+            default=[],
+            format_func=lambda city: city_labels.get(city, city),
+            help=(
+                "No se generarán envíos hacia las ciudades seleccionadas. Sus "
+                "requerimientos se eliminan antes de asignar, por lo que ese stock "
+                "queda disponible para otras tiendas."
+                + (
+                    " El perfil Raiden no puede bloquear Ciudad de México, "
+                    "Guadalajara, Monterrey, Puebla, Querétaro ni Saltillo."
+                    if is_raiden
+                    else ""
+                )
+            ),
+        )
+        if selected_blocked_cities:
+            selected_names = ", ".join(
+                city_labels.get(city, city) for city in selected_blocked_cities
+            )
+            st.warning(f"Se bloqueará completamente: {selected_names}")
+
+        minimum_positive_quantity = st.number_input(
+            "Mínimo de unidades a enviar (cuando sí se manda algo)",
+            min_value=1,
+            value=3 if is_raiden else 4,
+            step=1,
+            help=(
+                "Piso general de unidades cuando el modelo decide enviar "
+                "algo: MOV_MINIMO_3, los hardcodes de Otacon (Cubrir a "
+                "Fountain9), AVL, Preventivo, y el Refuerzo Golden/"
+                "Infaltable/Anchor sin ADU disponible. Default 4 para Big "
+                "Boss, 3 para Raiden — se puede ajustar cada corrida."
+            ),
+        )
+
+        st.markdown("###### Reglas activas por default — desactivar es la excepción")
+        rules_col1, rules_col2, rules_col3, rules_col4, rules_col5 = st.columns(5)
+        with rules_col1:
+            enable_rackeados_rule = st.toggle(
+                "Regla de rackeados",
+                value=True,
+                help=(
+                    "Si se apaga, ningún SKU se trata como rackeado en 444 (hoja RACKEADOS): "
+                    "su stock deja de excluirse por esta regla."
+                ),
+            )
+        with rules_col2:
+            enable_closed_stores_rule = st.toggle(
+                "Regla de tiendas cerradas",
+                value=True,
+                help=(
+                    "Si se apaga, ninguna tienda se excluye por el bloqueo "
+                    "permanente de TIENDAS_CERRADAS."
+                ),
+            )
+        with rules_col3:
+            enable_regional_block_rule = st.toggle(
+                "Regla de bloqueo regional",
+                value=True,
+                help=(
+                    "Si se apaga, el bloqueo CDMX→GDL/MTY de la hoja "
+                    "BLOQUEOS_FORANEAS deja de aplicarse."
+                ),
+            )
+        with rules_col4:
+            enable_route_cost_block_rule = st.toggle(
+                "Regla de ruta de costos",
+                value=True,
+                help=(
+                    "Si se apaga, ninguna combinación tienda-SKU se bloquea "
+                    "por la hoja RUTA_COSTOS."
+                ),
+            )
+
+        with rules_col5:
+            enable_global_blocks_rule = st.toggle(
+                "Regla de bloqueos",
+                value=True,
+                help=(
+                    "Si se apaga, los SKUs de la hoja BLOQUEOS dejan de excluirse "
+                    "de todos los engines. La exclusión manual de SKUs sigue "
+                    "aplicando. No confundir con BLOQUEOS_FORANEAS (bloqueo regional)."
+                ),
+            )
+
+        selected_excluded_stores = st.multiselect(
+            "Excluir tiendas directamente (opcional)",
+            options=list(store_labels),
+            default=[],
+            format_func=lambda warehouse: store_labels.get(
+                warehouse, str(warehouse)
+            ),
+            help=(
+                "Excluye temporalmente tiendas completas de todos los engines. "
+                "No reemplaza el bloqueo permanente de TIENDAS_CERRADAS y solo "
+                "aplica durante esta ejecución."
+            ),
+        )
+        if selected_excluded_stores:
+            st.warning(
+                "Tiendas excluidas en esta corrida: "
+                + ", ".join(
+                    store_labels.get(warehouse, str(warehouse))
+                    for warehouse in selected_excluded_stores
+                )
+            )
+
+        # Detección de outliers de Fountain9 eliminada (sin toggle ni UI).
+        exclude_fountain9_outlier_stores = False
+
+        excluded_skus_raw = st.text_area(
+            "Excluir SKUs globalmente (opcional)",
+            value="",
+            placeholder="Ejemplo: 14588, 85097, 86195",
+            help=(
+                "Los PRODUCT_ID ingresados se eliminan de Naked, Solidus, "
+                "Shalashaska, Liquid e Insumos. No aparecerán en los Bulk ni consumirán stock, "
+                "capacidad o tareas. Acepta comas o saltos de línea."
+            ),
+        )
+
+        support_left, support_center, support_right, support_capacity = st.columns(4)
+        with support_capacity:
+            ignore_store_capacity = st.toggle(
+                "Ignorar capacidad de tienda (m³)",
+                value=False,
+                help=(
+                    "Ningún engine corta por capacidad de recibo de la tienda "
+                    "(CAP_RECIBO). El uso de m³ se sigue registrando en los "
+                    "reportes. Venom tiene su propio tope de capacidad aparte."
+                ),
+            )
+        with support_left:
+            include_insumos = st.toggle(
+                "Agregar insumos al Bulk del 444",
+                value=True,
+                help=(
+                    "Anexa insumos únicamente a tiendas que ya reciben producto "
+                    "normal desde 444. No consumen tareas."
+                ),
+            )
+        with support_center:
+            block_fruver_811 = st.toggle(
+                "Bloquear FRUVER desde el origen 811",
+                value=True,
+                help=(
+                    "El stock FRUVER del 811 queda fuera de los tres engines; los "
+                    "demás orígenes permanecen disponibles."
+                ),
+            )
+        with support_right:
+            block_off_schedule_shipments = st.toggle(
+                "Bloquear envíos fuera de frecuencia",
+                value=True,
+                help=(
+                    "Usa la hoja SCHEDULE (WAREHOUSE_ID + ORIGEN + DAYS) para "
+                    "impedir que un origen envíe a una tienda en un día no "
+                    "programado. Aplica a Naked, Solidus, Shalashaska, Liquid e "
+                    "Insumos. Un par destino-origen ausente de SCHEDULE no tiene "
+                    "restricción y se evalúa contra la fecha real del servidor."
+                ),
+            )
+        # Soporte legado conservado en backend para una futura reactivación.
+        apply_origin_storage_override = False
+        st.caption(
+            "Presupuesto de tareas compartido: Naked, Otacon, Solidus, Shalashaska y Liquid "
+            "nunca lo exceden."
+        )
+
+    st.session_state.setdefault("mb_engine_naked_enabled", True)
+    st.session_state.setdefault("mb_engine_solidus_enabled", True)
+    st.session_state.setdefault("mb_engine_shalashaska_enabled", False)
+    st.session_state.setdefault("mb_engine_liquid_enabled", False)
+    st.session_state.setdefault("mb_engine_venom_enabled", False)
+    st.session_state.setdefault("mb_engine_kazuhira_enabled", False)
+    st.session_state.setdefault("mb_kazuhira_ignore_task_budget", False)
+    st.session_state.setdefault("mb_kazuhira_ignore_store_capacity", False)
+    st.session_state.setdefault("mb_kazuhira_swa_priority", False)
+
+    with st.container(border=True, key="engine_naked_module"):
+        include_naked_engine = bool(
+            st.session_state["mb_engine_naked_enabled"]
+        )
+        if render_action_card(
+            key="engine_naked_card",
+            eyebrow="ENGINE / 01 · FOUNTAIN9",
+            title="NAKED ENGINE",
+            description=ENGINE_INFO["Naked"]["card"],
+            active=include_naked_engine,
+            tone="acid",
+            status="ACTIVO" if include_naked_engine else "INACTIVO · CLIC PARA ACTIVAR",
+            min_height=150,
+            help_text="Haz clic en la tarjeta para activar o desactivar Naked Engine.",
+        ):
+            st.session_state["mb_engine_naked_enabled"] = not include_naked_engine
+            st.rerun()
+    with st.container(border=True, key="engine_otacon_module"):
+        # Otacon must use the same engine card as every other engine.  Its
+        # controls remain below the card, but the engine identity/status is
+        # rendered through the shared action-card component.
+        if render_action_card(
+            key="engine_otacon_card",
+            eyebrow="ENGINE / 02 · RESIDUAL",
+            title="OTACON ENGINE",
+            description=ENGINE_INFO["Otacon"]["card"],
+            active=True,
+            tone="purple",
+            status="ACTIVO",
+            min_height=150,
+            help_text="Otacon completa el residual después de Naked.",
+        ):
+            st.rerun()
+        cover_fountain9_hardcodes = False
+        hardcode_zero_total = True
+        hardcode_inventory_below_demand = True
+        hardcode_low_net_transfer = True
+        net_transfer_max = 3.0
+        destination_stock_below = 3.0
+        raise_small_roq_to_minimum = True
+        use_extra_mov_columns = True
+        naked_left, naked_right = st.columns(2)
+        with naked_left:
+            raise_small_roq_to_minimum = st.toggle(
+                "Subir recomendaciones pequeñas al mínimo",
+                value=True,
+                help=(
+                    "Una recomendación positiva de Fountain9 menor al mínimo "
+                    "de unidades se sube a ese mínimo. Apagado: se envía el "
+                    "ROQ redondeado hacia arriba, sin piso."
+                ),
+            )
+        with naked_right:
+            use_extra_mov_columns = st.toggle(
+                "Usar columnas adicionales de MOV",
+                value=True,
+                help=(
+                    "El MOV efectivo es el máximo entre la columna MOV y las "
+                    "columnas opcionales del Bulk de Fountain9. Apagado: "
+                    "cuentan MOV y Allocation DOI."
+                ),
+            )
+        cover_fountain9_hardcodes = st.toggle(
+            "Cubrir a Fountain9",
+            value=True,
+            help=(
+                "Cuando Fountain9 no dio un ROQ positivo (MOV ≤ 0), el "
+                "modelo igual puede armar un mínimo de unidades según "
+                "inventario y demanda en destino. Apagar esto deja esos "
+                "casos sin cubrir por Otacon; Solidus puede cubrirlos por "
+                "su cuenta si aplica."
+            ),
+        )
+        if cover_fountain9_hardcodes:
+            rule_left, rule_center, rule_right = st.columns(3)
+            with rule_left:
+                hardcode_zero_total = st.toggle(
+                    "Cubrir forecast y stock en cero",
+                    value=True,
+                    help=(
+                        "Regla HARDCODE_4_CERO_TOTAL: demanda y opening "
+                        "predichos en cero."
+                    ),
+                )
+            with rule_center:
+                hardcode_inventory_below_demand = st.toggle(
+                    "Cubrir inventario menor a la demanda",
+                    value=True,
+                    help=(
+                        "Regla HARDCODE_3_INVENTARIO_MENOR_DEMANDA: ROQ no "
+                        "positivo y opening predicho menor a la demanda."
+                    ),
+                )
+            with rule_right:
+                hardcode_low_net_transfer = st.toggle(
+                    "Cubrir net transfer bajo",
+                    value=True,
+                    help=(
+                        "Regla HARDCODE_3_NET_TRANSFER_BAJO: ROQ no positivo, "
+                        "net transfer bajo y poco stock en destino."
+                    ),
+                )
+            if hardcode_low_net_transfer:
+                net_left, net_right = st.columns(2)
+                with net_left:
+                    net_transfer_max = float(
+                        st.number_input(
+                            "Net transfer máximo (unidades)",
+                            min_value=0.0,
+                            max_value=50.0,
+                            value=3.0,
+                            step=1.0,
+                            help="La regla aplica con net transfer menor o igual a este valor.",
+                        )
+                    )
+                with net_right:
+                    destination_stock_below = float(
+                        st.number_input(
+                            "Stock destino menor a (unidades)",
+                            min_value=0.0,
+                            max_value=50.0,
+                            value=3.0,
+                            step=1.0,
+                            help="La regla aplica con stock en destino estrictamente menor a este valor.",
+                        )
+                    )
+
+    include_avl_fill = False
+    include_preventive_fill = False
+    include_special_doh_fill = False
+    include_no_fountain9_coverage = False
+    avl_doh = 3.0
+    special_doh_target = 3.0
+    special_doh_targets: dict[str, float] = {}
+    solidus_swa_priority = True
+    with st.container(border=True, key="engine_solidus_module"):
+        if is_raiden:
+            st.session_state["mb_engine_solidus_enabled"] = False
+        include_solidus_engine = bool(
+            st.session_state["mb_engine_solidus_enabled"]
+        )
+        if render_action_card(
+            key="engine_solidus_card",
+            eyebrow="ENGINE / 03 · CATALOG COVERAGE",
+            title="SOLIDUS ENGINE",
+            description=(
+                ENGINE_INFO["Solidus"]["card"]
+                if not is_raiden
+                else "Bloqueado para el perfil Raiden."
+            ),
+            active=include_solidus_engine,
+            tone="blue",
+            status=(
+                "BLOQUEADO · SOLO BIG BOSS"
+                if is_raiden
+                else ("ACTIVO" if include_solidus_engine else "INACTIVO · CLIC PARA ACTIVAR")
+            ),
+            min_height=150,
+            help_text=(
+                "El perfil Raiden no puede activar Solidus Engine."
+                if is_raiden
+                else "Haz clic en la tarjeta para activar o desactivar Solidus Engine."
+            ),
+        ):
+            if not is_raiden:
+                st.session_state["mb_engine_solidus_enabled"] = not include_solidus_engine
+                st.rerun()
+        if is_raiden:
+            st.caption(
+                "Solidus Engine está bloqueado para el perfil Raiden. Inicia "
+                "sesión como Big Boss para usarlo."
+            )
+        elif include_solidus_engine:
+            avl_left, preventive_mid, no_f9_right = st.columns(3)
+            with avl_left:
+                include_avl_fill = st.toggle(
+                    "Cubrir quiebres del catálogo (AVL)",
+                    value=False,
+                    help=(
+                        "Busca productos del catálogo con stock final cero y utiliza "
+                        "exclusivamente tareas sobrantes."
+                    ),
+                )
+            with preventive_mid:
+                include_preventive_fill = st.toggle(
+                    "Blindar posibles quiebres del catálogo",
+                    value=False,
+                    help=(
+                        "Busca inventarios positivos menores a 1 DOH o a 3 unidades, "
+                        "sin recomendación positiva de Fountain9."
+                    ),
+                )
+            with no_f9_right:
+                include_no_fountain9_coverage = st.toggle(
+                    "Cubrir quiebres sin recomendación positiva de Fountain9",
+                    value=False,
+                    help=(
+                        "Corre al final de Solidus, con lo que sobró después de "
+                        "AVL/Preventivo/Refuerzo. Cubre SKUs de catálogo con stock "
+                        "en cero sin recomendación positiva de Fountain9 — ya sea "
+                        "porque la fila no existe en su Bulk, o porque existe pero "
+                        "dice 'sin recomendación' (basado en su propio Predicted "
+                        "Opening Inventory, que puede no coincidir con el stock "
+                        "real). Usa la moda de Duration y Lead Time por tienda del "
+                        "propio Bulk de Fountain9 en vez del DOH fijo, y resta "
+                        "STOCK.INCOMING si está disponible. Sin ADU (propio ni de "
+                        f"ciudad), usa un ADU ficticio de "
+                        f"{FICTITIOUS_ADU_NO_FOUNTAIN9:g}/día."
+                    ),
+                )
+            avl_doh = st.number_input(
+                "DOH objetivo (AVL y preventivo)",
+                min_value=0.5,
+                max_value=30.0,
+                value=3.0,
+                step=0.5,
+                disabled=not (include_avl_fill or include_preventive_fill),
+                help=(
+                    "Aplica a cobertura AVL y prevención. Se envían al menos 3 "
+                    "unidades salvo falta de stock o capacidad."
+                ),
+            )
+            st.markdown("**Refuerzo por bucket** · cada uno con su DOH objetivo")
+            special_cols = st.columns(4)
+            special_buckets = (
+                ("INFALTABLE", "Reforzar Infaltables", "Infaltables"),
+                ("GOLDEN", "Reforzar Golden", "Golden"),
+                ("ANCHOR", "Reforzar Anchor", "Anchor"),
+                ("KVI", "Reforzar KVIs", "KVIs"),
+            )
+            special_doh_targets = {}
+            for column, (bucket, toggle_label, plural) in zip(special_cols, special_buckets):
+                with column:
+                    bucket_on = st.toggle(
+                        toggle_label,
+                        value=False,
+                        key=f"mb_special_{bucket.lower()}_on",
+                        help=(
+                            f"Sube el DOH de los {plural} que estén por debajo de su "
+                            "objetivo, sin recomendación positiva de Fountain9. "
+                            "Nunca modifica una recomendación de Fountain9."
+                        ),
+                    )
+                    bucket_doh = st.number_input(
+                        f"DOH objetivo ({plural})",
+                        min_value=0.5,
+                        max_value=90.0,
+                        value=3.0,
+                        step=0.5,
+                        key=f"mb_special_{bucket.lower()}_doh",
+                        disabled=not bucket_on,
+                        help="Sin mínimo forzado: si ya están cerca del objetivo, sube exactamente lo que falta.",
+                    )
+                    if bucket_on:
+                        special_doh_targets[bucket] = float(bucket_doh)
+            include_special_doh_fill = bool(special_doh_targets)
+            special_doh_target = max(special_doh_targets.values(), default=3.0)
+            solidus_swa_priority = st.toggle(
+                "Priorizar por SWA cuando falte capacidad o tareas",
+                value=True,
+                help=(
+                    "Si no alcanza la capacidad de la tienda o el presupuesto de "
+                    "tareas, las 4 coberturas atienden primero lo que más SWA país "
+                    "recupera (hoja SWA). Sin escasez no cambia nada."
+                ),
+            )
+        else:
+            st.caption(
+                "Solidus Engine está apagado. Sus protecciones y parámetros no "
+                "están disponibles para esta corrida."
+            )
+
+    shalashaska_target_doh = 7.0       # nivelación interna; ya no se expone en CODEC
+    shalashaska_extra_cities: list[str] = []
+    shalashaska_allow_sensitive = False
+    shalashaska_evacuation_fraction = 1.0
+    with st.container(border=True, key="engine_shalashaska_module"):
+        include_shalashaska_engine = bool(
+            st.session_state["mb_engine_shalashaska_enabled"]
+        )
+        if render_action_card(
+            key="engine_shalashaska_card",
+            eyebrow="ENGINE / 04 · EXPIRATION EVACUATION",
+            title="SHALASHASKA ENGINE",
+            description=ENGINE_INFO["Shalashaska"]["card"],
+            active=include_shalashaska_engine,
+            tone="orange",
+            status=(
+                "ACTIVO"
+                if include_shalashaska_engine
+                else "INACTIVO · CLIC PARA ACTIVAR"
+            ),
+            min_height=150,
+            help_text=(
+                "Haz clic en la tarjeta para activar o desactivar Shalashaska Engine."
+            ),
+        ):
+            st.session_state["mb_engine_shalashaska_enabled"] = (
+                not include_shalashaska_engine
+            )
+            st.rerun()
+        if include_shalashaska_engine:
+            forced_cities = shalashaska_forced_cities(tuple(selected_origins))
+            city_names = {"CDMX": "Ciudad de México", "GDL": "Guadalajara", "MTY": "Monterrey"}
+            if forced_cities:
+                st.markdown(
+                    "**Ciudades siempre activas** (por los orígenes elegidos): "
+                    + ", ".join(city_names[c] for c in sorted(forced_cities))
+                    + ". 444, 811, 831 y 834 activan CDMX; 425, Guadalajara; "
+                    "856 y 49, Monterrey."
+                )
+            else:
+                st.caption("Con los orígenes elegidos no hay ciudad forzada: sin restricción por ciudad.")
+            shalashaska_extra_cities = st.multiselect(
+                "Ciudades adicionales (opcional)",
+                options=[
+                    city for city in city_labels
+                    if engine.normalize_city(city) not in forced_cities
+                ],
+                default=[],
+                format_func=lambda city: city_labels.get(city, city),
+                help=(
+                    "Por defecto la merma solo viaja a las ciudades forzadas por el "
+                    "origen: las lejanas tardan más en evacuarla."
+                ),
+            )
+            shala_left, shala_right = st.columns(2)
+            with shala_left:
+                shalashaska_allow_sensitive = st.toggle(
+                    "Permitir categorías sensibles (Huevo)",
+                    value=False,
+                    help=(
+                        "Apagado: los SKUs de categoría sensible (hoy Huevo, según "
+                        "CATEGORY_NAME de la hoja DATA) no se evacúan. Encendido: "
+                        "pueden enviarse."
+                    ),
+                )
+            with shala_right:
+                limit_evacuation = st.toggle(
+                    "Evacuar solo una parte de la merma",
+                    value=False,
+                    help=(
+                        "Envía solo el porcentaje indicado de las unidades en riesgo "
+                        "de cada SKU y deja el resto disponible para otros usos."
+                    ),
+                )
+                evacuation_percent = st.number_input(
+                    "Porcentaje de merma a evacuar (%)",
+                    min_value=10,
+                    max_value=100,
+                    value=80,
+                    step=5,
+                    disabled=not limit_evacuation,
+                )
+                if limit_evacuation:
+                    shalashaska_evacuation_fraction = float(evacuation_percent) / 100.0
+            st.caption(
+                "Solo recibe merma una tienda con ROQ positivo de Fountain9 que ya "
+                "recibe del mismo origen: los mínimos (hardcode) no cuentan."
+            )
+        else:
+            st.caption(
+                "Shalashaska Engine está apagado. No se procesará la hoja POR_MERMAR."
+            )
+
+    liquid_manual_skus_by_origin_raw: dict[int, str] = {}
+    liquid_automatic_tail = False
+    liquid_automatic_tail_origins: set[int] = set()
+    liquid_tail_threshold = 10
+    forecast_horizon_days = 7
+    with st.container(border=True, key="engine_liquid_module"):
+        if is_raiden:
+            st.session_state["mb_engine_liquid_enabled"] = False
+        include_liquid_engine = bool(
+            st.session_state["mb_engine_liquid_enabled"]
+        )
+        if render_action_card(
+            key="engine_liquid_card",
+            eyebrow="ENGINE / 05 · INVENTORY LIQUIDATION",
+            title="LIQUID ENGINE",
+            description=(
+                ENGINE_INFO["Liquid"]["card"]
+                if not is_raiden
+                else "Bloqueado para el perfil Raiden."
+            ),
+            active=include_liquid_engine,
+            tone="coral",
+            status=(
+                "BLOQUEADO · SOLO BIG BOSS"
+                if is_raiden
+                else ("ACTIVO" if include_liquid_engine else "INACTIVO · CLIC PARA ACTIVAR")
+            ),
+            min_height=150,
+            help_text=(
+                "El perfil Raiden no puede activar Liquid Engine."
+                if is_raiden
+                else "Haz clic en la tarjeta para activar o desactivar Liquid Engine."
+            ),
+        ):
+            if not is_raiden:
+                st.session_state["mb_engine_liquid_enabled"] = not include_liquid_engine
+                st.rerun()
+        if is_raiden:
+            st.caption(
+                "Liquid Engine está bloqueado para el perfil Raiden. Inicia "
+                "sesión como Big Boss para usarlo."
+            )
+        elif include_liquid_engine:
+            liquid_left, liquid_right = st.columns([2, 1])
+            with liquid_left:
+                liquid_automatic_tail = st.toggle(
+                    "Agotar automáticamente remanentes bajo el umbral",
+                    value=True,
+                    help=(
+                        "Evalúa el stock que quede después de Naked, Solidus, "
+                        "Shalashaska y las coberturas activas. Solo crea tareas "
+                        "mientras exista cupo global."
+                    ),
+                )
+                liquid_tail_threshold = st.number_input(
+                    "Umbral de remanente (unidades; menos de X se agota)",
+                    min_value=1,
+                    max_value=1000,
+                    value=10,
+                    step=1,
+                    disabled=not liquid_automatic_tail,
+                    help=(
+                        "Un origen-SKU entra a la cola automática cuando su "
+                        "remanente es mayor a 0 y menor a este valor. Antes estaba "
+                        "fijo en 10; ahora es ajustable por corrida."
+                    ),
+                )
+                liquid_automatic_tail_origins = set(
+                    st.multiselect(
+                        "Orígenes habilitados para remanentes automáticos",
+                        options=list(selected_origins),
+                        default=list(selected_origins),
+                        format_func=format_origin,
+                        disabled=not liquid_automatic_tail,
+                        help=(
+                            "Liquid solo agotará automáticamente saldos por debajo "
+                            f"del umbral ({int(liquid_tail_threshold):,} unidades) en "
+                            "los orígenes marcados aquí."
+                        ),
+                    )
+                )
+            with liquid_right:
+                st.info(
+                    "Solo considera tiendas que ya recibieron unidades de otro engine "
+                    "en esta corrida; no exige el SKU en CATALOGO. Nivela con el ADU "
+                    "de CATALOGO hasta un máximo de 14 DOH."
+                )
+
+            st.markdown("#### SKUs manuales a agotar por origen")
+            if selected_origins:
+                sku_columns = st.columns(2)
+                for index, origin in enumerate(selected_origins):
+                    with sku_columns[index % 2]:
+                        liquid_manual_skus_by_origin_raw[origin] = st.text_area(
+                            f"{format_origin(origin)}",
+                            value="",
+                            placeholder="Ejemplo: 10087, 10589, 10848",
+                            key=f"liquid_manual_skus_{origin}",
+                            help=(
+                                "Estos SKUs se agotarán únicamente desde este warehouse. "
+                                "Acepta comas o saltos de línea."
+                            ),
+                        )
+            else:
+                st.info(
+                    "Selecciona al menos un warehouse origen en CODEC para "
+                    "capturar SKUs manuales de Liquid."
+                )
+        else:
+            st.caption(
+                "Liquid Engine apagado."
+            )
+
+    venom_manual_skus_by_origin_raw: dict[int, str] = {}
+    venom_ltf = 0.5
+    venom_vf = 0.5
+    venom_min_green_units = None
+    venom_order_cycle_days = 0.0
+    venom_trigger_zone = "yellow"
+    venom_shipping_multiple = 1
+    venom_subtract_lead_time_demand = True
+    venom_consider_incoming = False
+    venom_cap_to_store_capacity = False
+    venom_only_manual_skus = False
+    with st.container(border=True, key="engine_venom_module"):
+        include_venom_engine = bool(st.session_state["mb_engine_venom_enabled"])
+        if render_action_card(
+            key="engine_venom_card",
+            eyebrow="ENGINE / 06 · DDMRP POST-PLANEACIÓN",
+            title="VENOM ENGINE",
+            description=ENGINE_INFO["Venom"]["card"],
+            active=include_venom_engine,
+            tone="purple",
+            status="ACTIVO" if include_venom_engine else "INACTIVO · CLIC PARA ACTIVAR",
+            min_height=150,
+            help_text="Haz clic en la tarjeta para activar o desactivar Venom Engine.",
+        ):
+            st.session_state["mb_engine_venom_enabled"] = not include_venom_engine
+            st.rerun()
+        if include_venom_engine:
+            venom_left, venom_right = st.columns([2, 1])
+            with venom_left:
+                venom_origins = st.multiselect(
+                    "Orígenes (Venom)",
+                    options=list(selected_origins),
+                    default=list(selected_origins),
+                    format_func=format_origin,
+                    help=(
+                        "Solo puede usar orígenes ya seleccionados arriba en "
+                        "CODEC, en el mismo orden de prioridad."
+                    ),
+                )
+                venom_destinations = st.multiselect(
+                    "Tiendas destino (Venom)",
+                    options=list(store_labels),
+                    default=[],
+                    format_func=lambda warehouse: store_labels.get(
+                        warehouse, str(warehouse)
+                    ),
+                    help=(
+                        "Venom solo evalúa buffers DDMRP para las tiendas "
+                        "seleccionadas aquí. Respeta TIENDAS_CERRADAS, "
+                        "exclusiones y ciudades bloqueadas igual que el resto "
+                        "de los engines."
+                    ),
+                )
+            with venom_right:
+                venom_lead_time_days = st.number_input(
+                    "Lead time (días)",
+                    min_value=0.1,
+                    max_value=365.0,
+                    value=2.0,
+                    step=0.5,
+                    help=(
+                        "Días de cobertura usados para construir las zonas "
+                        "roja/amarilla/verde del buffer DDMRP."
+                    ),
+                )
+                venom_consider_current_planning = st.toggle(
+                    "Considerar planeación actual",
+                    value=True,
+                    help=(
+                        "Activo: el On-Order del Net Flow Position incluye lo ya "
+                        "asignado por Naked/Solidus/AVL/Preventivo/Shalashaska/"
+                        "Liquid/Insumos en esta misma corrida. Apagado: Venom "
+                        "evalúa el buffer como si nada más hubiera corrido hoy."
+                    ),
+                )
+            st.markdown("**Parámetros DDMRP**")
+            ddmrp_a, ddmrp_b, ddmrp_c = st.columns(3)
+            with ddmrp_a:
+                venom_ltf = float(
+                    st.number_input(
+                        "Factor de lead time (LTF)",
+                        min_value=0.1, max_value=1.0, value=0.5, step=0.05,
+                        help=(
+                            "Qué tan larga es la zona verde y la base de la roja frente "
+                            "al lead time: 0.2–0.4 lead time largo, 0.41–0.6 medio "
+                            "(estándar), 0.61–1.0 corto."
+                        ),
+                    )
+                )
+                venom_min_green_units = float(
+                    st.number_input(
+                        "Mínimo de orden (unidades)",
+                        min_value=1.0, max_value=500.0, value=float(minimum_positive_quantity),
+                        step=1.0,
+                        help="Piso de la zona verde: Venom no pide menos que esto. Por defecto, el mínimo de unidades de CODEC.",
+                    )
+                )
+            with ddmrp_b:
+                venom_vf = float(
+                    st.number_input(
+                        "Factor de variabilidad (VF)",
+                        min_value=0.0, max_value=1.0, value=0.5, step=0.05,
+                        help=(
+                            "Tamaño de la zona roja de seguridad: 0–0.4 baja "
+                            "variabilidad, 0.41–0.6 media (estándar), 0.61–1.0 alta."
+                        ),
+                    )
+                )
+                venom_order_cycle_days = float(
+                    st.number_input(
+                        "Ciclo de pedido (días)",
+                        min_value=0.0, max_value=60.0, value=0.0, step=0.5,
+                        help="Zona verde mínima = ADU × ciclo de pedido. 0 = sin ciclo de pedido.",
+                    )
+                )
+            with ddmrp_c:
+                trigger_labels = {
+                    "yellow": "Techo amarillo (estándar)",
+                    "red": "Techo rojo (solo urgencias)",
+                    "green": "Techo verde (siempre llenar)",
+                }
+                venom_trigger_zone = st.selectbox(
+                    "Disparador de reorden",
+                    options=list(trigger_labels),
+                    format_func=trigger_labels.get,
+                    help=(
+                        "Cuándo se reordena: si el NFP queda bajo este techo, se pide "
+                        "hasta el techo verde."
+                    ),
+                )
+                venom_shipping_multiple = st.number_input(
+                    "Múltiplo de envío (unidades)",
+                    min_value=1, max_value=100, value=1, step=1,
+                    help="La cantidad se redondea hacia arriba a un múltiplo de este valor.",
+                )
+            flag_a, flag_b = st.columns(2)
+            with flag_a:
+                venom_subtract_lead_time_demand = st.toggle(
+                    "Restar demanda del lead time (demanda calificada)",
+                    value=True,
+                    help=(
+                        "Activo: NFP = on-hand + on-order − ADU × lead time. "
+                        "Apagado: NFP = on-hand + on-order."
+                    ),
+                )
+                venom_consider_incoming = st.toggle(
+                    "Considerar incoming en tránsito",
+                    value=True,
+                    help="Suma STOCK.INCOMING_TR al on-order del NFP.",
+                )
+            with flag_b:
+                venom_cap_to_store_capacity = st.toggle(
+                    "Limitar a la capacidad de la tienda",
+                    value=False,
+                    help=(
+                        "Venom tiene su propia capacidad: la de CAP_RECIBO completa, "
+                        "aparte de lo que ya usaron los demás engines y sin sumarse a "
+                        "ello. Kazuhira solo ve el remanente de los demás engines, "
+                        "sin contar a Venom."
+                    ),
+                )
+                venom_only_manual_skus = st.toggle(
+                    "Usar solo los SKUs específicos",
+                    value=False,
+                    help=(
+                        "Ignora los tipos de sección y evalúa con DDMRP únicamente los "
+                        "SKUs capturados abajo."
+                    ),
+                )
+            venom_section_type_labels = {
+                "IS_INFALTABLE": "Infaltable",
+                "IS_GOLDEN": "Golden",
+                "IS_ANCHOR": "Anchor",
+                "IS_KVI": "KVI",
+                "BL": "BL (CATALOGO.LIST_TYPE)",
+            }
+            venom_section_type_options = [
+                value for value in VENOM_SECTION_TYPES if value != "OOWL"
+            ]
+            venom_section_types = st.multiselect(
+                "Tipo de sección (Venom)",
+                options=venom_section_type_options,
+                default=[],
+                format_func=lambda value: venom_section_type_labels.get(
+                    value, value
+                ),
+                help=(
+                    "Venom solo construye buffer para tienda-SKU que califiquen "
+                    "en al menos uno de los tipos marcados aquí. OOWL está "
+                    "bloqueado en esta corrida y no se puede seleccionar."
+                ),
+            )
+            st.markdown("#### SKUs específicos por origen")
+            if venom_origins:
+                venom_sku_columns = st.columns(2)
+                for index, origin in enumerate(venom_origins):
+                    with venom_sku_columns[index % 2]:
+                        venom_manual_skus_by_origin_raw[origin] = st.text_area(
+                            f"{format_origin(origin)}",
+                            value="",
+                            placeholder="Ejemplo: 10087, 10589, 10848",
+                            key=f"venom_manual_skus_{origin}",
+                            help=(
+                                "Estos SKUs se evalúan con DDMRP en las tiendas destino "
+                                "elegidas, surtidos solo desde este warehouse, aunque no "
+                                "califiquen en ningún tipo de sección. Acepta comas o "
+                                "saltos de línea."
+                            ),
+                        )
+            if not venom_section_types and not any(
+                parse_manual_skus(raw) for raw in venom_manual_skus_by_origin_raw.values()
+            ):
+                st.info(
+                    "Selecciona al menos un tipo de sección o captura SKUs "
+                    "específicos para que Venom genere líneas."
+                )
+        else:
+            venom_origins = []
+            venom_destinations = []
+            venom_section_types = []
+            venom_lead_time_days = 2.0
+            venom_consider_current_planning = True
+            st.caption(
+                "Venom Engine está apagado. No se ejecutará ningún llenado "
+                "DDMRP posterior a la planeación."
+            )
+
+    with st.container(border=True, key="engine_kazuhira_module"):
+        if is_raiden:
+            st.session_state["mb_engine_kazuhira_enabled"] = False
+        include_kazuhira_engine = bool(
+            st.session_state["mb_engine_kazuhira_enabled"]
+        )
+        if render_action_card(
+            key="engine_kazuhira_card",
+            eyebrow="ENGINE / 07 · GARANTÍA TOTAL",
+            title="KAZUHIRA ENGINE",
+            description=(
+                ENGINE_INFO["Kazuhira"]["card"]
+                if not is_raiden
+                else "Bloqueado para el perfil Raiden."
+            ),
+            active=include_kazuhira_engine,
+            tone="coral",
+            status=(
+                "BLOQUEADO · SOLO BIG BOSS"
+                if is_raiden
+                else (
+                    "ACTIVO"
+                    if include_kazuhira_engine
+                    else "INACTIVO · CLIC PARA ACTIVAR"
+                )
+            ),
+            min_height=150,
+            help_text=(
+                "El perfil Raiden no puede activar Kazuhira Engine."
+                if is_raiden
+                else "Haz clic en la tarjeta para activar o desactivar Kazuhira Engine."
+            ),
+        ):
+            if not is_raiden:
+                st.session_state["mb_engine_kazuhira_enabled"] = (
+                    not include_kazuhira_engine
+                )
+                st.rerun()
+        if is_raiden:
+            st.caption(
+                "Kazuhira Engine está bloqueado para el perfil Raiden. Inicia "
+                "sesión como Big Boss para usarlo."
+            )
+            kazuhira_ignore_task_budget = False
+            kazuhira_ignore_store_capacity = False
+            kazuhira_swa_priority = False
+        elif include_kazuhira_engine:
+            kaz_left, kaz_right = st.columns(2)
+            with kaz_left:
+                kazuhira_ignore_task_budget = st.toggle(
+                    "Ignorar presupuesto de tareas",
+                    value=bool(
+                        st.session_state["mb_kazuhira_ignore_task_budget"]
+                    ),
+                    help=(
+                        "Si se activa, Kazuhira no se detiene aunque el "
+                        "presupuesto compartido de tareas (MAX_TASKS) ya se "
+                        "haya agotado por Naked/Otacon/Solidus/Shalashaska/Liquid/"
+                        "Venom — la garantía de cobertura total se vuelve "
+                        "absoluta en vez de 'mejor esfuerzo dentro del "
+                        "límite'."
+                    ),
+                )
+                st.session_state["mb_kazuhira_ignore_task_budget"] = (
+                    kazuhira_ignore_task_budget
+                )
+            with kaz_right:
+                kazuhira_ignore_store_capacity = st.toggle(
+                    "Ignorar capacidad de tienda (solo Kazuhira)",
+                    value=bool(
+                        st.session_state["mb_kazuhira_ignore_store_capacity"]
+                    ),
+                    help=(
+                        "Si se activa, Kazuhira puede exceder la capacidad "
+                        "física registrada de la tienda con tal de "
+                        "garantizar cobertura. El reporte sigue mostrando "
+                        "cuánto se excedió, no lo esconde."
+                    ),
+                )
+                st.session_state["mb_kazuhira_ignore_store_capacity"] = (
+                    kazuhira_ignore_store_capacity
+                )
+            kazuhira_swa_priority = st.toggle(
+                "Priorizar por SWA cuando falte capacidad o tareas",
+                value=bool(st.session_state["mb_kazuhira_swa_priority"]),
+                help=(
+                    "Cuando la capacidad de la tienda o el presupuesto de "
+                    "tareas no alcanzan para todos los quiebres, atiende "
+                    "primero los que más SWA país recuperan (hoja SWA) en "
+                    "vez del orden por prioridad de producto/tienda. No "
+                    "cambia nada si no hay escasez."
+                ),
+            )
+            st.session_state["mb_kazuhira_swa_priority"] = kazuhira_swa_priority
+        else:
+            kazuhira_ignore_task_budget = False
+            kazuhira_ignore_store_capacity = False
+            kazuhira_swa_priority = False
+            st.caption(
+                "Kazuhira Engine apagado."
+            )
+
+    simulation_mode = False
+    if not is_raiden:
+        simulation_mode = st.toggle(
+            "Modo simulación (solo calcular, no generar archivos)",
+            value=False,
+            help=(
+                "Corre la planeación completa con números exactos, pero no "
+                "escribe ni entrega ningún CSV, Excel, PDF o ZIP — todo se "
+                "borra al terminar. Útil para probar parámetros (por "
+                "ejemplo un DOH distinto) sin comprometer una entrega. "
+                "Exclusivo de Big Boss."
+            ),
+        )
+        if simulation_mode:
+            st.info(
+                "MODO SIMULACIÓN ACTIVO: no se generarán archivos. Apágalo para una "
+                "entrega real."
+            )
+
+    submitted_click = st.button(
+        "Ejecutar planeación →",
+        use_container_width=True,
+        type="primary",
+    )
+    if submitted_click:
+        st.session_state["mb_pending_confirmation"] = True
+
+    if st.session_state.get("mb_pending_confirmation"):
+        render_pre_run_confirmation_dialog()
+
+    submitted = st.session_state.pop("mb_run_confirmed", False)
+
+    if submitted:
+        if not uploaded_plans:
+            st.error("Primero sube al menos un CSV de planeación.")
+            st.stop()
+        if not selected_origins:
+            st.error("Selecciona al menos un warehouse origen.")
+            st.stop()
+        origins_needing_copernico = (
+            set(selected_origins) & COPERNICO_REQUIRED_WAREHOUSES
+        )
+        if origins_needing_copernico:
+            copernico_warehouses = detect_copernico_warehouses(uploaded_copernico)
+            missing_copernico = sorted(
+                origins_needing_copernico - copernico_warehouses
+            )
+            if missing_copernico:
+                missing_text = ", ".join(str(w) for w in missing_copernico)
+                st.error(
+                    "Faltan archivos de COPÉRNICO para los warehouses "
+                    f"seleccionados como origen: {missing_text}. Los orígenes "
+                    "444, 831 y 856 requieren su propio archivo COPÉRNICO "
+                    "cargado (columna Bodega) antes de ejecutar la planeación."
+                )
+                st.stop()
+        if not (
+            include_naked_engine
+            or include_solidus_engine
+            or include_shalashaska_engine
+            or include_liquid_engine
+            or include_venom_engine
+            or include_kazuhira_engine
+        ):
+            st.error("Activa al menos un engine para ejecutar la misión.")
+            st.stop()
+        try:
+            origins = tuple(selected_origins)
+            excluded_skus = parse_manual_skus(excluded_skus_raw)
+            liquid_manual_skus_by_origin = {
+                int(origin): parsed
+                for origin, raw_value in liquid_manual_skus_by_origin_raw.items()
+                if include_liquid_engine
+                and (parsed := parse_manual_skus(raw_value))
+            }
+            venom_manual_skus_by_origin = {
+                int(origin): parsed
+                for origin, raw_value in venom_manual_skus_by_origin_raw.items()
+                if include_venom_engine
+                and int(origin) in venom_origins
+                and (parsed := parse_manual_skus(raw_value))
+            }
+            with st.status("Ejecutando motor de planeación…", expanded=True) as status:
+                if uploaded_copernico:
+                    st.write(
+                        "Guardando y procesando "
+                        f"{len(uploaded_copernico):,} archivo(s) de inventario "
+                        "COPÉRNICO cargado(s)…"
+                    )
+                else:
+                    st.write(
+                        "COPÉRNICO no cargado: se ejecutará sin descuento por "
+                        "ubicaciones no pickeables."
+                    )
+                st.write(
+                    f"Guardando y consolidando {len(uploaded_plans):,} CSV "
+                    "cargado(s) de forma temporal…"
+                )
+                st.write("Usando la base de datos validada al iniciar la sesión…")
+                if database_bytes is None or database_health is None:
+                    raise RuntimeError(
+                        "La base de datos no está disponible. Presiona 'Volver a "
+                        "validar la base' antes de ejecutar."
+                    )
+                if not database_health["online"]:
+                    raise RuntimeError(
+                        "La base de datos tiene una o más fuentes con error. "
+                        "Abre el panel de estado y corrige las hojas indicadas."
+                    )
+                if selected_blocked_cities:
+                    blocked_names = ", ".join(
+                        city_labels.get(city, city)
+                        for city in selected_blocked_cities
+                    )
+                    st.write(f"Excluyendo ciudades bloqueadas: {blocked_names}…")
+                if selected_excluded_stores:
+                    st.write(
+                        "Excluyendo temporalmente desde CODEC: "
+                        + ", ".join(
+                            store_labels.get(warehouse, str(warehouse))
+                            for warehouse in selected_excluded_stores
+                        )
+                        + "…"
+                    )
+                if include_insumos and 444 in origins:
+                    st.write("Preparando insumos para las rutas activas del 444…")
+                elif include_insumos:
+                    st.write(
+                        "Insumos activos, pero sin efecto porque el origen 444 no "
+                        "está seleccionado."
+                    )
+                else:
+                    st.write("Envío de insumos desactivado para esta corrida.")
+                if block_fruver_811 and 811 in origins:
+                    st.write(
+                        "Bloqueando el stock FRUVER del origen 811 y habilitando "
+                        "la reasignación desde otros orígenes…"
+                    )
+                elif block_fruver_811:
+                    st.write(
+                        "Bloqueo FRUVER 811 activo, pero sin efecto porque el 811 "
+                        "no está seleccionado como origen."
+                    )
+                if block_off_schedule_shipments:
+                    st.write(
+                        "Validando SCHEDULE: se bloquearán los envíos "
+                        "origen-destino fuera de los días programados para hoy…"
+                    )
+                st.write("Calculando demanda, stock, capacidad y tareas…")
+                if st.session_state.get("mb_profile") == "RAIDEN":
+                    st.write(
+                        "Asignando ventana de procesamiento para el perfil "
+                        "operativo…"
+                    )
+                    time.sleep(10)
+                st.write(
+                    "Loadout activo: "
+                    + ", ".join(
+                        name
+                        for enabled, name in (
+                            (include_naked_engine, "Naked"),
+                            (include_solidus_engine, "Solidus"),
+                            (include_shalashaska_engine, "Shalashaska"),
+                            (include_liquid_engine, "Liquid"),
+                            (include_venom_engine, "Venom"),
+                        )
+                        if enabled
+                    )
+                    + "."
+                )
+                if include_venom_engine:
+                    st.write(
+                        "Reservando la última pasada para el llenado DDMRP de "
+                        f"Venom (lead time {venom_lead_time_days:g}d)…"
+                    )
+                if include_avl_fill:
+                    st.write(
+                        f"Reservando una pasada para quiebres AVL a "
+                        f"{avl_doh:g} DOH…"
+                    )
+                if include_preventive_fill:
+                    st.write(
+                        "Reservando la última pasada para inventarios positivos con "
+                        "menos de 1 DOH o menos de 3 unidades, sin recomendación "
+                        "positiva de Fountain9…"
+                    )
+                run = execute_planning(
+                    uploaded_copernico=uploaded_copernico,
+                    uploaded_plans=uploaded_plans,
+                    database_bytes=database_bytes,
+                    origins=origins,
+                    max_tasks=int(max_tasks),
+                    run_date=run_date,
+                    blocked_cities=tuple(selected_blocked_cities),
+                    include_insumos=include_insumos,
+                    include_avl_fill=include_avl_fill,
+                    avl_doh=float(avl_doh),
+                    block_fruver_811=block_fruver_811,
+                    block_off_schedule_shipments=block_off_schedule_shipments,
+                    enable_rackeados_rule=enable_rackeados_rule,
+                    enable_closed_stores_rule=enable_closed_stores_rule,
+                    enable_regional_block_rule=enable_regional_block_rule,
+                    enable_global_blocks_rule=enable_global_blocks_rule,
+                    ignore_store_capacity=ignore_store_capacity,
+                    enable_route_cost_block_rule=enable_route_cost_block_rule,
+                    simulation_mode=simulation_mode,
+                    minimum_positive_quantity=minimum_positive_quantity,
+                    include_preventive_fill=include_preventive_fill,
+                    include_special_doh_fill=include_special_doh_fill,
+                    include_no_fountain9_coverage=include_no_fountain9_coverage,
+                    special_doh_target=float(special_doh_target),
+                    special_doh_targets=special_doh_targets,
+                    solidus_swa_priority=solidus_swa_priority,
+                    include_naked_engine=include_naked_engine,
+                    shalashaska_extra_cities=tuple(shalashaska_extra_cities),
+                    shalashaska_allow_sensitive=shalashaska_allow_sensitive,
+                    shalashaska_evacuation_fraction=shalashaska_evacuation_fraction,
+                    cover_fountain9_hardcodes=cover_fountain9_hardcodes,
+                    hardcode_zero_total=hardcode_zero_total,
+                    hardcode_inventory_below_demand=hardcode_inventory_below_demand,
+                    hardcode_low_net_transfer=hardcode_low_net_transfer,
+                    net_transfer_max=net_transfer_max,
+                    destination_stock_below=destination_stock_below,
+                    raise_small_roq_to_minimum=raise_small_roq_to_minimum,
+                    use_extra_mov_columns=use_extra_mov_columns,
+                    include_solidus_engine=include_solidus_engine,
+                    include_shalashaska_engine=include_shalashaska_engine,
+                    shalashaska_target_doh=float(shalashaska_target_doh),
+                    include_liquid_engine=include_liquid_engine,
+                    liquid_automatic_tail=liquid_automatic_tail,
+                    liquid_automatic_tail_origins=(
+                        liquid_automatic_tail_origins
+                        if include_liquid_engine and liquid_automatic_tail
+                        else set()
+                    ),
+                    liquid_tail_threshold=int(liquid_tail_threshold),
+                    liquid_manual_skus_by_origin=liquid_manual_skus_by_origin,
+                    forecast_horizon_days=int(forecast_horizon_days),
+                    excluded_skus=excluded_skus,
+                    excluded_store_ids=set(selected_excluded_stores),
+                    apply_origin_storage_override=apply_origin_storage_override,
+                    exclude_fountain9_outlier_stores=(
+                        exclude_fountain9_outlier_stores
+                    ),
+                    include_venom_engine=include_venom_engine,
+                    include_kazuhira_engine=include_kazuhira_engine,
+                    kazuhira_ignore_task_budget=kazuhira_ignore_task_budget,
+                    kazuhira_ignore_store_capacity=kazuhira_ignore_store_capacity,
+                    kazuhira_swa_priority=kazuhira_swa_priority,
+                    venom_origins=tuple(venom_origins),
+                    venom_destinations=tuple(venom_destinations),
+                    venom_section_types=frozenset(venom_section_types) - {"OOWL"},
+                    venom_lead_time_days=float(venom_lead_time_days),
+                    venom_consider_current_planning=(
+                        venom_consider_current_planning
+                    ),
+                    venom_ltf=venom_ltf,
+                    venom_vf=venom_vf,
+                    venom_min_green_units=venom_min_green_units,
+                    venom_order_cycle_days=venom_order_cycle_days,
+                    venom_trigger_zone=venom_trigger_zone,
+                    venom_subtract_lead_time_demand=venom_subtract_lead_time_demand,
+                    venom_consider_incoming=venom_consider_incoming,
+                    venom_shipping_multiple=int(venom_shipping_multiple),
+                    venom_cap_to_store_capacity=venom_cap_to_store_capacity,
+                    venom_manual_skus_by_origin=venom_manual_skus_by_origin,
+                    venom_only_manual_skus=venom_only_manual_skus,
+                )
+                status.update(label="Planeación finalizada", state="complete", expanded=False)
+            st.session_state["last_run"] = run
+        except Exception as exc:
+            st.session_state.pop("last_run", None)
+            st.error(f"No se pudo completar la planeación: {exc}")
+            st.info(
+                "Revisa el CSV, el panel de estado y que los warehouses origen existan en TIENDA."
+            )
+
+    last_run = st.session_state.get("last_run")
+    if last_run and Path(last_run["zip"]).exists():
+        render_results(last_run)
