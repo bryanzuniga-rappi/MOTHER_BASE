@@ -9226,54 +9226,33 @@ def render_engine_header(
 
 
 def render_mail_section(run: dict[str, Any]) -> None:
-    """Un solo botón: manda por correo COPÉRNICO, BASE_TRANSFERS, Sin recomendación y
-    OVERVIEW de la corrida a una lista editable de destinatarios."""
-    st.markdown('<span class="section-label">ENVIAR POR MAIL</span>', unsafe_allow_html=True)
+    """Sube el paquete ZIP de la corrida a la carpeta operativa de Drive."""
+    st.markdown('<span class="section-label">SUBIR A DRIVE</span>', unsafe_allow_html=True)
     if run.get("simulation"):
-        st.caption("Modo simulación: la corrida no generó archivos que enviar.")
+        st.caption("Modo simulación: la corrida no generó archivos que subir.")
         return
-    st.caption("Un solo correo con " + ", ".join(mail_sender.preview_names(run)) + ".")
-    recipients_text = st.text_area(
-        "Destinatarios (uno por línea)",
-        value="\n".join(mail_sender.DEFAULT_RECIPIENTS),
-        key="mb_mail_recipients",
-        height=100,
-        help="También acepta comas o punto y coma. Se envía desde la cuenta de Google autorizada en Secrets.",
-    )
-    recipients, invalid = mail_sender.parse_recipients(recipients_text)
-    if invalid:
-        st.warning("Direcciones no válidas: " + ", ".join(invalid))
+    st.caption("El paquete se guardará en Drive como " + mail_sender.drive_package_name(run) + ".")
     if st.button(
-        "Enviar por mail",
+        "Subir ZIP a Drive",
         key="mb_mail_send",
-        disabled=bool(invalid) or not recipients,
     ):
-        with st.spinner("Armando y enviando el correo…"):
+        with st.spinner("Armando y subiendo el ZIP a Drive…"):
             try:
-                result = mail_sender.send_run_package(run, recipients)
+                drive_link = mail_sender.upload_run_package_to_drive(run)
             except mail_sender.MailError as error:
                 st.error(str(error))
             except Exception as error:  # nunca debe tumbar la pantalla de resultados
-                st.error(f"No se pudo enviar el correo: {error}")
+                st.error(f"No se pudo subir el ZIP a Drive: {error}")
             else:
                 st.session_state["mb_mail_last"] = {
                     "run": str(run.get("zip")),
-                    "recipients": result.recipients,
-                    "attachments": result.attachments,
-                    "notes": result.notes,
+                    "drive_link": drive_link,
+                    "filename": mail_sender.drive_package_name(run),
                 }
     last = st.session_state.get("mb_mail_last")
     if last and last.get("run") == str(run.get("zip")):
-        sent = ", ".join(
-            f"{name} ({size / 1024 / 1024:,.1f} MB)" for name, size in last["attachments"]
-        )
-        st.success(
-            f"Correo enviado a {len(last['recipients'])} destinatario(s): "
-            + ", ".join(last["recipients"])
-            + f". Adjuntos: {sent}."
-        )
-        for note in last.get("notes", []):
-            st.caption(note)
+        st.success(f"ZIP subido a Drive: {last['filename']}")
+        st.markdown(f"[Abrir archivo en Drive]({last['drive_link']})")
 
 
 def render_engine_summary_table(

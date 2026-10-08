@@ -40,6 +40,7 @@ NO_RECOMMENDATION_NAME = "Sin_Recomendación_{date}.csv"
 OVERVIEW_NAME = "OVERVIEW_{date}.csv"
 COPERNICO_NAME = "Copernico_{warehouse}_{date}.csv"
 PACKAGE_ZIP_NAME = "Planeacion_{date}.zip"
+DRIVE_FOLDER_ID = "1SfvpuHo0uhZLQb8pG5HZuJFH0bJPMu1f"
 
 # Gmail acepta 25 MB por mensaje ya codificado en base64 (+37 %): el tope de los
 # adjuntos crudos es ~18 MB. Arriba de eso se comprimen en un solo ZIP.
@@ -128,6 +129,44 @@ def date_label(run: dict[str, Any]) -> str:
         return date.fromisoformat(str(raw)).strftime("%d-%m-%Y")
     match = re.search(r"(\d{2}-\d{2}-\d{4})", Path(str(run.get("zip", ""))).name)
     return match.group(1) if match else date.today().strftime("%d-%m-%Y")
+
+
+def drive_package_name(run: dict[str, Any]) -> str:
+    """Nombre del ZIP operativo que se subirá a la carpeta de Drive."""
+    origins = [str(int(origin)) for origin in run.get("origins", [])]
+    origins_label = "_".join(origins) or "SIN_ORIGEN"
+    return f"TR_{origins_label}_{date_label(run)}.zip"
+
+
+def upload_run_package_to_drive(run: dict[str, Any]) -> str:
+    """Arma el ZIP completo y lo sube a la carpeta de Drive operativa."""
+    package = build_package(run)
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for attachment in package.attachments:
+            archive.writestr(attachment.name, attachment.data)
+    payload = buffer.getvalue()
+    filename = drive_package_name(run)
+    try:
+        from googleapiclient.http import MediaIoBaseUpload
+        from modules.militaires_sans_frontieres import get_drive_service
+
+        service = get_drive_service()
+        metadata = {
+            "name": filename,
+            "parents": [DRIVE_FOLDER_ID],
+            "mimeType": ZIP_MIME,
+        }
+        media = MediaIoBaseUpload(io.BytesIO(payload), mimetype=ZIP_MIME, resumable=True)
+        response = service.files().create(
+            body=metadata,
+            media_body=media,
+            supportsAllDrives=True,
+            fields="id,name,webViewLink",
+        ).execute()
+    except Exception as exc:
+        raise MailError(f"No se pudo subir el ZIP a Drive: {exc}") from exc
+    return str(response.get("webViewLink") or response.get("id") or filename)
 
 
 def copernico_attachment_names(
