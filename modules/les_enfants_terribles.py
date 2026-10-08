@@ -785,6 +785,17 @@ def inject_styles() -> None:
             box-shadow: none;
         }
 
+        /* Solid paper behind the full Otacon/Kazuhira modules, including
+           their controls. The card color alone does not cover this wrapper. */
+        [class*="st-key-engine_otacon_module"],
+        [class*="st-key-engine_kazuhira_module"],
+        [class*="st-key-engine_otacon_module"] > div,
+        [class*="st-key-engine_kazuhira_module"] > div {
+            background: #fffdf7 !important;
+            background-color: #fffdf7 !important;
+            opacity: 1 !important;
+        }
+
         div[data-testid="stTextInput"] input,
         div[data-testid="stNumberInput"] input,
         div[data-testid="stDateInput"] input,
