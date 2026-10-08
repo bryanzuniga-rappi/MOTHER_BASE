@@ -784,34 +784,6 @@ def inject_styles() -> None:
             box-shadow: none;
         }
 
-        div[data-testid="stVerticalBlockBorderWrapper"]:has(.st-key-engine_otacon_card),
-        div[data-testid="stVerticalBlockBorderWrapper"]:has(.st-key-engine_kazuhira_card) {
-            background: var(--white) !important;
-            background-color: var(--white) !important;
-        }
-
-        /* Streamlit places the module key on the inner block rather than on
-           the border wrapper. Style both levels so the controls area cannot
-           fall through to the grid background. */
-        .st-key-engine_otacon_module,
-        .st-key-engine_otacon_module > div,
-        .st-key-engine_otacon_module [data-testid="stVerticalBlock"],
-        .st-key-engine_kazuhira_module,
-        .st-key-engine_kazuhira_module > div,
-        .st-key-engine_kazuhira_module [data-testid="stVerticalBlock"] {
-            background: var(--white) !important;
-            background-color: var(--white) !important;
-        }
-
-        /* Keep the complete engine module on the same paper panel.  Otacon
-           and Kazuhira contain controls below their action card, so styling
-           only the card leaves the outer module transparent over the grid. */
-        div[data-testid="stVerticalBlockBorderWrapper"]:has(.st-key-engine_otacon_card),
-        div[data-testid="stVerticalBlockBorderWrapper"]:has(.st-key-engine_kazuhira_card) {
-            background: var(--white) !important;
-            background-color: var(--white) !important;
-        }
-
         div[data-testid="stTextInput"] input,
         div[data-testid="stNumberInput"] input,
         div[data-testid="stDateInput"] input,
@@ -11380,9 +11352,7 @@ def render() -> None:
             st.session_state["mb_engine_naked_enabled"] = not include_naked_engine
             st.rerun()
     with st.container(border=True, key="engine_otacon_module"):
-        include_otacon_engine = bool(
-            st.session_state["mb_engine_otacon_enabled"]
-        )
+        include_otacon_engine = bool(st.session_state["mb_engine_otacon_enabled"])
         # Otacon must use the same engine card as every other engine.  Its
         # controls remain below the card, but the engine identity/status is
         # rendered through the shared action-card component.
@@ -11393,118 +11363,115 @@ def render() -> None:
             description=ENGINE_INFO["Otacon"]["card"],
             active=include_otacon_engine,
             tone="purple",
-            status=(
-                "ACTIVO"
-                if include_otacon_engine
-                else "INACTIVO · CLIC PARA ACTIVAR"
-            ),
+            status="ACTIVO" if include_otacon_engine else "INACTIVO · CLIC PARA ACTIVAR",
             min_height=150,
-            help_text="Haz clic en la tarjeta para activar o desactivar Otacon Engine.",
+            help_text="Otacon completa el residual después de Naked.",
         ):
             st.session_state["mb_engine_otacon_enabled"] = not include_otacon_engine
             st.rerun()
-        cover_fountain9_hardcodes = False
-        hardcode_zero_total = True
-        hardcode_inventory_below_demand = True
-        hardcode_low_net_transfer = True
-        net_transfer_max = 3.0
-        destination_stock_below = 3.0
-        raise_small_roq_to_minimum = True
-        use_extra_mov_columns = True
-        naked_left, naked_right = st.columns(2)
-        with naked_left:
-            raise_small_roq_to_minimum = st.toggle(
-                "Subir recomendaciones pequeñas al mínimo",
+        if include_otacon_engine:
+            cover_fountain9_hardcodes = False
+            hardcode_zero_total = True
+            hardcode_inventory_below_demand = True
+            hardcode_low_net_transfer = True
+            net_transfer_max = 3.0
+            destination_stock_below = 3.0
+            raise_small_roq_to_minimum = True
+            use_extra_mov_columns = True
+            naked_left, naked_right = st.columns(2)
+            with naked_left:
+                raise_small_roq_to_minimum = st.toggle(
+                    "Subir recomendaciones pequeñas al mínimo",
+                    value=True,
+                    help=(
+                        "Una recomendación positiva de Fountain9 menor al mínimo "
+                        "de unidades se sube a ese mínimo. Apagado: se envía el "
+                        "ROQ redondeado hacia arriba, sin piso."
+                    ),
+                )
+            with naked_right:
+                use_extra_mov_columns = st.toggle(
+                    "Usar columnas adicionales de MOV",
+                    value=True,
+                    help=(
+                        "El MOV efectivo es el máximo entre la columna MOV y las "
+                        "columnas opcionales del Bulk de Fountain9. Apagado: "
+                        "cuentan MOV y Allocation DOI."
+                    ),
+                )
+            cover_fountain9_hardcodes = st.toggle(
+                "Cubrir a Fountain9",
                 value=True,
                 help=(
-                    "Una recomendación positiva de Fountain9 menor al mínimo "
-                    "de unidades se sube a ese mínimo. Apagado: se envía el "
-                    "ROQ redondeado hacia arriba, sin piso."
+                    "Cuando Fountain9 no dio un ROQ positivo (MOV ≤ 0), el "
+                    "modelo igual puede armar un mínimo de unidades según "
+                    "inventario y demanda en destino. Apagar esto deja esos "
+                    "casos sin cubrir por Otacon; Solidus puede cubrirlos por "
+                    "su cuenta si aplica."
                 ),
             )
-        with naked_right:
-            use_extra_mov_columns = st.toggle(
-                "Usar columnas adicionales de MOV",
-                value=True,
-                help=(
-                    "El MOV efectivo es el máximo entre la columna MOV y las "
-                    "columnas opcionales del Bulk de Fountain9. Apagado: "
-                    "cuentan MOV y Allocation DOI."
-                ),
-            )
-        cover_fountain9_hardcodes = st.toggle(
-            "Cubrir a Fountain9",
-            value=True,
-            help=(
-                "Cuando Fountain9 no dio un ROQ positivo (MOV ≤ 0), el "
-                "modelo igual puede armar un mínimo de unidades según "
-                "inventario y demanda en destino. Apagar esto deja esos "
-                "casos sin cubrir por Otacon; Solidus puede cubrirlos por "
-                "su cuenta si aplica."
-            ),
-        )
-        if cover_fountain9_hardcodes:
-            rule_left, rule_center, rule_right = st.columns(3)
-            with rule_left:
-                hardcode_zero_total = st.toggle(
-                    "Cubrir forecast y stock en cero",
-                    value=True,
-                    help=(
-                        "Regla HARDCODE_4_CERO_TOTAL: demanda y opening "
-                        "predichos en cero."
-                    ),
-                )
-            with rule_center:
-                hardcode_inventory_below_demand = st.toggle(
-                    "Cubrir inventario menor a la demanda",
-                    value=True,
-                    help=(
-                        "Regla HARDCODE_3_INVENTARIO_MENOR_DEMANDA: ROQ no "
-                        "positivo y opening predicho menor a la demanda."
-                    ),
-                )
-            with rule_right:
-                hardcode_low_net_transfer = st.toggle(
-                    "Cubrir net transfer bajo",
-                    value=True,
-                    help=(
-                        "Regla HARDCODE_3_NET_TRANSFER_BAJO: ROQ no positivo, "
-                        "net transfer bajo y poco stock en destino."
-                    ),
-                )
-            if hardcode_low_net_transfer:
-                net_left, net_right = st.columns(2)
-                with net_left:
-                    net_transfer_max = float(
-                        st.number_input(
-                            "Net transfer máximo (unidades)",
-                            min_value=0.0,
-                            max_value=50.0,
-                            value=3.0,
-                            step=1.0,
-                            help="La regla aplica con net transfer menor o igual a este valor.",
-                        )
+            if cover_fountain9_hardcodes:
+                rule_left, rule_center, rule_right = st.columns(3)
+                with rule_left:
+                    hardcode_zero_total = st.toggle(
+                        "Cubrir forecast y stock en cero",
+                        value=True,
+                        help=(
+                            "Regla HARDCODE_4_CERO_TOTAL: demanda y opening "
+                            "predichos en cero."
+                        ),
                     )
-                with net_right:
-                    destination_stock_below = float(
-                        st.number_input(
-                            "Stock destino menor a (unidades)",
-                            min_value=0.0,
-                            max_value=50.0,
-                            value=3.0,
-                            step=1.0,
-                            help="La regla aplica con stock en destino estrictamente menor a este valor.",
-                        )
+                with rule_center:
+                    hardcode_inventory_below_demand = st.toggle(
+                        "Cubrir inventario menor a la demanda",
+                        value=True,
+                        help=(
+                            "Regla HARDCODE_3_INVENTARIO_MENOR_DEMANDA: ROQ no "
+                            "positivo y opening predicho menor a la demanda."
+                        ),
                     )
-
-    include_avl_fill = False
-    include_preventive_fill = False
-    include_special_doh_fill = False
-    include_no_fountain9_coverage = False
-    avl_doh = 3.0
-    special_doh_target = 3.0
-    special_doh_targets: dict[str, float] = {}
-    solidus_swa_priority = True
+                with rule_right:
+                    hardcode_low_net_transfer = st.toggle(
+                        "Cubrir net transfer bajo",
+                        value=True,
+                        help=(
+                            "Regla HARDCODE_3_NET_TRANSFER_BAJO: ROQ no positivo, "
+                            "net transfer bajo y poco stock en destino."
+                        ),
+                    )
+                if hardcode_low_net_transfer:
+                    net_left, net_right = st.columns(2)
+                    with net_left:
+                        net_transfer_max = float(
+                            st.number_input(
+                                "Net transfer máximo (unidades)",
+                                min_value=0.0,
+                                max_value=50.0,
+                                value=3.0,
+                                step=1.0,
+                                help="La regla aplica con net transfer menor o igual a este valor.",
+                            )
+                        )
+                    with net_right:
+                        destination_stock_below = float(
+                            st.number_input(
+                                "Stock destino menor a (unidades)",
+                                min_value=0.0,
+                                max_value=50.0,
+                                value=3.0,
+                                step=1.0,
+                                help="La regla aplica con stock en destino estrictamente menor a este valor.",
+                            )
+                        )
+    
+        include_avl_fill = False
+        include_preventive_fill = False
+        include_special_doh_fill = False
+        include_no_fountain9_coverage = False
+        avl_doh = 3.0
+        special_doh_target = 3.0
+        special_doh_targets: dict[str, float] = {}
+        solidus_swa_priority = True
     with st.container(border=True, key="engine_solidus_module"):
         if is_raiden:
             st.session_state["mb_engine_solidus_enabled"] = False
