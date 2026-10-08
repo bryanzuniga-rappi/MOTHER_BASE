@@ -784,6 +784,15 @@ def inject_styles() -> None:
             box-shadow: none;
         }
 
+        /* Keep the complete engine module on the same paper panel.  Otacon
+           and Kazuhira contain controls below their action card, so styling
+           only the card leaves the outer module transparent over the grid. */
+        div[data-testid="stVerticalBlockBorderWrapper"]:has(.st-key-engine_otacon_card),
+        div[data-testid="stVerticalBlockBorderWrapper"]:has(.st-key-engine_kazuhira_card) {
+            background: var(--white) !important;
+            background-color: var(--white) !important;
+        }
+
         div[data-testid="stTextInput"] input,
         div[data-testid="stNumberInput"] input,
         div[data-testid="stDateInput"] input,
