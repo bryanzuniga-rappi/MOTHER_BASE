@@ -49,8 +49,8 @@ def render_required_google_oauth() -> bool:
     st.caption("Este permiso habilita Drive y Gmail para subir resultados y enviar únicamente el enlace por correo.")
     drive_token = configured_oauth_refresh_token()
     mail_token = configured_mail_oauth_refresh_token()
-    if drive_token and mail_token:
-        st.success("OAuth configurado: Drive y Gmail autorizados.")
+    if drive_token or mail_token:
+        st.success("OAuth configurado en Secrets. Puedes entrar a MOTHER BASE.")
         return True
     if not oauth_is_configured():
         st.error(
@@ -68,6 +68,7 @@ def render_required_google_oauth() -> bool:
                 if token:
                     st.success("Copia este refresh token en Secrets como MAIL_OAUTH_REFRESH_TOKEN y recarga la app.")
                     st.code(token, language=None)
+                    st.query_params.clear()
                 else:
                     st.error("Google no devolvió refresh token; revoca el acceso anterior y vuelve a autorizar.")
             except RuntimeError as error:
