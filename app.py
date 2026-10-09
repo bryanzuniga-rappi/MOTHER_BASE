@@ -98,8 +98,6 @@ def render_big_boss_authentication() -> None:
 
 
 def render_gateway() -> None:
-    if not render_required_google_oauth():
-        return
     render_system_stamp("TACTICAL SUPPLY SYSTEM / ACCESS GATE")
     st.markdown(
         """

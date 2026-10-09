@@ -274,6 +274,34 @@ def get_drive_service():
         raise RuntimeError(f"No pude iniciar el cliente de Drive: {exc}") from exc
 
 
+def get_drive_upload_service():
+    """Cliente de Drive exclusivamente para subir los ZIP de resultados.
+
+    Las subidas no dependen del OAuth de Gmail/usuario: usan la cuenta de
+    servicio configurada en ``[gcp_service_account]``. Así un refresh token
+    expirado o revocado no bloquea la entrega del ZIP.
+    """
+    info = _drive_service_account_info()
+    if not info:
+        raise RuntimeError(
+            "Falta configurar [gcp_service_account] en Secrets para subir el ZIP."
+        )
+    try:
+        credentials = service_account.Credentials.from_service_account_info(
+            info, scopes=DRIVE_SCOPES
+        )
+        impersonate_email = configured_impersonate_email()
+        if impersonate_email:
+            credentials = credentials.with_subject(impersonate_email)
+        return build_drive_service(
+            "drive", "v3", credentials=credentials, cache_discovery=False
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"No pude iniciar la cuenta de servicio para subir el ZIP: {exc}"
+        ) from exc
+
+
 def _resolve_shared_drive_id(service, folder_id: str) -> str | None:
     """Devuelve el ID del Drive compartido que contiene ``folder_id``, o None si es una
     carpeta normal de Mi unidad.

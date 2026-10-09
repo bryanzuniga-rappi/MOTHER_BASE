@@ -157,9 +157,9 @@ def upload_run_package_to_drive(run: dict[str, Any]) -> str:
     filename = drive_package_name(run)
     try:
         from googleapiclient.http import MediaIoBaseUpload
-        from modules.militaires_sans_frontieres import get_drive_service
+        from modules.militaires_sans_frontieres import get_drive_upload_service
 
-        service = get_drive_service()
+        service = get_drive_upload_service()
         metadata = {
             "name": filename,
             "parents": [DRIVE_FOLDER_ID],

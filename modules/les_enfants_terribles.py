@@ -9231,40 +9231,27 @@ def render_mail_section(run: dict[str, Any]) -> None:
         st.caption("Modo simulación: la corrida no generó archivos que subir.")
         return
     st.caption("El paquete se guardará en Drive como " + mail_sender.drive_package_name(run) + ".")
-    recipients_text = st.text_area(
-        "Destinatarios de la notificación (uno por línea)",
-        value="\n".join(mail_sender.DEFAULT_RECIPIENTS),
-        key="mb_drive_notification_recipients",
-        height=90,
-        help="Recibirán solo un enlace al ZIP en Drive; no se adjuntan archivos.",
-    )
-    recipients, invalid = mail_sender.parse_recipients(recipients_text)
-    if invalid:
-        st.warning("Direcciones no válidas: " + ", ".join(invalid))
     if st.button(
-        "Subir a Drive y notificar",
+        "Subir ZIP a Drive",
         key="mb_mail_send",
-        disabled=bool(invalid) or not recipients,
     ):
-        with st.spinner("Subiendo el ZIP a Drive y enviando la notificación…"):
+        with st.spinner("Subiendo el ZIP a Drive…"):
             try:
                 drive_link = mail_sender.upload_run_package_to_drive(run)
-                mail_sender.send_drive_notification(run, recipients, drive_link)
             except mail_sender.MailError as error:
                 st.error(str(error))
             except Exception as error:  # nunca debe tumbar la pantalla de resultados
-                st.error(f"No se pudo completar la subida/notificación: {error}")
+                st.error(f"No se pudo subir el ZIP a Drive: {error}")
             else:
                 st.session_state["mb_mail_last"] = {
                     "run": str(run.get("zip")),
                     "drive_link": drive_link,
                     "filename": mail_sender.drive_package_name(run),
-                    "recipients": recipients,
                 }
     last = st.session_state.get("mb_mail_last")
     if last and last.get("run") == str(run.get("zip")):
         st.success(
-            f"ZIP subido a Drive y notificación enviada a: {', '.join(last['recipients'])}"
+            "ZIP subido a Drive. Apps Script enviará la notificación."
         )
         st.markdown(f"[Abrir archivo en Drive]({last['drive_link']})")
 
