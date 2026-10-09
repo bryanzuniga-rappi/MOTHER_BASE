@@ -793,7 +793,6 @@ def inject_styles() -> None:
         [class*="st-key-engine_kazuhira_module"] > div {
             background: #fffdf7 !important;
             background-color: #fffdf7 !important;
-            opacity: 1 !important;
         }
 
         div[data-testid="stTextInput"] input,

@@ -138,6 +138,11 @@ def drive_package_name(run: dict[str, Any]) -> str:
     return f"TR_{origins_label}_{date_label(run)}.zip"
 
 
+def configured_mail_oauth_refresh_token() -> str:
+    """Refresh token autorizado también para Gmail (no solo para Drive)."""
+    return _secrets().get("MAIL_OAUTH_REFRESH_TOKEN", "")
+
+
 def upload_run_package_to_drive(run: dict[str, Any]) -> str:
     """Arma el ZIP completo y lo sube a la carpeta de Drive operativa."""
     buffer = io.BytesIO()

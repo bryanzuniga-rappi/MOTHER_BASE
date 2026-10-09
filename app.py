@@ -42,12 +42,14 @@ def render_required_google_oauth() -> bool:
         exchange_oauth_code_for_tokens,
         oauth_is_configured,
     )
+    from modules.mail_sender import configured_mail_oauth_refresh_token
 
     st.markdown('<span class="section-label">AUTORIZACIÓN OBLIGATORIA</span>', unsafe_allow_html=True)
     st.subheader("Conecta Google antes de entrar a MOTHER BASE")
     st.caption("Este permiso habilita Drive y Gmail para subir resultados y enviar únicamente el enlace por correo.")
-    refresh_token = configured_oauth_refresh_token()
-    if refresh_token:
+    drive_token = configured_oauth_refresh_token()
+    mail_token = configured_mail_oauth_refresh_token()
+    if drive_token and mail_token:
         st.success("OAuth configurado: Drive y Gmail autorizados.")
         return True
     if not oauth_is_configured():
@@ -64,7 +66,7 @@ def render_required_google_oauth() -> bool:
                 tokens = exchange_oauth_code_for_tokens(oauth_code)
                 token = tokens.get("refresh_token")
                 if token:
-                    st.success("Copia este refresh token en Secrets como DATA_DASHBOARD_OAUTH_REFRESH_TOKEN y recarga la app.")
+                    st.success("Copia este refresh token en Secrets como MAIL_OAUTH_REFRESH_TOKEN y recarga la app.")
                     st.code(token, language=None)
                 else:
                     st.error("Google no devolvió refresh token; revoca el acceso anterior y vuelve a autorizar.")
