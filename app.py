@@ -114,6 +114,41 @@ def render_home() -> None:
         unsafe_allow_html=True,
     )
     st.write("")
+    with st.expander("Conectar Google para Drive y notificaciones", expanded=False):
+        from modules.militaires_sans_frontieres import (
+            build_oauth_authorization_url,
+            exchange_oauth_code_for_tokens,
+            oauth_is_configured,
+        )
+        st.caption(
+            "Autoriza Drive y Gmail antes de ejecutar una planeación. El refresh "
+            "token se guarda en Secrets como DATA_DASHBOARD_OAUTH_REFRESH_TOKEN."
+        )
+        if not oauth_is_configured():
+            st.warning(
+                "Configura DATA_DASHBOARD_OAUTH_CLIENT_ID, "
+                "DATA_DASHBOARD_OAUTH_CLIENT_SECRET y "
+                "DATA_DASHBOARD_OAUTH_REDIRECT_URI en Secrets."
+            )
+        else:
+            oauth_code = st.query_params.get("code")
+            if oauth_code:
+                if st.button("Completar conexión OAuth", key="home_oauth_exchange"):
+                    try:
+                        tokens = exchange_oauth_code_for_tokens(oauth_code)
+                        refresh_token = tokens.get("refresh_token")
+                        if refresh_token:
+                            st.success("Copia este refresh token en Secrets:")
+                            st.code(refresh_token, language=None)
+                        else:
+                            st.error("Google no devolvió un refresh token. Revoca el acceso anterior y vuelve a autorizar.")
+                    except RuntimeError as error:
+                        st.error(str(error))
+            else:
+                st.link_button(
+                    "Conectar mi cuenta personal de Google",
+                    build_oauth_authorization_url(),
+                )
     planning_column, reporting_column = st.columns(2, gap="large")
     with planning_column:
         if render_action_card(

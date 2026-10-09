@@ -9232,38 +9232,6 @@ def render_mail_section(run: dict[str, Any]) -> None:
         st.caption("Modo simulación: la corrida no generó archivos que subir.")
         return
     st.caption("El paquete se guardará en Drive como " + mail_sender.drive_package_name(run) + ".")
-    with st.expander("Conectar mi cuenta personal de Google (OAuth)", expanded=False):
-        from modules.militaires_sans_frontieres import (
-            build_oauth_authorization_url,
-            exchange_oauth_code_for_tokens,
-            oauth_is_configured,
-        )
-        st.caption(
-            "Autoriza Drive y Gmail desde aquí. Después pega el refresh token "
-            "en Secrets; no necesitas ir al módulo Militaires Sans Frontières."
-        )
-        if not oauth_is_configured():
-            st.warning(
-                "Configura DATA_DASHBOARD_OAUTH_CLIENT_ID, "
-                "DATA_DASHBOARD_OAUTH_CLIENT_SECRET y "
-                "DATA_DASHBOARD_OAUTH_REDIRECT_URI en Secrets."
-            )
-        else:
-            oauth_code = st.query_params.get("code")
-            if oauth_code:
-                if st.button("Completar conexión OAuth", key="mb_oauth_exchange"):
-                    try:
-                        tokens = exchange_oauth_code_for_tokens(oauth_code)
-                        refresh_token = tokens.get("refresh_token")
-                        if refresh_token:
-                            st.success("Copia este refresh token en Secrets como DATA_DASHBOARD_OAUTH_REFRESH_TOKEN.")
-                            st.code(refresh_token, language=None)
-                        else:
-                            st.error("Google no devolvió un refresh token. Revoca el acceso anterior y vuelve a autorizar.")
-                    except RuntimeError as error:
-                        st.error(str(error))
-            else:
-                st.link_button("Conectar mi cuenta personal de Google", build_oauth_authorization_url())
     recipients_text = st.text_area(
         "Destinatarios de la notificación (uno por línea)",
         value="\n".join(mail_sender.DEFAULT_RECIPIENTS),
