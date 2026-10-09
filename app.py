@@ -34,6 +34,52 @@ MODULE_PLANNING = "LES ENFANTS TERRIBLES"
 MODULE_REPORTS = "MILITAIRES SANS FRONTIÈRES"
 
 
+def render_required_google_oauth() -> bool:
+    """Gate obligatorio: no permite acceso sin OAuth Drive + Gmail configurado."""
+    from modules.militaires_sans_frontieres import (
+        build_oauth_authorization_url,
+        configured_oauth_refresh_token,
+        exchange_oauth_code_for_tokens,
+        oauth_is_configured,
+    )
+
+    refresh_token = configured_oauth_refresh_token()
+    if refresh_token:
+        return True
+    st.warning(
+        "Debes conectar Google antes de entrar a MOTHER BASE. "
+        "La autorización requiere Drive y Gmail para subir resultados y enviar "
+        "solo el enlace por correo."
+    )
+    with st.expander("Conectar Google para continuar", expanded=True):
+        if not oauth_is_configured():
+            st.error(
+                "Configura DATA_DASHBOARD_OAUTH_CLIENT_ID, "
+                "DATA_DASHBOARD_OAUTH_CLIENT_SECRET y "
+                "DATA_DASHBOARD_OAUTH_REDIRECT_URI en Secrets."
+            )
+            return False
+        oauth_code = st.query_params.get("code")
+        if oauth_code:
+            if st.button("Completar conexión OAuth", key="gateway_oauth_exchange"):
+                try:
+                    tokens = exchange_oauth_code_for_tokens(oauth_code)
+                    token = tokens.get("refresh_token")
+                    if token:
+                        st.success(
+                            "Copia este refresh token en Secrets como "
+                            "DATA_DASHBOARD_OAUTH_REFRESH_TOKEN y recarga la app."
+                        )
+                        st.code(token, language=None)
+                    else:
+                        st.error("Google no devolvió refresh token; revoca el acceso anterior y vuelve a autorizar.")
+                except RuntimeError as error:
+                    st.error(str(error))
+        else:
+            st.link_button("Autorizar Drive y Gmail", build_oauth_authorization_url())
+    return False
+
+
 @st.dialog("BIG BOSS · ACCESS CONTROL", width="small")
 def render_big_boss_authentication() -> None:
     st.caption("Ingresa el código de acceso para desbloquear Mother Base.")
@@ -54,6 +100,8 @@ def render_big_boss_authentication() -> None:
 
 
 def render_gateway() -> None:
+    if not render_required_google_oauth():
+        return
     render_system_stamp("TACTICAL SUPPLY SYSTEM / ACCESS GATE")
     st.markdown(
         """
