@@ -140,7 +140,7 @@ def drive_package_name(run: dict[str, Any]) -> str:
 
 def configured_mail_oauth_refresh_token() -> str:
     """Refresh token autorizado también para Gmail (no solo para Drive)."""
-    return _secrets().get("MAIL_OAUTH_REFRESH_TOKEN", "")
+    return _read_streamlit_secrets().get("MAIL_OAUTH_REFRESH_TOKEN", "")
 
 
 def upload_run_package_to_drive(run: dict[str, Any]) -> str:
