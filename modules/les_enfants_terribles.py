@@ -245,10 +245,11 @@ SHEET_DESCRIPTIONS = {
     ),
     "SCHEDULE": (
         "Frecuencia de envío permitida por combinación de WAREHOUSE_ID destino "
-        "y ORIGEN. El toggle 'Bloquear envíos fuera de frecuencia' de CODEC usa "
-        "esta hoja para impedir que un origen envíe a una tienda en un día no "
-        "programado. Un par destino-origen ausente de SCHEDULE no tiene "
-        "restricción de frecuencia."
+        "y ORIGEN; cuando existe STORAGE_TYPE, la frecuencia se aplica al SKU "
+        "según su condición (Room Temperature, Refrigerated o Freezer). El "
+        "toggle 'Bloquear envíos fuera de frecuencia' de CODEC usa esta hoja "
+        "para impedir envíos en un día no programado. Un par destino-origen "
+        "ausente de SCHEDULE no tiene restricción de frecuencia."
     ),
     "DATA": (
         "Catálogo maestro de producto (nombre, categoría, marca, maker, EAN, "
@@ -2205,7 +2206,7 @@ def _diagnose_uncovered_bucket_reason(
         ):
             per_origin_reasons.append(f"{source}: BLOQUEO REGIONAL")
             continue
-        if engine.is_schedule_blocked(catalogs, source, destination):
+        if engine.is_schedule_blocked(catalogs, source, destination, sku):
             per_origin_reasons.append(f"{source}: BLOQUEO POR FRECUENCIA")
             continue
         if (destination, sku) in catalogs.route_cost_blocks:
@@ -2514,7 +2515,7 @@ def append_insumos_to_bulk_444(
         ):
             summary["lines_blocked_regional"] += 1
             continue
-        if engine.is_schedule_blocked(catalogs, 444, destination):
+        if engine.is_schedule_blocked(catalogs, 444, destination, sku):
             summary["lines_blocked_schedule"] += 1
             continue
         selected_requested.append(row)
@@ -5683,7 +5684,7 @@ def apply_avl_fill(
                 city_norm,
                 is_golden,
             )
-            schedule_block = engine.is_schedule_blocked(catalogs, source, destination)
+            schedule_block = engine.is_schedule_blocked(catalogs, source, destination, sku)
             regional_blocks[source] = regional_block
             schedule_blocks[source] = schedule_block
             if regional_block or schedule_block:
@@ -5710,7 +5711,7 @@ def apply_avl_fill(
                 is_golden,
             )
             schedule_blocks[source] = engine.is_schedule_blocked(
-                catalogs, source, destination
+                catalogs, source, destination, sku
             )
 
         available_task_slots = (

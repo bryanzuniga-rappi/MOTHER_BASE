@@ -461,7 +461,7 @@ def apply_venom_engine(
                     "is_golden"
                 ],
             )
-            and not engine.is_schedule_blocked(catalogs, source, destination)
+            and not engine.is_schedule_blocked(catalogs, source, destination, sku)
         ]
         blocked_origin_count = len(manual_origins_by_sku.get(sku) or venom_origins) - len(
             eligible_origins
@@ -665,7 +665,7 @@ def apply_venom_engine(
                         store.get("city_norm", ""),
                         profile["is_golden"],
                     )
-                    and not engine.is_schedule_blocked(catalogs, source, destination)
+                    and not engine.is_schedule_blocked(catalogs, source, destination, sku)
                 ]
                 if not eligible_origins:
                     summary["skipped_regional_block"] += 1

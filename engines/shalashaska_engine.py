@@ -410,7 +410,7 @@ def apply_shalashaska_engine(
                 catalogs, source, destination, sku, city_norm, is_golden
             ):
                 continue
-            if engine.is_schedule_blocked(catalogs, source, destination):
+            if engine.is_schedule_blocked(catalogs, source, destination, sku):
                 continue
             priority_rank = min(priority_rank, priority_profile["rank"])
         candidate.update(
@@ -480,7 +480,7 @@ def apply_shalashaska_engine(
             ):
                 summary["skipped_regional_block"] += 1
                 continue
-            if engine.is_schedule_blocked(catalogs, source, destination):
+            if engine.is_schedule_blocked(catalogs, source, destination, sku):
                 summary["skipped_schedule_block"] += 1
                 continue
 

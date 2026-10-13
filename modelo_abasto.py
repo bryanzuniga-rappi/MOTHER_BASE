@@ -261,6 +261,7 @@ def iter_schedule_records(workbook) -> Iterator[dict[str, Any]]:
         "ORIGEN": "ORIGEN",
         "DAYS": "DAYS",
     }
+    optional_aliases = {"STORAGE_TYPE": "STORAGETYPE"}
     header_row: int | None = None
     positions: dict[str, int] = {}
     for row_number, row in enumerate(
@@ -272,6 +273,8 @@ def iter_schedule_records(workbook) -> Iterator[dict[str, Any]]:
             for target, alias in alias_targets.items():
                 if squashed == alias and target not in found:
                     found[target] = column_index
+            if squashed == optional_aliases["STORAGE_TYPE"]:
+                found["STORAGE_TYPE"] = column_index
         if set(alias_targets) <= set(found):
             header_row, positions = row_number, found
             break
@@ -291,6 +294,11 @@ def iter_schedule_records(workbook) -> Iterator[dict[str, Any]]:
                 row[positions["ORIGEN"]] if positions["ORIGEN"] < len(row) else None
             ),
             "DAYS": row[positions["DAYS"]] if positions["DAYS"] < len(row) else None,
+            "STORAGE_TYPE": (
+                row[positions["STORAGE_TYPE"]]
+                if positions.get("STORAGE_TYPE", len(row)) < len(row)
+                else None
+            ),
         }
         if any(clean_text(value) for value in record.values()):
             yield record
@@ -656,6 +664,10 @@ class Catalogs:
     owner_stock: dict[tuple[int, int, str], int] = field(default_factory=dict)
     # SCHEDULE: (WAREHOUSE_ID destino, ORIGEN) -> días permitidos normalizados.
     schedule_days: dict[tuple[int, int], frozenset[str]] = field(
+        default_factory=dict
+    )
+    # SCHEDULE con STORAGE_TYPE: (destino, origen, storage_type) -> días.
+    schedule_days_by_storage: dict[tuple[int, int, str], frozenset[str]] = field(
         default_factory=dict
     )
     # Toggle de CODEC "Bloquear envíos fuera de frecuencia". Apagado por
@@ -1065,6 +1077,7 @@ def load_catalogs(
         # Cada par destino-origen de SCHEDULE es independiente y opcional; la
         # ausencia de la hoja en sí no bloquea la carga (ver iter_schedule_records).
         schedule_days: dict[tuple[int, int], frozenset[str]] = {}
+        schedule_days_by_storage: dict[tuple[int, int, str], frozenset[str]] = {}
         for row in iter_schedule_records(workbook):
             destination = to_id(row["WAREHOUSE_ID"], "SCHEDULE.WAREHOUSE_ID", True)
             origin = to_id(row["ORIGEN"], "SCHEDULE.ORIGEN", True)
@@ -1083,7 +1096,16 @@ def load_catalogs(
             if not days_set:
                 continue
             key = (destination, origin)
-            if key in schedule_days and schedule_days[key] != days_set:
+            storage_type = clean_text(row.get("STORAGE_TYPE"))
+            if storage_type:
+                typed_key = (destination, origin, storage_type.casefold())
+                schedule_days_by_storage[typed_key] = (
+                    schedule_days_by_storage.get(typed_key, frozenset()) | days_set
+                )
+                # The generic map is also maintained as a union so the store
+                # universe can still be built before a SKU is known.
+                schedule_days[key] = schedule_days.get(key, frozenset()) | days_set
+            elif key in schedule_days and schedule_days[key] != days_set:
                 warnings.append(
                     f"SCHEDULE: WAREHOUSE_ID {destination} + ORIGEN {origin} "
                     "aparece más de una vez con días distintos; se combinaron "
@@ -1145,7 +1167,7 @@ def load_catalogs(
                 f"El origen {origin} no existe en TIENDA; no puedo evaluar bloqueos regionales"
             )
 
-    return Catalogs(
+        return Catalogs(
         volume_m3=volume_m3,
         blocked_products=blocked_products,
         route_cost_blocks=route_cost_blocks,
@@ -1172,7 +1194,8 @@ def load_catalogs(
         golden_products=golden_products,
         anchor_products=anchor_products,
         owner_stock=dict(owner_stock),
-        schedule_days=schedule_days,
+            schedule_days=schedule_days,
+            schedule_days_by_storage=schedule_days_by_storage,
         run_weekday_norm=run_weekday_norm,
         copernico_unusable_by_reason=copernico_unusable_by_reason,
         globally_blocked_skus=globally_blocked_skus,
@@ -1718,11 +1741,20 @@ def is_regional_block(
     )
 
 
-def is_schedule_blocked(catalogs: Catalogs, source: int, destination: int) -> bool:
-    """Bloquea un origen-destino si hoy no es un día permitido en SCHEDULE."""
+def is_schedule_blocked(
+    catalogs: Catalogs, source: int, destination: int, sku: int | None = None
+) -> bool:
+    """Bloquea según SCHEDULE, usando la fila del STORAGE_TYPE del SKU."""
     if not catalogs.schedule_block_enabled:
         return False
-    allowed_days = catalogs.schedule_days.get((destination, source))
+    allowed_days = None
+    if sku is not None:
+        storage_type = source_storage_type(catalogs, source, sku).casefold()
+        allowed_days = catalogs.schedule_days_by_storage.get(
+            (destination, source, storage_type)
+        )
+    if not allowed_days:
+        allowed_days = catalogs.schedule_days.get((destination, source))
     if not allowed_days:
         return False
     return catalogs.run_weekday_norm not in allowed_days
@@ -1953,7 +1985,7 @@ def plan_transfers(
                 is_golden,
             )
             schedule_blocks[source] = is_schedule_blocked(
-                catalogs, source, destination
+                catalogs, source, destination, sku
             )
 
         allocations: list[tuple[int, int]] = []
@@ -2327,7 +2359,7 @@ def plan_transfers(
                 row["CITY_NORMALIZED"],
                 row["ES_GOLDEN"],
             )
-            schedule_blocked = is_schedule_blocked(catalogs, source, destination)
+            schedule_blocked = is_schedule_blocked(catalogs, source, destination, sku)
             second_pass_blocks[source] = blocked
             second_pass_schedule_blocks[source] = schedule_blocked
             if blocked or schedule_blocked:
