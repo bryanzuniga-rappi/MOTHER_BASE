@@ -1998,11 +1998,12 @@ def plan_transfers(
         capacity_target = 0
 
         forced_source = row.get("FORCED_SOURCE")
-        is_forced = "FORCED_SOURCE" in row
+        # Fountain9 puede traer un source vacío o que ya no existe. Eso no
+        # invalida la necesidad: en ese caso la línea vuelve al conjunto
+        # completo de orígenes y se cubre desde cualquier stock utilizable.
+        forced_source_valid = forced_source in config.origin_warehouses
+        is_forced = "FORCED_SOURCE" in row and forced_source_valid
         allow_partial = bool(row.get("ALLOW_PARTIAL", False))
-        forced_source_valid = (
-            not is_forced or forced_source in config.origin_warehouses
-        )
         eligible_sources = (
             (int(forced_source),)
             if is_forced and forced_source_valid
@@ -2012,15 +2013,6 @@ def plan_transfers(
         if target <= 0:
             tipo_corte = "SIN DEMANDA"
             detalle_motivo = "MOV cero y no activa reglas de hardcode"
-        elif is_forced and not forced_source_valid:
-            tipo_corte = "F9 SIN ORIGEN" if forced_source is None else "F9 ORIGEN INVALIDO"
-            detalle_motivo = (
-                "Fountain9 no indicó Source Id Before Multi Source"
-                if forced_source is None
-                else f"El origen Fountain9 {forced_source} no está configurado"
-            )
-            passes_capacity = False
-            passes_tasks = False
         elif not city_norm:
             tipo_corte = "ERROR DE DATOS"
             detalle_motivo = "El warehouse destino no existe en TIENDA"
