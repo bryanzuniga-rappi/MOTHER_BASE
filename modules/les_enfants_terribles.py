@@ -1731,7 +1731,13 @@ def build_naked_fountain9_rows(
     instructions: list[dict[str, Any]],
     plan_rows: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Arma la cola estricta de Naked desde Allocation (DOI Based)."""
+    """Arma la cola Naked desde Allocation (DOI Based).
+
+    Fountain9 define la necesidad (destino, SKU y cantidad). Naked consume el
+    inventario desde todos los orígenes del CODEC, respetando exactamente el
+    orden elegido por el usuario; la fuente original de Fountain9 se conserva
+    exclusivamente para auditoría.
+    """
     by_key = {
         (int(row["WAREHOUSE_DESTINATION"]), int(row["RETAIL_ID"])): row
         for row in plan_rows
@@ -1749,6 +1755,7 @@ def build_naked_fountain9_rows(
                 "FORCED_SOURCE": instruction.get("WAREHOUSE_SOURCE"),
                 "FORCED_RULE": "FOUNTAIN9_DOI",
                 "ALLOW_PARTIAL": True,
+                "SOURCE_PRIORITY_CODEC": True,
             }
         )
         naked_rows.append(base)

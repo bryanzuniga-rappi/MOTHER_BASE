@@ -58,6 +58,30 @@ def test_invalid_origin_never_falls_back(source, cause):
     assert cause in result.base_rows[0]["TIPO_DE_CORTE"]
 
 
+def test_naked_uses_full_codec_order_instead_of_fountain9_source():
+    """F9 conserva la referencia 811; Naked toma primero el 444 del CODEC."""
+    result = engine.plan_transfers(
+        [row(3, source=811, SOURCE_PRIORITY_CODEC=True)],
+        catalogs(stock_base={(444, 10): 3, (811, 10): 20}),
+        engine.Config(origin_warehouses=(444, 811)),
+    )
+    assert [(line["WAREHOUSE_SOURCE"], line["QUANTITY"])
+            for line in result.allocation_rows] == [(444, 3)]
+    assert result.base_rows[0]["F9_SOURCE"] == 811
+
+
+def test_naked_splits_partial_coverage_in_full_codec_order():
+    """Naked agota 444 y completa el saldo desde 811 en la misma pasada."""
+    result = engine.plan_transfers(
+        [row(3, source=811, SOURCE_PRIORITY_CODEC=True)],
+        catalogs(stock_base={(444, 10): 2, (811, 10): 20}),
+        engine.Config(origin_warehouses=(444, 811)),
+    )
+    assert [(line["WAREHOUSE_SOURCE"], line["QUANTITY"])
+            for line in result.allocation_rows] == [(444, 2), (811, 1)]
+    assert result.base_rows[0]["CANTIDAD_ASIGNADA"] == 3
+
+
 def test_residual_reuses_task_and_capacity_without_double_consumption():
     cat = catalogs(store_capacity={100: 10})
     config = engine.Config(origin_warehouses=(444,), max_tasks=1)

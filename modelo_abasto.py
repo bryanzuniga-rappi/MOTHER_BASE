@@ -1998,11 +1998,20 @@ def plan_transfers(
         capacity_target = 0
 
         forced_source = row.get("FORCED_SOURCE")
+        # Naked conserva la cantidad/destino/SKU definidos por Fountain9,
+        # pero consume los orígenes configurados en el CODEC en su orden.
+        # La fuente Fountain9 queda como referencia para auditoría. El resto
+        # de usos históricos de FORCED_SOURCE conserva el origen estricto.
+        prioritize_codec_sources = bool(row.get("SOURCE_PRIORITY_CODEC", False))
         # Fountain9 puede traer un source vacío o que ya no existe. Eso no
         # invalida la necesidad: en ese caso la línea vuelve al conjunto
         # completo de orígenes y se cubre desde cualquier stock utilizable.
         forced_source_valid = forced_source in config.origin_warehouses
-        is_forced = "FORCED_SOURCE" in row and forced_source_valid
+        is_forced = (
+            not prioritize_codec_sources
+            and "FORCED_SOURCE" in row
+            and forced_source_valid
+        )
         allow_partial = bool(row.get("ALLOW_PARTIAL", False))
         eligible_sources = (
             (int(forced_source),)
