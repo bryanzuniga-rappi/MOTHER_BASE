@@ -1,6 +1,6 @@
 """Militaires Sans Frontières — primera capa de asignación de rutas."""
 from __future__ import annotations
-import csv, io, urllib.request
+import csv, io, os, urllib.request
 from datetime import datetime
 from pathlib import Path
 import openpyxl
@@ -11,8 +11,15 @@ def _inject_style():
     st.markdown('<style>.msf-shell{border:3px solid #111;background:#fffdf5;padding:28px;box-shadow:8px 8px 0 #111;margin-bottom:28px}.msf-label{display:inline-block;background:#5f7cff;color:#111;border:3px solid #111;padding:8px 12px;font-weight:800;letter-spacing:.08em}.msf-note{border:2px solid #111;background:#e8edff;padding:14px;margin-top:16px}</style>', unsafe_allow_html=True)
 
 def _secret(name):
-    try: return str(st.secrets.get(name, '')).strip()
-    except Exception: return ''
+    try:
+        value=st.secrets.get(name, '')
+        if value: return str(value).strip()
+        for key in st.secrets.keys():
+            if str(key).upper()==name.upper():
+                return str(st.secrets[key]).strip()
+    except Exception:
+        pass
+    return os.environ.get(name, os.environ.get(name.upper(), '')).strip()
 
 def _read_csv_dispatchtrack(uploaded_file):
     rows=list(csv.reader(io.StringIO(uploaded_file.getvalue().decode('utf-8-sig'))))
