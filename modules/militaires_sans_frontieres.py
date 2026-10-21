@@ -74,7 +74,13 @@ def _load_directions():
         if key: result[key]={'CONSTRAIN':str(row[pos['CONSTRAIN']]).strip() if 'CONSTRAIN' in pos and row[pos['CONSTRAIN']] is not None else '', 'PRIORITY':_number(row[pos['PRIORITY']]) if 'PRIORITY' in pos else 0}
     return result
 
-def _number(value): return float(str(value).replace(',','.').strip() or 0)
+def _number(value):
+    if value is None: return 0.0
+    text=str(value).strip().replace(',','.')
+    if not text or text.lower() in {'none','nan','null'}: return 0.0
+    try: return float(text)
+    except (TypeError,ValueError): return 0.0
+
 
 def _assign_and_split(headers,rows,fleet,directions=None):
     directions=directions or {}; cap_header=next((h for h in headers if h.upper()=='CAPACIDAD UNO'),None)
