@@ -37,38 +37,59 @@ def _read_excel_dispatchtrack(uploaded_file):
 def _read_dispatchtrack_file(uploaded_file):
     return _read_csv_dispatchtrack(uploaded_file) if Path(uploaded_file.name).suffix.lower()=='.csv' else _read_excel_dispatchtrack(uploaded_file)
 
-def _load_fleet():
+def _load_logistics_book():
     sheet_id=_secret('DATA_LOGISTICS_ID')
     if not sheet_id: raise ValueError('Falta DATA_LOGISTICS_ID en Secrets.')
     with urllib.request.urlopen(f'https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx',timeout=60) as response: raw=response.read()
-    wb=openpyxl.load_workbook(io.BytesIO(raw),read_only=True,data_only=True,keep_links=False)
+    return raw
+
+def _load_fleet():
+    raw=_load_logistics_book(); wb=openpyxl.load_workbook(io.BytesIO(raw),read_only=True,data_only=True,keep_links=False)
     try:
         if 'FLOTA' not in wb.sheetnames: raise ValueError('DATA_LOGISTICS no contiene la hoja FLOTA.')
         rows=list(wb['FLOTA'].iter_rows(values_only=True))
     finally: wb.close(); del raw
-    headers=[str(v or '').strip().upper() for v in rows[0]]; required={'UNIDAD','CANTIDAD','CAPACIDAD UNO'}
-    if not required.issubset(headers): raise ValueError('FLOTA debe contener UNIDAD, CANTIDAD y CAPACIDAD UNO.')
+    headers=[str(v or '').strip().upper() for v in rows[0]]; required={'UNIDAD','CANTIDAD','CAPACIDAD UNO','VUELTAS'}
+    if not required.issubset(headers): raise ValueError('FLOTA debe contener UNIDAD, CANTIDAD, CAPACIDAD UNO y VUELTAS.')
     pos={h:headers.index(h) for h in required}; fleet=[]
     for row in rows[1:]:
-        try: qty=int(float(row[pos['CANTIDAD']] or 0)); cap=float(row[pos['CAPACIDAD UNO']] or 0)
+        try: qty=int(float(row[pos['CANTIDAD']] or 0)); turns=int(float(row[pos['VUELTAS']] or 1)); cap=float(row[pos['CAPACIDAD UNO']] or 0)
         except (TypeError,ValueError): continue
-        if qty>0 and cap>0: fleet.append({'UNIDAD':str(row[pos['UNIDAD']]).strip(),'CANTIDAD':qty,'CAPACIDAD':cap})
+        if qty>0 and turns>0 and cap>0: fleet.append({'UNIDAD':str(row[pos['UNIDAD']]).strip(),'CANTIDAD':qty*turns,'CAPACIDAD':cap})
     if not fleet: raise ValueError('FLOTA no tiene unidades válidas.')
     return sorted(fleet,key=lambda x:float(x['CAPACIDAD']),reverse=True)
 
+def _load_directions():
+    raw=_load_logistics_book(); wb=openpyxl.load_workbook(io.BytesIO(raw),read_only=True,data_only=True,keep_links=False)
+    try:
+        if 'DIRECCIONES' not in wb.sheetnames: return {}
+        rows=list(wb['DIRECCIONES'].iter_rows(values_only=True))
+    finally: wb.close(); del raw
+    if not rows: return {}
+    headers=[str(v or '').strip().upper() for v in rows[0]]; pos={h:headers.index(h) for h in headers}
+    if 'WAREHOUSE_ID' not in pos: return {}
+    result={}
+    for row in rows[1:]:
+        key=str(row[pos['WAREHOUSE_ID']] or '').strip().replace('.0','')
+        if key: result[key]={'CONSTRAIN':str(row[pos['CONSTRAIN']]).strip() if 'CONSTRAIN' in pos and row[pos['CONSTRAIN']] is not None else '', 'PRIORITY':_number(row[pos['PRIORITY']]) if 'PRIORITY' in pos else 0}
+    return result
+
 def _number(value): return float(str(value).replace(',','.').strip() or 0)
 
-def _assign_and_split(headers,rows,fleet):
-    cap_header=next((h for h in headers if h.upper()=='CAPACIDAD UNO'),None)
+def _assign_and_split(headers,rows,fleet,directions=None):
+    directions=directions or {}; cap_header=next((h for h in headers if h.upper()=='CAPACIDAD UNO'),None)
     id_header=next((h for h in headers if h.upper() in {'CÓDIGO DE PARADA*','CODIGO DE PARADA*','TRANSFER ID'}),headers[0])
-    type_header=next((h for h in headers if h.upper()=='TIPO CAMION'),None)
+    origin_header=next((h for h in headers if h.upper() in {'CT ORIGEN*','CT ORIGEN','WAREHOUSE_ID'}),None); type_header=next((h for h in headers if h.upper()=='TIPO CAMION'),None)
     if not cap_header: raise ValueError('El archivo no tiene CAPACIDAD UNO.')
     remaining=[dict(x) for x in fleet]; output=[]; warnings=[]
     for row in rows:
-        required=_number(row.get(cap_header,''))
+        required=_number(row.get(cap_header,'')); info=directions.get(str(row.get(origin_header,'')).strip().replace('.0',''),{}) if origin_header else {}
         if required<=0: output.append(row); continue
+        allowed=str(info.get('CONSTRAIN','')).strip().lower(); candidates=[u for u in remaining if not allowed or str(u['UNIDAD']).strip().lower()==allowed]
+        if not candidates: warnings.append(f"{row.get(id_header,'')}: no hay unidad compatible con CONSTRAIN={allowed}."); output.append(row); continue
+        candidates=sorted(candidates,key=lambda x:(str(x['UNIDAD']).strip().lower()!='torton',-float(x['CAPACIDAD'])) if info.get('PRIORITY',0)>0 else -float(x['CAPACIDAD']))
         chunks=[]; left=required
-        for unit in remaining:
+        for unit in candidates:
             while unit['CANTIDAD'] and left>1e-9 and float(unit['CAPACIDAD'])<=left+1e-9:
                 chunks.append((float(unit['CAPACIDAD']),str(unit['UNIDAD']))); unit['CANTIDAD']-=1; left-=float(unit['CAPACIDAD'])
         if left>1e-9: warnings.append(f"{row.get(id_header,'')}: faltan {left:g} unidades de capacidad; no se asignó completamente."); output.append(row); continue
@@ -90,9 +111,10 @@ def render():
     st.markdown('<div class="msf-note">La flota se lee desde FLOTA en el Sheet indicado por DATA_LOGISTICS_ID.</div>',unsafe_allow_html=True); st.markdown('</div>',unsafe_allow_html=True)
     if run and uploaded is not None:
         with st.spinner('Leyendo pedidos, FLOTA y asignando unidades…'):
-            try: headers,rows=_read_dispatchtrack_file(uploaded); result,warnings=_assign_and_split(headers,rows,_load_fleet()); csv_bytes=_to_csv(headers,result)
+            try: headers,rows=_read_dispatchtrack_file(uploaded); result,warnings=_assign_and_split(headers,rows,_load_fleet(),_load_directions()); csv_bytes=_to_csv(headers,result)
             except Exception as exc: st.error(f'No se pudo ejecutar la planeación: {exc}'); return
         st.success(f'Planeación generada: {len(rows):,} pedidos de entrada → {len(result):,} líneas de salida.')
         for warning in warnings: st.warning(warning)
         st.download_button('DESCARGAR CSV DISPATCHTRACK →',data=csv_bytes,file_name=f'MSF_DISPATCHTRACK_{datetime.now():%Y%m%d_%H%M%S}.csv',mime='text/csv',use_container_width=True,key='msf_download_shell_csv')
     if st.button('← Volver a Mother Base',key='msf_back_home'): st.session_state['mb_module']='MOTHER BASE'; st.rerun()
+
