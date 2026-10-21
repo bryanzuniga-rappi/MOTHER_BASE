@@ -22,6 +22,7 @@ import html
 import io
 import math
 import csv
+import gc
 import re
 import shutil
 import tempfile
@@ -1151,15 +1152,17 @@ def relative_update_text(
 def inspect_database(workbook_bytes: bytes) -> dict[str, Any]:
     """Valida presencia de hojas, actualizaciones Aleph y errores IMPORTRANGE."""
     rows: list[dict[str, Any]] = []
-    formula_workbook = openpyxl.load_workbook(
-        io.BytesIO(workbook_bytes), read_only=True, data_only=False
-    )
-    value_workbook = openpyxl.load_workbook(
+    # La validación se ejecutaba con dos libros XLSX abiertos en paralelo
+    # (fórmulas + valores), duplicando el pico de memoria antes de planear.
+    # Abrimos la vista calculada y solo hacemos fallback a fórmulas si una
+    # celda de control no tiene valor cacheado.
+    workbook = openpyxl.load_workbook(
         io.BytesIO(workbook_bytes), read_only=True, data_only=True
     )
+    formula_workbook = None
     try:
         for sheet_name in REQUIRED_DATABASE_SHEETS:
-            if sheet_name not in formula_workbook.sheetnames:
+            if sheet_name not in workbook.sheetnames:
                 rows.append(
                     {
                         "HOJA": sheet_name,
@@ -1171,12 +1174,15 @@ def inspect_database(workbook_bytes: bytes) -> dict[str, Any]:
                 )
                 continue
 
-            formula_sheet = formula_workbook[sheet_name]
-            value_sheet = value_workbook[sheet_name]
+            sheet = workbook[sheet_name]
             if sheet_name in ALEPH_SHEETS:
-                value = value_sheet["C7"].value
+                value = sheet["C7"].value
                 if value is None:
-                    value = formula_sheet["C7"].value
+                    if formula_workbook is None:
+                        formula_workbook = openpyxl.load_workbook(
+                            io.BytesIO(workbook_bytes), read_only=True, data_only=False
+                        )
+                    value = formula_workbook[sheet_name]["C7"].value
                 detail, healthy = relative_update_text(
                     value,
                     max_age_hours=ALEPH_MAX_AGE_HOURS.get(sheet_name, 24.0),
@@ -1185,11 +1191,14 @@ def inspect_database(workbook_bytes: bytes) -> dict[str, Any]:
                     healthy = False
                     detail = "#REF! DETECTADO EN C7"
             elif sheet_name in MANUAL_BACKEND_SHEETS:
-                formula_value = formula_sheet["A1"].value
-                displayed_value = value_sheet["A1"].value
-                header = engine.normalize_header(
-                    displayed_value if displayed_value is not None else formula_value
-                )
+                displayed_value = sheet["A1"].value
+                if displayed_value is None:
+                    if formula_workbook is None:
+                        formula_workbook = openpyxl.load_workbook(
+                            io.BytesIO(workbook_bytes), read_only=True, data_only=False
+                        )
+                    displayed_value = formula_workbook[sheet_name]["A1"].value
+                header = engine.normalize_header(displayed_value)
                 healthy = header == "WAREHOUSE_ID"
                 detail = (
                     "BLOQUEO BACKEND DISPONIBLE"
@@ -1197,12 +1206,8 @@ def inspect_database(workbook_bytes: bytes) -> dict[str, Any]:
                     else "A1 DEBE SER WAREHOUSE_ID"
                 )
             else:
-                formula_value = formula_sheet["A1"].value
-                displayed_value = value_sheet["A1"].value
-                healthy = not (
-                    contains_ref_error(formula_value)
-                    or contains_ref_error(displayed_value)
-                )
+                displayed_value = sheet["A1"].value
+                healthy = not contains_ref_error(displayed_value)
                 detail = "SIN #REF!" if healthy else "#REF! DETECTADO"
 
             rows.append(
@@ -1215,8 +1220,9 @@ def inspect_database(workbook_bytes: bytes) -> dict[str, Any]:
                 }
             )
     finally:
-        formula_workbook.close()
-        value_workbook.close()
+        workbook.close()
+        if formula_workbook is not None:
+            formula_workbook.close()
 
     healthy_count = sum(row["ESTADO"] == "OK" for row in rows)
     return {
@@ -6835,6 +6841,12 @@ def execute_planning(
     venom_manual_skus_by_origin: dict[int, set[int]] | None = None,
     venom_only_manual_skus: bool = False,
 ) -> dict[str, Any]:
+    # El resultado anterior puede contener cientos de miles de diccionarios y
+    # permanecer en session_state mientras se construye la siguiente corrida.
+    # Liberarlo antes de abrir el XLSX evita que dos planeaciones convivan en
+    # memoria durante el pico de carga.
+    st.session_state.pop("last_run", None)
+    gc.collect()
     clear_previous_workspace()
     workspace = Path(tempfile.mkdtemp(prefix="transfer_planner_"))
     st.session_state["last_workspace"] = str(workspace)
@@ -6878,6 +6890,9 @@ def execute_planning(
         save_uploaded_file(uploaded_plan, plan_path)
         plan_paths.append(plan_path)
     save_database(database_bytes, data_path)
+    # El archivo ya está persistido; no mantengas otra referencia local al
+    # XLSX comprimido mientras openpyxl construye los catálogos.
+    del database_bytes
 
     config = engine.Config(
         origin_warehouses=origins,
