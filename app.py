@@ -34,50 +34,6 @@ MODULE_PLANNING = "LES ENFANTS TERRIBLES"
 MODULE_REPORTS = "MILITAIRES SANS FRONTIÈRES"
 
 
-def render_required_google_oauth() -> bool:
-    """Gate obligatorio visible antes del selector de perfil."""
-    from modules.militaires_sans_frontieres import (
-        build_oauth_authorization_url,
-        configured_oauth_refresh_token,
-        exchange_oauth_code_for_tokens,
-        oauth_is_configured,
-    )
-    from modules.mail_sender import configured_mail_oauth_refresh_token
-
-    st.markdown('<span class="section-label">AUTORIZACIÓN OBLIGATORIA</span>', unsafe_allow_html=True)
-    st.subheader("Conecta Google antes de entrar a MOTHER BASE")
-    st.caption("Este permiso habilita Drive y Gmail para subir resultados y enviar únicamente el enlace por correo.")
-    drive_token = configured_oauth_refresh_token()
-    mail_token = configured_mail_oauth_refresh_token()
-    if drive_token or mail_token:
-        st.success("OAuth configurado en Secrets. Puedes entrar a MOTHER BASE.")
-        return True
-    if not oauth_is_configured():
-        st.error(
-            "Configura DATA_DASHBOARD_OAUTH_CLIENT_ID, "
-            "DATA_DASHBOARD_OAUTH_CLIENT_SECRET y "
-            "DATA_DASHBOARD_OAUTH_REDIRECT_URI en Secrets."
-        )
-        return False
-    oauth_code = st.query_params.get("code")
-    if oauth_code:
-        if st.button("Completar conexión OAuth", key="gateway_oauth_exchange"):
-            try:
-                tokens = exchange_oauth_code_for_tokens(oauth_code)
-                token = tokens.get("refresh_token")
-                if token:
-                    st.success("Copia este refresh token en Secrets como MAIL_OAUTH_REFRESH_TOKEN y recarga la app.")
-                    st.code(token, language=None)
-                    st.query_params.clear()
-                else:
-                    st.error("Google no devolvió refresh token; revoca el acceso anterior y vuelve a autorizar.")
-            except RuntimeError as error:
-                st.error(str(error))
-    else:
-        st.link_button("Autorizar Drive y Gmail", build_oauth_authorization_url())
-    return False
-
-
 @st.dialog("BIG BOSS · ACCESS CONTROL", width="small")
 def render_big_boss_authentication() -> None:
     st.caption("Ingresa el código de acceso para desbloquear Mother Base.")
@@ -178,7 +134,7 @@ def render_home() -> None:
             key="module_reporting",
             eyebrow="MODULE / 02 · INTELLIGENCE",
             title="MILITAIRES SANS FRONTIÈRES",
-            description="Reportes ejecutivos, históricos y seguimiento de misiones.",
+            description="Carga de Exceles, ejecución de planeación y salida CSV.",
             active=True,
             tone="blue",
             status="WORK IN PROGRESS",
