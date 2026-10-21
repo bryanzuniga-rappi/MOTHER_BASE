@@ -95,9 +95,17 @@ def _assign_and_split(headers,rows,fleet,directions=None):
         if not candidates: warnings.append(f"{row.get(id_header,'')}: no hay unidad compatible con CONSTRAIN={allowed}."); output.append(row); continue
         candidates=sorted(candidates,key=lambda x:(str(x['UNIDAD']).strip().lower()!='torton',-float(x['CAPACIDAD'])) if info.get('PRIORITY',0)>0 else -float(x['CAPACIDAD']))
         chunks=[]; left=required
-        for unit in candidates:
-            while unit['CANTIDAD'] and left>1e-9 and float(unit['CAPACIDAD'])<=left+1e-9:
-                chunks.append((float(unit['CAPACIDAD']),str(unit['UNIDAD']))); unit['CANTIDAD']-=1; left-=float(unit['CAPACIDAD'])
+        while left>1e-9:
+            available=[u for u in candidates if u['CANTIDAD']>0]
+            if not available: break
+            fitting=[u for u in available if float(u['CAPACIDAD'])<=left+1e-9]
+            if fitting:
+                unit=max(fitting,key=lambda x:float(x['CAPACIDAD']))
+            else:
+                # El último camión puede tener más capacidad que el remanente.
+                # Esto cubre pedidos pequeños (por ejemplo 0.22) con una unidad 2.
+                unit=min(available,key=lambda x:float(x['CAPACIDAD']))
+            capacity=float(unit['CAPACIDAD']); chunks.append((capacity,str(unit['UNIDAD']))); unit['CANTIDAD']-=1; left-=capacity
         if left>1e-9: warnings.append(f"{row.get(id_header,'')}: faltan {left:g} unidades de capacidad; no se asignó completamente."); output.append(row); continue
         for index,(capacity,unit_name) in enumerate(chunks):
             clone=dict(row); clone[id_header]=row.get(id_header,'') if index==0 else f"{row.get(id_header,'')}-{index}"; clone[cap_header]=f'{capacity:g}'
