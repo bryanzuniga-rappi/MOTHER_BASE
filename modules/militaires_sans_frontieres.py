@@ -105,7 +105,7 @@ def _assign_and_split(headers,rows,fleet,directions=None):
                 # El último camión puede tener más capacidad que el remanente.
                 # Esto cubre pedidos pequeños (por ejemplo 0.22) con una unidad 2.
                 unit=min(available,key=lambda x:float(x['CAPACIDAD']))
-            capacity=float(unit['CAPACIDAD']); chunks.append((capacity,str(unit['UNIDAD']))); unit['CANTIDAD']-=1; left-=capacity
+            capacity=float(unit['CAPACIDAD']); allocated=min(capacity,left); chunks.append((allocated,str(unit['UNIDAD']))); unit['CANTIDAD']-=1; left-=allocated
         if left>1e-9: warnings.append(f"{row.get(id_header,'')}: faltan {left:g} unidades de capacidad; no se asignó completamente."); output.append(row); continue
         for index,(capacity,unit_name) in enumerate(chunks):
             clone=dict(row); clone[id_header]=row.get(id_header,'') if index==0 else f"{row.get(id_header,'')}-{index}"; clone[cap_header]=f'{capacity:g}'
