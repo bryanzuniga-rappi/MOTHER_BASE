@@ -90,6 +90,31 @@ def test_mov_max_works_with_only_required_mov_column(tmp_path):
     assert consolidated[(100, 10)]["ROQ_INPUT"] == 7.0
 
 
+def test_consolidation_reuses_in_memory_plan_rows(tmp_path):
+    """El canónico se escribe sin volver a parsearse para armar el plan."""
+    plan_path = tmp_path / "plan.csv"
+    _write_plan_csv(
+        plan_path,
+        [
+            "Warehouseid", "SKU ID", "Predicted Demand for selected duration",
+            "Predicted Opening Inventory",
+            "Replenishment Quantity for Plan Duration (MOV)",
+            "Net Inter-Store Transfers",
+        ],
+        [[100, 10, "4", "0", "5", "0"]],
+    )
+    output_path = tmp_path / "canonical.csv"
+    _, consolidated, summary = m.consolidate_plan_files(
+        [plan_path], make_catalogs(), CONFIG, output_path
+    )
+    plan_read = summary.pop("_plan_read")
+    m.enrich_consolidated_plan_read(plan_read, consolidated, summary)
+
+    assert len(plan_read.rows) == 1
+    assert plan_read.rows[0]["MOV_ORIGINAL"] == 5.0
+    assert plan_read.rows[0]["ROQ_INPUT"] == 5.0
+
+
 def test_mov_max_duplicate_rows_take_max_not_sum(tmp_path):
     """La misma tienda-SKU en dos filas (o archivos) distintos debe quedarse con el
     MÁXIMO, nunca la suma.

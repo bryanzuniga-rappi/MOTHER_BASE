@@ -23,7 +23,6 @@ import io
 import math
 import csv
 import re
-import statistics
 import shutil
 import tempfile
 import time
@@ -1306,12 +1305,16 @@ COPERNICO_REQUIRED_WAREHOUSES: frozenset[int] = frozenset({444, 831, 856})
 COPERNICO_BODEGA_HEADER_ALIASES = {"BODEGA", "WAREHOUSE ID", "WAREHOUSE_ID"}
 
 
-def copernico_warehouses_from_text(text: str) -> set[int]:
-    """Bodegas de la columna Bodega de un CSV de COPÉRNICO ya decodificado."""
+def copernico_warehouses_from_stream(handle) -> set[int]:
+    """Bodegas de COPÉRNICO sin materializar el CSV completo en memoria."""
     warehouses: set[int] = set()
     # Mismo formato fijo que el lector de COPÉRNICO del motor (sin Sniffer).
-    dialect = engine.copernico_csv_dialect(text.split("\n", 1)[0])
-    reader = csv.DictReader(io.StringIO(text), dialect=dialect)
+    header_line = handle.readline()
+    if not header_line:
+        return warehouses
+    dialect = engine.copernico_csv_dialect(header_line)
+    handle.seek(0)
+    reader = csv.DictReader(handle, dialect=dialect)
     if not reader.fieldnames:
         return warehouses
     bodega_field = next(
@@ -1331,26 +1334,48 @@ def copernico_warehouses_from_text(text: str) -> set[int]:
     return warehouses
 
 
+def copernico_warehouses_from_path(path: Path) -> set[int]:
+    """Versión en streaming para los archivos ya persistidos de la corrida."""
+    with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as handle:
+        return copernico_warehouses_from_stream(handle)
+
+
 def detect_copernico_warehouses(uploaded_files) -> set[int]:
-    """Lee la columna Bodega de cada archivo COPÉRNICO cargado, sin guardar nada en
-    disco, para saber qué warehouses cubre antes de validar la corrida.
-    """
+    """Lee Bodega en streaming para validar los orígenes requeridos."""
     warehouses: set[int] = set()
     for uploaded_file in uploaded_files or ():
+        text_handle = None
         try:
             uploaded_file.seek(0)
-            raw_bytes = uploaded_file.getvalue()
+            # UploadedFile de Streamlit es un stream. El fallback conserva la
+            # compatibilidad con dobles ligeros de prueba que sólo exponen
+            # getvalue(), sin afectar los archivos reales.
+            raw_handle = (
+                uploaded_file
+                if (
+                    callable(getattr(uploaded_file, "read", None))
+                    and callable(getattr(uploaded_file, "readable", None))
+                )
+                else io.BytesIO(uploaded_file.getvalue())
+            )
+            text_handle = io.TextIOWrapper(
+                raw_handle, encoding="utf-8-sig", errors="replace", newline=""
+            )
+            warehouses |= copernico_warehouses_from_stream(text_handle)
         except Exception:
             continue
-        try:
-            text = raw_bytes.decode("utf-8-sig", errors="replace")
-        except Exception:
-            continue
-        warehouses |= copernico_warehouses_from_text(text)
-        try:
-            uploaded_file.seek(0)
-        except Exception:
-            pass
+        finally:
+            # detach evita que TextIOWrapper cierre el UploadedFile de
+            # Streamlit; éste se reutiliza después para copiarlo a disco.
+            if text_handle is not None:
+                try:
+                    text_handle.detach()
+                except Exception:
+                    pass
+            try:
+                uploaded_file.seek(0)
+            except Exception:
+                pass
     return warehouses
 
 
@@ -1374,9 +1399,11 @@ def consolidate_plan_files(
     source_row_count = 0
     source_counts: Counter[str] = Counter()
     fountain9_instructions: dict[tuple[int | None, int, int], int] = defaultdict(int)
-    # Para la moda de Duration/Lead Time por tienda (ver más abajo).
-    duration_values_by_store: dict[int, list[float]] = defaultdict(list)
-    lead_time_values_by_store: dict[int, list[float]] = defaultdict(list)
+    # Una moda no requiere guardar cada observación. Counter conserva el
+    # desempate por primera aparición y evita listas proporcionales a todas
+    # las filas de Fountain9.
+    duration_counts_by_store: dict[int, Counter[float]] = defaultdict(Counter)
+    lead_time_counts_by_store: dict[int, Counter[float]] = defaultdict(Counter)
 
     for path in plan_paths:
         with path.open(
@@ -1492,11 +1519,11 @@ def consolidate_plan_files(
                 if duration_field is not None:
                     duration_value = engine.to_float(raw.get(duration_field, ""))
                     if duration_value > 0:
-                        duration_values_by_store[destination].append(duration_value)
+                        duration_counts_by_store[destination][duration_value] += 1
                 if lead_time_field is not None:
                     lead_time_value = engine.to_float(raw.get(lead_time_field, ""))
                     if lead_time_value > 0:
-                        lead_time_values_by_store[destination].append(lead_time_value)
+                        lead_time_counts_by_store[destination][lead_time_value] += 1
                 sku_field = required_lookup["SKU ID"]
                 sku = engine.to_id(
                     raw.get(sku_field, ""),
@@ -1588,47 +1615,11 @@ def consolidate_plan_files(
     if not consolidated:
         raise ValueError("Los archivos cargados no contienen requerimientos válidos.")
 
-    output_rows: list[dict[str, Any]] = []
+    # El CSV canónico sigue siendo un artefacto de la corrida, pero se escribe
+    # en streaming. Así no coexistirá una segunda lista completa de filas con
+    # el diccionario consolidado.
+    plan_rows: list[dict[str, Any]] = []
     net_transfer_hardcodes = 0
-    for key, record in consolidated.items():
-        destination, sku = key
-        destination_stock = max(
-            float(catalogs.stock_base.get((destination, sku), 0.0)),
-            0.0,
-        )
-        demand = record["PREDICTED_DEMAND"]
-        opening = record["PREDICTED_OPENING_INVENTORY"]
-        record["ROQ_INPUT"] = max(record["ROQ_INPUT"], record["FOUNTAIN9_ALLOCATION"] or 0)
-        roq_input = record["ROQ_INPUT"]
-        net_transfer = record["NET_INTER_STORE_TRANSFERS"]
-        zero_total_rule = (
-            math.isclose(demand, 0.0, abs_tol=1e-9)
-            and math.isclose(opening, 0.0, abs_tol=1e-9)
-        )
-        deficit_rule = opening < demand
-        net_transfer_rule = (
-            net_transfer_rule_enabled
-            and roq_input <= 0
-            and net_transfer <= net_transfer_max
-            and destination_stock < destination_stock_below
-            and not zero_total_rule
-            and not deficit_rule
-        )
-        record["NET_TRANSFER_HARDCODE_3"] = net_transfer_rule
-        effective_roq = 3.0 if net_transfer_rule else roq_input
-        net_transfer_hardcodes += int(net_transfer_rule)
-        output_rows.append(
-            {
-                "Warehouseid": destination,
-                "SKU ID": sku,
-                "Current Inventory": destination_stock,
-                "Predicted Demand for selected duration": demand,
-                "Predicted Opening Inventory": opening,
-                "Replenishment Quantity for Plan Duration (MOV)": effective_roq,
-                "Net Inter-Store Transfers": net_transfer,
-            }
-        )
-
     canonical_columns = [
         "Warehouseid",
         "SKU ID",
@@ -1638,26 +1629,65 @@ def consolidate_plan_files(
         "Replenishment Quantity for Plan Duration (MOV)",
         "Net Inter-Store Transfers",
     ]
-    output_rows.sort(key=lambda row: (row["Warehouseid"], row["SKU ID"]))
-    engine.write_csv(output_path, output_rows, canonical_columns)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=canonical_columns)
+        writer.writeheader()
+        for input_row, (key, record) in enumerate(sorted(consolidated.items()), start=2):
+            destination, sku = key
+            destination_stock = max(float(catalogs.stock_base.get((destination, sku), 0.0)), 0.0)
+            demand = record["PREDICTED_DEMAND"]
+            opening = record["PREDICTED_OPENING_INVENTORY"]
+            record["ROQ_INPUT"] = max(record["ROQ_INPUT"], record["FOUNTAIN9_ALLOCATION"] or 0)
+            roq_input = record["ROQ_INPUT"]
+            net_transfer = record["NET_INTER_STORE_TRANSFERS"]
+            zero_total_rule = math.isclose(demand, 0.0, abs_tol=1e-9) and math.isclose(opening, 0.0, abs_tol=1e-9)
+            net_transfer_rule = (
+                net_transfer_rule_enabled and roq_input <= 0
+                and net_transfer <= net_transfer_max
+                and destination_stock < destination_stock_below
+                and not zero_total_rule and not (opening < demand)
+            )
+            record["NET_TRANSFER_HARDCODE_3"] = net_transfer_rule
+            effective_roq = 3.0 if net_transfer_rule else roq_input
+            net_transfer_hardcodes += int(net_transfer_rule)
+            writer.writerow({
+                "Warehouseid": destination, "SKU ID": sku,
+                "Current Inventory": destination_stock,
+                "Predicted Demand for selected duration": demand,
+                "Predicted Opening Inventory": opening,
+                "Replenishment Quantity for Plan Duration (MOV)": effective_roq,
+                "Net Inter-Store Transfers": net_transfer,
+            })
+            plan_rows.append({
+                "INPUT_ROW": input_row,
+                "WAREHOUSE_DESTINATION": destination,
+                "RETAIL_ID": sku,
+                "SKU_NAME": "", "CSV_WAREHOUSE_NAME": "",
+                "CURRENT_INVENTORY": destination_stock,
+                "PREDICTED_DEMAND": demand,
+                "PREDICTED_OPENING_INVENTORY": opening,
+                "MOV_ORIGINAL": effective_roq,
+                "INPUT_DUPLICATE_COUNT": 1,
+                "INPUT_ROWS_MERGED": str(input_row),
+                "INPUT_DUPLICATE_CONFLICT": False,
+            })
 
     unique_count = len(consolidated)
     duplicated_keys = sum(
         int(record["SOURCE_ROWS"] > 1) for record in consolidated.values()
     )
-    # Moda de Duration/Lead Time por tienda — una sola vez, sobre TODAS las
-    # filas de esa tienda en TODOS los archivos cargados (no por archivo).
-    # statistics.mode() toma el primer valor más frecuente en caso de
-    # empate (determinístico, sin lanzar excepción).
+    # Counter conserva orden de inserción, por lo que max() mantiene el mismo
+    # desempate de primera aparición que tenía statistics.mode().
     duration_mode_by_store: dict[int, float] = {
-        store: statistics.mode(values)
-        for store, values in duration_values_by_store.items()
-        if values
+        store: max(counts, key=counts.get)
+        for store, counts in duration_counts_by_store.items()
+        if counts
     }
     lead_time_mode_by_store: dict[int, float] = {
-        store: statistics.mode(values)
-        for store, values in lead_time_values_by_store.items()
-        if values
+        store: max(counts, key=counts.get)
+        for store, counts in lead_time_counts_by_store.items()
+        if counts
     }
     summary = {
         "files": len(plan_paths),
@@ -1691,6 +1721,16 @@ def consolidate_plan_files(
                 ),
             )
         ],
+        # execute_planning lo extrae enseguida con pop(), evitando conservar
+        # una segunda representación de la planeación en el resumen final.
+        "_plan_read": engine.PlanReadResult(
+            rows=plan_rows,
+            warnings=[],
+            input_row_count=source_row_count,
+            duplicate_row_count=max(source_row_count - unique_count, 0),
+            duplicate_key_count=duplicated_keys,
+            conflicting_duplicate_key_count=0,
+        ),
     }
     return output_path, consolidated, summary
 
@@ -6964,7 +7004,9 @@ def execute_planning(
                 destination_stock_below=destination_stock_below,
             )
         )
-        plan_read = engine.read_plan_csv(plan_path, config)
+        # Ya se construyó al escribir el canónico; releer el CSV completo
+        # duplicaba el pico de memoria sin cambiar reglas ni resultados.
+        plan_read = consolidation_summary.pop("_plan_read")
         enrich_consolidated_plan_read(
             plan_read,
             consolidated_input,
@@ -8134,9 +8176,7 @@ def execute_planning(
             {
                 "path": str(path),
                 "warehouses": sorted(
-                    copernico_warehouses_from_text(
-                        path.read_text(encoding="utf-8-sig", errors="replace")
-                    )
+                    copernico_warehouses_from_path(path)
                 ),
             }
             for path in copernico_paths
