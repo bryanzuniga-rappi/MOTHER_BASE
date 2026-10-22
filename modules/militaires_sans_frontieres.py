@@ -104,7 +104,7 @@ def _round_pallets(value):
     if value<=0: return 0
     whole=int(value); return max(1,whole+(1 if value-whole>=0.3 else 0))
 
-def _assign_and_split(headers,rows,fleet,directions=None):
+def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None):
     directions=directions or {}; cap_header=next((h for h in headers if h.upper()=='CAPACIDAD UNO'),None)
     id_header=next((h for h in headers if h.upper() in {'CÓDIGO DE PARADA*','CODIGO DE PARADA*','TRANSFER ID'}),headers[0])
     origin_header=next((h for h in headers if h.upper() in {'CT ORIGEN*','CT ORIGEN','WAREHOUSE_ID'}),None)
@@ -118,23 +118,28 @@ def _assign_and_split(headers,rows,fleet,directions=None):
     for row in rows:
         origin=str(row.get(origin_header,'')).strip() if origin_header else ''
         info=directions.get(origin.replace('.0',''),directions.get(_norm(origin),{}))
+        if allowed_cities and _norm(info.get('CITY','')) not in {_norm(city) for city in allowed_cities}:
+            continue
         ordered.append((row,info))
     ordered.sort(key=lambda x:(-float(x[1].get('PRIORITY',0)), -_round_pallets(x[0].get(cap_header,''))))
     for row,info in ordered:
         pallets=_round_pallets(row.get(cap_header,'')); left=pallets
         allowed=_norm(info.get('CONSTRAIN',''))
         while left>0:
-            candidates=[b for b in bins if b['LIBRE']>=1 and (not allowed or _norm(b['UNIDAD'])==allowed)]
-            if info.get('PRIORITY',0)>0: candidates.sort(key=lambda b:(0 if _norm(b['UNIDAD'])=='torton' else 1,b['LIBRE']))
-            elif allowed=='1.5': candidates.sort(key=lambda b:(0 if _norm(b['UNIDAD'])=='1.5' else 1,b['LIBRE']))
-            else: candidates.sort(key=lambda b:b['LIBRE'])
+            if info.get('PRIORITY',0)>0:
+                candidates=[b for b in bins if b['LIBRE']>=1 and _norm(b['UNIDAD'])=='torton']
+                candidates.sort(key=lambda b:b['LIBRE'])
+            else:
+                candidates=[b for b in bins if b['LIBRE']>=1 and (not allowed or _norm(b['UNIDAD'])==allowed)]
+                if allowed=='1.5': candidates.sort(key=lambda b:(0 if _norm(b['UNIDAD'])=='1.5' else 1,b['LIBRE']))
+                else: candidates.sort(key=lambda b:b['LIBRE'])
             if not candidates:
                 warnings.append(f"{row.get(id_header,'')}: faltan {left} pallets; no se asignó completamente."); break
             bin_=candidates[0]; amount=min(left,int(bin_['LIBRE']))
             clone=dict(row); index=0
             if amount<left or pallets>amount:
                 clone[id_header]=f"{row.get(id_header,'')}-{pallets-left+1}"
-            clone[cap_header]=str(amount); 
+            clone[cap_header]=row.get(cap_header,''); 
             if type_header: clone[type_header]=bin_['UNIDAD']
             output.append(clone); bin_['LIBRE']-=amount; left-=amount
     return output,warnings
@@ -170,12 +175,13 @@ def render():
                 filtered_directions={k:dict(v) for k,v in direction_config.items() if (not selected_cities or _norm(v.get('CITY','')) in {_norm(city) for city in selected_cities}) and (use_constraints or not v.get('CONSTRAIN'))}
                 if not prioritize:
                     for value in filtered_directions.values(): value['PRIORITY']=0
-                result,warnings=_assign_and_split(headers,rows,filtered_fleet,filtered_directions); csv_bytes=_to_csv(headers,result)
+                result,warnings=_assign_and_split(headers,rows,filtered_fleet,filtered_directions,selected_cities); csv_bytes=_to_csv(headers,result)
             except Exception as exc: st.error(f'No se pudo ejecutar la planeación: {exc}'); return
         st.success(f'Planeación generada: {len(rows):,} pedidos de entrada → {len(result):,} líneas de salida.')
         for warning in warnings: st.warning(warning)
         st.download_button('DESCARGAR CSV DISPATCHTRACK →',data=csv_bytes,file_name=f'MSF_DISPATCHTRACK_{datetime.now():%Y%m%d_%H%M%S}.csv',mime='text/csv',use_container_width=True,key='msf_download_shell_csv')
     if st.button('← Volver a Mother Base',key='msf_back_home'): st.session_state['mb_module']='MOTHER BASE'; st.rerun()
+
 
 
 
