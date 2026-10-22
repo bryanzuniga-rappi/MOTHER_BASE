@@ -167,7 +167,7 @@ def render():
             try:
                 headers,rows=_read_dispatchtrack_file(uploaded)
                 filtered_fleet=[u for u in fleet_config if u['UNIDAD'] in selected_units]
-                filtered_directions={k:dict(v) for k,v in direction_config.items() if (not selected_cities or v.get('CITY','') in selected_cities) and (use_constraints or not v.get('CONSTRAIN'))}
+                filtered_directions={k:dict(v) for k,v in direction_config.items() if (not selected_cities or _norm(v.get('CITY','')) in {_norm(city) for city in selected_cities}) and (use_constraints or not v.get('CONSTRAIN'))}
                 if not prioritize:
                     for value in filtered_directions.values(): value['PRIORITY']=0
                 result,warnings=_assign_and_split(headers,rows,filtered_fleet,filtered_directions); csv_bytes=_to_csv(headers,result)
@@ -176,6 +176,7 @@ def render():
         for warning in warnings: st.warning(warning)
         st.download_button('DESCARGAR CSV DISPATCHTRACK →',data=csv_bytes,file_name=f'MSF_DISPATCHTRACK_{datetime.now():%Y%m%d_%H%M%S}.csv',mime='text/csv',use_container_width=True,key='msf_download_shell_csv')
     if st.button('← Volver a Mother Base',key='msf_back_home'): st.session_state['mb_module']='MOTHER BASE'; st.rerun()
+
 
 
 
