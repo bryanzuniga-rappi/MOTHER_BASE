@@ -1,6 +1,6 @@
 """Militaires Sans Frontières — primera capa de asignación de rutas."""
 from __future__ import annotations
-import csv, io, os, urllib.request
+import csv, io, os, unicodedata, urllib.request
 from datetime import datetime
 from pathlib import Path
 import openpyxl
@@ -83,8 +83,13 @@ def _load_directions():
     result={}
     for row in rows[1:]:
         key=str(row[pos['WAREHOUSE_ID']] or '').strip().replace('.0','')
-        if key: result[key]={'CONSTRAIN':str(row[pos['CONSTRAIN']]).strip() if 'CONSTRAIN' in pos and row[pos['CONSTRAIN']] is not None else '', 'PRIORITY':_number(row[pos['PRIORITY']]) if 'PRIORITY' in pos else 0}
+        data={'CONSTRAIN':str(row[pos['CONSTRAIN']]).strip() if 'CONSTRAIN' in pos and row[pos['CONSTRAIN']] is not None else '', 'PRIORITY':_number(row[pos['PRIORITY']]) if 'PRIORITY' in pos else 0}
+        if key: result[key]=data
+        if 'WAREHOUSE_NAME' in pos and row[pos['WAREHOUSE_NAME']]: result[_norm(row[pos['WAREHOUSE_NAME']])]=data
     return result
+
+def _norm(value):
+    return ''.join(ch for ch in unicodedata.normalize('NFKD',str(value or '')) if not unicodedata.combining(ch)).strip().casefold()
 
 def _number(value):
     if value is None: return 0.0
@@ -97,11 +102,12 @@ def _number(value):
 def _assign_and_split(headers,rows,fleet,directions=None):
     directions=directions or {}; cap_header=next((h for h in headers if h.upper()=='CAPACIDAD UNO'),None)
     id_header=next((h for h in headers if h.upper() in {'CÓDIGO DE PARADA*','CODIGO DE PARADA*','TRANSFER ID'}),headers[0])
-    origin_header=next((h for h in headers if h.upper() in {'CT ORIGEN*','CT ORIGEN','WAREHOUSE_ID'}),None); type_header=next((h for h in headers if h.upper()=='TIPO CAMION'),None)
+    origin_header=next((h for h in headers if h.upper() in {'CT ORIGEN*','CT ORIGEN','WAREHOUSE_ID'}),None); type_header=next((h for h in headers if _norm(h).replace(' ','') in {'tipocamion','tipodecamion'}),None)
     if not cap_header: raise ValueError('El archivo no tiene CAPACIDAD UNO.')
     remaining=[dict(x) for x in fleet]; output=[]; warnings=[]
     for row in rows:
-        required=_number(row.get(cap_header,'')); info=directions.get(str(row.get(origin_header,'')).strip().replace('.0',''),{}) if origin_header else {}
+        required=_number(row.get(cap_header,'')); origin=str(row.get(origin_header,'')).strip() if origin_header else ''
+        info=directions.get(origin.replace('.0',''),directions.get(_norm(origin),{}))
         if required<=0: output.append(row); continue
         allowed=str(info.get('CONSTRAIN','')).strip().lower(); candidates=[u for u in remaining if not allowed or str(u['UNIDAD']).strip().lower()==allowed]
         if not candidates: warnings.append(f"{row.get(id_header,'')}: no hay unidad compatible con CONSTRAIN={allowed}."); output.append(row); continue
