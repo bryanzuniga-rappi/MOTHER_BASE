@@ -11,15 +11,20 @@ def _inject_style():
     st.markdown('<style>.msf-shell{border:3px solid #111;background:#fffdf5;padding:28px;box-shadow:8px 8px 0 #111;margin-bottom:28px}.msf-label{display:inline-block;background:#5f7cff;color:#111;border:3px solid #111;padding:8px 12px;font-weight:800;letter-spacing:.08em}.msf-note{border:2px solid #111;background:#e8edff;padding:14px;margin-top:16px}</style>', unsafe_allow_html=True)
 
 def _secret(name):
+    def find(value):
+        if isinstance(value, dict):
+            for key,item in value.items():
+                if str(key).strip().upper()==name.upper() and item not in (None,''):
+                    return str(item).strip()
+                found=find(item)
+                if found: return found
+        return ''
     try:
-        value=st.secrets.get(name, '')
-        if value: return str(value).strip()
-        for key in st.secrets.keys():
-            if str(key).upper()==name.upper():
-                return str(st.secrets[key]).strip()
+        found=find(st.secrets.to_dict() if hasattr(st.secrets,'to_dict') else st.secrets)
+        if found: return found
     except Exception:
         pass
-    return os.environ.get(name, os.environ.get(name.upper(), '')).strip()
+    return os.environ.get(name,'').strip()
 
 def _read_csv_dispatchtrack(uploaded_file):
     rows=list(csv.reader(io.StringIO(uploaded_file.getvalue().decode('utf-8-sig'))))
