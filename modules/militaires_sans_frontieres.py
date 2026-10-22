@@ -126,7 +126,7 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None):
         ordered=[(row,{}) for row in rows]
     ordered.sort(key=lambda x:(-float(x[1].get('PRIORITY',0)), _norm(x[1].get('_STORE','')), -_round_pallets(x[0].get(cap_header,''))))
     for row,info in ordered:
-        pallets=_round_pallets(row.get(cap_header,'')); left=pallets
+        original_capacity=_number(row.get(cap_header,'')); pallets=_round_pallets(original_capacity); left=pallets; original_left=original_capacity
         allowed=_norm(info.get('CONSTRAIN',''))
         while left>0:
             if info.get('PRIORITY',0)>0:
@@ -143,7 +143,7 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None):
             base_id=str(row.get(id_header,'')); split_index=split_counts.get(base_id,0)
             if split_index>0: clone[id_header]=f"{base_id}-{split_index}"
             split_counts[base_id]=split_index+1
-            clone[cap_header]=row.get(cap_header,''); 
+            clone[cap_header]=row.get(cap_header,'') if pallets<=4 else (str(min(4,original_left)).rstrip('0').rstrip('.') if original_left>0 else '0'); original_left=max(0,original_left-4); 
             if type_header: clone[type_header]=bin_['UNIDAD']
             output.append(clone); bin_['ORIGEN']=info.get('_STORE'); bin_['LIBRE']-=amount; left-=amount
     return output,warnings
