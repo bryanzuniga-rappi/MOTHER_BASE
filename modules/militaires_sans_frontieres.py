@@ -113,7 +113,7 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None):
     bins=[]
     for item in fleet:
         for _ in range(int(item['CANTIDAD'])): bins.append({'UNIDAD':item['UNIDAD'],'CAPACIDAD':float(item['CAPACIDAD']),'LIBRE':float(item['CAPACIDAD']),'ORIGEN':None})
-    output=[]; warnings=[]
+    output=[]; warnings=[]; split_counts={}
     ordered=[]
     for row in rows:
         origin=str(row.get(origin_header,'')).strip() if origin_header else ''
@@ -135,13 +135,14 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None):
             else:
                 candidates=[b for b in bins if b['LIBRE']>=1 and (not allowed or _norm(b['UNIDAD'])==allowed)]
                 if allowed=='1.5': candidates.sort(key=lambda b:(0 if _norm(b['UNIDAD'])=='1.5' else 1,b['LIBRE']))
-                else: candidates.sort(key=lambda b:(0 if b.get('ORIGEN')==info.get('_STORE') else 1,b['LIBRE']))
+                else: candidates.sort(key=lambda b:(0 if b.get('ORIGEN')==info.get('_STORE') else 1,-b['CAPACIDAD']))
             if not candidates:
                 warnings.append(f"{row.get(id_header,'')}: faltan {left} pallets; no se asignó completamente."); break
             bin_=candidates[0]; amount=min(left,4,int(bin_['LIBRE']))
-            clone=dict(row); index=0
-            if amount<left or pallets>amount:
-                clone[id_header]=f"{row.get(id_header,'')}-{pallets-left+1}"
+            clone=dict(row)
+            base_id=str(row.get(id_header,'')); split_index=split_counts.get(base_id,0)
+            if split_index>0: clone[id_header]=f"{base_id}-{split_index}"
+            split_counts[base_id]=split_index+1
             clone[cap_header]=row.get(cap_header,''); 
             if type_header: clone[type_header]=bin_['UNIDAD']
             output.append(clone); bin_['ORIGEN']=info.get('_STORE'); bin_['LIBRE']-=amount; left-=amount
