@@ -99,36 +99,44 @@ def _number(value):
     except (TypeError,ValueError): return 0.0
 
 
+def _round_pallets(value):
+    value=_number(value)
+    if value<=0: return 0
+    whole=int(value); return max(1,whole+(1 if value-whole>=0.3 else 0))
+
 def _assign_and_split(headers,rows,fleet,directions=None):
     directions=directions or {}; cap_header=next((h for h in headers if h.upper()=='CAPACIDAD UNO'),None)
     id_header=next((h for h in headers if h.upper() in {'CÓDIGO DE PARADA*','CODIGO DE PARADA*','TRANSFER ID'}),headers[0])
-    origin_header=next((h for h in headers if h.upper() in {'CT ORIGEN*','CT ORIGEN','WAREHOUSE_ID'}),None); type_header=next((h for h in headers if _norm(h).replace(' ','') in {'tipocamion','tipodecamion'}),None)
+    origin_header=next((h for h in headers if h.upper() in {'CT ORIGEN*','CT ORIGEN','WAREHOUSE_ID'}),None)
+    type_header=next((h for h in headers if _norm(h).replace(' ','') in {'tipocamion','tipodecamion'}),None)
     if not cap_header: raise ValueError('El archivo no tiene CAPACIDAD UNO.')
-    remaining=[dict(x) for x in fleet]; output=[]; warnings=[]
+    bins=[]
+    for item in fleet:
+        for _ in range(int(item['CANTIDAD'])): bins.append({'UNIDAD':item['UNIDAD'],'CAPACIDAD':float(item['CAPACIDAD']),'LIBRE':float(item['CAPACIDAD']),'ORIGEN':None})
+    output=[]; warnings=[]
+    ordered=[]
     for row in rows:
-        required=_number(row.get(cap_header,'')); origin=str(row.get(origin_header,'')).strip() if origin_header else ''
+        origin=str(row.get(origin_header,'')).strip() if origin_header else ''
         info=directions.get(origin.replace('.0',''),directions.get(_norm(origin),{}))
-        if required<=0: output.append(row); continue
-        allowed=str(info.get('CONSTRAIN','')).strip().lower(); candidates=[u for u in remaining if not allowed or str(u['UNIDAD']).strip().lower()==allowed]
-        if not candidates: warnings.append(f"{row.get(id_header,'')}: no hay unidad compatible con CONSTRAIN={allowed}."); output.append(row); continue
-        candidates=sorted(candidates,key=lambda x:(str(x['UNIDAD']).strip().lower()!='torton',-float(x['CAPACIDAD'])) if info.get('PRIORITY',0)>0 else -float(x['CAPACIDAD']))
-        chunks=[]; left=required
-        while left>1e-9:
-            available=[u for u in candidates if u['CANTIDAD']>0]
-            if not available: break
-            fitting=[u for u in available if float(u['CAPACIDAD'])<=left+1e-9]
-            if fitting:
-                unit=max(fitting,key=lambda x:float(x['CAPACIDAD']))
-            else:
-                # El último camión puede tener más capacidad que el remanente.
-                # Esto cubre pedidos pequeños (por ejemplo 0.22) con una unidad 2.
-                unit=min(available,key=lambda x:float(x['CAPACIDAD']))
-            capacity=float(unit['CAPACIDAD']); allocated=min(capacity,left); chunks.append((allocated,str(unit['UNIDAD']))); unit['CANTIDAD']-=1; left-=allocated
-        if left>1e-9: warnings.append(f"{row.get(id_header,'')}: faltan {left:g} unidades de capacidad; no se asignó completamente."); output.append(row); continue
-        for index,(capacity,unit_name) in enumerate(chunks):
-            clone=dict(row); clone[id_header]=row.get(id_header,'') if index==0 else f"{row.get(id_header,'')}-{index}"; clone[cap_header]=f'{capacity:g}'
-            if type_header: clone[type_header]=unit_name
-            output.append(clone)
+        ordered.append((row,info))
+    ordered.sort(key=lambda x:(-float(x[1].get('PRIORITY',0)), -_round_pallets(x[0].get(cap_header,''))))
+    for row,info in ordered:
+        pallets=_round_pallets(row.get(cap_header,'')); left=pallets
+        allowed=_norm(info.get('CONSTRAIN',''))
+        while left>0:
+            candidates=[b for b in bins if b['LIBRE']>=1 and (not allowed or _norm(b['UNIDAD'])==allowed)]
+            if info.get('PRIORITY',0)>0: candidates.sort(key=lambda b:(0 if _norm(b['UNIDAD'])=='torton' else 1,b['LIBRE']))
+            elif allowed=='1.5': candidates.sort(key=lambda b:(0 if _norm(b['UNIDAD'])=='1.5' else 1,b['LIBRE']))
+            else: candidates.sort(key=lambda b:b['LIBRE'])
+            if not candidates:
+                warnings.append(f"{row.get(id_header,'')}: faltan {left} pallets; no se asignó completamente."); break
+            bin_=candidates[0]; amount=min(left,int(bin_['LIBRE']))
+            clone=dict(row); index=0
+            if amount<left or pallets>amount:
+                clone[id_header]=f"{row.get(id_header,'')}-{pallets-left+1}"
+            clone[cap_header]=str(amount); 
+            if type_header: clone[type_header]=bin_['UNIDAD']
+            output.append(clone); bin_['LIBRE']-=amount; left-=amount
     return output,warnings
 
 def _to_csv(headers,rows):
@@ -168,5 +176,6 @@ def render():
         for warning in warnings: st.warning(warning)
         st.download_button('DESCARGAR CSV DISPATCHTRACK →',data=csv_bytes,file_name=f'MSF_DISPATCHTRACK_{datetime.now():%Y%m%d_%H%M%S}.csv',mime='text/csv',use_container_width=True,key='msf_download_shell_csv')
     if st.button('← Volver a Mother Base',key='msf_back_home'): st.session_state['mb_module']='MOTHER BASE'; st.rerun()
+
 
 
