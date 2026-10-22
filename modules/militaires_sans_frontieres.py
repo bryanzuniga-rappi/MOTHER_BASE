@@ -117,31 +117,34 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None):
     ordered=[]
     for row in rows:
         origin=str(row.get(origin_header,'')).strip() if origin_header else ''
-        info=directions.get(origin.replace('.0',''),directions.get(_norm(origin),{}))
+        info=dict(directions.get(origin.replace('.0',''),directions.get(_norm(origin),{})))
+        info['_STORE']=_norm(origin)
         if allowed_cities and _norm(info.get('CITY','')) not in {_norm(city) for city in allowed_cities}:
             continue
         ordered.append((row,info))
-    ordered.sort(key=lambda x:(-float(x[1].get('PRIORITY',0)), -_round_pallets(x[0].get(cap_header,''))))
+    if not ordered:
+        ordered=[(row,{}) for row in rows]
+    ordered.sort(key=lambda x:(-float(x[1].get('PRIORITY',0)), _norm(x[1].get('_STORE','')), -_round_pallets(x[0].get(cap_header,''))))
     for row,info in ordered:
         pallets=_round_pallets(row.get(cap_header,'')); left=pallets
         allowed=_norm(info.get('CONSTRAIN',''))
         while left>0:
             if info.get('PRIORITY',0)>0:
                 candidates=[b for b in bins if b['LIBRE']>=1 and _norm(b['UNIDAD'])=='torton']
-                candidates.sort(key=lambda b:b['LIBRE'])
+                candidates.sort(key=lambda b:(0 if b.get('ORIGEN')==info.get('_STORE') else 1,b['LIBRE']))
             else:
                 candidates=[b for b in bins if b['LIBRE']>=1 and (not allowed or _norm(b['UNIDAD'])==allowed)]
                 if allowed=='1.5': candidates.sort(key=lambda b:(0 if _norm(b['UNIDAD'])=='1.5' else 1,b['LIBRE']))
-                else: candidates.sort(key=lambda b:b['LIBRE'])
+                else: candidates.sort(key=lambda b:(0 if b.get('ORIGEN')==info.get('_STORE') else 1,b['LIBRE']))
             if not candidates:
                 warnings.append(f"{row.get(id_header,'')}: faltan {left} pallets; no se asignó completamente."); break
-            bin_=candidates[0]; amount=min(left,int(bin_['LIBRE']))
+            bin_=candidates[0]; amount=min(left,4,int(bin_['LIBRE']))
             clone=dict(row); index=0
             if amount<left or pallets>amount:
                 clone[id_header]=f"{row.get(id_header,'')}-{pallets-left+1}"
             clone[cap_header]=row.get(cap_header,''); 
             if type_header: clone[type_header]=bin_['UNIDAD']
-            output.append(clone); bin_['LIBRE']-=amount; left-=amount
+            output.append(clone); bin_['ORIGEN']=info.get('_STORE'); bin_['LIBRE']-=amount; left-=amount
     return output,warnings
 
 def _to_csv(headers,rows):
@@ -181,6 +184,7 @@ def render():
         for warning in warnings: st.warning(warning)
         st.download_button('DESCARGAR CSV DISPATCHTRACK →',data=csv_bytes,file_name=f'MSF_DISPATCHTRACK_{datetime.now():%Y%m%d_%H%M%S}.csv',mime='text/csv',use_container_width=True,key='msf_download_shell_csv')
     if st.button('← Volver a Mother Base',key='msf_back_home'): st.session_state['mb_module']='MOTHER BASE'; st.rerun()
+
 
 
 
