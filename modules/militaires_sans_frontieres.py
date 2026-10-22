@@ -83,7 +83,7 @@ def _load_directions():
     result={}
     for row in rows[1:]:
         key=str(row[pos['WAREHOUSE_ID']] or '').strip().replace('.0','')
-        data={'CONSTRAIN':str(row[pos['CONSTRAIN']]).strip() if 'CONSTRAIN' in pos and row[pos['CONSTRAIN']] is not None else '', 'PRIORITY':_number(row[pos['PRIORITY']]) if 'PRIORITY' in pos else 0}
+        data={'CITY':str(row[pos['CITY']]).strip() if 'CITY' in pos and row[pos['CITY']] is not None else '', 'CONSTRAIN':str(row[pos['CONSTRAIN']]).strip() if 'CONSTRAIN' in pos and row[pos['CONSTRAIN']] is not None else '', 'PRIORITY':_number(row[pos['PRIORITY']]) if 'PRIORITY' in pos else 0}
         if key: result[key]=data
         if 'WAREHOUSE_NAME' in pos and row[pos['WAREHOUSE_NAME']]: result[_norm(row[pos['WAREHOUSE_NAME']])]=data
     return result
@@ -138,15 +138,35 @@ def render():
     render_system_stamp('MODULE 02 / MILITAIRES SANS FRONTIÈRES'); _inject_style()
     st.markdown('<section class="mb-hero"><span class="mb-kicker">MODULE / 02 · INTELLIGENCE</span><h1>MILITAIRES SANS<br>FRONTIÈRES.</h1><p>Asignación inicial de pedidos a la flota y preparación de archivos DispatchTrack.</p></section>',unsafe_allow_html=True)
     st.markdown('<div class="msf-shell">',unsafe_allow_html=True); st.markdown('<span class="msf-label">CARGA DE PEDIDOS</span>',unsafe_allow_html=True)
+    try:
+        fleet_config=_load_fleet(); direction_config=_load_directions()
+        cities=sorted({str(v.get('CITY','')).strip() for v in direction_config.values() if v.get('CITY')})
+        units=sorted({str(v.get('UNIDAD','')).strip() for v in fleet_config if v.get('UNIDAD')})
+    except Exception as exc:
+        st.error(f'No se pudo leer DATA_LOGISTICS: {exc}'); fleet_config=[]; direction_config={}; cities=[]; units=[]
+    with st.expander('CONFIGURACIÓN DE PLANEACIÓN',expanded=True):
+        c1,c2=st.columns(2)
+        selected_cities=c1.multiselect('Ciudades',cities,default=cities,key='msf_cities')
+        selected_units=c2.multiselect('Unidades disponibles',units,default=units,key='msf_units')
+        c3,c4=st.columns(2)
+        use_constraints=c3.checkbox('Aplicar CONSTRAIN por tienda',value=True,key='msf_constraints')
+        prioritize=c4.checkbox('Priorizar tiendas con PRIORITY usando Torton',value=True,key='msf_priority')
     uploaded=st.file_uploader('Archivo de pedidos',type=['xlsx','xlsm','csv'],accept_multiple_files=False,key='msf_excel_inputs',help='Se conservan únicamente las columnas marcadas como DispatchTrack en la fila 1.')
     run=st.button('EJECUTAR PLANEACIÓN →',type='primary',use_container_width=True,disabled=uploaded is None,key='msf_run_excel_shell')
-    st.markdown('<div class="msf-note">La flota se lee desde FLOTA en el Sheet indicado por DATA_LOGISTICS_ID.</div>',unsafe_allow_html=True); st.markdown('</div>',unsafe_allow_html=True)
+    st.markdown('<div class="msf-note">La configuración se lee desde FLOTA y DIRECCIONES en DATA_LOGISTICS.</div>',unsafe_allow_html=True); st.markdown('</div>',unsafe_allow_html=True)
     if run and uploaded is not None:
         with st.spinner('Leyendo pedidos, FLOTA y asignando unidades…'):
-            try: headers,rows=_read_dispatchtrack_file(uploaded); result,warnings=_assign_and_split(headers,rows,_load_fleet(),_load_directions()); csv_bytes=_to_csv(headers,result)
+            try:
+                headers,rows=_read_dispatchtrack_file(uploaded)
+                filtered_fleet=[u for u in fleet_config if u['UNIDAD'] in selected_units]
+                filtered_directions={k:dict(v) for k,v in direction_config.items() if (not selected_cities or v.get('CITY','') in selected_cities) and (use_constraints or not v.get('CONSTRAIN'))}
+                if not prioritize:
+                    for value in filtered_directions.values(): value['PRIORITY']=0
+                result,warnings=_assign_and_split(headers,rows,filtered_fleet,filtered_directions); csv_bytes=_to_csv(headers,result)
             except Exception as exc: st.error(f'No se pudo ejecutar la planeación: {exc}'); return
         st.success(f'Planeación generada: {len(rows):,} pedidos de entrada → {len(result):,} líneas de salida.')
         for warning in warnings: st.warning(warning)
         st.download_button('DESCARGAR CSV DISPATCHTRACK →',data=csv_bytes,file_name=f'MSF_DISPATCHTRACK_{datetime.now():%Y%m%d_%H%M%S}.csv',mime='text/csv',use_container_width=True,key='msf_download_shell_csv')
     if st.button('← Volver a Mother Base',key='msf_back_home'): st.session_state['mb_module']='MOTHER BASE'; st.rerun()
+
 
