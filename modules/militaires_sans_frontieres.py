@@ -137,9 +137,16 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None):
                 if allowed=='1.5': candidates.sort(key=lambda b:(0 if _norm(b['UNIDAD'])=='1.5' else 1,b['LIBRE']))
                 else: candidates.sort(key=lambda b:(0 if b.get('ORIGEN')==info.get('_STORE') else 1,-b['CAPACIDAD']))
             if not candidates:
-                remainder=dict(row); remainder[cap_header]=str(max(0,original_left)).rstrip('0').rstrip('.') if original_left else row.get(cap_header,'')
-                if type_header: remainder[type_header]=''
-                output.append(remainder); left=0; break
+                remainder_left=max(0,original_left)
+                while remainder_left>1e-9:
+                    remainder=dict(row); part=min(4,remainder_left)
+                    remainder[cap_header]=str(part).rstrip('0').rstrip('.')
+                    if type_header: remainder[type_header]=''
+                    base_id=str(row.get(id_header,'')); split_index=split_counts.get(base_id,0)
+                    if split_index>0: remainder[id_header]=f'{base_id}-{split_index}'
+                    split_counts[base_id]=split_index+1
+                    output.append(remainder); remainder_left-=part
+                left=0; break
             bin_=candidates[0]; amount=min(left,4,int(bin_['LIBRE']))
             clone=dict(row)
             base_id=str(row.get(id_header,'')); split_index=split_counts.get(base_id,0)
