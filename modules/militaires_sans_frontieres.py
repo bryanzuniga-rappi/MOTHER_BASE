@@ -152,7 +152,7 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None):
             base_id=str(row.get(id_header,'')); split_index=split_counts.get(base_id,0)
             if split_index>0: clone[id_header]=f"{base_id}-{split_index}"
             split_counts[base_id]=split_index+1
-            clone[cap_header]=row.get(cap_header,'') if pallets<=4 else (str(min(4,original_left)).rstrip('0').rstrip('.') if original_left>0 else '0'); original_left=max(0,original_left-(2 if _norm(bin_['UNIDAD'])=='1.5' else 4)); 
+            limit=2 if _norm(bin_['UNIDAD'])=='1.5' else 4; clone[cap_header]=row.get(cap_header,'') if original_capacity<=limit and pallets<=limit else (str(min(limit,original_left)).rstrip('0').rstrip('.') if original_left>0 else '0'); original_left=max(0,original_left-limit); 
             if type_header: clone[type_header]=bin_['UNIDAD'] if _norm(bin_['UNIDAD']) in {'torton','1.5'} else ''
             importance_header=next((h for h in headers if _norm(h).replace(' ','')=='importancia'),None)
             if importance_header: clone[importance_header]='1'
