@@ -50,12 +50,13 @@ La ruta normal para Supply es: validar fuentes → cargar Fountain9/COPÉRNICO �
 10. [Engines de planeación](#engines-de-planeación)
 11. [Restricciones y bloqueos](#restricciones-y-bloqueos)
 12. [Perfiles de acceso](#perfiles-de-acceso)
-13. [Resultados y cómo leerlos](#resultados-y-cómo-leerlos)
-14. [Operación diaria](#operación-diaria)
-15. [Instalación y despliegue](#instalación-y-despliegue)
-16. [Guía de desarrollo](#guía-de-desarrollo)
-17. [Pruebas y liberaciones](#pruebas-y-liberaciones)
-18. [Limitaciones conocidas](#limitaciones-conocidas)
+13. [Militaires Sans Frontières](#militaires-sans-frontières)
+14. [Resultados y cómo leerlos](#resultados-y-cómo-leerlos)
+15. [Operación diaria](#operación-diaria)
+16. [Instalación y despliegue](#instalación-y-despliegue)
+17. [Guía de desarrollo](#guía-de-desarrollo)
+18. [Pruebas y liberaciones](#pruebas-y-liberaciones)
+19. [Limitaciones conocidas](#limitaciones-conocidas)
 
 ---
 
@@ -101,7 +102,7 @@ flowchart TD
 1. El usuario entra a **Les Enfants Terribles** y el sistema obtiene `DATA_TRANSFERS`.
 2. Se valida que las fuentes y hojas requeridas estén disponibles y con una frescura aceptable.
 3. Se cargan uno o varios CSV de Fountain9. Opcionalmente se agregan los archivos de COPÉRNICO.
-4. Supply define orígenes, máximo de tareas, bloqueos temporales y engines activos en el panel **CODEC**.
+4. Supply define orígenes, máximo de tareas (11,000 por defecto), bloqueos temporales y engines activos en el panel **CODEC**. En Big Boss todos los engines inician activos salvo Venom.
 5. El motor consolida las necesidades por tienda-SKU y asigna respetando todas las restricciones.
 6. Se generan diagnósticos, KPIs y archivos de salida.
 
@@ -153,7 +154,7 @@ flowchart TD
 | `engines/shalashaska_engine.py` | Evacuación de producto por mermar. |
 | `engines/liquid_engine.py` | Liquidación de remanente. |
 | `engines/venom_engine.py` | Cobertura DDMRP posterior a la planeación. |
-| `modules/militaires_sans_frontieres.py` | Reporting histórico y ejecutivo; módulo en evolución. |
+| `modules/militaires_sans_frontieres.py` | Asignación de pedidos a flota y generación de archivo listo para DispatchTrack. No altera la planeación de inventario. |
 | `modules/install_check.py` | Detecta una instalación aplanada, duplicados en raíz o una versión de planeación equivocada. |
 | `mother_base_theme.py` | Sistema visual de la aplicación. |
 | `tests/` | Pruebas de reglas de negocio y contratos críticos. |
@@ -545,6 +546,30 @@ Al terminar la corrida, Mother Base revisa el universo de los buckets del Refuer
 
 ---
 
+## Militaires Sans Frontières
+
+Militaires Sans Frontières prepara la logística de última milla; no es un engine de inventario. Recibe un pedido de DispatchTrack y la configuración logística de `DATA_LOGISTICS`, asigna la carga a la flota disponible y entrega un XLSX listo para volver a cargar en DispatchTrack. No modifica stock, capacidad de tienda, tareas, bulks ni resultados de **Les Enfants Terribles**.
+
+```mermaid
+flowchart LR
+    A["Pedido DispatchTrack"] --> C["Militaires Sans Frontières"]
+    B["FLOTA + DIRECCIONES"] --> C
+    C --> D["XLSX para DispatchTrack"]
+```
+
+| Entrada / control | Cómo se usa |
+|---|---|
+| Pedido `.xlsx`, `.xlsm` o `.csv` | Conserva las columnas marcadas `DispatchTrack` en la primera fila; si no hay marcadores, usa las columnas del archivo. |
+| `DATA_LOGISTICS` → `FLOTA` | Requiere `UNIDAD`, `CANTIDAD`, `CAPACIDAD UNO` y `VUELTAS`. La disponibilidad efectiva es `CANTIDAD × VUELTAS`. |
+| `DATA_LOGISTICS` → `DIRECCIONES` | Usa `WAREHOUSE_ID` (o nombre), `CITY`, `CONSTRAIN` y `PRIORITY` para filtrar y ordenar. |
+| Ciudades, unidades y toggles de la pantalla | Delimitan la flota y los destinos que se pueden asignar en esa ejecución. |
+
+La secuencia es: filtrar los pedidos permitidos → expandir los viajes de la flota → atender prioridades (con Torton para prioridades configuradas) → respetar restricciones de vehículo → partir la carga por capacidad → descargar `MSF_DISPATCHTRACK_<timestamp>.xlsx`. Las cargas sin vehículo disponible quedan advertidas para revisión; no se eliminan silenciosamente.
+
+El ZIP de planeación se publica desde **Les Enfants Terribles**, en su sección **Subir a Drive**. Así el módulo de logística queda independiente y el paquete contiene exactamente los archivos ya generados por la corrida, sin volver a armarlo en memoria.
+
+---
+
 ## Restricciones y bloqueos
 
 | Restricción | Efecto |
@@ -593,26 +618,11 @@ La autenticación de Big Boss se configura mediante `BIG_BOSS_PASSWORD` en Strea
 
 Los archivos son temporales dentro de la sesión. Descárgalos antes de cerrar o dejar expirar la sesión.
 
-### Envío por mail
+### Publicar ZIP en Drive
 
-Debajo de las tarjetas de resultados, el botón **Enviar por mail** manda **un solo correo** con el paquete de la corrida:
+Debajo de las tarjetas de resultados de **Les Enfants Terribles**, el botón **Subir ZIP a Drive** publica el ZIP ya creado por esa corrida. No vuelve a comprimir los entregables, por lo que evita una segunda copia grande en memoria. El nombre operativo es `TR_<orígenes>_<fecha>.zip` y el enlace queda disponible al terminar.
 
-| Adjunto | Contenido |
-|---|---|
-| `Copernico_<bodega>_<fecha>.csv` | Cada COPÉRNICO subido, sin cambios, renombrado con su bodega (`444-831` si un archivo trae varias; sufijo `_2` si se repite). |
-| `Reporte_Planeación_<fecha>.xlsx` | Solo la hoja `BASE_TRANSFERS` del reporte, con el mismo contenido. |
-| `Sin_Recomendación_<fecha>.csv` | El archivo de Fountain9 sin recomendación. |
-| `OVERVIEW_<fecha>.csv` | La misma tabla "Overview general" de la pantalla. |
-
-Los destinatarios son una lista editable (uno por línea, o separados por comas); por defecto, `javier.ballesteros@rappi.com`, `bryan.zuniga@rappi.com` y `dorian.santiago@rappi.com`. Las direcciones inválidas bloquean el botón. En modo simulación no hay archivos y el botón no aparece. El envío sale de la cuenta de Google autorizada en Secrets (`DATA_DASHBOARD_OAUTH_*`, el mismo cliente que usa Militaires).
-
-**Configuración (una sola vez).** Un token autorizado solo para Drive no puede enviar correo:
-
-1. Habilita la **API de Gmail** en el proyecto de Google Cloud del cliente OAuth.
-2. En Militaires, abre "Conectar mi cuenta personal de Google (OAuth)" y autoriza de nuevo: ahora pide Drive y `gmail.send` (solo enviar; no lee la bandeja).
-3. Pega el nuevo refresh token en Secrets (`DATA_DASHBOARD_OAUTH_REFRESH_TOKEN`, o `MAIL_OAUTH_REFRESH_TOKEN` si lo quieres separado del de Drive) y reinicia la app.
-
-**Límites.** Gmail acepta unos 25 MB por correo; con la codificación, ~18 MB de adjuntos. Si no caben sueltos se comprimen en un solo `Planeacion_<fecha>.zip`. Si la hoja `BASE_TRANSFERS` por sí sola excede el límite (por ejemplo, ~35 MB en un reporte de 138 mil filas) el botón lo avisa al instante, antes de procesar, y hay que compartirla por Drive. Armar el adjunto de un reporte normal tarda unos 8 segundos.
+La cuenta de servicio en `[gcp_service_account]` debe tener acceso de editor a la carpeta operativa de Drive. Si el entorno usa delegación, se puede configurar `PLANNING_DRIVE_IMPERSONATE_EMAIL`; por compatibilidad también se reconoce `DATA_DASHBOARD_IMPERSONATE_EMAIL`. En modo simulación no hay ZIP para publicar.
 
 ### Breakdown de resultados
 
@@ -724,6 +734,7 @@ Variables relevantes:
 BIG_BOSS_PASSWORD = "un-secreto-fuerte-y-unico"
 DATA_TRANSFERS_SPREADSHEET_ID = "id-del-sheet"
 DATA_DASHBOARD_SPREADSHEET_ID = "id-del-dashboard"
+DATA_LOGISTICS_ID = "id-de-logistica"
 ```
 
 > **Seguridad:** `.streamlit/secrets.toml` debe estar en `.gitignore`. Si un secreto llegó al repositorio, elimínelo del historial y rótelo antes de desplegar.
@@ -846,7 +857,7 @@ Antes de confiar una liberación a operación, reprocesar al menos tres fechas h
 - Los resultados y workspaces de corrida son temporales.
 - No existe una bitácora persistente de parámetros, inputs y entregables.
 - Los CSV grandes se consolidan en memoria.
-- `Militaires Sans Frontières` continúa en evolución.
+- Militaires Sans Frontières prepara archivos para DispatchTrack; no persiste la ejecución real de la flota ni la confirmación de entrega.
 - `STOCK.INCOMING` no interviene en la planeación base.
 - `OVER_ORIGEN_STORAGE` conserva compatibilidad de backend, pero no se usa en interfaz.
 - El calendario se evalúa contra la fecha real del servidor; no contra una fecha histórica o simulada de entrega.

@@ -30,7 +30,7 @@ import xlsxwriter
 class Config:
     # El orden representa la prioridad de consumo del stock.
     origin_warehouses: tuple[int, ...] = (811, 834)
-    max_tasks: int = 14_000
+    max_tasks: int = 11_000
 
     # None usa la fecha actual de Ciudad de México.
     # Para reprocesar: "28-08-2026".

@@ -3,9 +3,10 @@
 Posición: acción posterior a la corrida (botón "Enviar por mail" en resultados).
 Entrada: el dict ``run`` de execute_planning (archivos en disco) y la lista de destinatarios.
 Salida: un solo correo con COPÉRNICO, BASE_TRANSFERS, Sin recomendación y OVERVIEW.
-Regla clave: usa la cuenta de Google autorizada por OAuth (mismo cliente que
-Militaires) con el permiso ``gmail.send``; un token autorizado solo para Drive
-no puede enviar correo y se explica cómo reautorizarlo.
+Regla clave: usa la cuenta de Google autorizada por OAuth con el permiso
+``gmail.send``; un token autorizado solo para Drive no puede enviar correo y se
+explica cómo reautorizarlo. La publicación del ZIP en Drive pertenece a
+``les_enfants_terribles``.
 """
 
 from __future__ import annotations
@@ -40,7 +41,6 @@ NO_RECOMMENDATION_NAME = "Sin_Recomendación_{date}.csv"
 OVERVIEW_NAME = "OVERVIEW_{date}.csv"
 COPERNICO_NAME = "Copernico_{warehouse}_{date}.csv"
 PACKAGE_ZIP_NAME = "Planeacion_{date}.zip"
-DRIVE_FOLDER_ID = "1SfvpuHo0uhZLQb8pG5HZuJFH0bJPMu1f"
 
 # Gmail acepta 25 MB por mensaje ya codificado en base64 (+37 %): el tope de los
 # adjuntos crudos es ~18 MB. Arriba de eso se comprimen en un solo ZIP.
@@ -144,37 +144,13 @@ def configured_mail_oauth_refresh_token() -> str:
 
 
 def upload_run_package_to_drive(run: dict[str, Any]) -> str:
-    """Arma el ZIP completo y lo sube a la carpeta de Drive operativa."""
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-        files = [Path(path) for path in run.get("files", [])]
-        if not files:
-            raise MailPackageError("La corrida no tiene archivos para subir a Drive.")
-        for path in files:
-            if path.exists() and path.is_file():
-                archive.write(path, arcname=path.name)
-    payload = buffer.getvalue()
-    filename = drive_package_name(run)
+    """Compatibilidad: la publicación de ZIP pertenece a Les Enfants Terribles."""
     try:
-        from googleapiclient.http import MediaIoBaseUpload
-        from modules.militaires_sans_frontieres import get_drive_upload_service
+        from modules.les_enfants_terribles import upload_planning_zip_to_drive
 
-        service = get_drive_upload_service()
-        metadata = {
-            "name": filename,
-            "parents": [DRIVE_FOLDER_ID],
-            "mimeType": ZIP_MIME,
-        }
-        media = MediaIoBaseUpload(io.BytesIO(payload), mimetype=ZIP_MIME, resumable=True)
-        response = service.files().create(
-            body=metadata,
-            media_body=media,
-            supportsAllDrives=True,
-            fields="id,name,webViewLink",
-        ).execute()
+        return upload_planning_zip_to_drive(run)
     except Exception as exc:
         raise MailError(f"No se pudo subir el ZIP a Drive: {exc}") from exc
-    return str(response.get("webViewLink") or response.get("id") or filename)
 
 
 def send_drive_notification(

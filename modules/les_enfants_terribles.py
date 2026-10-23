@@ -49,7 +49,6 @@ from reportlab.platypus import (
 )
 
 import modelo_abasto as engine
-from modules import mail_sender
 from engines.liquid_engine import (
     LIQUID_CUT,
     LIQUID_REASON,
@@ -84,6 +83,12 @@ from mother_base_theme import (
 
 APP_NAME = "Les Enfants Terribles"
 MAX_UPLOAD_MB = 500
+PLANNING_DRIVE_FOLDER_ID = "1SfvpuHo0uhZLQb8pG5HZuJFH0bJPMu1f"
+PLANNING_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
+
+
+class PlanningDriveError(RuntimeError):
+    """Error recuperable al publicar el ZIP de planeación en Drive."""
 
 
 def configured_data_transfers_spreadsheet_id() -> str:
@@ -9287,35 +9292,141 @@ def render_engine_header(
     render_kpi_cards(cards, columns_count=4)
 
 
-def render_mail_section(run: dict[str, Any]) -> None:
-    """Sube el paquete ZIP de la corrida a la carpeta operativa de Drive."""
+def _planning_drive_secret(name: str) -> str:
+    """Lee un secreto simple sin depender de que Streamlit esté inicializado."""
+    try:
+        value = st.secrets.get(name, "")
+    except Exception:
+        return ""
+    return str(value or "").strip()
+
+
+def _planning_drive_service_account_info() -> dict[str, Any]:
+    """Obtiene la cuenta de servicio que ya tenía acceso a la carpeta operativa."""
+    try:
+        info = st.secrets["gcp_service_account"]
+    except Exception as error:
+        raise PlanningDriveError(
+            "Falta [gcp_service_account] en Secrets para subir el ZIP a Drive."
+        ) from error
+    try:
+        return dict(info)
+    except (TypeError, ValueError) as error:
+        raise PlanningDriveError(
+            "[gcp_service_account] no tiene un formato válido para Drive."
+        ) from error
+
+
+def _build_planning_drive_service() -> Any:
+    """Crea el cliente de Drive de Les Enfants Terribles, sin usar Militaires."""
+    try:
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build as build_drive_service
+
+        credentials = service_account.Credentials.from_service_account_info(
+            _planning_drive_service_account_info(),
+            scopes=[PLANNING_DRIVE_SCOPE],
+        )
+        impersonate_email = (
+            _planning_drive_secret("PLANNING_DRIVE_IMPERSONATE_EMAIL")
+            or _planning_drive_secret("DATA_DASHBOARD_IMPERSONATE_EMAIL")
+        )
+        if impersonate_email:
+            credentials = credentials.with_subject(impersonate_email)
+        return build_drive_service(
+            "drive", "v3", credentials=credentials, cache_discovery=False
+        )
+    except PlanningDriveError:
+        raise
+    except Exception as error:
+        raise PlanningDriveError(
+            f"No se pudieron preparar las credenciales de Drive: {error}"
+        ) from error
+
+
+def planning_drive_package_name(run: dict[str, Any]) -> str:
+    """Nombre operativo del ZIP, estable para una corrida y sus orígenes."""
+    origins: list[str] = []
+    for origin in run.get("origins", []):
+        try:
+            origins.append(str(int(origin)))
+        except (TypeError, ValueError):
+            if str(origin).strip():
+                origins.append(str(origin).strip())
+    raw_date = str(run.get("run_date") or "").strip()
+    try:
+        label = date.fromisoformat(raw_date).strftime("%d-%m-%Y")
+    except ValueError:
+        match = re.search(r"(\d{2}-\d{2}-\d{4})", Path(str(run.get("zip", ""))).name)
+        label = (
+            match.group(1)
+            if match
+            else datetime.now(ZoneInfo("America/Mexico_City")).strftime("%d-%m-%Y")
+        )
+    return f"TR_{'_'.join(origins) or 'SIN_ORIGEN'}_{label}.zip"
+
+
+def upload_planning_zip_to_drive(
+    run: dict[str, Any], *, service: Any | None = None, media_upload_factory: Any | None = None
+) -> str:
+    """Publica el ZIP ya generado; evita duplicarlo en memoria antes de subirlo."""
+    zip_path = Path(str(run.get("zip") or ""))
+    if not zip_path.is_file() or zip_path.stat().st_size == 0:
+        raise PlanningDriveError("La corrida no tiene un ZIP válido para subir a Drive.")
+    try:
+        if media_upload_factory is None:
+            from googleapiclient.http import MediaFileUpload
+
+            media_upload_factory = MediaFileUpload
+        drive_service = service or _build_planning_drive_service()
+        response = drive_service.files().create(
+            body={
+                "name": planning_drive_package_name(run),
+                "parents": [PLANNING_DRIVE_FOLDER_ID],
+                "mimeType": "application/zip",
+            },
+            media_body=media_upload_factory(
+                str(zip_path), mimetype="application/zip", resumable=True
+            ),
+            supportsAllDrives=True,
+            fields="id,name,webViewLink",
+        ).execute()
+    except PlanningDriveError:
+        raise
+    except Exception as error:
+        raise PlanningDriveError(f"No se pudo subir el ZIP a Drive: {error}") from error
+    return str(
+        response.get("webViewLink") or response.get("id") or planning_drive_package_name(run)
+    )
+
+
+def render_planning_drive_section(run: dict[str, Any]) -> None:
+    """Sube el paquete ZIP de la corrida a Drive desde Les Enfants Terribles."""
     st.markdown('<span class="section-label">SUBIR A DRIVE</span>', unsafe_allow_html=True)
     if run.get("simulation"):
         st.caption("Modo simulación: la corrida no generó archivos que subir.")
         return
-    st.caption("El paquete se guardará en Drive como " + mail_sender.drive_package_name(run) + ".")
+    st.caption("El paquete se guardará en Drive como " + planning_drive_package_name(run) + ".")
     if st.button(
         "Subir ZIP a Drive",
-        key="mb_mail_send",
+        key="mb_planning_drive_upload",
     ):
         with st.spinner("Subiendo el ZIP a Drive…"):
             try:
-                drive_link = mail_sender.upload_run_package_to_drive(run)
-            except mail_sender.MailError as error:
+                drive_link = upload_planning_zip_to_drive(run)
+            except PlanningDriveError as error:
                 st.error(str(error))
             except Exception as error:  # nunca debe tumbar la pantalla de resultados
                 st.error(f"No se pudo subir el ZIP a Drive: {error}")
             else:
-                st.session_state["mb_mail_last"] = {
+                st.session_state["mb_planning_drive_last"] = {
                     "run": str(run.get("zip")),
                     "drive_link": drive_link,
-                    "filename": mail_sender.drive_package_name(run),
+                    "filename": planning_drive_package_name(run),
                 }
-    last = st.session_state.get("mb_mail_last")
+    last = st.session_state.get("mb_planning_drive_last")
     if last and last.get("run") == str(run.get("zip")):
-        st.success(
-            "ZIP subido a Drive. Apps Script enviará la notificación."
-        )
+        st.success("ZIP subido a Drive.")
         st.markdown(f"[Abrir archivo en Drive]({last['drive_link']})")
 
 
@@ -9533,7 +9644,7 @@ def render_results(run: dict[str, Any]) -> None:
         columns_count=3,
     )
 
-    render_mail_section(run)
+    render_planning_drive_section(run)
 
     st.markdown(
         '<div class="result-title">CIUDADES + TIENDAS ATENDIDAS.</div>',
@@ -11378,13 +11489,17 @@ def render() -> None:
             "nunca lo exceden."
         )
 
+    # Big Boss inicia con toda la secuencia operativa activa, excepto Venom.
+    # Raiden conserva su configuración restringida y los bloqueos explícitos
+    # de los engines que no puede ejecutar más abajo.
+    big_boss_engine_default = not is_raiden
     st.session_state.setdefault("mb_engine_naked_enabled", True)
     st.session_state.setdefault("mb_engine_otacon_enabled", True)
-    st.session_state.setdefault("mb_engine_solidus_enabled", True)
-    st.session_state.setdefault("mb_engine_shalashaska_enabled", False)
-    st.session_state.setdefault("mb_engine_liquid_enabled", False)
+    st.session_state.setdefault("mb_engine_solidus_enabled", big_boss_engine_default)
+    st.session_state.setdefault("mb_engine_shalashaska_enabled", big_boss_engine_default)
+    st.session_state.setdefault("mb_engine_liquid_enabled", big_boss_engine_default)
     st.session_state.setdefault("mb_engine_venom_enabled", False)
-    st.session_state.setdefault("mb_engine_kazuhira_enabled", False)
+    st.session_state.setdefault("mb_engine_kazuhira_enabled", big_boss_engine_default)
     st.session_state.setdefault("mb_kazuhira_ignore_task_budget", False)
     st.session_state.setdefault("mb_kazuhira_ignore_store_capacity", False)
     st.session_state.setdefault("mb_kazuhira_swa_priority", False)

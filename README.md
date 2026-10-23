@@ -52,6 +52,7 @@ The order is deliberate. Every assignment changes the shared stock, capacity and
 | Entry and session | `app.py`, `auth.py` | Streamlit entry point, navigation, authentication and profiles. |
 | Orchestration | `modules/les_enfants_terribles.py` | Input validation, CODEC configuration, engine order, reports and downloads. |
 | Domain | `modelo_abasto.py`, `engines/*.py` | Normalization, candidates, resource ledger, assignment and restrictions. |
+| Logistics | `modules/militaires_sans_frontieres.py` | Fleet assignment and a DispatchTrack-ready delivery file. |
 | Presentation | `mother_base_theme.py` | Visual system, standard engine cards and UI components. |
 | Validation | `tests/` | Business rules, engine contracts, UI labels and end-to-end checks. |
 
@@ -106,6 +107,19 @@ Runs DDMRP coverage at the end of the normal planning sequence. It calculates bu
 ### Kazuhira Engine
 
 Kazuhira is the final safety net. It can cover remaining catalog breaks when the required stock and routes exist. It is disabled by default and may use an explicit Big Boss bypass for task or capacity rules only where the configured policy permits it.
+
+### Militaires Sans Frontières
+
+Militaires Sans Frontières is a logistics module, separate from inventory planning. It reads a DispatchTrack order file and the `FLOTA` and `DIRECCIONES` sheets in `DATA_LOGISTICS`, assigns loads to the available fleet, and exports an XLSX ready for DispatchTrack. It does not consume Mother Base inventory, capacity, tasks or change the Les Enfants Terribles operational bulks.
+
+```mermaid
+flowchart LR
+    A["DispatchTrack order"] --> C["Militaires Sans Frontières"]
+    B["FLOTA + DIRECCIONES"] --> C
+    C --> D["DispatchTrack XLSX"]
+```
+
+The module expands the usable fleet by `CANTIDAD × VUELTAS`, applies city and vehicle constraints, honors store priority (with Torton priority where configured), splits loads by vehicle capacity, and reports unassigned remainder as warnings. Its output is downloaded from Militaires; the planning ZIP upload remains in Les Enfants Terribles.
 
 ### OWNER and Insumos
 
@@ -193,6 +207,7 @@ Typical values:
 BIG_BOSS_PASSWORD = "use-a-strong-unique-secret"
 DATA_TRANSFERS_SPREADSHEET_ID = "spreadsheet-id"
 DATA_DASHBOARD_SPREADSHEET_ID = "dashboard-id"
+DATA_LOGISTICS_ID = "logistics-spreadsheet-id"
 ```
 
 Never commit `.streamlit/secrets.toml`. If a secret was exposed, rotate it and remove it from repository history.
@@ -202,7 +217,7 @@ Never commit `.streamlit/secrets.toml`. If a secret was exposed, rotate it and r
 1. Validate `DATA_TRANSFERS` and source freshness.
 2. Load only the Fountain9 files belonging to the run.
 3. Load COPERNICO when required by the selected origins.
-4. Configure origins, task limit, capacity policy, locks and engine toggles in CODEC.
+4. Configure origins, task limit (11,000 by default), capacity policy, locks and engine toggles in CODEC. Big Boss starts with every engine enabled except Venom.
 5. Confirm Naked and Otacon settings.
 6. Run the plan.
 7. Review engine totals, cuts, blocked cases, stock consumption and capacity.
@@ -681,7 +696,7 @@ Regenerate the package outside the active source folder, exclude virtual environ
 - Historical delivery-date simulation is not available.
 - Incoming inventory is not part of base planning.
 - Multi-user concurrency and load testing need additional infrastructure.
-- The Militaires Sans Frontières reporting module remains under development.
+- Militaires Sans Frontières prepares DispatchTrack files; it does not persist fleet execution or delivery confirmation.
 
 ## Glossary
 
