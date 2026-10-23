@@ -112,7 +112,6 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None):
     if not cap_header: raise ValueError('El archivo no tiene CAPACIDAD UNO.')
     bins=[]
     for item in fleet:
-        if _norm(item['UNIDAD']) not in {'torton','1.5'}: continue
         for _ in range(int(item['CANTIDAD'])): bins.append({'UNIDAD':item['UNIDAD'],'CAPACIDAD':float(item['CAPACIDAD']),'LIBRE':float(item['CAPACIDAD']),'ORIGEN':None})
     output=[]; warnings=[]; split_counts={}
     ordered=[]
@@ -145,7 +144,7 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None):
             if split_index>0: clone[id_header]=f"{base_id}-{split_index}"
             split_counts[base_id]=split_index+1
             clone[cap_header]=row.get(cap_header,'') if pallets<=4 else (str(min(4,original_left)).rstrip('0').rstrip('.') if original_left>0 else '0'); original_left=max(0,original_left-4); 
-            if type_header: clone[type_header]=bin_['UNIDAD']
+            if type_header: clone[type_header]=bin_['UNIDAD'] if _norm(bin_['UNIDAD']) in {'torton','1.5'} else ''
             importance_header=next((h for h in headers if _norm(h).replace(' ','')=='importancia'),None)
             if importance_header: clone[importance_header]='1'
             output.append(clone); bin_['ORIGEN']=info.get('_STORE'); bin_['LIBRE']-=amount; left-=amount
