@@ -147,12 +147,12 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None):
                     split_counts[base_id]=split_index+1
                     output.append(remainder); remainder_left-=part
                 left=0; break
-            bin_=candidates[0]; amount=min(left,4,int(bin_['LIBRE']))
+            bin_=candidates[0]; chunk_limit=2 if _norm(bin_['UNIDAD'])=='1.5' else 4; amount=min(left,chunk_limit,int(bin_['LIBRE']))
             clone=dict(row)
             base_id=str(row.get(id_header,'')); split_index=split_counts.get(base_id,0)
             if split_index>0: clone[id_header]=f"{base_id}-{split_index}"
             split_counts[base_id]=split_index+1
-            clone[cap_header]=row.get(cap_header,'') if pallets<=4 else (str(min(4,original_left)).rstrip('0').rstrip('.') if original_left>0 else '0'); original_left=max(0,original_left-4); 
+            clone[cap_header]=row.get(cap_header,'') if pallets<=4 else (str(min(4,original_left)).rstrip('0').rstrip('.') if original_left>0 else '0'); original_left=max(0,original_left-(2 if _norm(bin_['UNIDAD'])=='1.5' else 4)); 
             if type_header: clone[type_header]=bin_['UNIDAD'] if _norm(bin_['UNIDAD']) in {'torton','1.5'} else ''
             importance_header=next((h for h in headers if _norm(h).replace(' ','')=='importancia'),None)
             if importance_header: clone[importance_header]='1'
@@ -174,7 +174,7 @@ def render():
         st.error(f'No se pudo leer DATA_LOGISTICS: {exc}'); fleet_config=[]; direction_config={}; cities=[]; units=[]
     with st.expander('CONFIGURACIÓN DE PLANEACIÓN',expanded=True):
         c1,c2=st.columns(2)
-        selected_cities=c1.multiselect('Ciudades',cities,default=cities,key='msf_cities')
+        selected_cities=c1.multiselect('Ciudades',cities,default=[c for c in cities if _norm(c).startswith('ciudad de')],key='msf_cities')
         selected_units=c2.multiselect('Unidades disponibles',units,default=units,key='msf_units')
         c3,c4=st.columns(2)
         use_constraints=c3.checkbox('Aplicar CONSTRAIN por tienda',value=True,key='msf_constraints')
@@ -194,8 +194,11 @@ def render():
             except Exception as exc: st.error(f'No se pudo ejecutar la planeación: {exc}'); return
         st.success(f'Planeación generada: {len(rows):,} pedidos de entrada → {len(result):,} líneas de salida.')
         for warning in warnings: st.info(warning)
-        st.download_button('DESCARGAR CSV DISPATCHTRACK →',data=csv_bytes,file_name=f'MSF_DISPATCHTRACK_{datetime.now():%Y%m%d_%H%M%S}.csv',mime='text/csv',use_container_width=True,key='msf_download_shell_csv')
+        st.session_state['msf_csv_bytes']=csv_bytes; st.session_state['msf_csv_name']=f'MSF_DISPATCHTRACK_{datetime.now():%Y%m%d_%H%M%S}.csv'; st.session_state['msf_result_count']=len(result)
+    if st.session_state.get('msf_csv_bytes'):
+        st.download_button('DESCARGAR CSV DISPATCHTRACK →',data=st.session_state['msf_csv_bytes'],file_name=st.session_state['msf_csv_name'],mime='text/csv',use_container_width=True,key='msf_download_shell_csv')
     if st.button('← Volver a Mother Base',key='msf_back_home'): st.session_state['mb_module']='MOTHER BASE'; st.rerun()
+
 
 
 
