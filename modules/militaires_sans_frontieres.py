@@ -137,7 +137,9 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None):
                 if allowed=='1.5': candidates.sort(key=lambda b:(0 if _norm(b['UNIDAD'])=='1.5' else 1,b['LIBRE']))
                 else: candidates.sort(key=lambda b:(0 if b.get('ORIGEN')==info.get('_STORE') else 1,-b['CAPACIDAD']))
             if not candidates:
-                warnings.append(f"{row.get(id_header,'')}: faltan {left} pallets; no se asignó completamente."); break
+                remainder=dict(row); remainder[cap_header]=str(max(0,original_left)).rstrip('0').rstrip('.') if original_left else row.get(cap_header,'')
+                if type_header: remainder[type_header]=''
+                output.append(remainder); left=0; break
             bin_=candidates[0]; amount=min(left,4,int(bin_['LIBRE']))
             clone=dict(row)
             base_id=str(row.get(id_header,'')); split_index=split_counts.get(base_id,0)
@@ -184,7 +186,7 @@ def render():
                 result,warnings=_assign_and_split(headers,rows,filtered_fleet,filtered_directions,selected_cities); csv_bytes=_to_csv(headers,result)
             except Exception as exc: st.error(f'No se pudo ejecutar la planeación: {exc}'); return
         st.success(f'Planeación generada: {len(rows):,} pedidos de entrada → {len(result):,} líneas de salida.')
-        for warning in warnings: st.warning(warning)
+        for warning in warnings: st.info(warning)
         st.download_button('DESCARGAR CSV DISPATCHTRACK →',data=csv_bytes,file_name=f'MSF_DISPATCHTRACK_{datetime.now():%Y%m%d_%H%M%S}.csv',mime='text/csv',use_container_width=True,key='msf_download_shell_csv')
     if st.button('← Volver a Mother Base',key='msf_back_home'): st.session_state['mb_module']='MOTHER BASE'; st.rerun()
 
