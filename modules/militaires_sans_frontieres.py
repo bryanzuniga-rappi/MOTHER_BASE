@@ -203,16 +203,13 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None):
             output.append(clone); bin_['ORIGEN']=info.get('_STORE'); bin_['LIBRE']-=amount; left-=amount
     return output,warnings
 
-def _to_xlsx(headers,rows):
-    output=io.BytesIO(); wb=openpyxl.Workbook(); ws=wb.active; ws.title='Sheet1'
-    ws.append(headers)
-    for row in rows: ws.append([row.get(h,'') for h in headers])
-    ws.freeze_panes='A2'; ws.auto_filter.ref=ws.dimensions
-    for cell in ws[1]: cell.font=openpyxl.styles.Font(bold=True)
-    wb.save(output); return output.getvalue()
-
 def _to_csv(headers,rows):
-    output=io.StringIO(newline=''); writer=csv.DictWriter(output,fieldnames=headers,extrasaction='ignore'); writer.writeheader(); writer.writerows(rows); return output.getvalue().encode('utf-8-sig')
+    """CSV compatible con Excel: UTF-8 con BOM, CRLF y escapado estándar."""
+    output=io.StringIO(newline='')
+    writer=csv.DictWriter(output,fieldnames=headers,extrasaction='ignore',lineterminator='\r\n')
+    writer.writeheader()
+    writer.writerows(rows)
+    return output.getvalue().encode('utf-8-sig')
 
 def render():
     render_system_stamp('MODULE 02 / MILITAIRES SANS FRONTIÈRES'); _inject_style()
@@ -242,13 +239,13 @@ def render():
                 filtered_directions={k:dict(v) for k,v in direction_config.items() if (not selected_cities or _norm(v.get('CITY','')) in {_norm(city) for city in selected_cities}) and (use_constraints or not v.get('CONSTRAIN'))}
                 if not prioritize:
                     for value in filtered_directions.values(): value['PRIORITY']=0
-                result,warnings=_assign_and_split(headers,rows,filtered_fleet,filtered_directions,selected_cities); csv_bytes=_to_xlsx(headers,result)
+                result,warnings=_assign_and_split(headers,rows,filtered_fleet,filtered_directions,selected_cities); csv_bytes=_to_csv(headers,result)
             except Exception as exc: st.error(f'No se pudo ejecutar la planeación: {exc}'); return
         st.success(f'Planeación generada: {len(rows):,} pedidos de entrada → {len(result):,} líneas de salida.')
         for warning in warnings: st.info(warning)
-        st.session_state['msf_csv_bytes']=csv_bytes; st.session_state['msf_csv_name']=f'MSF_DISPATCHTRACK_{datetime.now():%Y%m%d_%H%M%S}.xlsx'; st.session_state['msf_result_count']=len(result)
+        st.session_state['msf_csv_bytes']=csv_bytes; st.session_state['msf_csv_name']=f'MSF_DISPATCHTRACK_{datetime.now():%Y%m%d_%H%M%S}.csv'; st.session_state['msf_result_count']=len(result)
     if st.session_state.get('msf_csv_bytes'):
-        st.download_button('DESCARGAR XLSX DISPATCHTRACK →',data=st.session_state['msf_csv_bytes'],file_name=st.session_state['msf_csv_name'],mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',use_container_width=True,key='msf_download_shell_csv')
+        st.download_button('DESCARGAR CSV DISPATCHTRACK →',data=st.session_state['msf_csv_bytes'],file_name=st.session_state['msf_csv_name'],mime='text/csv; charset=utf-8',use_container_width=True,key='msf_download_shell_csv')
     if st.button('← Volver a Mother Base',key='msf_back_home'): st.session_state['mb_module']='MOTHER BASE'; st.rerun()
 
 

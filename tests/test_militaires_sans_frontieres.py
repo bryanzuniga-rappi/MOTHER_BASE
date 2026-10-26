@@ -4,7 +4,7 @@ from tests._streamlit_stub import install
 
 install()
 
-from modules.militaires_sans_frontieres import _mark_split_destination
+from modules.militaires_sans_frontieres import _mark_split_destination, _to_csv
 
 
 HEADERS = [
@@ -43,3 +43,16 @@ def test_second_split_uses_its_own_suffix_and_address_increment():
     assert row["DIRECCION*"] == "Calle Jalapa, 153, Roma Norte, 06700"
     assert row["IDENTIFICADOR CONTACTO*"] == "Ángel de Independencia-2"
     assert row["NOMBRE CONTACTO*"] == "Ángel de Independencia-2"
+
+
+def test_csv_is_utf8_with_bom_and_preserves_accents_for_excel():
+    content = _to_csv(
+        ["NOMBRE CONTACTO*", "DIRECCION*"],
+        [{"NOMBRE CONTACTO*": "Ángel de Independencia", "DIRECCION*": "Peña, 151"}],
+    )
+
+    assert content.startswith(b"\xef\xbb\xbf")
+    assert content.decode("utf-8-sig") == (
+        "NOMBRE CONTACTO*,DIRECCION*\r\n"
+        'Ángel de Independencia,"Peña, 151"\r\n'
+    )
