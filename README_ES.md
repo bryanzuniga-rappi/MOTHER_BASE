@@ -564,7 +564,7 @@ flowchart LR
 | `DATA_LOGISTICS` → `DIRECCIONES` | Usa `WAREHOUSE_ID` (o nombre), `CITY`, `CONSTRAIN` y `PRIORITY` para filtrar y ordenar. |
 | Ciudades, unidades y toggles de la pantalla | Delimitan la flota y los destinos que se pueden asignar en esa ejecución. |
 
-La secuencia es: filtrar los pedidos permitidos → expandir los viajes de la flota → atender prioridades (con Torton para prioridades configuradas) → respetar restricciones de vehículo → partir la carga por capacidad → descargar `MSF_DISPATCHTRACK_<timestamp>.xlsx`. Las cargas sin vehículo disponible quedan advertidas para revisión; no se eliminan silenciosamente.
+La secuencia es: filtrar los pedidos permitidos → expandir los viajes de la flota → atender prioridades (con Torton para prioridades configuradas) → respetar restricciones de vehículo → partir la carga por capacidad → descargar `MSF_DISPATCHTRACK_<timestamp>.xlsx`. Cada parte adicional recibe el sufijo `-1`, `-2`, etc. en código de parada, identificador y nombre de contacto; su número de calle aumenta en el mismo índice para que DispatchTrack la reconozca como un destino distinto. Las cargas sin vehículo disponible quedan advertidas para revisión; no se eliminan silenciosamente.
 
 El ZIP de planeación se publica desde **Les Enfants Terribles**, en su sección **Subir a Drive**. Así el módulo de logística queda independiente y el paquete contiene exactamente los archivos ya generados por la corrida, sin volver a armarlo en memoria.
 

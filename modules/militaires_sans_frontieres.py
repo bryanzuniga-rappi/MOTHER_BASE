@@ -1,6 +1,6 @@
 """Militaires Sans Frontières — primera capa de asignación de rutas."""
 from __future__ import annotations
-import csv, io, os, unicodedata, urllib.request
+import csv, io, os, re, unicodedata, urllib.request
 from datetime import datetime
 from pathlib import Path
 import openpyxl
@@ -104,6 +104,39 @@ def _round_pallets(value):
     if value<=0: return 0
     whole=int(value); return max(1,whole+(1 if value-whole>=0.3 else 0))
 
+
+def _split_destination_address(address, split_index):
+    """Crea una dirección distinguible para una parte adicional del mismo pedido."""
+    value=str(address or '')
+    if split_index<=0 or not value:
+        return value
+    match=re.search(r'(,\s*)(\d+)([A-Za-z]*)',value)
+    if not match:
+        return value
+    number=str(int(match.group(2))+split_index)
+    return f'{value[:match.start()]}{match.group(1)}{number}{match.group(3)}{value[match.end():]}'
+
+
+def _mark_split_destination(row,headers,split_index):
+    """Marca las partes derivadas para que DispatchTrack las trate como destinos únicos."""
+    if split_index<=0:
+        return
+    normalized=lambda header:_norm(header).replace(' ','')
+    contact_headers=[
+        header for header in headers
+        if normalized(header).replace('*','') in {'identificadorcontacto','nombrecontacto'}
+    ]
+    address_header=next(
+        (header for header in headers if normalized(header).replace('*','')=='direccion'),None
+    )
+    for header in contact_headers:
+        value=str(row.get(header,'') or '').strip()
+        if value:
+            row[header]=f'{value}-{split_index}'
+    if address_header:
+        row[address_header]=_split_destination_address(row.get(address_header,''),split_index)
+
+
 def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None):
     directions=directions or {}; cap_header=next((h for h in headers if h.upper()=='CAPACIDAD UNO'),None)
     id_header=next((h for h in headers if h.upper() in {'CÓDIGO DE PARADA*','CODIGO DE PARADA*','TRANSFER ID'}),headers[0])
@@ -143,14 +176,18 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None):
                     remainder[cap_header]=str(part).rstrip('0').rstrip('.')
                     if type_header: remainder[type_header]=''
                     base_id=str(row.get(id_header,'')); split_index=split_counts.get(base_id,0)
-                    if split_index>0: remainder[id_header]=f'{base_id}-{split_index}'
+                    if split_index>0:
+                        remainder[id_header]=f'{base_id}-{split_index}'
+                        _mark_split_destination(remainder,headers,split_index)
                     split_counts[base_id]=split_index+1
                     output.append(remainder); remainder_left-=part
                 left=0; break
             bin_=candidates[0]; chunk_limit=2 if _norm(bin_['UNIDAD'])=='1.5' else 4; amount=min(left,chunk_limit,int(bin_['LIBRE']))
             clone=dict(row)
             base_id=str(row.get(id_header,'')); split_index=split_counts.get(base_id,0)
-            if split_index>0: clone[id_header]=f"{base_id}-{split_index}"
+            if split_index>0:
+                clone[id_header]=f"{base_id}-{split_index}"
+                _mark_split_destination(clone,headers,split_index)
             split_counts[base_id]=split_index+1
             limit=2 if _norm(bin_['UNIDAD'])=='1.5' else 4; clone[cap_header]=row.get(cap_header,'') if original_capacity<=limit and pallets<=limit else (str(min(limit,original_left)).rstrip('0').rstrip('.') if original_left>0 else '0'); original_left=max(0,original_left-limit); 
             if type_header: clone[type_header]=bin_['UNIDAD'] if _norm(bin_['UNIDAD']) in {'torton','1.5'} else ''
