@@ -548,7 +548,7 @@ Al terminar la corrida, Mother Base revisa el universo de los buckets del Refuer
 
 ## Militaires Sans Frontières
 
-Militaires Sans Frontières prepara la logística de última milla; no es un engine de inventario. Recibe un pedido de DispatchTrack y la configuración logística de `DATA_LOGISTICS`, asigna la carga a la flota disponible y entrega un CSV listo para volver a cargar en DispatchTrack. El archivo usa UTF-8 con BOM, por lo que Excel conserva tildes, eñes y caracteres especiales. No modifica stock, capacidad de tienda, tareas, bulks ni resultados de **Les Enfants Terribles**.
+Militaires Sans Frontières prepara la logística de última milla; no es un engine de inventario. Recibe un pedido de DispatchTrack y la configuración logística de `DATA_LOGISTICS`, asigna la carga a la flota disponible y entrega un CSV listo para volver a cargar en DispatchTrack. El archivo usa UTF-8 con BOM, por lo que Excel conserva tildes, eñes y caracteres especiales. Las fechas de entrega y las dos ventanas horarias se prefijan con apóstrofo para que Excel las abra como texto, sin reinterpretar fecha ni hora. No modifica stock, capacidad de tienda, tareas, bulks ni resultados de **Les Enfants Terribles**.
 
 ```mermaid
 flowchart LR

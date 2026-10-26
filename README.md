@@ -110,7 +110,7 @@ Kazuhira is the final safety net. It can cover remaining catalog breaks when the
 
 ### Militaires Sans Frontières
 
-Militaires Sans Frontières is a logistics module, separate from inventory planning. It reads a DispatchTrack order file and the `FLOTA` and `DIRECCIONES` sheets in `DATA_LOGISTICS`, assigns loads to the available fleet, and exports a DispatchTrack-ready CSV. The file uses UTF-8 with BOM so Excel preserves accents and special characters. It does not consume Mother Base inventory, capacity, tasks or change the Les Enfants Terribles operational bulks.
+Militaires Sans Frontières is a logistics module, separate from inventory planning. It reads a DispatchTrack order file and the `FLOTA` and `DIRECCIONES` sheets in `DATA_LOGISTICS`, assigns loads to the available fleet, and exports a DispatchTrack-ready CSV. The file uses UTF-8 with BOM so Excel preserves accents and special characters; delivery dates and both values of the first delivery window are prefixed with an apostrophe so Excel keeps them as text. It does not consume Mother Base inventory, capacity, tasks or change the Les Enfants Terribles operational bulks.
 
 ```mermaid
 flowchart LR

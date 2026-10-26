@@ -56,3 +56,22 @@ def test_csv_is_utf8_with_bom_and_preserves_accents_for_excel():
         "NOMBRE CONTACTO*,DIRECCION*\r\n"
         'Ángel de Independencia,"Peña, 151"\r\n'
     )
+
+
+def test_csv_prefixes_dispatchtrack_dates_and_time_windows_as_excel_text():
+    headers = [
+        "FECHA MIN ENTREGA*",
+        "FECHA MAX ENTREGA*",
+        "MIN VENTANA HORARIO 1*",
+        "MAX VENTANA HORARIA 1*",
+        "NOMBRE CONTACTO*",
+    ]
+    content = _to_csv(headers, [{
+        "FECHA MIN ENTREGA*": "23/10/2026",
+        "FECHA MAX ENTREGA*": "24/10/2026",
+        "MIN VENTANA HORARIO 1*": "00:00",
+        "MAX VENTANA HORARIA 1*": "07:00",
+        "NOMBRE CONTACTO*": "Ángel",
+    }]).decode("utf-8-sig")
+
+    assert content.splitlines()[1] == "'23/10/2026,'24/10/2026,'00:00,'07:00,Ángel"

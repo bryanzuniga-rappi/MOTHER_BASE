@@ -203,12 +203,34 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None):
             output.append(clone); bin_['ORIGEN']=info.get('_STORE'); bin_['LIBRE']-=amount; left-=amount
     return output,warnings
 
+EXCEL_TEXT_FIELD_NAMES=frozenset({
+    'fechaminentrega',
+    'fechamaxentrega',
+    'minventanahoraria1',
+    'minventanahorario1',
+    'maxventanahoraria1',
+    'maxventanahorario1',
+})
+
+
+def _csv_value(header,value):
+    """Fuerza texto en Excel solo para fechas y ventanas de DispatchTrack."""
+    if value is None:
+        return ''
+    text=str(value)
+    field_name=_norm(header).replace(' ','').replace('*','')
+    if field_name in EXCEL_TEXT_FIELD_NAMES and text and not text.startswith("'"):
+        return f"'{text}"
+    return text
+
+
 def _to_csv(headers,rows):
     """CSV compatible con Excel: UTF-8 con BOM, CRLF y escapado estándar."""
     output=io.StringIO(newline='')
     writer=csv.DictWriter(output,fieldnames=headers,extrasaction='ignore',lineterminator='\r\n')
     writer.writeheader()
-    writer.writerows(rows)
+    for row in rows:
+        writer.writerow({header:_csv_value(header,row.get(header,'')) for header in headers})
     return output.getvalue().encode('utf-8-sig')
 
 def render():
