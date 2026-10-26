@@ -67,13 +67,7 @@ def _load_fleet():
     for row in rows[1:]:
         try: qty=int(float(row[pos['CANTIDAD']] or 0)); turns=int(float(row[pos['VUELTAS']] or 1)); cap=float(row[pos['CAPACIDAD UNO']] or 0)
         except (TypeError,ValueError): continue
-        if qty>0 and turns>0 and cap>0:
-            fleet.append({
-                'UNIDAD':str(row[pos['UNIDAD']]).strip(),
-                'CANTIDAD':qty,
-                'CAPACIDAD':cap,
-                'VUELTAS':turns,
-            })
+        if qty>0 and turns>0 and cap>0: fleet.append({'UNIDAD':str(row[pos['UNIDAD']]).strip(),'CANTIDAD':qty*turns,'CAPACIDAD':cap})
     if not fleet: raise ValueError('FLOTA no tiene unidades válidas.')
     return sorted(fleet,key=lambda x:float(x['CAPACIDAD']),reverse=True)
 
@@ -151,15 +145,7 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None):
     if not cap_header: raise ValueError('El archivo no tiene CAPACIDAD UNO.')
     bins=[]
     for item in fleet:
-        for turn in range(1,int(item.get('VUELTAS',1))+1):
-            for _ in range(int(item['CANTIDAD'])):
-                bins.append({
-                    'UNIDAD':item['UNIDAD'],
-                    'CAPACIDAD':float(item['CAPACIDAD']),
-                    'LIBRE':float(item['CAPACIDAD']),
-                    'ORIGEN':None,
-                    'VUELTA':turn,
-                })
+        for _ in range(int(item['CANTIDAD'])): bins.append({'UNIDAD':item['UNIDAD'],'CAPACIDAD':float(item['CAPACIDAD']),'LIBRE':float(item['CAPACIDAD']),'ORIGEN':None})
     output=[]; warnings=[]; split_counts={}
     ordered=[]
     for row in rows:
@@ -171,26 +157,13 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None):
         ordered.append((row,info))
     if not ordered:
         ordered=[(row,{}) for row in rows]
-    # Priority 1 es la única prioridad especial de esta política: siempre se
-    # atiende antes que el resto y solo puede consumir la primera vuelta de Torton.
-    ordered.sort(key=lambda x:(
-        0 if _number(x[1].get('PRIORITY',0))==1 else 1,
-        _norm(x[1].get('_STORE','')),
-        -_round_pallets(x[0].get(cap_header,'')),
-    ))
+    ordered.sort(key=lambda x:(-float(x[1].get('PRIORITY',0)), _norm(x[1].get('_STORE','')), -_round_pallets(x[0].get(cap_header,''))))
     for row,info in ordered:
         original_capacity=_number(row.get(cap_header,'')); pallets=_round_pallets(original_capacity); pallets=max(pallets, 5 if original_capacity>4 else pallets); left=pallets; original_left=original_capacity
         allowed=_norm(info.get('CONSTRAIN',''))
         while left>0:
-            priority_one=_number(info.get('PRIORITY',0))==1
-            if priority_one and allowed=='1.5':
-                candidates=[b for b in bins if b['LIBRE']>=1 and _norm(b['UNIDAD'])=='1.5']
-                candidates.sort(key=lambda b:(0 if b.get('ORIGEN')==info.get('_STORE') else 1,b['LIBRE']))
-            elif priority_one:
-                candidates=[
-                    b for b in bins
-                    if b['LIBRE']>=1 and _norm(b['UNIDAD'])=='torton' and b['VUELTA']==1
-                ]
+            if info.get('PRIORITY',0)>0:
+                candidates=[b for b in bins if b['LIBRE']>=1 and _norm(b['UNIDAD'])=='torton']
                 candidates.sort(key=lambda b:(0 if b.get('ORIGEN')==info.get('_STORE') else 1,b['LIBRE']))
             else:
                 candidates=[b for b in bins if b['LIBRE']>=1 and (not allowed or _norm(b['UNIDAD'])==allowed)]
@@ -199,17 +172,14 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None):
             if not candidates:
                 remainder_left=max(0,original_left)
                 while remainder_left>1e-9:
-                    remainder=dict(row); part=min(2 if allowed=='1.5' else 4,remainder_left)
+                    remainder=dict(row); part=min(4,remainder_left)
                     remainder[cap_header]=str(part).rstrip('0').rstrip('.')
-                    if type_header: remainder[type_header]='1.5' if allowed=='1.5' else ''
+                    if type_header: remainder[type_header]=''
                     base_id=str(row.get(id_header,'')); split_index=split_counts.get(base_id,0)
                     if split_index>0:
                         remainder[id_header]=f'{base_id}-{split_index}'
                         _mark_split_destination(remainder,headers,split_index)
                     split_counts[base_id]=split_index+1
-                    importance_header=next((h for h in headers if _norm(h).replace(' ','')=='importancia'),None)
-                    if importance_header:
-                        remainder[importance_header]='1' if allowed=='1.5' else ''
                     output.append(remainder); remainder_left-=part
                 left=0; break
             bin_=candidates[0]; chunk_limit=2 if _norm(bin_['UNIDAD'])=='1.5' else 4; amount=min(left,chunk_limit,int(bin_['LIBRE']))
