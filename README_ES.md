@@ -548,13 +548,13 @@ Al terminar la corrida, Mother Base revisa el universo de los buckets del Refuer
 
 ## Militaires Sans Frontières
 
-Militaires Sans Frontières prepara la logística de última milla; no es un engine de inventario. Recibe un pedido de DispatchTrack y la configuración logística de `DATA_LOGISTICS`, asigna la carga a la flota disponible y entrega un CSV listo para volver a cargar en DispatchTrack. El archivo usa UTF-8 con BOM, por lo que Excel conserva tildes, eñes y caracteres especiales. Las fechas de entrega y las dos ventanas horarias se prefijan con apóstrofo para que Excel las abra como texto, sin reinterpretar fecha ni hora. No modifica stock, capacidad de tienda, tareas, bulks ni resultados de **Les Enfants Terribles**.
+Militaires Sans Frontières prepara la logística de última milla; no es un engine de inventario. Recibe un pedido de DispatchTrack y la configuración logística de `DATA_LOGISTICS`, asigna la carga a la flota disponible y entrega un XLSX listo para volver a cargar en DispatchTrack. El archivo tiene una sola hoja `Sheet1` y los 25 encabezados en español exactamente como la plantilla aceptada por DispatchTrack. Las fechas de entrega y las dos ventanas horarias son celdas de texto reales, no fechas ni horas. No modifica stock, capacidad de tienda, tareas, bulks ni resultados de **Les Enfants Terribles**.
 
 ```mermaid
 flowchart LR
     A["Pedido DispatchTrack"] --> C["Militaires Sans Frontières"]
     B["FLOTA + DIRECCIONES"] --> C
-    C --> D["CSV para DispatchTrack"]
+    C --> D["XLSX para DispatchTrack"]
 ```
 
 | Entrada / control | Cómo se usa |
@@ -564,7 +564,7 @@ flowchart LR
 | `DATA_LOGISTICS` → `DIRECCIONES` | Usa `WAREHOUSE_ID` (o nombre), `CITY`, `CONSTRAIN` y `PRIORITY` para filtrar y ordenar. |
 | Ciudades, unidades y toggles de la pantalla | Delimitan la flota y los destinos que se pueden asignar en esa ejecución. |
 
-La secuencia es: filtrar los pedidos permitidos → expandir los viajes de la flota → atender prioridades (con Torton para prioridades configuradas) → respetar restricciones de vehículo → partir la carga por capacidad → descargar `MSF_DISPATCHTRACK_<timestamp>.csv`. Cada parte adicional recibe el sufijo `-1`, `-2`, etc. en código de parada, identificador y nombre de contacto; su número de calle aumenta en el mismo índice para que DispatchTrack la reconozca como un destino distinto. Las cargas sin vehículo disponible quedan advertidas para revisión; no se eliminan silenciosamente.
+La secuencia es: filtrar los pedidos permitidos → expandir los viajes de la flota → atender prioridades (con Torton para prioridades configuradas) → respetar restricciones de vehículo → partir la carga por capacidad → descargar `MSF_DISPATCHTRACK_<timestamp>.xlsx`. Cada parte adicional recibe el sufijo `-1`, `-2`, etc. en código de parada, identificador y nombre de contacto; su número de calle aumenta en el mismo índice para que DispatchTrack la reconozca como un destino distinto. Las cargas sin vehículo disponible quedan advertidas para revisión; no se eliminan silenciosamente.
 
 El ZIP de planeación se publica desde **Les Enfants Terribles**, en su sección **Subir a Drive**. Así el módulo de logística queda independiente y el paquete contiene exactamente los archivos ya generados por la corrida, sin volver a armarlo en memoria.
 

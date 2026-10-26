@@ -1,10 +1,18 @@
 """Contrato de partición de destinos para la salida de DispatchTrack."""
 
+import io
+
+import openpyxl
+
 from tests._streamlit_stub import install
 
 install()
 
-from modules.militaires_sans_frontieres import _mark_split_destination, _to_csv
+from modules.militaires_sans_frontieres import (
+    DISPATCHTRACK_OUTPUT_HEADERS,
+    _mark_split_destination,
+    _to_xlsx,
+)
 
 
 HEADERS = [
@@ -45,20 +53,7 @@ def test_second_split_uses_its_own_suffix_and_address_increment():
     assert row["NOMBRE CONTACTO*"] == "Ángel de Independencia-2"
 
 
-def test_csv_is_utf8_with_bom_and_preserves_accents_for_excel():
-    content = _to_csv(
-        ["NOMBRE CONTACTO*", "DIRECCION*"],
-        [{"NOMBRE CONTACTO*": "Ángel de Independencia", "DIRECCION*": "Peña, 151"}],
-    )
-
-    assert content.startswith(b"\xef\xbb\xbf")
-    assert content.decode("utf-8-sig") == (
-        "NOMBRE CONTACTO*,DIRECCION*\r\n"
-        'Ángel de Independencia,"Peña, 151"\r\n'
-    )
-
-
-def test_csv_prefixes_dispatchtrack_dates_and_time_windows_as_excel_text():
+def test_output_uses_the_exact_spanish_dispatchtrack_headers_and_text_dates():
     headers = [
         "FECHA MIN ENTREGA*",
         "FECHA MAX ENTREGA*",
@@ -66,12 +61,23 @@ def test_csv_prefixes_dispatchtrack_dates_and_time_windows_as_excel_text():
         "MAX VENTANA HORARIA 1*",
         "NOMBRE CONTACTO*",
     ]
-    content = _to_csv(headers, [{
+    content = _to_xlsx(headers, [{
         "FECHA MIN ENTREGA*": "23/10/2026",
         "FECHA MAX ENTREGA*": "24/10/2026",
         "MIN VENTANA HORARIO 1*": "00:00",
         "MAX VENTANA HORARIA 1*": "07:00",
         "NOMBRE CONTACTO*": "Ángel",
-    }]).decode("utf-8-sig")
+    }])
+    workbook = openpyxl.load_workbook(io.BytesIO(content), data_only=False)
+    worksheet = workbook['Sheet1']
 
-    assert content.splitlines()[1] == "'23/10/2026,'24/10/2026,'00:00,'07:00,Ángel"
+    assert tuple(cell.value for cell in worksheet[1]) == DISPATCHTRACK_OUTPUT_HEADERS
+    assert worksheet['H2'].value == '23/10/2026'
+    assert worksheet['I2'].value == '24/10/2026'
+    assert worksheet['J2'].value == '00:00'
+    assert worksheet['K2'].value == '07:00'
+    assert all(worksheet[cell].data_type == 's' for cell in ('H2','I2','J2','K2'))
+    assert all(worksheet[cell].number_format == '@' for cell in ('H2','I2','J2','K2'))
+    assert worksheet['T2'].value == 'Ángel'
+    workbook.close()
+

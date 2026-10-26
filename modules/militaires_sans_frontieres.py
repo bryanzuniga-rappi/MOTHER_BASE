@@ -1,7 +1,7 @@
 """Militaires Sans Frontières — primera capa de asignación de rutas."""
 from __future__ import annotations
 import csv, io, os, re, unicodedata, urllib.request
-from datetime import datetime
+from datetime import date, datetime, time as datetime_time
 from pathlib import Path
 import openpyxl
 import streamlit as st
@@ -203,6 +203,15 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None):
             output.append(clone); bin_['ORIGEN']=info.get('_STORE'); bin_['LIBRE']-=amount; left-=amount
     return output,warnings
 
+DISPATCHTRACK_OUTPUT_HEADERS=(
+    'CÓDIGO DE PARADA*','LATITUD','LONGITUD','DIRECCION*','NOMBRE ITEM*',
+    'CANTIDAD*','CODIGO ITEM','FECHA MIN ENTREGA*','FECHA MAX ENTREGA*',
+    'MIN VENTANA HORARIA 1*','MAX VENTANA HORARIA 1*','MIN VENTANA HORARIA 2',
+    'MAX VENTANA HORARIA 2','COSTO ITEM','CAPACIDAD UNO','CAPACIDAD DOS',
+    'SERVICE TIME','IMPORTANCIA','IDENTIFICADOR CONTACTO*','NOMBRE CONTACTO*',
+    'TELEFONO','EMAIL CONTACTO','CT ORIGEN*','Tipo camion','SERVICE TIME MINIMO',
+)
+
 EXCEL_TEXT_FIELD_NAMES=frozenset({
     'fechaminentrega',
     'fechamaxentrega',
@@ -213,25 +222,66 @@ EXCEL_TEXT_FIELD_NAMES=frozenset({
 })
 
 
-def _csv_value(header,value):
-    """Fuerza texto en Excel solo para fechas y ventanas de DispatchTrack."""
+def _field_name(header):
+    name=_norm(header).replace(' ','').replace('*','')
+    # Algunos exports antiguos escriben HORARIO en vez de HORARIA; la plantilla
+    # aceptada por DispatchTrack usa HORARIA y el valor pertenece al mismo campo.
+    return {'minventanahorario1':'minventanahoraria1','maxventanahorario1':'maxventanahoraria1'}.get(name,name)
+
+
+def _dispatchtrack_text_value(header,value):
+    """Normaliza fecha/hora y las conserva como texto en el XLSX de salida."""
     if value is None:
         return ''
     text=str(value)
-    field_name=_norm(header).replace(' ','').replace('*','')
-    if field_name in EXCEL_TEXT_FIELD_NAMES and text and not text.startswith("'"):
-        return f"'{text}"
+    field_name=_field_name(header)
+    if field_name not in EXCEL_TEXT_FIELD_NAMES:
+        return value
+    text=text.lstrip("'").strip()
+    if not text:
+        return ''
+    if field_name.startswith('fecha'):
+        if isinstance(value,(datetime,date)):
+            return value.strftime('%d/%m/%Y')
+        for pattern in ('%d/%m/%Y','%Y-%m-%d','%Y-%m-%d %H:%M:%S'):
+            try:
+                return datetime.strptime(text,pattern).strftime('%d/%m/%Y')
+            except ValueError:
+                pass
+    else:
+        if isinstance(value,(datetime,datetime_time)):
+            return value.strftime('%H:%M')
+        for pattern in ('%H:%M','%H:%M:%S','%Y-%m-%d %H:%M:%S'):
+            try:
+                return datetime.strptime(text,pattern).strftime('%H:%M')
+            except ValueError:
+                pass
     return text
 
 
-def _to_csv(headers,rows):
-    """CSV compatible con Excel: UTF-8 con BOM, CRLF y escapado estándar."""
-    output=io.StringIO(newline='')
-    writer=csv.DictWriter(output,fieldnames=headers,extrasaction='ignore',lineterminator='\r\n')
-    writer.writeheader()
+def _to_xlsx(headers,rows):
+    """Entrega el XLSX con el encabezado español exacto que acepta DispatchTrack."""
+    source_headers={_field_name(header):header for header in headers if str(header).strip()}
+    output=io.BytesIO()
+    workbook=openpyxl.Workbook()
+    worksheet=workbook.active
+    worksheet.title='Sheet1'
+    worksheet.append(DISPATCHTRACK_OUTPUT_HEADERS)
     for row in rows:
-        writer.writerow({header:_csv_value(header,row.get(header,'')) for header in headers})
-    return output.getvalue().encode('utf-8-sig')
+        values=[]
+        for header in DISPATCHTRACK_OUTPUT_HEADERS:
+            source_header=source_headers.get(_field_name(header))
+            value=row.get(source_header,'') if source_header else ''
+            values.append(_dispatchtrack_text_value(header,value))
+        worksheet.append(values)
+    for column,header in enumerate(DISPATCHTRACK_OUTPUT_HEADERS,start=1):
+        if _field_name(header) in EXCEL_TEXT_FIELD_NAMES:
+            for cell in worksheet.iter_cols(min_col=column,max_col=column,min_row=2):
+                cell[0].number_format='@'
+    worksheet.auto_filter.ref=worksheet.dimensions
+    workbook.save(output)
+    workbook.close()
+    return output.getvalue()
 
 def render():
     render_system_stamp('MODULE 02 / MILITAIRES SANS FRONTIÈRES'); _inject_style()
@@ -261,13 +311,13 @@ def render():
                 filtered_directions={k:dict(v) for k,v in direction_config.items() if (not selected_cities or _norm(v.get('CITY','')) in {_norm(city) for city in selected_cities}) and (use_constraints or not v.get('CONSTRAIN'))}
                 if not prioritize:
                     for value in filtered_directions.values(): value['PRIORITY']=0
-                result,warnings=_assign_and_split(headers,rows,filtered_fleet,filtered_directions,selected_cities); csv_bytes=_to_csv(headers,result)
+                result,warnings=_assign_and_split(headers,rows,filtered_fleet,filtered_directions,selected_cities); csv_bytes=_to_xlsx(headers,result)
             except Exception as exc: st.error(f'No se pudo ejecutar la planeación: {exc}'); return
         st.success(f'Planeación generada: {len(rows):,} pedidos de entrada → {len(result):,} líneas de salida.')
         for warning in warnings: st.info(warning)
-        st.session_state['msf_csv_bytes']=csv_bytes; st.session_state['msf_csv_name']=f'MSF_DISPATCHTRACK_{datetime.now():%Y%m%d_%H%M%S}.csv'; st.session_state['msf_result_count']=len(result)
+        st.session_state['msf_csv_bytes']=csv_bytes; st.session_state['msf_csv_name']=f'MSF_DISPATCHTRACK_{datetime.now():%Y%m%d_%H%M%S}.xlsx'; st.session_state['msf_result_count']=len(result)
     if st.session_state.get('msf_csv_bytes'):
-        st.download_button('DESCARGAR CSV DISPATCHTRACK →',data=st.session_state['msf_csv_bytes'],file_name=st.session_state['msf_csv_name'],mime='text/csv; charset=utf-8',use_container_width=True,key='msf_download_shell_csv')
+        st.download_button('DESCARGAR XLSX DISPATCHTRACK →',data=st.session_state['msf_csv_bytes'],file_name=st.session_state['msf_csv_name'],mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',use_container_width=True,key='msf_download_shell_csv')
     if st.button('← Volver a Mother Base',key='msf_back_home'): st.session_state['mb_module']='MOTHER BASE'; st.rerun()
 
 

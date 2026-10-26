@@ -110,13 +110,13 @@ Kazuhira is the final safety net. It can cover remaining catalog breaks when the
 
 ### Militaires Sans Frontières
 
-Militaires Sans Frontières is a logistics module, separate from inventory planning. It reads a DispatchTrack order file and the `FLOTA` and `DIRECCIONES` sheets in `DATA_LOGISTICS`, assigns loads to the available fleet, and exports a DispatchTrack-ready CSV. The file uses UTF-8 with BOM so Excel preserves accents and special characters; delivery dates and both values of the first delivery window are prefixed with an apostrophe so Excel keeps them as text. It does not consume Mother Base inventory, capacity, tasks or change the Les Enfants Terribles operational bulks.
+Militaires Sans Frontières is a logistics module, separate from inventory planning. It reads a DispatchTrack order file and the `FLOTA` and `DIRECCIONES` sheets in `DATA_LOGISTICS`, assigns loads to the available fleet, and exports a DispatchTrack-ready XLSX. The output has one `Sheet1` worksheet and the exact 25 Spanish headers from the accepted DispatchTrack template; delivery dates and both values of the first delivery window are native text cells, not dates or times. It does not consume Mother Base inventory, capacity, tasks or change the Les Enfants Terribles operational bulks.
 
 ```mermaid
 flowchart LR
     A["DispatchTrack order"] --> C["Militaires Sans Frontières"]
     B["FLOTA + DIRECCIONES"] --> C
-    C --> D["DispatchTrack CSV"]
+    C --> D["DispatchTrack XLSX"]
 ```
 
 The module expands the usable fleet by `CANTIDAD × VUELTAS`, applies city and vehicle constraints, honors store priority (with Torton priority where configured), splits loads by vehicle capacity, and reports unassigned remainder as warnings. Each additional split receives `-1`, `-2`, and so on in the stop code and both contact fields; its street number increases by the same index so DispatchTrack recognizes a distinct destination. Its output is downloaded from Militaires; the planning ZIP upload remains in Les Enfants Terribles.
