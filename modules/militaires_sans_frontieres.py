@@ -67,7 +67,8 @@ def _load_fleet():
     for row in rows[1:]:
         try: qty=int(float(row[pos['CANTIDAD']] or 0)); turns=int(float(row[pos['VUELTAS']] or 1)); cap=float(row[pos['CAPACIDAD UNO']] or 0)
         except (TypeError,ValueError): continue
-        if qty>0 and turns>0 and cap>0: fleet.append({'UNIDAD':str(row[pos['UNIDAD']]).strip(),'CANTIDAD':qty*turns,'CAPACIDAD':cap})
+        if qty>0 and turns>0 and cap>0:
+            fleet.append({'UNIDAD':str(row[pos['UNIDAD']]).strip(),'CANTIDAD':qty,'CAPACIDAD':cap,'VUELTAS':turns})
     if not fleet: raise ValueError('FLOTA no tiene unidades válidas.')
     return sorted(fleet,key=lambda x:float(x['CAPACIDAD']),reverse=True)
 
@@ -154,6 +155,37 @@ def _apply_split_quantities(clone, row, cap_header, cap2_header, cost_header, pa
         clone[header]=_display_number(_number(row.get(header,''))*ratio)
 
 
+def _priority_store_key(info):
+    """Agrupa una tienda física aunque DispatchTrack haya agregado -1, -2, etc."""
+    return re.sub(r'-\d+$','',_norm(info.get('_STORE','')))
+
+
+def _select_first_turn_torton_stores(ordered, cap_header, first_turn_slots):
+    """Maximiza tiendas PRIORITY=1 completas; después, uso de slots Torton."""
+    stores={}
+    for row,info in ordered:
+        if _number(info.get('PRIORITY',0))!=1 or _norm(info.get('CONSTRAIN',''))=='1.5':
+            continue
+        key=_priority_store_key(info)
+        slots=max(_round_pallets(row.get(cap_header,'')),5 if _number(row.get(cap_header,''))>4 else 0)
+        stores[key]=stores.get(key,0)+slots
+    # Programación dinámica: primero más tiendas completas, después más uso de Torton.
+    choices={0:()}
+    for key,slots in sorted(stores.items()):
+        if slots>first_turn_slots:
+            continue
+        for used,selected in list(choices.items())[::-1]:
+            total=used+slots
+            if total>first_turn_slots:
+                continue
+            candidate=selected+(key,)
+            current=choices.get(total)
+            if current is None or len(candidate)>len(current) or (len(candidate)==len(current) and candidate<current):
+                choices[total]=candidate
+    best=max(choices.items(),key=lambda item:(len(item[1]),item[0],tuple(reversed(item[1]))))
+    return set(best[1])
+
+
 def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None):
     directions=directions or {}; cap_header=next((h for h in headers if h.upper()=='CAPACIDAD UNO'),None)
     id_header=next((h for h in headers if h.upper() in {'CÓDIGO DE PARADA*','CODIGO DE PARADA*','TRANSFER ID'}),headers[0])
@@ -162,7 +194,9 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None):
     if not cap_header: raise ValueError('El archivo no tiene CAPACIDAD UNO.')
     bins=[]
     for item in fleet:
-        for _ in range(int(item['CANTIDAD'])): bins.append({'UNIDAD':item['UNIDAD'],'CAPACIDAD':float(item['CAPACIDAD']),'LIBRE':float(item['CAPACIDAD']),'ORIGEN':None})
+        for turn in range(1,int(item.get('VUELTAS',1))+1):
+            for _ in range(int(item['CANTIDAD'])):
+                bins.append({'UNIDAD':item['UNIDAD'],'CAPACIDAD':float(item['CAPACIDAD']),'LIBRE':float(item['CAPACIDAD']),'ORIGEN':None,'VUELTA':turn})
     importance_header=next((h for h in headers if _norm(h).replace(' ','')=='importancia'),None)
     cap2_header=next((h for h in headers if _norm(h).replace(' ','')=='capacidaddos'),None)
     cost_header=next((h for h in headers if _norm(h).replace(' ','')=='costoitem'),None)
@@ -177,14 +211,24 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None):
         ordered.append((row,info))
     if not ordered:
         ordered=[(row,{}) for row in rows]
-    ordered.sort(key=lambda x:(-float(x[1].get('PRIORITY',0)), _norm(x[1].get('_STORE','')), -_round_pallets(x[0].get(cap_header,''))))
+    ordered.sort(key=lambda x:(0 if _number(x[1].get('PRIORITY',0))==1 else 1, _priority_store_key(x[1]), -_round_pallets(x[0].get(cap_header,''))))
+    first_turn_slots=sum(int(item['CANTIDAD'])*int(item.get('VUELTAS',1)>=1)*int(item['CAPACIDAD']) for item in fleet if _norm(item['UNIDAD'])=='torton')
+    first_turn_priority_stores=_select_first_turn_torton_stores(ordered,cap_header,first_turn_slots)
     for row,info in ordered:
         original_capacity=_number(row.get(cap_header,'')); pallets=_round_pallets(original_capacity); pallets=max(pallets, 5 if original_capacity>4 else pallets); left=pallets; original_left=original_capacity
         allowed=_norm(info.get('CONSTRAIN',''))
         while left>0:
-            if info.get('PRIORITY',0)>0:
-                candidates=[b for b in bins if b['LIBRE']>=1 and _norm(b['UNIDAD'])=='torton']
+            priority_one=_number(info.get('PRIORITY',0))==1
+            priority_torton=priority_one and allowed!='1.5' and _priority_store_key(info) in first_turn_priority_stores
+            if priority_one and allowed=='1.5':
+                candidates=[b for b in bins if b['LIBRE']>=1 and _norm(b['UNIDAD'])=='1.5']
                 candidates.sort(key=lambda b:(0 if b.get('ORIGEN')==info.get('_STORE') else 1,b['LIBRE']))
+            elif priority_torton:
+                candidates=[b for b in bins if b['LIBRE']>=1 and _norm(b['UNIDAD'])=='torton' and b['VUELTA']==1]
+                candidates.sort(key=lambda b:(0 if b.get('ORIGEN')==info.get('_STORE') else 1,b['LIBRE']))
+            elif priority_one:
+                candidates=[b for b in bins if b['LIBRE']>=1 and _norm(b['UNIDAD'])=='3.5']
+                candidates.sort(key=lambda b:(0 if b.get('ORIGEN')==info.get('_STORE') else 1,-b['CAPACIDAD']))
             else:
                 candidates=[b for b in bins if b['LIBRE']>=1 and (not allowed or _norm(b['UNIDAD'])==allowed)]
                 if allowed=='1.5': candidates.sort(key=lambda b:(0 if _norm(b['UNIDAD'])=='1.5' else 1,b['LIBRE']))
@@ -195,8 +239,9 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None):
                     part=original_left*amount/left if left else 0
                     remainder=dict(row)
                     _apply_split_quantities(remainder,row,cap_header,cap2_header,cost_header,part,original_capacity)
-                    if type_header: remainder[type_header]=''
-                    if importance_header: remainder[importance_header]=''
+                    fallback_unit='1.5' if allowed=='1.5' else ('3.5' if priority_one else '')
+                    if type_header: remainder[type_header]=fallback_unit
+                    if importance_header: remainder[importance_header]='1' if fallback_unit in {'torton','1.5'} else ''
                     base_id=str(row.get(id_header,'')); split_index=split_counts.get(base_id,0)
                     if split_index>0:
                         remainder[id_header]=f'{base_id}-{split_index}'
@@ -214,7 +259,9 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None):
             part=original_left*amount/left if left else 0
             _apply_split_quantities(clone,row,cap_header,cap2_header,cost_header,part,original_capacity)
             original_left=max(0,original_left-part)
-            if type_header: clone[type_header]=bin_['UNIDAD'] if _norm(bin_['UNIDAD']) in {'torton','1.5'} else ''
+            assigned_unit=_norm(bin_['UNIDAD'])
+            if type_header:
+                clone[type_header]=bin_['UNIDAD'] if assigned_unit in {'torton','1.5'} or (priority_one and assigned_unit=='3.5') else ''
             visible_type=clone.get(type_header,'') if type_header else ''
             if importance_header: clone[importance_header]='1' if _norm(visible_type) in {'torton','1.5'} else ''
             output.append(clone); bin_['ORIGEN']=info.get('_STORE'); bin_['LIBRE']-=amount; left-=amount
