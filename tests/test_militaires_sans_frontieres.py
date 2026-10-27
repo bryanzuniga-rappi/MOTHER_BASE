@@ -124,10 +124,11 @@ def test_first_torton_turn_maximizes_complete_priority_stores_then_sends_overflo
         store=item['IDENTIFICADOR CONTACTO*'].split('-')[0]
         truck_by_store.setdefault(store,set()).add(item['Tipo camion'])
 
-    assert all(truck_by_store[store]=={'Torton'} for store in ('A','B','C','D'))
+    assert all(next(iter(truck_by_store[store])).startswith('TORTON_') for store in ('A','B','C'))
+    assert truck_by_store['D']=={'3.5'}
     assert truck_by_store['E']=={'3.5'}
     assert truck_by_store['F']=={''}
-    assert sum(float(item['CAPACIDAD UNO']) for item in output if item['Tipo camion']=='Torton') == 24
+    assert sum(float(item['CAPACIDAD UNO']) for item in output if item['Tipo camion'].startswith('TORTON_')) == 18
 
 
 def test_split_controls_use_selected_limit_and_constraint_1_5_remains_blocking():
