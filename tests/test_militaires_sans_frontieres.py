@@ -10,6 +10,7 @@ install()
 
 from modules.militaires_sans_frontieres import (
     DISPATCHTRACK_OUTPUT_HEADERS,
+    _assign_and_split,
     _mark_split_destination,
     _to_xlsx,
 )
@@ -80,4 +81,29 @@ def test_output_uses_the_exact_spanish_dispatchtrack_headers_and_text_dates():
     assert all(worksheet[cell].number_format == '@' for cell in ('H2','I2','J2','K2'))
     assert worksheet['T2'].value == 'Ángel'
     workbook.close()
+
+
+def test_split_conserves_capacity_cost_and_secondary_capacity_when_fleet_is_fragmented():
+    headers = [
+        'CÓDIGO DE PARADA*', 'IDENTIFICADOR CONTACTO*', 'CAPACIDAD UNO',
+        'CAPACIDAD DOS', 'COSTO ITEM', 'Tipo camion', 'IMPORTANCIA',
+    ]
+    rows = [{
+        'CÓDIGO DE PARADA*': 'PEDIDO-1',
+        'IDENTIFICADOR CONTACTO*': 'TIENDA',
+        'CAPACIDAD UNO': '3.85',
+        'CAPACIDAD DOS': '7.7',
+        'COSTO ITEM': '385',
+    }]
+    # La primera parte toma 3 de los 4 pallets redondeados; el restante cae
+    # fuera de flota. Antes se clonaban 3.85 unidades en ambas partes.
+    output, _ = _assign_and_split(headers, rows, [
+        {'UNIDAD': 'Torton', 'CANTIDAD': 1, 'CAPACIDAD': 3},
+    ])
+
+    assert [item['CÓDIGO DE PARADA*'] for item in output] == ['PEDIDO-1', 'PEDIDO-1-1']
+    assert sum(float(item['CAPACIDAD UNO']) for item in output) == 3.85
+    assert sum(float(item['CAPACIDAD DOS']) for item in output) == 7.7
+    assert sum(float(item['COSTO ITEM']) for item in output) == 385
+    assert [item['CAPACIDAD UNO'] for item in output] == ['2.8875', '0.9625']
 

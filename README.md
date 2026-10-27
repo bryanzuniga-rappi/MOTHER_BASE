@@ -119,7 +119,7 @@ flowchart LR
     C --> D["DispatchTrack XLSX"]
 ```
 
-The module expands the usable fleet by `CANTIDAD × VUELTAS`, applies city and vehicle constraints, honors store priority (with Torton priority where configured), splits loads by vehicle capacity, and reports unassigned remainder as warnings. Each additional split receives `-1`, `-2`, and so on in the stop code and both contact fields; its street number increases by the same index so DispatchTrack recognizes a distinct destination. Its output is downloaded from Militaires; the planning ZIP upload remains in Les Enfants Terribles.
+The module expands the usable fleet by `CANTIDAD × VUELTAS`, applies city and vehicle constraints, honors store priority (with Torton priority where configured), splits loads by vehicle capacity, and reports unassigned remainder as warnings. A split is a partition, never a duplicate: for each original stop, the sum of `CAPACIDAD UNO`, `CAPACIDAD DOS` and `COSTO ITEM` across all its parts equals the original values. Each additional split receives `-1`, `-2`, and so on in the stop code and both contact fields; its street number increases by the same index so DispatchTrack recognizes a distinct destination. Its output is downloaded from Militaires; the planning ZIP upload remains in Les Enfants Terribles.
 
 ### OWNER and Insumos
 

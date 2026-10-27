@@ -137,6 +137,23 @@ def _mark_split_destination(row,headers,split_index):
         row[address_header]=_split_destination_address(row.get(address_header,''),split_index)
 
 
+def _display_number(value):
+    """Serializa una cantidad sin introducir ruido de punto flotante."""
+    return f'{float(value):.12f}'.rstrip('0').rstrip('.') or '0'
+
+
+def _apply_split_quantities(clone, row, cap_header, cap2_header, cost_header, part_capacity, original_capacity):
+    """Conserva los totales de capacidad, capacidad secundaria y costo al partir una fila."""
+    clone[cap_header]=_display_number(part_capacity)
+    if original_capacity<=0:
+        return
+    ratio=part_capacity/original_capacity
+    for header in (cap2_header,cost_header):
+        if not header or str(row.get(header,'')).strip()=='':
+            continue
+        clone[header]=_display_number(_number(row.get(header,''))*ratio)
+
+
 def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None):
     directions=directions or {}; cap_header=next((h for h in headers if h.upper()=='CAPACIDAD UNO'),None)
     id_header=next((h for h in headers if h.upper() in {'CÓDIGO DE PARADA*','CODIGO DE PARADA*','TRANSFER ID'}),headers[0])
@@ -146,6 +163,9 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None):
     bins=[]
     for item in fleet:
         for _ in range(int(item['CANTIDAD'])): bins.append({'UNIDAD':item['UNIDAD'],'CAPACIDAD':float(item['CAPACIDAD']),'LIBRE':float(item['CAPACIDAD']),'ORIGEN':None})
+    importance_header=next((h for h in headers if _norm(h).replace(' ','')=='importancia'),None)
+    cap2_header=next((h for h in headers if _norm(h).replace(' ','')=='capacidaddos'),None)
+    cost_header=next((h for h in headers if _norm(h).replace(' ','')=='costoitem'),None)
     output=[]; warnings=[]; split_counts={}
     ordered=[]
     for row in rows:
@@ -170,18 +190,20 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None):
                 if allowed=='1.5': candidates.sort(key=lambda b:(0 if _norm(b['UNIDAD'])=='1.5' else 1,b['LIBRE']))
                 else: candidates.sort(key=lambda b:(0 if b.get('ORIGEN')==info.get('_STORE') else 1,-b['CAPACIDAD']))
             if not candidates:
-                remainder_left=max(0,original_left)
-                while remainder_left>1e-9:
-                    remainder=dict(row); part=min(4,remainder_left)
-                    remainder[cap_header]=str(part).rstrip('0').rstrip('.')
+                while left>0:
+                    amount=min(left,4)
+                    part=original_left*amount/left if left else 0
+                    remainder=dict(row)
+                    _apply_split_quantities(remainder,row,cap_header,cap2_header,cost_header,part,original_capacity)
                     if type_header: remainder[type_header]=''
+                    if importance_header: remainder[importance_header]=''
                     base_id=str(row.get(id_header,'')); split_index=split_counts.get(base_id,0)
                     if split_index>0:
                         remainder[id_header]=f'{base_id}-{split_index}'
                         _mark_split_destination(remainder,headers,split_index)
                     split_counts[base_id]=split_index+1
-                    output.append(remainder); remainder_left-=part
-                left=0; break
+                    output.append(remainder); original_left=max(0,original_left-part); left-=amount
+                break
             bin_=candidates[0]; chunk_limit=2 if _norm(bin_['UNIDAD'])=='1.5' else 4; amount=min(left,chunk_limit,int(bin_['LIBRE']))
             clone=dict(row)
             base_id=str(row.get(id_header,'')); split_index=split_counts.get(base_id,0)
@@ -189,17 +211,12 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None):
                 clone[id_header]=f"{base_id}-{split_index}"
                 _mark_split_destination(clone,headers,split_index)
             split_counts[base_id]=split_index+1
-            limit=2 if _norm(bin_['UNIDAD'])=='1.5' else 4; clone[cap_header]=row.get(cap_header,'') if original_capacity<=limit and pallets<=limit else (str(min(limit,original_left)).rstrip('0').rstrip('.') if original_left>0 else '0'); original_left=max(0,original_left-limit); 
+            part=original_left*amount/left if left else 0
+            _apply_split_quantities(clone,row,cap_header,cap2_header,cost_header,part,original_capacity)
+            original_left=max(0,original_left-part)
             if type_header: clone[type_header]=bin_['UNIDAD'] if _norm(bin_['UNIDAD']) in {'torton','1.5'} else ''
-            importance_header=next((h for h in headers if _norm(h).replace(' ','')=='importancia'),None)
-            cap2_header=next((h for h in headers if _norm(h).replace(' ','')=='capacidaddos'),None)
-            cost_header=next((h for h in headers if _norm(h).replace(' ','')=='costoitem'),None)
             visible_type=clone.get(type_header,'') if type_header else ''
             if importance_header: clone[importance_header]='1' if _norm(visible_type) in {'torton','1.5'} else ''
-            if original_capacity>0 and (original_capacity>limit or pallets>limit):
-                ratio=float(clone[cap_header] or 0)/original_capacity
-                if cap2_header: clone[cap2_header]=str(_number(row.get(cap2_header,''))*ratio)
-                if cost_header: clone[cost_header]=str(_number(row.get(cost_header,''))*ratio)
             output.append(clone); bin_['ORIGEN']=info.get('_STORE'); bin_['LIBRE']-=amount; left-=amount
     return output,warnings
 
