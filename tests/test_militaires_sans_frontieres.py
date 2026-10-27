@@ -116,7 +116,9 @@ def test_first_torton_turn_maximizes_complete_priority_stores_then_sends_overflo
     ]
     directions = {store.lower(): {'PRIORITY': 1} for store in ('A', 'B', 'C', 'D', 'E')}
     output, _ = _assign_and_split(headers, rows, [
-        {'UNIDAD': 'Torton', 'CANTIDAD': 3, 'CAPACIDAD': 8, 'VUELTAS': 2},
+        {'UNIDAD': 'TORTON_1', 'CANTIDAD': 1, 'CAPACIDAD': 8, 'VUELTAS': 2},
+        {'UNIDAD': 'TORTON_2', 'CANTIDAD': 1, 'CAPACIDAD': 8, 'VUELTAS': 2},
+        {'UNIDAD': 'TORTON_3', 'CANTIDAD': 1, 'CAPACIDAD': 8, 'VUELTAS': 2},
         {'UNIDAD': '3.5', 'CANTIDAD': 19, 'CAPACIDAD': 4, 'VUELTAS': 2},
     ], directions)
     truck_by_store = {}

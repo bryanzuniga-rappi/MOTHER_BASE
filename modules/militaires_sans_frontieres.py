@@ -165,6 +165,10 @@ def _priority_store_key(info):
     return re.sub(r'-\d+$','',_norm(info.get('_STORE','')))
 
 
+def _is_torton(unit):
+    return _norm(unit).startswith('torton')
+
+
 def _select_first_turn_torton_stores(ordered, cap_header, first_turn_slots):
     """Maximiza tiendas PRIORITY=1 completas; después, uso de slots Torton."""
     stores={}
@@ -191,7 +195,7 @@ def _select_first_turn_torton_stores(ordered, cap_header, first_turn_slots):
     return set(best[1])
 
 
-def _assign_priority_torton_labels(ordered,headers,cap_header,selected_stores):
+def _assign_priority_torton_labels(ordered,headers,cap_header,selected_stores,torton_capacities):
     """Asigna tiendas P1 completas a Torton físico, agrupando por cercanía."""
     lat_header=next((h for h in headers if _norm(h) in {'latitud','latitude'}),None)
     lon_header=next((h for h in headers if _norm(h) in {'longitud','longitude'}),None)
@@ -205,7 +209,7 @@ def _assign_priority_torton_labels(ordered,headers,cap_header,selected_stores):
         if lat_header and lon_header:
             lat,lon=_number(row.get(lat_header,'')),_number(row.get(lon_header,''))
             if lat and lon: group['points'].append((lat,lon))
-    labels={f'TORTON_{index}':{'free':8,'points':[]} for index in range(1,4)}
+    labels={label:{'free':capacity,'points':[]} for label,capacity in torton_capacities.items()}
     assigned={}
     # Primero las tiendas grandes; entre opciones factibles elige la zona más cercana.
     for key,group in sorted(groups.items(),key=lambda item:(-item[1]['slots'],item[0])):
@@ -224,11 +228,11 @@ def _assign_priority_torton_labels(ordered,headers,cap_header,selected_stores):
     return assigned
 
 
-def _assign_second_turn_torton_labels(ordered,headers,cap_header,first_labels):
+def _assign_second_turn_torton_labels(ordered,headers,cap_header,first_labels,torton_capacities):
     """Llena la segunda vuelta con tiendas no P1 cercanas a cada Torton."""
     lat_header=next((h for h in headers if _norm(h) in {'latitud','latitude'}),None)
     lon_header=next((h for h in headers if _norm(h) in {'longitud','longitude'}),None)
-    labels={f'TORTON_{index}':{'free':8,'stops':0,'points':[]} for index in range(1,4)}
+    labels={label:{'free':capacity,'stops':0,'points':[]} for label,capacity in torton_capacities.items()}
     groups={}
     for row,info in ordered:
         key=_priority_store_key(info)
@@ -286,10 +290,11 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None,*,r
     if not ordered:
         ordered=[(row,{}) for row in rows]
     ordered.sort(key=lambda x:(0 if _number(x[1].get('PRIORITY',0))==1 else 1, _priority_store_key(x[1]), -_round_pallets(x[0].get(cap_header,''))))
-    first_turn_slots=sum(int(item['CANTIDAD'])*int(item.get('VUELTAS',1)>=1)*int(item['CAPACIDAD']) for item in fleet if _norm(item['UNIDAD'])=='torton')
+    torton_capacities={str(item['UNIDAD']):float(item['CAPACIDAD']) for item in fleet if _is_torton(item['UNIDAD'])}
+    first_turn_slots=sum(int(item['CANTIDAD'])*int(capacity) for item,capacity in ((item,torton_capacities[str(item['UNIDAD'])]) for item in fleet if _is_torton(item['UNIDAD'])))
     first_turn_priority_stores=_select_first_turn_torton_stores(ordered,cap_header,first_turn_slots)
-    priority_torton_labels=_assign_priority_torton_labels(ordered,headers,cap_header,first_turn_priority_stores)
-    second_turn_torton_labels=_assign_second_turn_torton_labels(ordered,headers,cap_header,priority_torton_labels) if mother_base_routes else {}
+    priority_torton_labels=_assign_priority_torton_labels(ordered,headers,cap_header,first_turn_priority_stores,torton_capacities)
+    second_turn_torton_labels=_assign_second_turn_torton_labels(ordered,headers,cap_header,priority_torton_labels,torton_capacities) if mother_base_routes else {}
     for row,info in ordered:
         original_capacity=_number(row.get(cap_header,'')); pallets=_round_pallets(original_capacity); pallets=max(pallets, 5 if original_capacity>4 else pallets); left=pallets; original_left=original_capacity
         allowed=_norm(info.get('CONSTRAIN','')) if respect_constraints else ''
@@ -309,10 +314,10 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None,*,r
                 candidates=[b for b in bins if b['LIBRE']>=1 and _norm(b['UNIDAD'])=='1.5']
                 candidates.sort(key=lambda b:(0 if b.get('ORIGEN')==info.get('_STORE') else 1,b['LIBRE']))
             elif priority_torton:
-                candidates=[b for b in bins if b['LIBRE']>=1 and _norm(b['UNIDAD'])=='torton' and b['VUELTA']==1]
+                candidates=[b for b in bins if b['LIBRE']>=1 and b['UNIDAD']==priority_torton_label and b['VUELTA']==1]
                 candidates.sort(key=lambda b:(0 if b.get('ORIGEN')==info.get('_STORE') else 1,b['LIBRE']))
             elif second_torton_label:
-                candidates=[b for b in bins if b['LIBRE']>=1 and _norm(b['UNIDAD'])=='torton' and b['VUELTA']==2]
+                candidates=[b for b in bins if b['LIBRE']>=1 and b['UNIDAD']==second_torton_label and b['VUELTA']==2]
                 candidates.sort(key=lambda b:(0 if b.get('ORIGEN')==info.get('_STORE') else 1,b['LIBRE']))
             elif priority_one:
                 candidates=[b for b in bins if b['LIBRE']>=1 and _norm(b['UNIDAD'])=='3.5']
@@ -320,7 +325,7 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None,*,r
             else:
                 # Esta iteración reserva toda etiqueta TORTON para la primera
                 # vuelta P1. El resto queda disponible para flota regular.
-                candidates=[b for b in bins if b['LIBRE']>=1 and _norm(b['UNIDAD'])!='torton' and (not allowed or _norm(b['UNIDAD'])==allowed)]
+                candidates=[b for b in bins if b['LIBRE']>=1 and not _is_torton(b['UNIDAD']) and (not allowed or _norm(b['UNIDAD'])==allowed)]
                 if allowed=='1.5': candidates.sort(key=lambda b:(0 if _norm(b['UNIDAD'])=='1.5' else 1,b['LIBRE']))
                 else: candidates.sort(key=lambda b:(0 if b.get('ORIGEN')==info.get('_STORE') else 1,-b['CAPACIDAD']))
             if not can_split:
