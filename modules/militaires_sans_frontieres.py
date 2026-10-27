@@ -504,6 +504,64 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None,*,r
     return output,warnings
 
 
+def _guarantee_priority_torton_coverage(headers, rows, fleet):
+    """Garantiza una P1 completa por cada Torton físico activo.
+
+    La asignación por bins puede dejar una P1 sin etiqueta al no caber en el
+    estado intermedio de una vuelta. Esta validación final trabaja sobre las
+    filas ya generadas, conserva juntas todas las partes de la tienda y evita
+    que un Torton físico válido desaparezca del XLSX.
+    """
+    type_header=next((h for h in headers if _norm(h).replace(' ','') in {'tipocamion','tipodecamion'}),None)
+    importance_header=next((h for h in headers if _norm(h).replace(' ','')=='importancia'),None)
+    cap_header=next((h for h in headers if h.upper()=='CAPACIDAD UNO'),None)
+    contact_header=next((h for h in headers if _norm(h).replace(' ','').replace('*','')=='identificadorcontacto'),None)
+    if not all((type_header,importance_header,cap_header,contact_header)):
+        return []
+    capacities={str(item['UNIDAD']):float(item['CAPACIDAD']) for item in fleet if _is_torton(item['UNIDAD'])}
+    if not capacities:
+        return []
+    groups={}
+    for row in rows:
+        if str(row.get(importance_header,'')).strip()!='1':
+            continue
+        key=re.sub(r'-\d+$','',_norm(row.get(contact_header,'')))
+        if not key:
+            continue
+        group=groups.setdefault(key,{'rows':[],'capacity':0.0,'types':set()})
+        group['rows'].append(row); group['capacity']+=_number(row.get(cap_header,''))
+        value=str(row.get(type_header,'')).strip()
+        if value: group['types'].add(value)
+    coverage={unit:0 for unit in capacities}
+    for group in groups.values():
+        for unit in coverage:
+            if unit in group['types']:
+                coverage[unit]+=1
+    forced=[]
+    for unit,capacity in capacities.items():
+        if coverage[unit]>0:
+            continue
+        candidates=[]
+        for key,group in groups.items():
+            if group['capacity']>capacity+1e-9 or group['types']=={'1.5'}:
+                continue
+            current=next(iter(group['types']), '') if len(group['types'])==1 else ''
+            # Preferimos P1 aún sin vehículo. Si no existe, movemos una P1 de
+            # un Torton que ya tenga más de una tienda para no vaciarlo.
+            movable=not current or (current in coverage and coverage[current]>1)
+            if movable:
+                candidates.append((group['capacity'],key,current,group))
+        if not candidates:
+            continue
+        _,key,current,group=min(candidates,key=lambda item:(item[0],item[1]))
+        if current in coverage:
+            coverage[current]-=1
+        for row in group['rows']:
+            row[type_header]=unit
+        group['types']={unit}; coverage[unit]+=1; forced.append(unit)
+    return forced
+
+
 def _cap_final_output_parts(headers,rows,maximum):
     """Garantía final: ningún renglón enviado a DispatchTrack excede el tope."""
     cap_header=next((h for h in headers if h.upper()=='CAPACIDAD UNO'),None)
@@ -659,6 +717,9 @@ def render():
                 result,warnings=_assign_and_split(headers,rows,filtered_fleet,filtered_directions,selected_cities,respect_constraints=use_constraints,split_orders=split_orders,split_capacity=split_capacity,mother_base_routes=mother_base_routes,route_time_windows=route_time_windows)
                 if forced_tortons:
                     warnings.insert(0,f"Tortons físicos incluidos automáticamente desde FLOTA: {', '.join(forced_tortons)}.")
+                covered_tortons=_guarantee_priority_torton_coverage(headers,result,filtered_fleet)
+                if covered_tortons:
+                    warnings.insert(0,f"Cobertura P1 corregida para: {', '.join(covered_tortons)}.")
                 result=_cap_final_output_parts(headers,result,split_capacity)
                 csv_bytes=_to_xlsx(headers,result)
             except Exception as exc: st.error(f'No se pudo ejecutar la planeación: {exc}'); return

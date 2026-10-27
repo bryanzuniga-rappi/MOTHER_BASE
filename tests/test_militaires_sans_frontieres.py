@@ -12,6 +12,7 @@ from modules.militaires_sans_frontieres import (
     DISPATCHTRACK_OUTPUT_HEADERS,
     _assign_and_split,
     _cap_final_output_parts,
+    _guarantee_priority_torton_coverage,
     _mark_split_destination,
     _to_xlsx,
 )
@@ -180,6 +181,23 @@ def test_final_capacity_cap_never_discards_a_small_remainder():
 
     assert [float(row['CAPACIDAD UNO']) for row in result] == [4,0.05]
     assert sum(float(row['CAPACIDAD UNO']) for row in result) == 4.05
+
+
+def test_final_priority_coverage_assigns_missing_physical_torton_to_an_untyped_p1_store():
+    headers = ['IDENTIFICADOR CONTACTO*', 'CAPACIDAD UNO', 'IMPORTANCIA', 'Tipo camion']
+    rows = [
+        {'IDENTIFICADOR CONTACTO*':'A','CAPACIDAD UNO':'3','IMPORTANCIA':'1','Tipo camion':'TORTON_1'},
+        {'IDENTIFICADOR CONTACTO*':'B','CAPACIDAD UNO':'3','IMPORTANCIA':'1','Tipo camion':'TORTON_3'},
+        {'IDENTIFICADOR CONTACTO*':'C','CAPACIDAD UNO':'3','IMPORTANCIA':'1','Tipo camion':''},
+    ]
+    forced = _guarantee_priority_torton_coverage(headers, rows, [
+        {'UNIDAD':'TORTON_1','CAPACIDAD':8},
+        {'UNIDAD':'TORTON_2','CAPACIDAD':8},
+        {'UNIDAD':'TORTON_3','CAPACIDAD':8},
+    ])
+
+    assert forced == ['TORTON_2']
+    assert rows[2]['Tipo camion'] == 'TORTON_2'
 
 
 def test_torton_routes_fill_first_turn_before_second_and_write_delivery_windows():
