@@ -26,6 +26,11 @@ def _secret(name):
         pass
     return os.environ.get(name,'').strip()
 
+
+def _cell(row,index,default=None):
+    """Lee filas de hojas externas que pueden venir truncadas al final."""
+    return row[index] if index < len(row) else default
+
 def _read_csv_dispatchtrack(uploaded_file):
     rows=list(csv.reader(io.StringIO(uploaded_file.getvalue().decode('utf-8-sig'))))
     if len(rows)<2: raise ValueError('El CSV debe tener marcadores y encabezados.')
@@ -65,10 +70,10 @@ def _load_fleet():
     if not required.issubset(headers): raise ValueError('FLOTA debe contener UNIDAD, CANTIDAD, CAPACIDAD UNO y VUELTAS.')
     pos={h:headers.index(h) for h in required}; fleet=[]
     for row in rows[1:]:
-        try: qty=int(float(row[pos['CANTIDAD']] or 0)); turns=int(float(row[pos['VUELTAS']] or 1)); cap=float(row[pos['CAPACIDAD UNO']] or 0)
+        try: qty=int(float(_cell(row,pos['CANTIDAD'],0) or 0)); turns=int(float(_cell(row,pos['VUELTAS'],1) or 1)); cap=float(_cell(row,pos['CAPACIDAD UNO'],0) or 0)
         except (TypeError,ValueError): continue
         if qty>0 and turns>0 and cap>0:
-            fleet.append({'UNIDAD':str(row[pos['UNIDAD']]).strip(),'CANTIDAD':qty,'CAPACIDAD':cap,'VUELTAS':turns})
+            fleet.append({'UNIDAD':str(_cell(row,pos['UNIDAD'],'')).strip(),'CANTIDAD':qty,'CAPACIDAD':cap,'VUELTAS':turns})
     if not fleet: raise ValueError('FLOTA no tiene unidades válidas.')
     return sorted(fleet,key=lambda x:float(x['CAPACIDAD']),reverse=True)
 
@@ -83,10 +88,10 @@ def _load_directions():
     if 'WAREHOUSE_ID' not in pos: return {}
     result={}
     for row in rows[1:]:
-        key=str(row[pos['WAREHOUSE_ID']] or '').strip().replace('.0','')
-        data={'CITY':str(row[pos['CITY']]).strip() if 'CITY' in pos and row[pos['CITY']] is not None else '', 'CONSTRAIN':str(row[pos['CONSTRAIN']]).strip() if 'CONSTRAIN' in pos and row[pos['CONSTRAIN']] is not None else '', 'PRIORITY':_number(row[pos['PRIORITY']]) if 'PRIORITY' in pos else 0}
+        key=str(_cell(row,pos['WAREHOUSE_ID'],'') or '').strip().replace('.0','')
+        data={'CITY':str(_cell(row,pos['CITY'],'')).strip() if 'CITY' in pos and _cell(row,pos['CITY']) is not None else '', 'CONSTRAIN':str(_cell(row,pos['CONSTRAIN'],'')).strip() if 'CONSTRAIN' in pos and _cell(row,pos['CONSTRAIN']) is not None else '', 'PRIORITY':_number(_cell(row,pos['PRIORITY'])) if 'PRIORITY' in pos else 0}
         if key: result[key]=data
-        if 'WAREHOUSE_NAME' in pos and row[pos['WAREHOUSE_NAME']]: result[_norm(row[pos['WAREHOUSE_NAME']])]=data
+        if 'WAREHOUSE_NAME' in pos and _cell(row,pos['WAREHOUSE_NAME']): result[_norm(_cell(row,pos['WAREHOUSE_NAME']))]=data
     return result
 
 def _norm(value):
@@ -186,7 +191,7 @@ def _select_first_turn_torton_stores(ordered, cap_header, first_turn_slots):
     return set(best[1])
 
 
-def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None):
+def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None,*,respect_constraints=True,split_orders=True,split_capacity=4):
     directions=directions or {}; cap_header=next((h for h in headers if h.upper()=='CAPACIDAD UNO'),None)
     id_header=next((h for h in headers if h.upper() in {'CÓDIGO DE PARADA*','CODIGO DE PARADA*','TRANSFER ID'}),headers[0])
     origin_header=next((h for h in headers if h.upper() in {'IDENTIFICADOR CONTACTO*','IDENTIFICADOR CONTACTO','WAREHOUSE_NAME'}),None) or next((h for h in headers if h.upper() in {'CT ORIGEN*','CT ORIGEN','WAREHOUSE_ID'}),None)
@@ -216,7 +221,10 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None):
     first_turn_priority_stores=_select_first_turn_torton_stores(ordered,cap_header,first_turn_slots)
     for row,info in ordered:
         original_capacity=_number(row.get(cap_header,'')); pallets=_round_pallets(original_capacity); pallets=max(pallets, 5 if original_capacity>4 else pallets); left=pallets; original_left=original_capacity
-        allowed=_norm(info.get('CONSTRAIN',''))
+        allowed=_norm(info.get('CONSTRAIN','')) if respect_constraints else ''
+        split_limit=max(1,int(split_capacity))
+        must_split=respect_constraints and allowed=='1.5'
+        can_split=split_orders or must_split
         while left>0:
             priority_one=_number(info.get('PRIORITY',0))==1
             priority_torton=priority_one and allowed!='1.5' and _priority_store_key(info) in first_turn_priority_stores
@@ -235,9 +243,18 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None):
                 candidates=[b for b in bins if b['LIBRE']>=1 and _norm(b['UNIDAD'])!='torton' and (not allowed or _norm(b['UNIDAD'])==allowed)]
                 if allowed=='1.5': candidates.sort(key=lambda b:(0 if _norm(b['UNIDAD'])=='1.5' else 1,b['LIBRE']))
                 else: candidates.sort(key=lambda b:(0 if b.get('ORIGEN')==info.get('_STORE') else 1,-b['CAPACIDAD']))
+            if not can_split:
+                candidates=[b for b in candidates if int(b['LIBRE'])>=left]
             if not candidates:
+                if not can_split:
+                    remainder=dict(row)
+                    fallback_unit='1.5' if allowed=='1.5' else ('3.5' if priority_one else '')
+                    if type_header: remainder[type_header]=fallback_unit
+                    if importance_header: remainder[importance_header]='1' if fallback_unit in {'torton','1.5'} else ''
+                    output.append(remainder)
+                    break
                 while left>0:
-                    amount=min(left,4)
+                    amount=min(left,2 if allowed=='1.5' else split_limit)
                     part=original_left*amount/left if left else 0
                     remainder=dict(row)
                     _apply_split_quantities(remainder,row,cap_header,cap2_header,cost_header,part,original_capacity)
@@ -251,7 +268,7 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None):
                     split_counts[base_id]=split_index+1
                     output.append(remainder); original_left=max(0,original_left-part); left-=amount
                 break
-            bin_=candidates[0]; chunk_limit=2 if _norm(bin_['UNIDAD'])=='1.5' else 4; amount=min(left,chunk_limit,int(bin_['LIBRE']))
+            bin_=candidates[0]; chunk_limit=2 if _norm(bin_['UNIDAD'])=='1.5' and respect_constraints else (split_limit if can_split else left); amount=min(left,chunk_limit,int(bin_['LIBRE']))
             clone=dict(row)
             base_id=str(row.get(id_header,'')); split_index=split_counts.get(base_id,0)
             if split_index>0:
@@ -364,8 +381,11 @@ def render():
         selected_cities=c1.multiselect('Ciudades',cities,default=[c for c in cities if _norm(c).startswith('ciudad de')],key='msf_cities')
         selected_units=c2.multiselect('Unidades disponibles',units,default=units,key='msf_units')
         c3,c4=st.columns(2)
-        use_constraints=c3.checkbox('Aplicar CONSTRAIN por tienda',value=True,key='msf_constraints')
+        use_constraints=c3.checkbox('Respetar configuraciones bloqueantes',value=True,key='msf_constraints')
         prioritize=c4.checkbox('Priorizar tiendas con PRIORITY usando Torton',value=True,key='msf_priority')
+        c5,c6=st.columns(2)
+        split_orders=c5.checkbox('Partir pedidos',value=True,key='msf_split_orders')
+        split_capacity=c6.number_input('CAPACIDAD UNO máxima por parte',min_value=1,max_value=100,value=4,step=1,disabled=not split_orders,key='msf_split_capacity')
     uploaded=st.file_uploader('Archivo de pedidos',type=['xlsx','xlsm','csv'],accept_multiple_files=False,key='msf_excel_inputs',help='Se conservan únicamente las columnas marcadas como DispatchTrack en la fila 1.')
     run=st.button('EJECUTAR PLANEACIÓN →',type='primary',use_container_width=True,disabled=uploaded is None,key='msf_run_excel_shell')
     st.markdown('<div class="msf-note">La configuración se lee desde FLOTA y DIRECCIONES en DATA_LOGISTICS.</div>',unsafe_allow_html=True); st.markdown('</div>',unsafe_allow_html=True)
@@ -374,10 +394,10 @@ def render():
             try:
                 headers,rows=_read_dispatchtrack_file(uploaded)
                 filtered_fleet=[u for u in fleet_config if u['UNIDAD'] in selected_units]
-                filtered_directions={k:dict(v) for k,v in direction_config.items() if (not selected_cities or _norm(v.get('CITY','')) in {_norm(city) for city in selected_cities}) and (use_constraints or not v.get('CONSTRAIN'))}
+                filtered_directions={k:dict(v) for k,v in direction_config.items() if not selected_cities or _norm(v.get('CITY','')) in {_norm(city) for city in selected_cities}}
                 if not prioritize:
                     for value in filtered_directions.values(): value['PRIORITY']=0
-                result,warnings=_assign_and_split(headers,rows,filtered_fleet,filtered_directions,selected_cities); csv_bytes=_to_xlsx(headers,result)
+                result,warnings=_assign_and_split(headers,rows,filtered_fleet,filtered_directions,selected_cities,respect_constraints=use_constraints,split_orders=split_orders,split_capacity=split_capacity); csv_bytes=_to_xlsx(headers,result)
             except Exception as exc: st.error(f'No se pudo ejecutar la planeación: {exc}'); return
         st.success(f'Planeación generada: {len(rows):,} pedidos de entrada → {len(result):,} líneas de salida.')
         for warning in warnings: st.info(warning)

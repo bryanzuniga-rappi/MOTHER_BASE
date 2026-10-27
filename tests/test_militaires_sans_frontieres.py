@@ -129,3 +129,23 @@ def test_first_torton_turn_maximizes_complete_priority_stores_then_sends_overflo
     assert truck_by_store['F']=={''}
     assert sum(float(item['CAPACIDAD UNO']) for item in output if item['Tipo camion']=='Torton') == 24
 
+
+def test_split_controls_use_selected_limit_and_constraint_1_5_remains_blocking():
+    headers = ['CÓDIGO DE PARADA*', 'IDENTIFICADOR CONTACTO*', 'CAPACIDAD UNO', 'Tipo camion']
+    regular = [{'UNIDAD': '3.5', 'CANTIDAD': 2, 'CAPACIDAD': 4, 'VUELTAS': 1}]
+    row = {'CÓDIGO DE PARADA*': 'A', 'IDENTIFICADOR CONTACTO*': 'A', 'CAPACIDAD UNO': '5'}
+    split, _ = _assign_and_split(headers, [row], regular, split_orders=True, split_capacity=2)
+    assert [float(item['CAPACIDAD UNO']) for item in split] == [2, 2, 1]
+
+    unsplit, _ = _assign_and_split(headers, [row], [{'UNIDAD': '3.5', 'CANTIDAD': 1, 'CAPACIDAD': 8, 'VUELTAS': 1}], split_orders=False)
+    assert len(unsplit) == 1
+    assert unsplit[0]['CAPACIDAD UNO'] == '5'
+
+    constrained, _ = _assign_and_split(headers, [
+        {'CÓDIGO DE PARADA*': 'B', 'IDENTIFICADOR CONTACTO*': 'B', 'CAPACIDAD UNO': '3'},
+    ], [{'UNIDAD': '1.5', 'CANTIDAD': 2, 'CAPACIDAD': 2, 'VUELTAS': 1}], {
+        'b': {'CONSTRAIN': '1.5'},
+    }, split_orders=False)
+    assert [float(item['CAPACIDAD UNO']) for item in constrained] == [2, 1]
+    assert {item['Tipo camion'] for item in constrained} == {'1.5'}
+
