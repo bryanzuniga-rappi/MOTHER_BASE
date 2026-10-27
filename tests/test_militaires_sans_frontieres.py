@@ -99,7 +99,7 @@ def test_split_conserves_capacity_cost_and_secondary_capacity_when_fleet_is_frag
     # fuera de flota. Antes se clonaban 3.85 unidades en ambas partes.
     output, _ = _assign_and_split(headers, rows, [
         {'UNIDAD': '3.5', 'CANTIDAD': 1, 'CAPACIDAD': 3},
-    ])
+    ], mother_base_routes=True)
 
     assert [item['CÓDIGO DE PARADA*'] for item in output] == ['PEDIDO-1', 'PEDIDO-1-1']
     assert sum(float(item['CAPACIDAD UNO']) for item in output) == 3.85
@@ -149,6 +149,26 @@ def test_disabling_mother_base_routes_keeps_physical_torton_tags_without_v2_logi
     ], {store.lower():{'PRIORITY':1} for store in ('A','B','C')}, mother_base_routes=False)
 
     assert {item['Tipo camion'] for item in output} == {'TORTON_1','TORTON_2'}
+
+
+def test_routes_off_leaves_non_torton_orders_untyped_and_only_p1_has_importance():
+    headers = ['CÓDIGO DE PARADA*', 'IDENTIFICADOR CONTACTO*', 'CAPACIDAD UNO', 'Tipo camion', 'IMPORTANCIA']
+    rows = [
+        {'CÓDIGO DE PARADA*':'P','IDENTIFICADOR CONTACTO*':'P','CAPACIDAD UNO':'9'},
+        {'CÓDIGO DE PARADA*':'N','IDENTIFICADOR CONTACTO*':'N','CAPACIDAD UNO':'3'},
+    ]
+    output, _ = _assign_and_split(headers, rows, [
+        {'UNIDAD':'TORTON_1','CANTIDAD':1,'CAPACIDAD':8,'VUELTAS':2},
+        {'UNIDAD':'3.5','CANTIDAD':2,'CAPACIDAD':4,'VUELTAS':1},
+    ], {'p':{'PRIORITY':1},'n':{'PRIORITY':0}}, mother_base_routes=False)
+    by_store={}
+    for item in output:
+        by_store.setdefault(item['IDENTIFICADOR CONTACTO*'].split('-')[0],[]).append(item)
+
+    assert {item['Tipo camion'] for item in by_store['P']} == {''}
+    assert {item['IMPORTANCIA'] for item in by_store['P']} == {'1'}
+    assert {item['Tipo camion'] for item in by_store['N']} == {''}
+    assert {item['IMPORTANCIA'] for item in by_store['N']} == {''}
 
 
 def test_torton_routes_fill_first_turn_before_second_and_write_delivery_windows():

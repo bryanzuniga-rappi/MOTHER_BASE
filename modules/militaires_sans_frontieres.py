@@ -422,12 +422,12 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None,*,r
                 candidates=[b for b in bins if b['LIBRE']>=1 and b['UNIDAD']==second_torton_label and b['VUELTA']==2]
                 candidates.sort(key=lambda b:(0 if b.get('ORIGEN')==info.get('_STORE') else 1,b['LIBRE']))
             elif priority_one:
-                candidates=[b for b in bins if b['LIBRE']>=1 and _norm(b['UNIDAD'])=='3.5']
+                candidates=[b for b in bins if b['LIBRE']>=1 and _norm(b['UNIDAD'])=='3.5'] if mother_base_routes else []
                 candidates.sort(key=lambda b:(0 if b.get('ORIGEN')==info.get('_STORE') else 1,-b['CAPACIDAD']))
             else:
                 # Esta iteración reserva toda etiqueta TORTON para la primera
                 # vuelta P1. El resto queda disponible para flota regular.
-                candidates=[b for b in bins if b['LIBRE']>=1 and not _is_torton(b['UNIDAD']) and (not allowed or _norm(b['UNIDAD'])==allowed)]
+                candidates=[b for b in bins if b['LIBRE']>=1 and not _is_torton(b['UNIDAD']) and (not allowed or _norm(b['UNIDAD'])==allowed)] if mother_base_routes or allowed=='1.5' else []
                 if allowed=='1.5': candidates.sort(key=lambda b:(0 if _norm(b['UNIDAD'])=='1.5' else 1,b['LIBRE']))
                 else: candidates.sort(key=lambda b:(0 if b.get('ORIGEN')==info.get('_STORE') else 1,-b['CAPACIDAD']))
             if not can_split:
@@ -435,9 +435,9 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None,*,r
             if not candidates:
                 if not can_split:
                     remainder=dict(row)
-                    fallback_unit='1.5' if allowed=='1.5' else '3.5'
+                    fallback_unit='1.5' if allowed=='1.5' else ('3.5' if mother_base_routes else '')
                     if type_header: remainder[type_header]=fallback_unit
-                    if importance_header: remainder[importance_header]='1' if priority_one else '2'
+                    if importance_header: remainder[importance_header]=('1' if priority_one else ('2' if mother_base_routes else ''))
                     if mother_base_routes and route_time_windows and priority_one:
                         _apply_torton_turn_window(remainder,headers,1)
                     output.append(remainder)
@@ -447,9 +447,9 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None,*,r
                     part=original_left*amount/left if left else 0
                     remainder=dict(row)
                     _apply_split_quantities(remainder,row,cap_header,cap2_header,cost_header,part,original_capacity)
-                    fallback_unit='1.5' if allowed=='1.5' else '3.5'
+                    fallback_unit='1.5' if allowed=='1.5' else ('3.5' if mother_base_routes else '')
                     if type_header: remainder[type_header]=fallback_unit
-                    if importance_header: remainder[importance_header]='1' if priority_one else '2'
+                    if importance_header: remainder[importance_header]=('1' if priority_one else ('2' if mother_base_routes else ''))
                     if mother_base_routes and route_time_windows and priority_one:
                         _apply_torton_turn_window(remainder,headers,1)
                     base_id=str(row.get(id_header,'')); split_index=split_counts.get(base_id,0)
@@ -473,10 +473,12 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None,*,r
             if type_header:
                 route_label=first_torton_label if first_torton else second_torton_label
                 clone[type_header]=route_label if route_label else (
-                    bin_['UNIDAD'] if assigned_unit in {'torton','1.5','3.5'} else ''
+                    bin_['UNIDAD'] if mother_base_routes and assigned_unit in {'torton','1.5','3.5'}
+                    else (bin_['UNIDAD'] if assigned_unit=='1.5' else '')
                 )
             visible_type=clone.get(type_header,'') if type_header else ''
-            if importance_header: clone[importance_header]=('1' if priority_one else '2') if str(visible_type or '').strip() else ''
+            if importance_header:
+                clone[importance_header]=('1' if priority_one else '2') if mother_base_routes and str(visible_type or '').strip() else ('1' if priority_one else '')
             route_turn=1 if (first_torton or priority_one) else (2 if second_torton_label else None)
             if mother_base_routes and route_time_windows:
                 _apply_torton_turn_window(clone,headers,route_turn)
