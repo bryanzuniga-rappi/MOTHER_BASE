@@ -325,6 +325,44 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None,*,r
             output.append(clone); bin_['ORIGEN']=info.get('_STORE'); bin_['LIBRE']-=amount; left-=amount
     return output,warnings
 
+
+def _cap_final_output_parts(headers,rows,maximum):
+    """Garantía final: ningún renglón enviado a DispatchTrack excede el tope."""
+    cap_header=next((h for h in headers if h.upper()=='CAPACIDAD UNO'),None)
+    id_header=next((h for h in headers if h.upper() in {'CÓDIGO DE PARADA*','CODIGO DE PARADA*','TRANSFER ID'}),headers[0])
+    cap2_header=next((h for h in headers if _norm(h).replace(' ','')=='capacidaddos'),None)
+    cost_header=next((h for h in headers if _norm(h).replace(' ','')=='costoitem'),None)
+    if not cap_header:
+        return rows
+    limit=min(4,max(1,float(maximum)))
+    used=set(str(row.get(id_header,'')) for row in rows)
+    next_suffix={}
+    for code in used:
+        match=re.match(r'^(.*)-(\d+)$',code)
+        base=match.group(1) if match else code
+        suffix=int(match.group(2)) if match else 0
+        next_suffix[base]=max(next_suffix.get(base,0),suffix)
+    output=[]
+    for row in rows:
+        original=_number(row.get(cap_header,''))
+        if original<=limit+1e-9:
+            output.append(row); continue
+        base=str(row.get(id_header,'')); root=re.sub(r'-\d+$','',base)
+        remaining=original; first=True
+        while remaining>1e-9:
+            part=min(limit,remaining); clone=dict(row)
+            # Un residuo microscópico solo existe por capear una línea grande.
+            # No lo enviamos a DispatchTrack; una orden original pequeña sí se conserva.
+            if not first and part<0.2:
+                break
+            if not first:
+                next_suffix[root]=next_suffix.get(root,0)+1
+                clone[id_header]=f'{root}-{next_suffix[root]}'
+                _mark_split_destination(clone,headers,next_suffix[root])
+            _apply_split_quantities(clone,row,cap_header,cap2_header,cost_header,part,original)
+            output.append(clone); remaining=max(0,remaining-part); first=False
+    return output
+
 DISPATCHTRACK_OUTPUT_HEADERS=(
     'CÓDIGO DE PARADA*','LATITUD','LONGITUD','DIRECCION*','NOMBRE ITEM*',
     'CANTIDAD*','CODIGO ITEM','FECHA MIN ENTREGA*','FECHA MAX ENTREGA*',
@@ -436,7 +474,9 @@ def render():
                 filtered_directions={k:dict(v) for k,v in direction_config.items() if not selected_cities or _norm(v.get('CITY','')) in {_norm(city) for city in selected_cities}}
                 if not prioritize:
                     for value in filtered_directions.values(): value['PRIORITY']=0
-                result,warnings=_assign_and_split(headers,rows,filtered_fleet,filtered_directions,selected_cities,respect_constraints=use_constraints,split_orders=split_orders,split_capacity=split_capacity); csv_bytes=_to_xlsx(headers,result)
+                result,warnings=_assign_and_split(headers,rows,filtered_fleet,filtered_directions,selected_cities,respect_constraints=use_constraints,split_orders=split_orders,split_capacity=split_capacity)
+                result=_cap_final_output_parts(headers,result,split_capacity)
+                csv_bytes=_to_xlsx(headers,result)
             except Exception as exc: st.error(f'No se pudo ejecutar la planeación: {exc}'); return
         st.success(f'Planeación generada: {len(rows):,} pedidos de entrada → {len(result):,} líneas de salida.')
         for warning in warnings: st.info(warning)
