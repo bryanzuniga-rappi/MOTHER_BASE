@@ -148,7 +148,7 @@ def test_disabling_mother_base_routes_keeps_physical_torton_tags_without_v2_logi
         {'UNIDAD':'TORTON_3','CANTIDAD':1,'CAPACIDAD':8,'VUELTAS':2},
     ], {store.lower():{'PRIORITY':1} for store in ('A','B','C')}, mother_base_routes=False)
 
-    assert {item['Tipo camion'] for item in output} == {'TORTON_1','TORTON_2'}
+    assert {item['Tipo camion'] for item in output} == {'TORTON_1','TORTON_2','TORTON_3'}
 
 
 def test_routes_off_leaves_non_torton_orders_untyped_and_only_p1_has_importance():

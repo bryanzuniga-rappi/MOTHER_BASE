@@ -251,9 +251,27 @@ def _assign_first_turn_torton_labels(ordered, headers, cap_header, torton_capaci
             if lat and lon: group['points'].append((lat,lon))
     labels={label:{'free':capacity,'stops':0,'points':[]} for label,capacity in torton_capacities.items()}
     assigned={}
-    # Menos pallets primero maximiza el número de tiendas completas; el mejor
-    # ajuste evita desperdiciar una unidad física cuando otra puede recibirla.
-    for key,group in sorted(groups.items(),key=lambda item:(item[1]['slots'],item[0])):
+
+    def commit(key, group, label, state):
+        state['free']-=group['slots']; state['stops']+=1
+        state['points'].extend(group['points']); assigned[key]=label
+
+    # Fase 1: asegurar presencia P1 en cada Torton físico disponible. El
+    # algoritmo previo aplicaba mejor-ajuste desde la primera tienda y podía
+    # concentrar P1 en dos unidades, dejando TORTON_2 totalmente vacío.
+    # Sembramos una tienda completa y factible por unidad antes de completar.
+    unassigned=set(groups)
+    for label in sorted(labels):
+        state=labels[label]
+        eligible=[(key,groups[key]) for key in unassigned if groups[key]['slots']<=state['free']]
+        if not eligible:
+            continue
+        key,group=min(eligible,key=lambda item:(item[1]['slots'],item[0]))
+        commit(key,group,label,state); unassigned.remove(key)
+
+    # Fase 2: Menos pallets primero maximiza tiendas completas; el mejor
+    # ajuste aprovecha el remanente sin deshacer la cobertura por Torton.
+    for key,group in sorted(((key,groups[key]) for key in unassigned),key=lambda item:(item[1]['slots'],item[0])):
         eligible=[(label,state) for label,state in labels.items() if state['free']>=group['slots'] and state['stops']<4]
         if not eligible:
             continue
@@ -266,7 +284,7 @@ def _assign_first_turn_torton_labels(ordered, headers, cap_header, torton_capaci
                 return (remaining,(point[0]-center[0])**2+(point[1]-center[1])**2,label)
             return (remaining,label)
         label,state=min(eligible,key=score)
-        state['free']-=group['slots']; state['stops']+=1; state['points'].extend(group['points']); assigned[key]=label
+        commit(key,group,label,state)
     return assigned
 
 
