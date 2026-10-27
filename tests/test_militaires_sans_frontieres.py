@@ -109,7 +109,7 @@ def test_split_conserves_capacity_cost_and_secondary_capacity_when_fleet_is_frag
 
 
 def test_first_torton_turn_maximizes_complete_priority_stores_then_sends_overflow_in_3_5():
-    headers = ['CÓDIGO DE PARADA*', 'IDENTIFICADOR CONTACTO*', 'CAPACIDAD UNO', 'Tipo camion']
+    headers = ['CÓDIGO DE PARADA*', 'IDENTIFICADOR CONTACTO*', 'CAPACIDAD UNO', 'Tipo camion', 'IMPORTANCIA']
     rows = [
         {'CÓDIGO DE PARADA*': f'P-{store}', 'IDENTIFICADOR CONTACTO*': store, 'CAPACIDAD UNO': '6'}
         for store in ('A', 'B', 'C', 'D', 'E', 'F')
@@ -127,10 +127,13 @@ def test_first_torton_turn_maximizes_complete_priority_stores_then_sends_overflo
         truck_by_store.setdefault(store,set()).add(item['Tipo camion'])
 
     assert all(next(iter(truck_by_store[store])).startswith('TORTON_') for store in ('A','B','C'))
+    assert {next(iter(truck_by_store[store])) for store in ('A','B','C')} == {'TORTON_1','TORTON_2','TORTON_3'}
     assert truck_by_store['D']=={'3.5'}
     assert truck_by_store['E']=={'3.5'}
-    assert truck_by_store['F']=={''}
+    assert truck_by_store['F']=={'3.5'}
     assert sum(float(item['CAPACIDAD UNO']) for item in output if item['Tipo camion'].startswith('TORTON_')) == 18
+    assert {item['IMPORTANCIA'] for item in output if item['IDENTIFICADOR CONTACTO*'].split('-')[0] in {'A','B','C','D','E'}} == {'1'}
+    assert {item['IMPORTANCIA'] for item in output if item['IDENTIFICADOR CONTACTO*'].split('-')[0]=='F'} == {'2'}
 
 
 def test_split_controls_use_selected_limit_and_constraint_1_5_remains_blocking():

@@ -228,6 +228,48 @@ def _assign_priority_torton_labels(ordered,headers,cap_header,selected_stores,to
     return assigned
 
 
+def _assign_first_turn_torton_labels(ordered, headers, cap_header, torton_capacities):
+    """Empaca P1 completas en los Torton físicos de su primera vuelta.
+
+    La selección anterior sólo validaba el total agregado (24 pallets, por
+    ejemplo). Eso podía seleccionar tiendas que no cabían en un Torton físico
+    de 8 y, como consecuencia, dejar un vehículo intermedio sin carga. Aquí
+    cada tienda se valida contra la capacidad y el máximo de paradas de cada
+    vehículo antes de asignarla.
+    """
+    lat_header=next((h for h in headers if _norm(h) in {'latitud','latitude'}),None)
+    lon_header=next((h for h in headers if _norm(h) in {'longitud','longitude'}),None)
+    groups={}
+    for row,info in ordered:
+        if _number(info.get('PRIORITY',0))!=1 or _norm(info.get('CONSTRAIN',''))=='1.5':
+            continue
+        key=_priority_store_key(info)
+        group=groups.setdefault(key,{'slots':0,'points':[]})
+        group['slots']+=max(_round_pallets(row.get(cap_header,'')),5 if _number(row.get(cap_header,''))>4 else 0)
+        if lat_header and lon_header:
+            lat,lon=_number(row.get(lat_header,'')),_number(row.get(lon_header,''))
+            if lat and lon: group['points'].append((lat,lon))
+    labels={label:{'free':capacity,'stops':0,'points':[]} for label,capacity in torton_capacities.items()}
+    assigned={}
+    # Menos pallets primero maximiza el número de tiendas completas; el mejor
+    # ajuste evita desperdiciar una unidad física cuando otra puede recibirla.
+    for key,group in sorted(groups.items(),key=lambda item:(item[1]['slots'],item[0])):
+        eligible=[(label,state) for label,state in labels.items() if state['free']>=group['slots'] and state['stops']<4]
+        if not eligible:
+            continue
+        point=(sum(x for x,_ in group['points'])/len(group['points']),sum(y for _,y in group['points'])/len(group['points'])) if group['points'] else None
+        def score(item):
+            label,state=item
+            remaining=state['free']-group['slots']
+            if point and state['points']:
+                center=(sum(x for x,_ in state['points'])/len(state['points']),sum(y for _,y in state['points'])/len(state['points']))
+                return (remaining,(point[0]-center[0])**2+(point[1]-center[1])**2,label)
+            return (remaining,label)
+        label,state=min(eligible,key=score)
+        state['free']-=group['slots']; state['stops']+=1; state['points'].extend(group['points']); assigned[key]=label
+    return assigned
+
+
 def _assign_second_turn_torton_labels(ordered,headers,cap_header,first_labels,torton_capacities):
     """Llena la segunda vuelta con tiendas no P1 cercanas a cada Torton."""
     lat_header=next((h for h in headers if _norm(h) in {'latitud','latitude'}),None)
@@ -290,10 +332,14 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None,*,r
     if not ordered:
         ordered=[(row,{}) for row in rows]
     ordered.sort(key=lambda x:(0 if _number(x[1].get('PRIORITY',0))==1 else 1, _priority_store_key(x[1]), -_round_pallets(x[0].get(cap_header,''))))
-    torton_capacities={str(item['UNIDAD']):float(item['CAPACIDAD']) for item in fleet if _is_torton(item['UNIDAD'])}
-    first_turn_slots=sum(int(item['CANTIDAD'])*int(capacity) for item,capacity in ((item,torton_capacities[str(item['UNIDAD'])]) for item in fleet if _is_torton(item['UNIDAD'])))
-    first_turn_priority_stores=_select_first_turn_torton_stores(ordered,cap_header,first_turn_slots)
-    priority_torton_labels=_assign_priority_torton_labels(ordered,headers,cap_header,first_turn_priority_stores,torton_capacities)
+    # Las etiquetas provienen de bins reales de vuelta 1, no de una suma
+    # teórica. Así nunca se reserva TORTON_2 si no existe físicamente en la
+    # corrida y cada tienda elegida cabe en su unidad concreta.
+    torton_capacities={}
+    for bin_ in bins:
+        if _is_torton(bin_['UNIDAD']) and bin_['VUELTA']==1:
+            torton_capacities.setdefault(str(bin_['UNIDAD']),float(bin_['CAPACIDAD']))
+    priority_torton_labels=_assign_first_turn_torton_labels(ordered,headers,cap_header,torton_capacities)
     second_turn_torton_labels=_assign_second_turn_torton_labels(ordered,headers,cap_header,priority_torton_labels,torton_capacities) if mother_base_routes else {}
     for row,info in ordered:
         original_capacity=_number(row.get(cap_header,'')); pallets=_round_pallets(original_capacity); pallets=max(pallets, 5 if original_capacity>4 else pallets); left=pallets; original_left=original_capacity
@@ -333,9 +379,9 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None,*,r
             if not candidates:
                 if not can_split:
                     remainder=dict(row)
-                    fallback_unit='1.5' if allowed=='1.5' else ('3.5' if priority_one else '')
+                    fallback_unit='1.5' if allowed=='1.5' else '3.5'
                     if type_header: remainder[type_header]=fallback_unit
-                    if importance_header: remainder[importance_header]='1' if fallback_unit else ''
+                    if importance_header: remainder[importance_header]='1' if priority_one else '2'
                     output.append(remainder)
                     break
                 while left>0:
@@ -343,9 +389,9 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None,*,r
                     part=original_left*amount/left if left else 0
                     remainder=dict(row)
                     _apply_split_quantities(remainder,row,cap_header,cap2_header,cost_header,part,original_capacity)
-                    fallback_unit='1.5' if allowed=='1.5' else ('3.5' if priority_one else '')
+                    fallback_unit='1.5' if allowed=='1.5' else '3.5'
                     if type_header: remainder[type_header]=fallback_unit
-                    if importance_header: remainder[importance_header]='1' if fallback_unit in {'torton','1.5'} else ''
+                    if importance_header: remainder[importance_header]='1' if priority_one else '2'
                     base_id=str(row.get(id_header,'')); split_index=split_counts.get(base_id,0)
                     if split_index>0:
                         remainder[id_header]=f'{base_id}-{split_index}'
@@ -366,7 +412,7 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None,*,r
             assigned_unit=_norm(bin_['UNIDAD'])
             if type_header:
                 route_label=priority_torton_label if priority_torton else second_torton_label
-                clone[type_header]=route_label if route_label else (bin_['UNIDAD'] if assigned_unit in {'torton','1.5'} or (priority_one and assigned_unit=='3.5') or (mother_base_routes and assigned_unit in {'1.5','3.5'}) else '')
+                clone[type_header]=route_label if route_label else (bin_['UNIDAD'] if assigned_unit in {'torton','1.5','3.5'} else '')
             visible_type=clone.get(type_header,'') if type_header else ''
             if importance_header: clone[importance_header]=('1' if priority_one else '2') if str(visible_type or '').strip() else ''
             output.append(clone); bin_['ORIGEN']=info.get('_STORE'); bin_['LIBRE']-=amount; left-=amount
