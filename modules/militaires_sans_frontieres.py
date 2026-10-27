@@ -386,9 +386,9 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None,*,r
     if not ordered:
         ordered=[(row,{}) for row in rows]
     ordered.sort(key=lambda x:(0 if _number(x[1].get('PRIORITY',0))==1 else 1, _priority_store_key(x[1]), -_round_pallets(x[0].get(cap_header,''))))
-    # Las etiquetas provienen de bins reales de vuelta 1, no de una suma
-    # teórica. Así nunca se reserva TORTON_2 si no existe físicamente en la
-    # corrida y cada tienda elegida cabe en su unidad concreta.
+    # Aun sin el modo de rutas, la flota sólo expone TORTON_1/2/3: la primera
+    # pasada P1 debe conservar esas etiquetas físicas. El toggle únicamente
+    # gobierna el relleno, V2 y las ventanas horarias.
     torton_capacities={}
     for bin_ in bins:
         if _is_torton(bin_['UNIDAD']) and bin_['VUELTA']==1:
@@ -409,7 +409,6 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None,*,r
         can_split=split_orders or must_split
         while left>0:
             priority_one=_number(info.get('PRIORITY',0))==1
-            priority_torton_label=priority_torton_labels.get(_priority_store_key(info))
             first_torton_label=first_turn_labels.get(_priority_store_key(info))
             second_torton_label=second_turn_torton_labels.get(_priority_store_key(info))
             first_torton=allowed!='1.5' and bool(first_torton_label)
@@ -473,7 +472,9 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None,*,r
             assigned_unit=_norm(bin_['UNIDAD'])
             if type_header:
                 route_label=first_torton_label if first_torton else second_torton_label
-                clone[type_header]=route_label if route_label else (bin_['UNIDAD'] if assigned_unit in {'torton','1.5','3.5'} else '')
+                clone[type_header]=route_label if route_label else (
+                    bin_['UNIDAD'] if assigned_unit in {'torton','1.5','3.5'} else ''
+                )
             visible_type=clone.get(type_header,'') if type_header else ''
             if importance_header: clone[importance_header]=('1' if priority_one else '2') if str(visible_type or '').strip() else ''
             route_turn=1 if (first_torton or priority_one) else (2 if second_torton_label else None)

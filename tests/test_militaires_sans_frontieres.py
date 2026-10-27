@@ -120,7 +120,7 @@ def test_first_torton_turn_maximizes_complete_priority_stores_then_sends_overflo
         {'UNIDAD': 'TORTON_2', 'CANTIDAD': 1, 'CAPACIDAD': 8, 'VUELTAS': 2},
         {'UNIDAD': 'TORTON_3', 'CANTIDAD': 1, 'CAPACIDAD': 8, 'VUELTAS': 2},
         {'UNIDAD': '3.5', 'CANTIDAD': 19, 'CAPACIDAD': 4, 'VUELTAS': 2},
-    ], directions)
+    ], directions, mother_base_routes=True)
     truck_by_store = {}
     for item in output:
         store=item['IDENTIFICADOR CONTACTO*'].split('-')[0]
@@ -130,10 +130,25 @@ def test_first_torton_turn_maximizes_complete_priority_stores_then_sends_overflo
     assert {next(iter(truck_by_store[store])) for store in ('A','B','C')} == {'TORTON_1','TORTON_2','TORTON_3'}
     assert truck_by_store['D']=={'3.5'}
     assert truck_by_store['E']=={'3.5'}
-    assert truck_by_store['F']=={'3.5'}
-    assert sum(float(item['CAPACIDAD UNO']) for item in output if item['Tipo camion'].startswith('TORTON_')) == 18
+    assert all(next(iter(truck_by_store[store])).startswith('TORTON_') for store in ('A','B','C','F'))
+    assert sum(float(item['CAPACIDAD UNO']) for item in output if item['Tipo camion'].startswith('TORTON_')) == 24
     assert {item['IMPORTANCIA'] for item in output if item['IDENTIFICADOR CONTACTO*'].split('-')[0] in {'A','B','C','D','E'}} == {'1'}
     assert {item['IMPORTANCIA'] for item in output if item['IDENTIFICADOR CONTACTO*'].split('-')[0]=='F'} == {'2'}
+
+
+def test_disabling_mother_base_routes_keeps_physical_torton_tags_without_v2_logic():
+    headers = ['CÓDIGO DE PARADA*', 'IDENTIFICADOR CONTACTO*', 'CAPACIDAD UNO', 'Tipo camion']
+    rows = [
+        {'CÓDIGO DE PARADA*':f'P-{store}','IDENTIFICADOR CONTACTO*':store,'CAPACIDAD UNO':'4'}
+        for store in ('A','B','C')
+    ]
+    output, _ = _assign_and_split(headers, rows, [
+        {'UNIDAD':'TORTON_1','CANTIDAD':1,'CAPACIDAD':8,'VUELTAS':2},
+        {'UNIDAD':'TORTON_2','CANTIDAD':1,'CAPACIDAD':8,'VUELTAS':2},
+        {'UNIDAD':'TORTON_3','CANTIDAD':1,'CAPACIDAD':8,'VUELTAS':2},
+    ], {store.lower():{'PRIORITY':1} for store in ('A','B','C')}, mother_base_routes=False)
+
+    assert {item['Tipo camion'] for item in output} == {'TORTON_1','TORTON_2'}
 
 
 def test_torton_routes_fill_first_turn_before_second_and_write_delivery_windows():
