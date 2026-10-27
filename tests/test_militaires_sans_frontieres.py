@@ -139,8 +139,7 @@ def test_split_controls_use_selected_limit_and_constraint_1_5_remains_blocking()
     assert [float(item['CAPACIDAD UNO']) for item in split] == [2, 2, 1]
 
     unsplit, _ = _assign_and_split(headers, [row], [{'UNIDAD': '3.5', 'CANTIDAD': 1, 'CAPACIDAD': 8, 'VUELTAS': 1}], split_orders=False)
-    assert len(unsplit) == 1
-    assert unsplit[0]['CAPACIDAD UNO'] == '5'
+    assert [float(item['CAPACIDAD UNO']) for item in unsplit] == [4, 1]
 
     constrained, _ = _assign_and_split(headers, [
         {'CÓDIGO DE PARADA*': 'B', 'IDENTIFICADOR CONTACTO*': 'B', 'CAPACIDAD UNO': '3'},

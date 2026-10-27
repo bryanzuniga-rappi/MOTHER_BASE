@@ -257,7 +257,9 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None,*,r
         original_capacity=_number(row.get(cap_header,'')); pallets=_round_pallets(original_capacity); pallets=max(pallets, 5 if original_capacity>4 else pallets); left=pallets; original_left=original_capacity
         allowed=_norm(info.get('CONSTRAIN','')) if respect_constraints else ''
         split_limit=max(1,int(split_capacity))
-        must_split=respect_constraints and allowed=='1.5'
+        # Nunca entregamos a DispatchTrack una línea mayor al límite elegido:
+        # se parte aunque el control general de partición esté apagado.
+        must_split=(respect_constraints and allowed=='1.5') or original_capacity>split_limit
         can_split=split_orders or must_split
         while left>0:
             priority_one=_number(info.get('PRIORITY',0))==1
@@ -285,7 +287,7 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None,*,r
                     remainder=dict(row)
                     fallback_unit='1.5' if allowed=='1.5' else ('3.5' if priority_one else '')
                     if type_header: remainder[type_header]=fallback_unit
-                    if importance_header: remainder[importance_header]='1' if fallback_unit in {'torton','1.5'} else ''
+                    if importance_header: remainder[importance_header]='1' if fallback_unit else ''
                     output.append(remainder)
                     break
                 while left>0:
@@ -317,7 +319,7 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None,*,r
             if type_header:
                 clone[type_header]=priority_torton_label if priority_torton else (bin_['UNIDAD'] if assigned_unit in {'torton','1.5'} or (priority_one and assigned_unit=='3.5') else '')
             visible_type=clone.get(type_header,'') if type_header else ''
-            if importance_header: clone[importance_header]='1' if _norm(visible_type) in {'torton','1.5'} else ''
+            if importance_header: clone[importance_header]='1' if str(visible_type or '').strip() else ''
             output.append(clone); bin_['ORIGEN']=info.get('_STORE'); bin_['LIBRE']-=amount; left-=amount
     return output,warnings
 
