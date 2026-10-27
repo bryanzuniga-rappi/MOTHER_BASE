@@ -224,7 +224,43 @@ def _assign_priority_torton_labels(ordered,headers,cap_header,selected_stores):
     return assigned
 
 
-def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None,*,respect_constraints=True,split_orders=True,split_capacity=4):
+def _assign_second_turn_torton_labels(ordered,headers,cap_header,first_labels):
+    """Llena la segunda vuelta con tiendas no P1 cercanas a cada Torton."""
+    lat_header=next((h for h in headers if _norm(h) in {'latitud','latitude'}),None)
+    lon_header=next((h for h in headers if _norm(h) in {'longitud','longitude'}),None)
+    labels={f'TORTON_{index}':{'free':8,'stops':0,'points':[]} for index in range(1,4)}
+    groups={}
+    for row,info in ordered:
+        key=_priority_store_key(info)
+        if _number(info.get('PRIORITY',0))==1 or _norm(info.get('CONSTRAIN',''))=='1.5':
+            continue
+        group=groups.setdefault(key,{'slots':0,'points':[]})
+        group['slots']+=max(_round_pallets(row.get(cap_header,'')),5 if _number(row.get(cap_header,''))>4 else 0)
+        if lat_header and lon_header:
+            lat,lon=_number(row.get(lat_header,'')),_number(row.get(lon_header,''))
+            if lat and lon: group['points'].append((lat,lon))
+    for row,info in ordered:
+        key=_priority_store_key(info); label=first_labels.get(key)
+        if not label or not lat_header or not lon_header: continue
+        lat,lon=_number(row.get(lat_header,'')),_number(row.get(lon_header,''))
+        if lat and lon: labels[label]['points'].append((lat,lon))
+    assigned={}
+    for key,group in sorted(groups.items(),key=lambda item:(-item[1]['slots'],item[0])):
+        eligible=[(label,state) for label,state in labels.items() if state['free']>=group['slots'] and state['stops']<4]
+        if not eligible: continue
+        point=(sum(x for x,_ in group['points'])/len(group['points']),sum(y for _,y in group['points'])/len(group['points'])) if group['points'] else None
+        def score(item):
+            label,state=item
+            if point and state['points']:
+                center=(sum(x for x,_ in state['points'])/len(state['points']),sum(y for _,y in state['points'])/len(state['points']))
+                return ((point[0]-center[0])**2+(point[1]-center[1])**2,label)
+            return (-state['free'],label)
+        label,state=min(eligible,key=score)
+        state['free']-=group['slots']; state['stops']+=1; state['points'].extend(group['points']); assigned[key]=label
+    return assigned
+
+
+def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None,*,respect_constraints=True,split_orders=True,split_capacity=4,mother_base_routes=False):
     directions=directions or {}; cap_header=next((h for h in headers if h.upper()=='CAPACIDAD UNO'),None)
     id_header=next((h for h in headers if h.upper() in {'CÓDIGO DE PARADA*','CODIGO DE PARADA*','TRANSFER ID'}),headers[0])
     origin_header=next((h for h in headers if h.upper() in {'IDENTIFICADOR CONTACTO*','IDENTIFICADOR CONTACTO','WAREHOUSE_NAME'}),None) or next((h for h in headers if h.upper() in {'CT ORIGEN*','CT ORIGEN','WAREHOUSE_ID'}),None)
@@ -253,6 +289,7 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None,*,r
     first_turn_slots=sum(int(item['CANTIDAD'])*int(item.get('VUELTAS',1)>=1)*int(item['CAPACIDAD']) for item in fleet if _norm(item['UNIDAD'])=='torton')
     first_turn_priority_stores=_select_first_turn_torton_stores(ordered,cap_header,first_turn_slots)
     priority_torton_labels=_assign_priority_torton_labels(ordered,headers,cap_header,first_turn_priority_stores)
+    second_turn_torton_labels=_assign_second_turn_torton_labels(ordered,headers,cap_header,priority_torton_labels) if mother_base_routes else {}
     for row,info in ordered:
         original_capacity=_number(row.get(cap_header,'')); pallets=_round_pallets(original_capacity); pallets=max(pallets, 5 if original_capacity>4 else pallets); left=pallets; original_left=original_capacity
         allowed=_norm(info.get('CONSTRAIN','')) if respect_constraints else ''
@@ -266,12 +303,16 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None,*,r
         while left>0:
             priority_one=_number(info.get('PRIORITY',0))==1
             priority_torton_label=priority_torton_labels.get(_priority_store_key(info))
+            second_torton_label=second_turn_torton_labels.get(_priority_store_key(info))
             priority_torton=priority_one and allowed!='1.5' and bool(priority_torton_label)
             if priority_one and allowed=='1.5':
                 candidates=[b for b in bins if b['LIBRE']>=1 and _norm(b['UNIDAD'])=='1.5']
                 candidates.sort(key=lambda b:(0 if b.get('ORIGEN')==info.get('_STORE') else 1,b['LIBRE']))
             elif priority_torton:
                 candidates=[b for b in bins if b['LIBRE']>=1 and _norm(b['UNIDAD'])=='torton' and b['VUELTA']==1]
+                candidates.sort(key=lambda b:(0 if b.get('ORIGEN')==info.get('_STORE') else 1,b['LIBRE']))
+            elif second_torton_label:
+                candidates=[b for b in bins if b['LIBRE']>=1 and _norm(b['UNIDAD'])=='torton' and b['VUELTA']==2]
                 candidates.sort(key=lambda b:(0 if b.get('ORIGEN')==info.get('_STORE') else 1,b['LIBRE']))
             elif priority_one:
                 candidates=[b for b in bins if b['LIBRE']>=1 and _norm(b['UNIDAD'])=='3.5']
@@ -319,9 +360,10 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None,*,r
             original_left=max(0,original_left-part)
             assigned_unit=_norm(bin_['UNIDAD'])
             if type_header:
-                clone[type_header]=priority_torton_label if priority_torton else (bin_['UNIDAD'] if assigned_unit in {'torton','1.5'} or (priority_one and assigned_unit=='3.5') else '')
+                route_label=priority_torton_label if priority_torton else second_torton_label
+                clone[type_header]=route_label if route_label else (bin_['UNIDAD'] if assigned_unit in {'torton','1.5'} or (priority_one and assigned_unit=='3.5') or (mother_base_routes and assigned_unit in {'1.5','3.5'}) else '')
             visible_type=clone.get(type_header,'') if type_header else ''
-            if importance_header: clone[importance_header]='1' if str(visible_type or '').strip() else ''
+            if importance_header: clone[importance_header]=('1' if priority_one else '2') if str(visible_type or '').strip() else ''
             output.append(clone); bin_['ORIGEN']=info.get('_STORE'); bin_['LIBRE']-=amount; left-=amount
     return output,warnings
 
@@ -463,6 +505,7 @@ def render():
         c5,c6=st.columns(2)
         split_orders=c5.checkbox('Partir pedidos',value=True,key='msf_split_orders')
         split_capacity=c6.number_input('CAPACIDAD UNO máxima por parte',min_value=1,max_value=4,value=4,step=1,disabled=not split_orders,key='msf_split_capacity')
+        mother_base_routes=st.checkbox('Asignación de rutas por Mother Base',value=False,key='msf_mother_base_routes',help='Asignación de Torton por vehículo y vuelta; la primera atiende P1 y la segunda tiendas no P1 cercanas.')
     uploaded=st.file_uploader('Archivo de pedidos',type=['xlsx','xlsm','csv'],accept_multiple_files=False,key='msf_excel_inputs',help='Se conservan únicamente las columnas marcadas como DispatchTrack en la fila 1.')
     run=st.button('EJECUTAR PLANEACIÓN →',type='primary',use_container_width=True,disabled=uploaded is None,key='msf_run_excel_shell')
     st.markdown('<div class="msf-note">La configuración se lee desde FLOTA y DIRECCIONES en DATA_LOGISTICS.</div>',unsafe_allow_html=True); st.markdown('</div>',unsafe_allow_html=True)
@@ -474,7 +517,7 @@ def render():
                 filtered_directions={k:dict(v) for k,v in direction_config.items() if not selected_cities or _norm(v.get('CITY','')) in {_norm(city) for city in selected_cities}}
                 if not prioritize:
                     for value in filtered_directions.values(): value['PRIORITY']=0
-                result,warnings=_assign_and_split(headers,rows,filtered_fleet,filtered_directions,selected_cities,respect_constraints=use_constraints,split_orders=split_orders,split_capacity=split_capacity)
+                result,warnings=_assign_and_split(headers,rows,filtered_fleet,filtered_directions,selected_cities,respect_constraints=use_constraints,split_orders=split_orders,split_capacity=split_capacity,mother_base_routes=mother_base_routes)
                 result=_cap_final_output_parts(headers,result,split_capacity)
                 csv_bytes=_to_xlsx(headers,result)
             except Exception as exc: st.error(f'No se pudo ejecutar la planeación: {exc}'); return
