@@ -529,10 +529,6 @@ def _cap_final_output_parts(headers,rows,maximum):
         remaining=original; first=True
         while remaining>1e-9:
             part=min(limit,remaining); clone=dict(row)
-            # Un residuo microscópico solo existe por capear una línea grande.
-            # No lo enviamos a DispatchTrack; una orden original pequeña sí se conserva.
-            if not first and part<0.2:
-                break
             if not first:
                 next_suffix[root]=next_suffix.get(root,0)+1
                 clone[id_header]=f'{root}-{next_suffix[root]}'
@@ -650,11 +646,19 @@ def render():
         with st.spinner('Leyendo pedidos, FLOTA y asignando unidades…'):
             try:
                 headers,rows=_read_dispatchtrack_file(uploaded)
-                filtered_fleet=[u for u in fleet_config if u['UNIDAD'] in selected_units]
+                # Las sesiones de Streamlit conservan el multiselect incluso
+                # después de que FLOTA cambia. Los Tortons físicos no pueden
+                # desaparecer silenciosamente por ese estado viejo: siempre
+                # participan cuando existen en FLOTA.
+                selected_unit_set=set(selected_units)
+                forced_tortons=[u['UNIDAD'] for u in fleet_config if _is_torton(u['UNIDAD']) and u['UNIDAD'] not in selected_unit_set]
+                filtered_fleet=[u for u in fleet_config if u['UNIDAD'] in selected_unit_set or _is_torton(u['UNIDAD'])]
                 filtered_directions={k:dict(v) for k,v in direction_config.items() if not selected_cities or _norm(v.get('CITY','')) in {_norm(city) for city in selected_cities}}
                 if not prioritize:
                     for value in filtered_directions.values(): value['PRIORITY']=0
                 result,warnings=_assign_and_split(headers,rows,filtered_fleet,filtered_directions,selected_cities,respect_constraints=use_constraints,split_orders=split_orders,split_capacity=split_capacity,mother_base_routes=mother_base_routes,route_time_windows=route_time_windows)
+                if forced_tortons:
+                    warnings.insert(0,f"Tortons físicos incluidos automáticamente desde FLOTA: {', '.join(forced_tortons)}.")
                 result=_cap_final_output_parts(headers,result,split_capacity)
                 csv_bytes=_to_xlsx(headers,result)
             except Exception as exc: st.error(f'No se pudo ejecutar la planeación: {exc}'); return

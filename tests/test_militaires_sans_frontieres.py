@@ -11,6 +11,7 @@ install()
 from modules.militaires_sans_frontieres import (
     DISPATCHTRACK_OUTPUT_HEADERS,
     _assign_and_split,
+    _cap_final_output_parts,
     _mark_split_destination,
     _to_xlsx,
 )
@@ -169,6 +170,16 @@ def test_routes_off_leaves_non_torton_orders_untyped_and_only_p1_has_importance(
     assert {item['IMPORTANCIA'] for item in by_store['P']} == {'1'}
     assert {item['Tipo camion'] for item in by_store['N']} == {''}
     assert {item['IMPORTANCIA'] for item in by_store['N']} == {''}
+
+
+def test_final_capacity_cap_never_discards_a_small_remainder():
+    headers = ['CÓDIGO DE PARADA*', 'IDENTIFICADOR CONTACTO*', 'CAPACIDAD UNO']
+    result = _cap_final_output_parts(headers, [{
+        'CÓDIGO DE PARADA*':'A', 'IDENTIFICADOR CONTACTO*':'A', 'CAPACIDAD UNO':'4.05',
+    }], 4)
+
+    assert [float(row['CAPACIDAD UNO']) for row in result] == [4,0.05]
+    assert sum(float(row['CAPACIDAD UNO']) for row in result) == 4.05
 
 
 def test_torton_routes_fill_first_turn_before_second_and_write_delivery_windows():
