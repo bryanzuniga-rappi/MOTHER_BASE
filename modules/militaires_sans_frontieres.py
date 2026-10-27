@@ -256,7 +256,9 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None,*,r
     for row,info in ordered:
         original_capacity=_number(row.get(cap_header,'')); pallets=_round_pallets(original_capacity); pallets=max(pallets, 5 if original_capacity>4 else pallets); left=pallets; original_left=original_capacity
         allowed=_norm(info.get('CONSTRAIN','')) if respect_constraints else ''
-        split_limit=max(1,int(split_capacity))
+        # DispatchTrack no acepta una parte por arriba de cuatro; el control
+        # permite dividir más fino, pero nunca relajar ese techo operativo.
+        split_limit=min(4,max(1,int(split_capacity)))
         # Nunca entregamos a DispatchTrack una línea mayor al límite elegido:
         # se parte aunque el control general de partición esté apagado.
         must_split=(respect_constraints and allowed=='1.5') or original_capacity>split_limit
@@ -422,7 +424,7 @@ def render():
         prioritize=c4.checkbox('Priorizar tiendas con PRIORITY usando Torton',value=True,key='msf_priority')
         c5,c6=st.columns(2)
         split_orders=c5.checkbox('Partir pedidos',value=True,key='msf_split_orders')
-        split_capacity=c6.number_input('CAPACIDAD UNO máxima por parte',min_value=1,max_value=100,value=4,step=1,disabled=not split_orders,key='msf_split_capacity')
+        split_capacity=c6.number_input('CAPACIDAD UNO máxima por parte',min_value=1,max_value=4,value=4,step=1,disabled=not split_orders,key='msf_split_capacity')
     uploaded=st.file_uploader('Archivo de pedidos',type=['xlsx','xlsm','csv'],accept_multiple_files=False,key='msf_excel_inputs',help='Se conservan únicamente las columnas marcadas como DispatchTrack en la fila 1.')
     run=st.button('EJECUTAR PLANEACIÓN →',type='primary',use_container_width=True,disabled=uploaded is None,key='msf_run_excel_shell')
     st.markdown('<div class="msf-note">La configuración se lee desde FLOTA y DIRECCIONES en DATA_LOGISTICS.</div>',unsafe_allow_html=True); st.markdown('</div>',unsafe_allow_html=True)
