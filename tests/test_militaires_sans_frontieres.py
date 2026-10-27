@@ -136,6 +136,33 @@ def test_first_torton_turn_maximizes_complete_priority_stores_then_sends_overflo
     assert {item['IMPORTANCIA'] for item in output if item['IDENTIFICADOR CONTACTO*'].split('-')[0]=='F'} == {'2'}
 
 
+def test_torton_routes_fill_first_turn_before_second_and_write_delivery_windows():
+    headers = [
+        'CÓDIGO DE PARADA*', 'IDENTIFICADOR CONTACTO*', 'CAPACIDAD UNO',
+        'Tipo camion', 'IMPORTANCIA', 'MIN VENTANA HORARIA 1*', 'MAX VENTANA HORARIA 1*',
+    ]
+    rows = [
+        {'CÓDIGO DE PARADA*':'A','IDENTIFICADOR CONTACTO*':'A','CAPACIDAD UNO':'4'},
+        {'CÓDIGO DE PARADA*':'B','IDENTIFICADOR CONTACTO*':'B','CAPACIDAD UNO':'3'},
+        {'CÓDIGO DE PARADA*':'C','IDENTIFICADOR CONTACTO*':'C','CAPACIDAD UNO':'5'},
+    ]
+    output, _ = _assign_and_split(headers, rows, [
+        {'UNIDAD':'TORTON_1','CANTIDAD':1,'CAPACIDAD':8,'VUELTAS':2},
+        {'UNIDAD':'3.5','CANTIDAD':4,'CAPACIDAD':4,'VUELTAS':2},
+    ], {'a':{'PRIORITY':1},'b':{'PRIORITY':0},'c':{'PRIORITY':0}}, mother_base_routes=True)
+    by_store={}
+    for item in output:
+        by_store.setdefault(item['IDENTIFICADOR CONTACTO*'].split('-')[0],[]).append(item)
+
+    for store in ('A','B'):
+        assert {item['Tipo camion'] for item in by_store[store]} == {'TORTON_1'}
+        assert {(item['MIN VENTANA HORARIA 1*'],item['MAX VENTANA HORARIA 1*']) for item in by_store[store]} == {('00:00','03:00')}
+    assert {item['IMPORTANCIA'] for item in by_store['A']} == {'1'}
+    assert {item['IMPORTANCIA'] for item in by_store['B']} == {'2'}
+    assert {item['Tipo camion'] for item in by_store['C']} == {'TORTON_1'}
+    assert {(item['MIN VENTANA HORARIA 1*'],item['MAX VENTANA HORARIA 1*']) for item in by_store['C']} == {('03:00','06:00')}
+
+
 def test_split_controls_use_selected_limit_and_constraint_1_5_remains_blocking():
     headers = ['CÓDIGO DE PARADA*', 'IDENTIFICADOR CONTACTO*', 'CAPACIDAD UNO', 'Tipo camion']
     regular = [{'UNIDAD': '3.5', 'CANTIDAD': 2, 'CAPACIDAD': 4, 'VUELTAS': 1}]
