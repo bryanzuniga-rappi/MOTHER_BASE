@@ -98,7 +98,7 @@ def test_split_conserves_capacity_cost_and_secondary_capacity_when_fleet_is_frag
     # La primera parte toma 3 de los 4 pallets redondeados; el restante cae
     # fuera de flota. Antes se clonaban 3.85 unidades en ambas partes.
     output, _ = _assign_and_split(headers, rows, [
-        {'UNIDAD': 'Torton', 'CANTIDAD': 1, 'CAPACIDAD': 3},
+        {'UNIDAD': '3.5', 'CANTIDAD': 1, 'CAPACIDAD': 3},
     ])
 
     assert [item['CÓDIGO DE PARADA*'] for item in output] == ['PEDIDO-1', 'PEDIDO-1-1']
@@ -112,7 +112,7 @@ def test_first_torton_turn_maximizes_complete_priority_stores_then_sends_overflo
     headers = ['CÓDIGO DE PARADA*', 'IDENTIFICADOR CONTACTO*', 'CAPACIDAD UNO', 'Tipo camion']
     rows = [
         {'CÓDIGO DE PARADA*': f'P-{store}', 'IDENTIFICADOR CONTACTO*': store, 'CAPACIDAD UNO': '6'}
-        for store in ('A', 'B', 'C', 'D', 'E')
+        for store in ('A', 'B', 'C', 'D', 'E', 'F')
     ]
     directions = {store.lower(): {'PRIORITY': 1} for store in ('A', 'B', 'C', 'D', 'E')}
     output, _ = _assign_and_split(headers, rows, [
@@ -126,4 +126,6 @@ def test_first_torton_turn_maximizes_complete_priority_stores_then_sends_overflo
 
     assert all(truck_by_store[store]=={'Torton'} for store in ('A','B','C','D'))
     assert truck_by_store['E']=={'3.5'}
+    assert truck_by_store['F']=={''}
+    assert sum(float(item['CAPACIDAD UNO']) for item in output if item['Tipo camion']=='Torton') == 24
 

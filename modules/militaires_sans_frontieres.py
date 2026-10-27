@@ -230,7 +230,9 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None):
                 candidates=[b for b in bins if b['LIBRE']>=1 and _norm(b['UNIDAD'])=='3.5']
                 candidates.sort(key=lambda b:(0 if b.get('ORIGEN')==info.get('_STORE') else 1,-b['CAPACIDAD']))
             else:
-                candidates=[b for b in bins if b['LIBRE']>=1 and (not allowed or _norm(b['UNIDAD'])==allowed)]
+                # Esta iteración reserva toda etiqueta TORTON para la primera
+                # vuelta P1. El resto queda disponible para flota regular.
+                candidates=[b for b in bins if b['LIBRE']>=1 and _norm(b['UNIDAD'])!='torton' and (not allowed or _norm(b['UNIDAD'])==allowed)]
                 if allowed=='1.5': candidates.sort(key=lambda b:(0 if _norm(b['UNIDAD'])=='1.5' else 1,b['LIBRE']))
                 else: candidates.sort(key=lambda b:(0 if b.get('ORIGEN')==info.get('_STORE') else 1,-b['CAPACIDAD']))
             if not candidates:
