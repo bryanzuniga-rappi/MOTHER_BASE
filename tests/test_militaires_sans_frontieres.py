@@ -112,7 +112,7 @@ def test_split_conserves_capacity_cost_and_secondary_capacity_when_fleet_is_frag
     assert [item['CAPACIDAD UNO'] for item in output] == ['2.8875', '0.9625']
 
 
-def test_first_torton_turn_maximizes_complete_priority_stores_then_sends_overflow_in_3_5():
+def test_first_torton_turn_uses_all_priority_capacity_before_non_priority_filler():
     headers = ['CÓDIGO DE PARADA*', 'IDENTIFICADOR CONTACTO*', 'CAPACIDAD UNO', 'Tipo camion', 'IMPORTANCIA']
     rows = [
         {'CÓDIGO DE PARADA*': f'P-{store}', 'IDENTIFICADOR CONTACTO*': store, 'CAPACIDAD UNO': '6'}
@@ -132,10 +132,10 @@ def test_first_torton_turn_maximizes_complete_priority_stores_then_sends_overflo
 
     assert all(next(iter(truck_by_store[store])).startswith('TORTON_') for store in ('A','B','C'))
     assert {next(iter(truck_by_store[store])) for store in ('A','B','C')} == {'TORTON_1','TORTON_2','TORTON_3'}
-    assert truck_by_store['D']=={'3.5'}
+    assert all(next(iter(truck_by_store['D'])).startswith('TORTON_') for _ in [0])
     assert truck_by_store['E']=={'3.5'}
     assert all(next(iter(truck_by_store[store])).startswith('TORTON_') for store in ('A','B','C','F'))
-    assert sum(float(item['CAPACIDAD UNO']) for item in output if item['Tipo camion'].startswith('TORTON_')) == 24
+    assert sum(float(item['CAPACIDAD UNO']) for item in output if item['Tipo camion'].startswith('TORTON_') and item['IDENTIFICADOR CONTACTO*'].split('-')[0] in {'A','B','C','D'}) == 24
     assert {item['IMPORTANCIA'] for item in output if item['IDENTIFICADOR CONTACTO*'].split('-')[0] in {'A','B','C','D','E'}} == {'1'}
     assert {item['IMPORTANCIA'] for item in output if item['IDENTIFICADOR CONTACTO*'].split('-')[0]=='F'} == {''}
 
@@ -156,7 +156,26 @@ def test_all_selected_tortons_are_dynamic_and_unused_v1_capacity_fills_non_prior
     assert {item['Tipo camion'] for item in output} == {'TORTON_1','TORTON_2','TORTON_3','TORTON_4'}
 
 
-def test_routes_off_uses_unused_selected_torton_for_a_non_priority_store():
+def test_large_priority_store_uses_free_torton_before_non_priority_filler():
+    headers=['CÓDIGO DE PARADA*','IDENTIFICADOR CONTACTO*','CAPACIDAD UNO','Tipo camion','IMPORTANCIA']
+    rows=[
+        {'CÓDIGO DE PARADA*':'ANGEL-8','IDENTIFICADOR CONTACTO*':'ANGEL','CAPACIDAD UNO':'8'},
+        {'CÓDIGO DE PARADA*':'ANGEL-4','IDENTIFICADOR CONTACTO*':'ANGEL','CAPACIDAD UNO':'4'},
+        {'CÓDIGO DE PARADA*':'B','IDENTIFICADOR CONTACTO*':'B','CAPACIDAD UNO':'4'},
+        {'CÓDIGO DE PARADA*':'C','IDENTIFICADOR CONTACTO*':'C','CAPACIDAD UNO':'4'},
+        {'CÓDIGO DE PARADA*':'D','IDENTIFICADOR CONTACTO*':'D','CAPACIDAD UNO':'4'},
+        {'CÓDIGO DE PARADA*':'N','IDENTIFICADOR CONTACTO*':'N','CAPACIDAD UNO':'3'},
+    ]
+    fleet=[{'UNIDAD':f'TORTON_{index}','CANTIDAD':1,'CAPACIDAD':8,'VUELTAS':2} for index in range(1,5)]
+    directions={store.lower():{'PRIORITY':1} for store in ('ANGEL','B','C','D')}
+    output,_=_assign_and_split(headers,rows,fleet,directions,split_orders=False,mother_base_routes=False)
+    by_stop={row['CÓDIGO DE PARADA*']:row for row in output}
+    assert by_stop['ANGEL-8']['Tipo camion']=='TORTON_4'
+    assert by_stop['ANGEL-4']['Tipo camion'] in {'TORTON_1','TORTON_2','TORTON_3'}
+    assert by_stop['N']['Tipo camion']==''
+
+
+def test_routes_off_reserves_torton_capacity_when_priority_store_overflows():
     headers = ['CÓDIGO DE PARADA*', 'IDENTIFICADOR CONTACTO*', 'CAPACIDAD UNO', 'Tipo camion', 'IMPORTANCIA']
     rows = [
         {'CÓDIGO DE PARADA*':'P','IDENTIFICADOR CONTACTO*':'P','CAPACIDAD UNO':'9'},
@@ -170,9 +189,9 @@ def test_routes_off_uses_unused_selected_torton_for_a_non_priority_store():
     for item in output:
         by_store.setdefault(item['IDENTIFICADOR CONTACTO*'].split('-')[0],[]).append(item)
 
-    assert {item['Tipo camion'] for item in by_store['P']} == {''}
+    assert {item['Tipo camion'] for item in by_store['P']} == {'TORTON_1',''}
     assert {item['IMPORTANCIA'] for item in by_store['P']} == {'1'}
-    assert {item['Tipo camion'] for item in by_store['N']} == {'TORTON_1'}
+    assert {item['Tipo camion'] for item in by_store['N']} == {''}
     assert {item['IMPORTANCIA'] for item in by_store['N']} == {''}
 
 
