@@ -421,10 +421,11 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None,*,r
         # DispatchTrack no acepta una parte por arriba de cuatro; el control
         # permite dividir más fino, pero nunca relajar ese techo operativo.
         split_limit=min(4,max(1,int(split_capacity)))
-        # Nunca entregamos a DispatchTrack una línea mayor al límite elegido:
-        # se parte aunque el control general de partición esté apagado.
-        must_split=(respect_constraints and allowed=='1.5') or original_capacity>split_limit
-        can_split=split_orders or must_split
+        # El toggle gobierna TODA partición de pedidos. Antes una regla
+        # interna por capacidad ignoraba el control y generaba -1/-2 aunque
+        # el usuario hubiera elegido no partir. Un CONSTRAIN conserva su
+        # etiqueta de camión, pero tampoco fragmenta el pedido si está apagado.
+        can_split=bool(split_orders)
         while left>0:
             priority_one=_number(info.get('PRIORITY',0))==1
             first_torton_label=first_turn_labels.get(_priority_store_key(info))
@@ -690,13 +691,13 @@ def render():
         selected_cities=c1.multiselect('Ciudades',cities,default=[c for c in cities if _norm(c).startswith('ciudad de')],key='msf_cities')
         selected_units=c2.multiselect('Unidades disponibles',units,default=units,key='msf_units')
         c3,c4=st.columns(2)
-        use_constraints=c3.checkbox('Respetar configuraciones bloqueantes',value=True,key='msf_constraints')
-        prioritize=c4.checkbox('Priorizar tiendas con PRIORITY usando Torton',value=True,key='msf_priority')
+        use_constraints=c3.toggle('Respetar configuraciones bloqueantes',value=True,key='msf_constraints')
+        prioritize=c4.toggle('Priorizar tiendas con PRIORITY usando Torton',value=True,key='msf_priority')
         c5,c6=st.columns(2)
-        split_orders=c5.checkbox('Partir pedidos',value=True,key='msf_split_orders')
+        split_orders=c5.toggle('Partir pedidos',value=True,key='msf_split_orders',help='Al apagarlo se conserva cada pedido como una sola línea; Mother Base no crea sufijos -1, -2 ni modifica el destino.')
         split_capacity=c6.number_input('CAPACIDAD UNO máxima por parte',min_value=1,max_value=4,value=4,step=1,disabled=not split_orders,key='msf_split_capacity')
-        mother_base_routes=st.checkbox('Asignación de rutas por Mother Base',value=False,key='msf_mother_base_routes',help='Asignación de Torton por vehículo y vuelta; la primera atiende P1 y la segunda tiendas no P1 cercanas.')
-        route_time_windows=st.checkbox('Separar vueltas con ventanas 00:00–03:00 / 03:00–06:00',value=True,key='msf_route_time_windows',disabled=not mother_base_routes,help='Vuelta 1: P1 y relleno cercano. Vuelta 2: remanente no prioritario.')
+        mother_base_routes=st.toggle('Asignación de rutas por Mother Base',value=False,key='msf_mother_base_routes',help='Asignación de Torton por vehículo y vuelta; la primera atiende P1 y la segunda tiendas no P1 cercanas.')
+        route_time_windows=st.toggle('Separar vueltas con ventanas 00:00–03:00 / 03:00–06:00',value=True,key='msf_route_time_windows',disabled=not mother_base_routes,help='Vuelta 1: P1 y relleno cercano. Vuelta 2: remanente no prioritario.')
     uploaded=st.file_uploader('Archivo de pedidos',type=['xlsx','xlsm','csv'],accept_multiple_files=False,key='msf_excel_inputs',help='Se conservan únicamente las columnas marcadas como DispatchTrack en la fila 1.')
     run=st.button('EJECUTAR PLANEACIÓN →',type='primary',use_container_width=True,disabled=uploaded is None,key='msf_run_excel_shell')
     st.markdown('<div class="msf-note">La configuración se lee desde FLOTA y DIRECCIONES en DATA_LOGISTICS.</div>',unsafe_allow_html=True); st.markdown('</div>',unsafe_allow_html=True)
@@ -720,7 +721,10 @@ def render():
                 covered_tortons=_guarantee_priority_torton_coverage(headers,result,filtered_fleet)
                 if covered_tortons:
                     warnings.insert(0,f"Cobertura P1 corregida para: {', '.join(covered_tortons)}.")
-                result=_cap_final_output_parts(headers,result,split_capacity)
+                # La garantía de tope es una segunda partición; no puede
+                # ejecutarse si el usuario apagó "Partir pedidos".
+                if split_orders:
+                    result=_cap_final_output_parts(headers,result,split_capacity)
                 csv_bytes=_to_xlsx(headers,result)
             except Exception as exc: st.error(f'No se pudo ejecutar la planeación: {exc}'); return
         st.success(f'Planeación generada: {len(rows):,} pedidos de entrada → {len(result):,} líneas de salida.')

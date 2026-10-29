@@ -227,7 +227,7 @@ def test_torton_routes_fill_first_turn_before_second_and_write_delivery_windows(
     assert {(item['MIN VENTANA HORARIA 1*'],item['MAX VENTANA HORARIA 1*']) for item in by_store['C']} == {('03:00','06:00')}
 
 
-def test_split_controls_use_selected_limit_and_constraint_1_5_remains_blocking():
+def test_split_controls_only_split_when_the_toggle_is_on():
     headers = ['CÓDIGO DE PARADA*', 'IDENTIFICADOR CONTACTO*', 'CAPACIDAD UNO', 'Tipo camion']
     regular = [{'UNIDAD': '3.5', 'CANTIDAD': 2, 'CAPACIDAD': 4, 'VUELTAS': 1}]
     row = {'CÓDIGO DE PARADA*': 'A', 'IDENTIFICADOR CONTACTO*': 'A', 'CAPACIDAD UNO': '5'}
@@ -235,7 +235,7 @@ def test_split_controls_use_selected_limit_and_constraint_1_5_remains_blocking()
     assert [float(item['CAPACIDAD UNO']) for item in split] == [2, 2, 1]
 
     unsplit, _ = _assign_and_split(headers, [row], [{'UNIDAD': '3.5', 'CANTIDAD': 1, 'CAPACIDAD': 8, 'VUELTAS': 1}], split_orders=False)
-    assert [float(item['CAPACIDAD UNO']) for item in unsplit] == [4, 1]
+    assert [float(item['CAPACIDAD UNO']) for item in unsplit] == [5]
     oversized_setting, _ = _assign_and_split(headers, [row], [{'UNIDAD': '3.5', 'CANTIDAD': 1, 'CAPACIDAD': 8, 'VUELTAS': 1}], split_orders=True, split_capacity=9)
     assert [float(item['CAPACIDAD UNO']) for item in oversized_setting] == [4, 1]
 
@@ -244,6 +244,6 @@ def test_split_controls_use_selected_limit_and_constraint_1_5_remains_blocking()
     ], [{'UNIDAD': '1.5', 'CANTIDAD': 2, 'CAPACIDAD': 2, 'VUELTAS': 1}], {
         'b': {'CONSTRAIN': '1.5'},
     }, split_orders=False)
-    assert [float(item['CAPACIDAD UNO']) for item in constrained] == [2, 1]
+    assert [float(item['CAPACIDAD UNO']) for item in constrained] == [3]
     assert {item['Tipo camion'] for item in constrained} == {'1.5'}
 
