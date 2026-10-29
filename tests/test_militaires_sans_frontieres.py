@@ -137,25 +137,26 @@ def test_first_torton_turn_maximizes_complete_priority_stores_then_sends_overflo
     assert all(next(iter(truck_by_store[store])).startswith('TORTON_') for store in ('A','B','C','F'))
     assert sum(float(item['CAPACIDAD UNO']) for item in output if item['Tipo camion'].startswith('TORTON_')) == 24
     assert {item['IMPORTANCIA'] for item in output if item['IDENTIFICADOR CONTACTO*'].split('-')[0] in {'A','B','C','D','E'}} == {'1'}
-    assert {item['IMPORTANCIA'] for item in output if item['IDENTIFICADOR CONTACTO*'].split('-')[0]=='F'} == {'2'}
+    assert {item['IMPORTANCIA'] for item in output if item['IDENTIFICADOR CONTACTO*'].split('-')[0]=='F'} == {''}
 
 
-def test_disabling_mother_base_routes_keeps_physical_torton_tags_without_v2_logic():
+def test_all_selected_tortons_are_dynamic_and_unused_v1_capacity_fills_non_priority():
     headers = ['CÓDIGO DE PARADA*', 'IDENTIFICADOR CONTACTO*', 'CAPACIDAD UNO', 'Tipo camion']
     rows = [
         {'CÓDIGO DE PARADA*':f'P-{store}','IDENTIFICADOR CONTACTO*':store,'CAPACIDAD UNO':'4'}
-        for store in ('A','B','C')
+        for store in ('A','B','C','D')
     ]
     output, _ = _assign_and_split(headers, rows, [
         {'UNIDAD':'TORTON_1','CANTIDAD':1,'CAPACIDAD':8,'VUELTAS':2},
         {'UNIDAD':'TORTON_2','CANTIDAD':1,'CAPACIDAD':8,'VUELTAS':2},
         {'UNIDAD':'TORTON_3','CANTIDAD':1,'CAPACIDAD':8,'VUELTAS':2},
+        {'UNIDAD':'TORTON_4','CANTIDAD':1,'CAPACIDAD':8,'VUELTAS':2},
     ], {store.lower():{'PRIORITY':1} for store in ('A','B','C')}, mother_base_routes=False)
 
-    assert {item['Tipo camion'] for item in output} == {'TORTON_1','TORTON_2','TORTON_3'}
+    assert {item['Tipo camion'] for item in output} == {'TORTON_1','TORTON_2','TORTON_3','TORTON_4'}
 
 
-def test_routes_off_leaves_non_torton_orders_untyped_and_only_p1_has_importance():
+def test_routes_off_uses_unused_selected_torton_for_a_non_priority_store():
     headers = ['CÓDIGO DE PARADA*', 'IDENTIFICADOR CONTACTO*', 'CAPACIDAD UNO', 'Tipo camion', 'IMPORTANCIA']
     rows = [
         {'CÓDIGO DE PARADA*':'P','IDENTIFICADOR CONTACTO*':'P','CAPACIDAD UNO':'9'},
@@ -171,7 +172,7 @@ def test_routes_off_leaves_non_torton_orders_untyped_and_only_p1_has_importance(
 
     assert {item['Tipo camion'] for item in by_store['P']} == {''}
     assert {item['IMPORTANCIA'] for item in by_store['P']} == {'1'}
-    assert {item['Tipo camion'] for item in by_store['N']} == {''}
+    assert {item['Tipo camion'] for item in by_store['N']} == {'TORTON_1'}
     assert {item['IMPORTANCIA'] for item in by_store['N']} == {''}
 
 
@@ -224,7 +225,7 @@ def test_torton_routes_fill_first_turn_before_second_and_write_delivery_windows(
         assert {item['Tipo camion'] for item in by_store[store]} == {'TORTON_1'}
         assert {(item['MIN VENTANA HORARIA 1*'],item['MAX VENTANA HORARIA 1*']) for item in by_store[store]} == {('00:00','03:00')}
     assert {item['IMPORTANCIA'] for item in by_store['A']} == {'1'}
-    assert {item['IMPORTANCIA'] for item in by_store['B']} == {'2'}
+    assert {item['IMPORTANCIA'] for item in by_store['B']} == {''}
     assert {item['Tipo camion'] for item in by_store['C']} == {'TORTON_1'}
     assert {(item['MIN VENTANA HORARIA 1*'],item['MAX VENTANA HORARIA 1*']) for item in by_store['C']} == {('03:00','06:00')}
 

@@ -344,10 +344,15 @@ def _assign_first_turn_filler_labels(ordered, headers, cap_header, priority_labe
         def score(item):
             label,state=item
             remaining=state['free']-group['slots']
+            # Antes el mejor-ajuste llenaba primero el hueco de un Torton ya
+            # usado. Para una flota seleccionada por el usuario, primero se
+            # activa cada unidad vacía (p. ej. TORTON_4) y sólo después se
+            # compactan los remanentes.
+            unused=0 if state['stops']==0 else 1
             if point and state['points']:
                 center=(sum(x for x,_ in state['points'])/len(state['points']),sum(y for _,y in state['points'])/len(state['points']))
-                return ((point[0]-center[0])**2+(point[1]-center[1])**2,remaining,label)
-            return (remaining,label)
+                return (unused,(point[0]-center[0])**2+(point[1]-center[1])**2,remaining,label)
+            return (unused,remaining,label)
         label,state=min(eligible,key=score)
         state['free']-=group['slots']; state['stops']+=1; state['points'].extend(group['points']); assigned[key]=label
     return assigned
@@ -429,15 +434,17 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None,*,r
     if not ordered:
         ordered=[(row,{}) for row in rows]
     ordered.sort(key=lambda x:(0 if _number(x[1].get('PRIORITY',0))==1 else 1, _priority_store_key(x[1]), -_round_pallets(x[0].get(cap_header,''))))
-    # Aun sin el modo de rutas, la flota sólo expone TORTON_1/2/3: la primera
-    # pasada P1 debe conservar esas etiquetas físicas. El toggle únicamente
-    # gobierna el relleno, V2 y las ventanas horarias.
+    # La lista de Tortons viene íntegramente de FLOTA + la selección del menú:
+    # no existe un máximo ni nombres fijos (puede ser TORTON_4, _5, etc.).
+    # P1 consume primero; los Tortons de V1 que queden libres se llenan con
+    # una tienda no P1 factible aun si el toggle de ruteo está apagado. Ese
+    # toggle sigue gobernando V2 y ventanas horarias.
     torton_capacities={}
     for bin_ in bins:
         if _is_torton(bin_['UNIDAD']) and bin_['VUELTA']==1:
             torton_capacities.setdefault(str(bin_['UNIDAD']),float(bin_['CAPACIDAD']))
     priority_torton_labels=_assign_first_turn_torton_labels(ordered,headers,cap_header,torton_capacities)
-    first_turn_filler_labels=_assign_first_turn_filler_labels(ordered,headers,cap_header,priority_torton_labels,torton_capacities) if mother_base_routes else {}
+    first_turn_filler_labels=_assign_first_turn_filler_labels(ordered,headers,cap_header,priority_torton_labels,torton_capacities)
     first_turn_labels={**priority_torton_labels,**first_turn_filler_labels}
     second_turn_torton_labels=_assign_second_turn_torton_labels(ordered,headers,cap_header,first_turn_labels,torton_capacities,set(first_turn_filler_labels)) if mother_base_routes else {}
     for row,info in ordered:
@@ -481,7 +488,7 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None,*,r
                     remainder=dict(row)
                     fallback_unit='1.5' if allowed=='1.5' else ('3.5' if mother_base_routes else '')
                     if type_header: remainder[type_header]=fallback_unit
-                    if importance_header: remainder[importance_header]=('1' if priority_one else ('2' if mother_base_routes else ''))
+                    if importance_header: remainder[importance_header]=('1' if priority_one else '')
                     if mother_base_routes and route_time_windows and priority_one:
                         _apply_torton_turn_window(remainder,headers,1)
                     output.append(remainder)
@@ -493,7 +500,7 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None,*,r
                     _apply_split_quantities(remainder,row,cap_header,cap2_header,cost_header,part,original_capacity)
                     fallback_unit='1.5' if allowed=='1.5' else ('3.5' if mother_base_routes else '')
                     if type_header: remainder[type_header]=fallback_unit
-                    if importance_header: remainder[importance_header]=('1' if priority_one else ('2' if mother_base_routes else ''))
+                    if importance_header: remainder[importance_header]=('1' if priority_one else '')
                     if mother_base_routes and route_time_windows and priority_one:
                         _apply_torton_turn_window(remainder,headers,1)
                     base_id=str(row.get(id_header,'')); split_index=split_counts.get(base_id,0)
@@ -517,12 +524,12 @@ def _assign_and_split(headers,rows,fleet,directions=None,allowed_cities=None,*,r
             if type_header:
                 route_label=first_torton_label if first_torton else second_torton_label
                 clone[type_header]=route_label if route_label else (
-                    bin_['UNIDAD'] if mother_base_routes and assigned_unit in {'torton','1.5','3.5'}
+                    bin_['UNIDAD'] if mother_base_routes and (_is_torton(bin_['UNIDAD']) or assigned_unit in {'1.5','3.5'})
                     else (bin_['UNIDAD'] if assigned_unit=='1.5' else '')
                 )
             visible_type=clone.get(type_header,'') if type_header else ''
             if importance_header:
-                clone[importance_header]=('1' if priority_one else '2') if mother_base_routes and str(visible_type or '').strip() else ('1' if priority_one else '')
+                clone[importance_header]='1' if priority_one else ''
             route_turn=1 if (first_torton or priority_one) else (2 if second_torton_label else None)
             if mother_base_routes and route_time_windows:
                 _apply_torton_turn_window(clone,headers,route_turn)
