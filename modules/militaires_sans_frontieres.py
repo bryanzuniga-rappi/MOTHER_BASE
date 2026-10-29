@@ -111,6 +111,31 @@ def _round_pallets(value):
     whole=int(value); return max(1,whole+(1 if value-whole>=0.3 else 0))
 
 
+def _round_down_small_capacity_tail(rows, headers):
+    """Elimina sólo el residuo operativo menor a 0.2 pallets.
+
+    CAPACIDAD UNO es el espacio que consume el pedido en el ruteador, no la
+    cantidad de producto. Por eso 8.02 debe viajar como 8, sin tocar ítems,
+    costo ni capacidad secundaria. No se redondean pedidos de un pallet o
+    menos: un pedido de 0.10 continúa existiendo.
+    """
+    cap_header=next((h for h in headers if h.upper()=='CAPACIDAD UNO'),None)
+    if not cap_header:
+        return rows
+    for row in rows:
+        value=_number(row.get(cap_header,''))
+        whole=int(value)
+        if value>1 and 0 < value-whole < 0.2:
+            row[cap_header]=_display_number(whole)
+    return rows
+
+
+def _selected_fleet(fleet, selected_units):
+    """La selección visible del usuario es la única autoridad sobre FLOTA."""
+    selected={str(unit).strip() for unit in selected_units}
+    return [item for item in fleet if str(item.get('UNIDAD','')).strip() in selected]
+
+
 def _split_destination_address(address, split_index):
     """Crea una dirección distinguible para una parte adicional del mismo pedido."""
     value=str(address or '')
@@ -705,19 +730,14 @@ def render():
         with st.spinner('Leyendo pedidos, FLOTA y asignando unidades…'):
             try:
                 headers,rows=_read_dispatchtrack_file(uploaded)
-                # Las sesiones de Streamlit conservan el multiselect incluso
-                # después de que FLOTA cambia. Los Tortons físicos no pueden
-                # desaparecer silenciosamente por ese estado viejo: siempre
-                # participan cuando existen en FLOTA.
-                selected_unit_set=set(selected_units)
-                forced_tortons=[u['UNIDAD'] for u in fleet_config if _is_torton(u['UNIDAD']) and u['UNIDAD'] not in selected_unit_set]
-                filtered_fleet=[u for u in fleet_config if u['UNIDAD'] in selected_unit_set or _is_torton(u['UNIDAD'])]
+                # La multiselección manda. Nunca se reincorpora un vehículo
+                # desde FLOTA, ni siquiera un Torton: hacerlo introducía el
+                # TORTON genérico que el usuario había quitado explícitamente.
+                filtered_fleet=_selected_fleet(fleet_config,selected_units)
                 filtered_directions={k:dict(v) for k,v in direction_config.items() if not selected_cities or _norm(v.get('CITY','')) in {_norm(city) for city in selected_cities}}
                 if not prioritize:
                     for value in filtered_directions.values(): value['PRIORITY']=0
                 result,warnings=_assign_and_split(headers,rows,filtered_fleet,filtered_directions,selected_cities,respect_constraints=use_constraints,split_orders=split_orders,split_capacity=split_capacity,mother_base_routes=mother_base_routes,route_time_windows=route_time_windows)
-                if forced_tortons:
-                    warnings.insert(0,f"Tortons físicos incluidos automáticamente desde FLOTA: {', '.join(forced_tortons)}.")
                 covered_tortons=_guarantee_priority_torton_coverage(headers,result,filtered_fleet)
                 if covered_tortons:
                     warnings.insert(0,f"Cobertura P1 corregida para: {', '.join(covered_tortons)}.")
@@ -725,6 +745,7 @@ def render():
                 # ejecutarse si el usuario apagó "Partir pedidos".
                 if split_orders:
                     result=_cap_final_output_parts(headers,result,split_capacity)
+                result=_round_down_small_capacity_tail(result,headers)
                 csv_bytes=_to_xlsx(headers,result)
             except Exception as exc: st.error(f'No se pudo ejecutar la planeación: {exc}'); return
         st.success(f'Planeación generada: {len(rows):,} pedidos de entrada → {len(result):,} líneas de salida.')

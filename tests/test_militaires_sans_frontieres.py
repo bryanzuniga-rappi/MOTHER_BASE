@@ -11,6 +11,8 @@ install()
 from modules.militaires_sans_frontieres import (
     DISPATCHTRACK_OUTPUT_HEADERS,
     _assign_and_split,
+    _round_down_small_capacity_tail,
+    _selected_fleet,
     _cap_final_output_parts,
     _guarantee_priority_torton_coverage,
     _mark_split_destination,
@@ -246,4 +248,26 @@ def test_split_controls_only_split_when_the_toggle_is_on():
     }, split_orders=False)
     assert [float(item['CAPACIDAD UNO']) for item in constrained] == [3]
     assert {item['Tipo camion'] for item in constrained} == {'1.5'}
+
+
+def test_selected_fleet_never_readds_a_torton_removed_from_the_menu():
+    fleet=[
+        {'UNIDAD':'TORTON','CANTIDAD':1,'CAPACIDAD':8,'VUELTAS':2},
+        {'UNIDAD':'TORTON_1','CANTIDAD':1,'CAPACIDAD':8,'VUELTAS':2},
+        {'UNIDAD':'TORTON_2','CANTIDAD':1,'CAPACIDAD':8,'VUELTAS':2},
+    ]
+    selected=_selected_fleet(fleet,['TORTON_1','TORTON_2'])
+    assert [item['UNIDAD'] for item in selected] == ['TORTON_1','TORTON_2']
+
+
+def test_small_capacity_tail_rounds_down_only_above_one_pallet():
+    headers=['CÓDIGO DE PARADA*','CAPACIDAD UNO']
+    rows=[
+        {'CÓDIGO DE PARADA*':'ANGEL','CAPACIDAD UNO':'8.02'},
+        {'CÓDIGO DE PARADA*':'LOW','CAPACIDAD UNO':'1.09'},
+        {'CÓDIGO DE PARADA*':'TINY','CAPACIDAD UNO':'0.10'},
+        {'CÓDIGO DE PARADA*':'KEEP','CAPACIDAD UNO':'3.20'},
+    ]
+    _round_down_small_capacity_tail(rows,headers)
+    assert [row['CAPACIDAD UNO'] for row in rows] == ['8','1','0.10','3.20']
 
