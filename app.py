@@ -32,16 +32,19 @@ st.set_page_config(
 MODULE_HOME = "MOTHER BASE"
 MODULE_PLANNING = "LES ENFANTS TERRIBLES"
 MODULE_REPORTS = "MILITAIRES SANS FRONTIÈRES"
+MODULE_LOGISTICS = "FOXHOUND"
 
 
 @st.dialog("BIG BOSS · ACCESS CONTROL", width="small")
 def render_big_boss_authentication() -> None:
     st.caption("Ingresa el código de acceso para desbloquear Mother Base.")
+    show_code = st.checkbox("Mostrar código", key="mb_big_boss_show_password")
     with st.form("big_boss_access", clear_on_submit=False):
         password = st.text_input(
             "Código de acceso",
-            type="password",
+            type="default" if show_code else "password",
             placeholder="••••••••",
+            key="mb_big_boss_password",
         )
         submitted = st.form_submit_button(
             "Desbloquear acceso →",
@@ -114,21 +117,21 @@ def render_home() -> None:
         unsafe_allow_html=True,
     )
     st.write("")
-    planning_column, reporting_column = st.columns(2, gap="large")
-    with planning_column:
-        if render_action_card(
-            key="module_planning",
-            eyebrow="MODULE / 01 · OPERATIONAL",
-            title="LES ENFANTS TERRIBLES",
-            description=(
-                "Naked, Solidus y Liquid Engines. Planeación táctica de "
-                "transferencias."
-            ),
-            active=True,
-            tone="acid",
-        ):
-            st.session_state["mb_module"] = MODULE_PLANNING
-            st.rerun()
+    if render_action_card(
+        key="module_planning",
+        eyebrow="MODULE / 01 · OPERATIONAL PLANNING",
+        title="LES ENFANTS TERRIBLES",
+        description=(
+            "Naked, Otacon, Solidus, Shalashaska, Liquid, Venom y Kazuhira. "
+            "Planeación táctica de transferencias."
+        ),
+        active=True,
+        tone="acid",
+        min_height=150,
+    ):
+        st.session_state["mb_module"] = MODULE_PLANNING
+        st.rerun()
+    reporting_column, logistics_column = st.columns(2, gap="large")
     with reporting_column:
         if render_action_card(
             key="module_reporting",
@@ -140,6 +143,21 @@ def render_home() -> None:
             status="WORK IN PROGRESS",
         ):
             st.session_state["mb_module"] = MODULE_REPORTS
+            st.rerun()
+    with logistics_column:
+        if render_action_card(
+            key="module_foxhound",
+            eyebrow="MODULE / 03 · LOGISTICS COMMAND",
+            title="FOXHOUND",
+            description=(
+                "Cumplimiento de entregas, flota, conductores y no entregas "
+                "desde DispatchTrack."
+            ),
+            active=True,
+            tone="blue",
+            status="ONLINE",
+        ):
+            st.session_state["mb_module"] = MODULE_LOGISTICS
             st.rerun()
 
 
@@ -176,6 +194,10 @@ def main() -> None:
         render()
     elif selected_module == MODULE_REPORTS:
         from modules.militaires_sans_frontieres import render
+
+        render()
+    elif selected_module == MODULE_LOGISTICS:
+        from modules.foxhound import render
 
         render()
     else:
