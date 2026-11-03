@@ -22,3 +22,40 @@ def test_foxhound_reason_categories():
     assert foxhound._reason("No se cargó en CD") == "No se cargó en CD"
     assert foxhound._reason("cancelación del cliente") == "Cancelación"
     assert foxhound._reason("") == "Sin motivo"
+
+
+def test_foxhound_matches_sap_transfer_and_split_without_using_store_name():
+    dispatch = foxhound.prepare_rows([
+        {"Orden": "4600000001.0", "Estado": "Entregado", "Nombre de conductor": "Ana", "Nombre cliente": "Nombre cambiado"},
+        {"Orden": "164596-1", "Estado": "Pendiente", "Nombre de conductor": "Ana", "Nombre cliente": "Nombre cambiado-1"},
+        {"Orden": "999999", "Estado": "Pendiente", "Nombre de conductor": "Ana"},
+    ])
+    transfers = foxhound.prepare_transfers([{
+        "TRANSFER_ID": "164596", "SAP_ID": "4600000001", "ORDERED": 10,
+        "PICKED": 9, "DELIVERED": 8, "DESTINATION_WAREHOUSE_ID": "820",
+        "DESTINATION_WAREHOUSE_NAME": "Nombre Aleph",
+    }])
+    directions = foxhound.prepare_directions([{
+        "WAREHOUSE_ID": "820", "WAREHOUSE_NAME": "Nombre canónico", "ADDRES": "Dirección canónica", "CITY": "CDMX",
+    }])
+
+    events, canonical = foxhound.build_logistics_model(dispatch, transfers, directions)
+
+    assert [event["match_transfer"] for event in events] == ["SAP exacto", "Transfer partida", "Sin match"]
+    assert canonical[0]["partes DT"] == 2
+    assert canonical[0]["tienda canónica"] == "Nombre canónico"
+    assert canonical[0]["estado consolidado"] == "Parcial"
+
+
+def test_foxhound_driver_fill_rate_counts_transfer_once_and_excludes_shared():
+    transfers = [
+        {"conductor": "Ana", "ordered": 10, "picked": 10, "delivered": 9, "estado consolidado": "Entregado"},
+        {"conductor": "Ana", "ordered": 20, "picked": 20, "delivered": 10, "estado consolidado": "No entregado"},
+        {"conductor": "Compartido", "ordered": 100, "picked": 100, "delivered": 100, "estado consolidado": "Entregado"},
+    ]
+    ranking = foxhound.driver_leaderboard(transfers, minimum_transfers=2)
+
+    assert len(ranking) == 1
+    assert ranking[0]["conductor"] == "Ana"
+    assert ranking[0]["fill entrega"] == 19 / 30
+    assert ranking[0]["elegible"] is True
