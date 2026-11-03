@@ -978,40 +978,6 @@ def inject_styles() -> None:
             font-weight: 700;
         }
 
-        .mb-static-table-wrap {
-            width: 100%;
-            overflow-x: auto;
-            border: 3px solid var(--ink);
-            background: var(--white);
-            margin: 7px 0 12px;
-        }
-
-        .mb-static-table {
-            width: 100%;
-            border-collapse: collapse;
-            font-size: .76rem;
-        }
-
-        .mb-static-table th {
-            position: sticky;
-            top: 0;
-            background: var(--ink);
-            color: var(--white);
-            text-align: left;
-            white-space: nowrap;
-            z-index: 1;
-        }
-
-        .mb-static-table th, .mb-static-table td {
-            border: 1px solid var(--ink);
-            padding: 7px 8px;
-            vertical-align: top;
-            max-width: 300px;
-            overflow-wrap: anywhere;
-        }
-
-        .mb-static-table tbody tr:nth-child(even) { background: #f2efe6; }
-
         @media (max-width: 800px) {
             .block-container { padding: 1rem 1rem 3rem; }
             .hero { padding: 22px 18px; }
@@ -8342,38 +8308,6 @@ def rows_to_csv_bytes(rows: list[dict[str, Any]]) -> bytes:
     return buffer.getvalue().encode("utf-8-sig")
 
 
-def render_static_table(rows: list[dict[str, Any]]) -> None:
-    """Tabla HTML segura, independiente del bundle DataFrame de Streamlit.
-
-    El frontend de Streamlit puede quedar con un CSS hasheado en caché después
-    de un redeploy y romper todos los ``st.dataframe``. Las tablas de resultados
-    no necesitan edición, filtros ni ordenamiento en pantalla; se conservan las
-    descargas CSV para el detalle completo.
-    """
-    if not rows:
-        st.info("No existen registros para mostrar en esta sección.")
-        return
-    columns = list(dict.fromkeys(key for row in rows for key in row))
-
-    def cell(value: Any) -> str:
-        if value is None:
-            return ""
-        if isinstance(value, float) and math.isnan(value):
-            return ""
-        return html.escape(str(value))
-
-    header_html = "".join(f"<th>{cell(column)}</th>" for column in columns)
-    body_html = "".join(
-        "<tr>" + "".join(f"<td>{cell(row.get(column))}</td>" for column in columns) + "</tr>"
-        for row in rows
-    )
-    st.markdown(
-        '<div class="mb-static-table-wrap"><table class="mb-static-table">'
-        f"<thead><tr>{header_html}</tr></thead><tbody>{body_html}</tbody></table></div>",
-        unsafe_allow_html=True,
-    )
-
-
 def render_capped_dataframe(
     rows: list[dict[str, Any]],
     *,
@@ -8391,10 +8325,14 @@ def render_capped_dataframe(
         return
     total = len(rows)
     display_rows = rows[:max_display]
-    # ``column_config`` se conserva en la firma por compatibilidad con los
-    # reportes actuales; esta vista es de consulta y no requiere DataFrame.
-    _ = column_config
-    render_static_table(display_rows)
+    height = (min(total, max_display) + 1) * 36 + 4
+    st.dataframe(
+        display_rows,
+        use_container_width=True,
+        hide_index=True,
+        height=height,
+        column_config=column_config or {},
+    )
     if total > max_display:
         st.caption(
             f"Mostrando {max_display:,} de {total:,} filas."
@@ -8423,8 +8361,14 @@ def report_table(
     display_rows = rows[:MAX_DISPLAY_ROWS]
     # Se limita el número de filas enviadas al navegador, no solo la altura del
     # contenedor.
-    _ = column_config, max_height
-    render_static_table(display_rows)
+    height = min(max(150, 36 * (len(display_rows) + 1)), max_height)
+    st.dataframe(
+        display_rows,
+        use_container_width=True,
+        hide_index=True,
+        height=height,
+        column_config=column_config or {},
+    )
     if total > MAX_DISPLAY_ROWS:
         st.caption(f"Mostrando {MAX_DISPLAY_ROWS:,} de {total:,} filas.")
 
@@ -10004,14 +9948,14 @@ def render_results(run: dict[str, Any]) -> None:
                     explanation = explain_store_sku(zip_path, int(query_store), int(query_sku))
                 if explanation["sent"]:
                     st.success(explanation["verdict"])
-                    render_static_table(explanation["sent"])
+                    st.dataframe(explanation["sent"], use_container_width=True)
                 elif explanation["declared"] or explanation["healthy"]:
                     st.info(explanation["verdict"])
                 else:
                     st.error(explanation["verdict"])
                 if explanation["declared"]:
                     st.markdown("**Declarado en BASE_TRANSFERS:**")
-                    render_static_table(explanation["declared"])
+                    st.dataframe(explanation["declared"], use_container_width=True)
                 if explanation["healthy"]:
                     st.markdown("**Universo sano:**")
                     st.json(explanation["healthy"])
