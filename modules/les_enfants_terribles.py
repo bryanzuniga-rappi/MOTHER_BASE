@@ -6995,20 +6995,25 @@ def execute_planning(
                 "de bloquearse (la exclusión manual de SKUs sigue aplicando)."
             )
             catalogs.globally_blocked_skus = set()
+        # Compatibilidad con despliegues que actualizaron esta pantalla antes
+        # de modelo_abasto.py. Sin esto una instalación parcial no debe tumbar
+        # toda la planeación; al actualizar ambos archivos, el conjunto viene
+        # cargado desde la hoja FARMA normalmente.
+        farma_block_pairs = set(getattr(catalogs, "farma_block_pairs", set()))
         if enable_farma_block_rule:
             # Se incorpora al filtro universal destino-SKU para que Naked,
             # Otacon, Solidus, Shalashaska, Liquid, Venom y Kazuhira vean la
             # misma regla antes de reservar inventario o tareas.
-            catalogs.route_cost_blocks |= catalogs.farma_block_pairs
-            if catalogs.farma_block_pairs:
+            catalogs.route_cost_blocks |= farma_block_pairs
+            if farma_block_pairs:
                 catalogs.warnings.append(
                     "Bloqueo FARMA activo: se bloquearon completamente "
-                    f"{len(catalogs.farma_block_pairs):,} combinaciones destino-SKU."
+                    f"{len(farma_block_pairs):,} combinaciones destino-SKU."
                 )
-        elif catalogs.farma_block_pairs:
+        elif farma_block_pairs:
             catalogs.warnings.append(
                 "Regla FARMA desactivada para esta corrida desde CODEC: "
-                f"{len(catalogs.farma_block_pairs):,} combinaciones dejaron de bloquearse."
+                f"{len(farma_block_pairs):,} combinaciones dejaron de bloquearse."
             )
         if ignore_store_capacity:
             catalogs.warnings.append(

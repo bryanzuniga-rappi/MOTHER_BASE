@@ -686,6 +686,9 @@ class Catalogs:
     # SKUs de la hoja BLOQUEOS (columna PRODUCT_ID) que nunca se envían a
     # ningún lugar, mantenidos directamente por negocio en DATA_TRANSFERS.
     globally_blocked_skus: set[int] = field(default_factory=set)
+    # FARMA bloquea únicamente una combinación destino-SKU. La hoja viene de
+    # IMPORTRANGE y puede no estar disponible temporalmente (#REF! en A2).
+    farma_block_pairs: set[tuple[int, int]] = field(default_factory=set)
     # Catálogo maestro de producto (hoja DATA), por SYNC_ID -> nombre y
     # categoría.
     product_catalog: dict[int, dict[str, str]] = field(default_factory=dict)
@@ -740,6 +743,27 @@ def load_catalogs(
             for row in iter_sheet_records(workbook, "BLOQUEOS", ["PRODUCT_ID"])
         }
         globally_blocked_skus.discard(None)
+
+        # FARMA tiene encabezados manuales en la fila 1. La disponibilidad del
+        # IMPORTRANGE se valida exclusivamente en A2: A1 nunca debe usarse
+        # como señal de #REF! porque siempre contiene WAREHOUSE_ID.
+        farma_block_pairs: set[tuple[int, int]] = set()
+        if "FARMA" in workbook.sheetnames:
+            farma_a2 = workbook["FARMA"].cell(row=2, column=1).value
+            if clean_text(farma_a2).upper() == "#REF!":
+                warnings.append(
+                    "FARMA no se aplicó: el IMPORTRANGE tiene #REF! en FARMA!A2."
+                )
+            else:
+                for row in iter_sheet_records(
+                    workbook, "FARMA", ["WAREHOUSE_ID", "PRODUCT_ID"]
+                ):
+                    destination = to_id(
+                        row["WAREHOUSE_ID"], "FARMA.WAREHOUSE_ID", True
+                    )
+                    sku = to_id(row["PRODUCT_ID"], "FARMA.PRODUCT_ID", True)
+                    if destination is not None and sku is not None:
+                        farma_block_pairs.add((destination, sku))
 
         route_cost_blocks: set[tuple[int, int]] = set()
         for row in iter_sheet_records(
@@ -1199,6 +1223,7 @@ def load_catalogs(
         run_weekday_norm=run_weekday_norm,
         copernico_unusable_by_reason=copernico_unusable_by_reason,
         globally_blocked_skus=globally_blocked_skus,
+        farma_block_pairs=farma_block_pairs,
         product_catalog=product_catalog,
         swa_potential_gain=swa_potential_gain,
         incoming_stock=dict(incoming_stock),
