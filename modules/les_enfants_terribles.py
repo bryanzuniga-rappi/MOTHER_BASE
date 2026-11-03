@@ -85,6 +85,7 @@ APP_NAME = "Les Enfants Terribles"
 MAX_UPLOAD_MB = 500
 PLANNING_DRIVE_FOLDER_ID = "1SfvpuHo0uhZLQb8pG5HZuJFH0bJPMu1f"
 PLANNING_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
+GOOGLE_OAUTH_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
 
 
 class PlanningDriveError(RuntimeError):
@@ -1871,6 +1872,12 @@ def omit_unexecuted_manual_task_rows(result) -> None:
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_public_database() -> bytes:
     """Exporta el Google Sheet público completo como XLSX y conserva 5 min de caché."""
+    # Adaptador para Snowflake Workspaces: el entrypoint puede cargar una
+    # copia local de DATA_TRANSFERS al estado de sesión. En producción esta
+    # llave no existe y el flujo de Google Sheets permanece idéntico.
+    workspace_database = st.session_state.get("mb_workspace_database_bytes")
+    if workspace_database:
+        return bytes(workspace_database)
     spreadsheet_id = configured_data_transfers_spreadsheet_id()
     if not spreadsheet_id:
         raise RuntimeError(
@@ -6788,6 +6795,7 @@ def execute_planning(
     enable_closed_stores_rule: bool = True,
     enable_regional_block_rule: bool = True,
     enable_global_blocks_rule: bool = True,
+    enable_farma_block_rule: bool = True,
     ignore_store_capacity: bool = False,
     enable_route_cost_block_rule: bool = True,
     simulation_mode: bool = False,
@@ -6959,6 +6967,21 @@ def execute_planning(
                 "de bloquearse (la exclusión manual de SKUs sigue aplicando)."
             )
             catalogs.globally_blocked_skus = set()
+        if enable_farma_block_rule:
+            # Se incorpora al filtro universal destino-SKU para que Naked,
+            # Otacon, Solidus, Shalashaska, Liquid, Venom y Kazuhira vean la
+            # misma regla antes de reservar inventario o tareas.
+            catalogs.route_cost_blocks |= catalogs.farma_block_pairs
+            if catalogs.farma_block_pairs:
+                catalogs.warnings.append(
+                    "Bloqueo FARMA activo: se bloquearon completamente "
+                    f"{len(catalogs.farma_block_pairs):,} combinaciones destino-SKU."
+                )
+        elif catalogs.farma_block_pairs:
+            catalogs.warnings.append(
+                "Regla FARMA desactivada para esta corrida desde CODEC: "
+                f"{len(catalogs.farma_block_pairs):,} combinaciones dejaron de bloquearse."
+            )
         if ignore_store_capacity:
             catalogs.warnings.append(
                 "Capacidad de tienda ignorada en todos los engines desde CODEC: "
@@ -9301,6 +9324,16 @@ def _planning_drive_secret(name: str) -> str:
     return str(value or "").strip()
 
 
+def configured_planning_drive_folder_id() -> str:
+    """Carpeta de entregables de Les Enfants, configurable sin cambiar código.
+
+    El valor histórico se mantiene como respaldo para no romper corridas ya
+    desplegadas. La configuración explícita permite mover la carpeta o usar
+    una distinta a la que consume Militaires Sans Frontières.
+    """
+    return _planning_drive_secret("PLANNING_DRIVE_FOLDER_ID") or PLANNING_DRIVE_FOLDER_ID
+
+
 def _planning_drive_service_account_info() -> dict[str, Any]:
     """Obtiene la cuenta de servicio que ya tenía acceso a la carpeta operativa."""
     try:
@@ -9317,22 +9350,63 @@ def _planning_drive_service_account_info() -> dict[str, Any]:
         ) from error
 
 
+def _planning_drive_oauth_values() -> tuple[str, str, str]:
+    """Obtiene OAuth reutilizable de Mother Base, priorizando Les Enfants."""
+    client_id = (
+        _planning_drive_secret("PLANNING_DRIVE_OAUTH_CLIENT_ID")
+        or _planning_drive_secret("DATA_DASHBOARD_OAUTH_CLIENT_ID")
+    )
+    client_secret = (
+        _planning_drive_secret("PLANNING_DRIVE_OAUTH_CLIENT_SECRET")
+        or _planning_drive_secret("DATA_DASHBOARD_OAUTH_CLIENT_SECRET")
+    )
+    refresh_token = (
+        _planning_drive_secret("PLANNING_DRIVE_OAUTH_REFRESH_TOKEN")
+        or _planning_drive_secret("DATA_DASHBOARD_OAUTH_REFRESH_TOKEN")
+        or _planning_drive_secret("MAIL_OAUTH_REFRESH_TOKEN")
+    )
+    return client_id, client_secret, refresh_token
+
+
 def _build_planning_drive_service() -> Any:
-    """Crea el cliente de Drive de Les Enfants Terribles, sin usar Militaires."""
+    """Crea el cliente de Drive de Les Enfants sin depender de Militaires.
+
+    Antes esta pantalla sólo aceptaba una cuenta de servicio. Eso se rompía al
+    migrar/configurar Drive con OAuth de usuario en Mother Base: el token sí
+    existía, pero Les Enfants lo ignoraba. Ahora acepta ambos mecanismos.
+    """
     try:
         from google.oauth2 import service_account
+        from google.oauth2.credentials import Credentials as OAuthUserCredentials
         from googleapiclient.discovery import build as build_drive_service
 
-        credentials = service_account.Credentials.from_service_account_info(
-            _planning_drive_service_account_info(),
-            scopes=[PLANNING_DRIVE_SCOPE],
-        )
-        impersonate_email = (
-            _planning_drive_secret("PLANNING_DRIVE_IMPERSONATE_EMAIL")
-            or _planning_drive_secret("DATA_DASHBOARD_IMPERSONATE_EMAIL")
-        )
-        if impersonate_email:
-            credentials = credentials.with_subject(impersonate_email)
+        client_id, client_secret, refresh_token = _planning_drive_oauth_values()
+        if refresh_token:
+            if not client_id or not client_secret:
+                raise PlanningDriveError(
+                    "Hay un refresh token de Google, pero faltan "
+                    "DATA_DASHBOARD_OAUTH_CLIENT_ID/CLIENT_SECRET (o sus "
+                    "equivalentes PLANNING_DRIVE_OAUTH_*)."
+                )
+            credentials = OAuthUserCredentials(
+                None,
+                refresh_token=refresh_token,
+                client_id=client_id,
+                client_secret=client_secret,
+                token_uri=GOOGLE_OAUTH_TOKEN_ENDPOINT,
+                scopes=[PLANNING_DRIVE_SCOPE],
+            )
+        else:
+            credentials = service_account.Credentials.from_service_account_info(
+                _planning_drive_service_account_info(),
+                scopes=[PLANNING_DRIVE_SCOPE],
+            )
+            impersonate_email = (
+                _planning_drive_secret("PLANNING_DRIVE_IMPERSONATE_EMAIL")
+                or _planning_drive_secret("DATA_DASHBOARD_IMPERSONATE_EMAIL")
+            )
+            if impersonate_email:
+                credentials = credentials.with_subject(impersonate_email)
         return build_drive_service(
             "drive", "v3", credentials=credentials, cache_discovery=False
         )
@@ -9379,10 +9453,18 @@ def upload_planning_zip_to_drive(
 
             media_upload_factory = MediaFileUpload
         drive_service = service or _build_planning_drive_service()
+        folder_id = configured_planning_drive_folder_id()
+        # Falla antes de iniciar una subida pesada y distingue carpeta/permisos
+        # de un problema del ZIP. También valida correctamente Shared Drives.
+        drive_service.files().get(
+            fileId=folder_id,
+            fields="id,name,driveId",
+            supportsAllDrives=True,
+        ).execute()
         response = drive_service.files().create(
             body={
                 "name": planning_drive_package_name(run),
-                "parents": [PLANNING_DRIVE_FOLDER_ID],
+                "parents": [folder_id],
                 "mimeType": "application/zip",
             },
             media_body=media_upload_factory(
@@ -9395,9 +9477,29 @@ def upload_planning_zip_to_drive(
         raise
     except Exception as error:
         raise PlanningDriveError(f"No se pudo subir el ZIP a Drive: {error}") from error
-    return str(
-        response.get("webViewLink") or response.get("id") or planning_drive_package_name(run)
-    )
+    if response.get("webViewLink"):
+        return str(response["webViewLink"])
+    if response.get("id"):
+        # Un ID solo no es un enlace navegable en Streamlit.
+        return f"https://drive.google.com/open?id={response['id']}"
+    return planning_drive_package_name(run)
+
+
+def test_planning_drive_connection(service: Any | None = None) -> str:
+    """Comprueba credenciales y acceso a la carpeta sin subir ningún archivo."""
+    try:
+        drive_service = service or _build_planning_drive_service()
+        folder = drive_service.files().get(
+            fileId=configured_planning_drive_folder_id(),
+            fields="id,name,driveId",
+            supportsAllDrives=True,
+        ).execute()
+        place = "Drive compartido" if folder.get("driveId") else "Mi unidad"
+        return f"Conexión lista: carpeta {folder.get('name', folder['id'])} ({place})."
+    except PlanningDriveError:
+        raise
+    except Exception as error:
+        raise PlanningDriveError(f"No se pudo validar la carpeta de Drive: {error}") from error
 
 
 def render_planning_drive_section(run: dict[str, Any]) -> None:
@@ -9407,6 +9509,13 @@ def render_planning_drive_section(run: dict[str, Any]) -> None:
         st.caption("Modo simulación: la corrida no generó archivos que subir.")
         return
     st.caption("El paquete se guardará en Drive como " + planning_drive_package_name(run) + ".")
+    with st.expander("Diagnóstico de conexión a Drive", expanded=False):
+        st.caption("Valida credenciales y acceso a la carpeta sin subir archivos.")
+        if st.button("Probar conexión con Drive", key="mb_planning_drive_test"):
+            try:
+                st.success(test_planning_drive_connection())
+            except PlanningDriveError as error:
+                st.error(str(error))
     if st.button(
         "Subir ZIP a Drive",
         key="mb_planning_drive_upload",
@@ -11356,7 +11465,7 @@ def render() -> None:
         )
 
         st.markdown("###### Reglas activas por default — desactivar es la excepción")
-        rules_col1, rules_col2, rules_col3, rules_col4, rules_col5 = st.columns(5)
+        rules_col1, rules_col2, rules_col3, rules_col4, rules_col5, rules_col6 = st.columns(6)
         with rules_col1:
             enable_rackeados_rule = st.toggle(
                 "Regla de rackeados",
@@ -11402,6 +11511,16 @@ def render() -> None:
                     "Si se apaga, los SKUs de la hoja BLOQUEOS dejan de excluirse "
                     "de todos los engines. La exclusión manual de SKUs sigue "
                     "aplicando. No confundir con BLOQUEOS_FORANEAS (bloqueo regional)."
+                ),
+            )
+        with rules_col6:
+            enable_farma_block_rule = st.toggle(
+                "Bloquear FARMA",
+                value=True,
+                help=(
+                    "Bloquea por completo cada combinación WAREHOUSE_ID + PRODUCT_ID "
+                    "de la hoja FARMA. Si FARMA!A2 tiene #REF!, se avisa y no se "
+                    "interpreta la hoja."
                 ),
             )
 
@@ -12517,6 +12636,7 @@ def render() -> None:
                     enable_closed_stores_rule=enable_closed_stores_rule,
                     enable_regional_block_rule=enable_regional_block_rule,
                     enable_global_blocks_rule=enable_global_blocks_rule,
+                    enable_farma_block_rule=enable_farma_block_rule,
                     ignore_store_capacity=ignore_store_capacity,
                     enable_route_cost_block_rule=enable_route_cost_block_rule,
                     simulation_mode=simulation_mode,
