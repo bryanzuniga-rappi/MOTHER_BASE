@@ -18,6 +18,7 @@ def _database_bytes(*, farma_a2=820):
     for name in m.REQUIRED_DATABASE_SHEETS:
         sheet = book.create_sheet(name)
         if name in m.ALEPH_SHEETS:
+            sheet.cell(6, 3, "12 rows by 4 columns")
             sheet.cell(7, 3, datetime(2026, 11, 3, 9, 0))
         elif name == "FARMA":
             sheet.append(["WAREHOUSE_ID", "PRODUCT_ID", "MAKER"])
@@ -38,7 +39,7 @@ def test_database_health_splits_manual_and_aleph_and_counts_used_rows():
     farma = next(row for row in health["rows"] if row["HOJA"] == "FARMA")
     stock = next(row for row in health["rows"] if row["HOJA"] == "STOCK")
     assert farma["LINEAS"] == 1
-    assert stock["LINEAS"] == 6
+    assert stock["LINEAS"] == 12
     assert m.database_section("FARMA") == "INPUTS MANUALES"
     assert m.database_section("STOCK") == "ALEPH"
 
@@ -49,3 +50,10 @@ def test_database_health_checks_farma_ref_in_a2_not_manual_header():
     assert farma["ESTADO"] == "ERROR"
     assert farma["CONTROL"] == "A2"
     assert "A2" in farma["DETALLE"]
+
+
+def test_database_health_uses_xml_rows_when_google_omits_sheet_dimensions():
+    counts = m.database_sheet_xml_row_counts(_database_bytes())
+    # Cabecera + una fila: el indicador reporta sólo la línea de datos.
+    assert counts["FARMA"] == 1
+    assert counts["VOLUMETRIA"] == 1

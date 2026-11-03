@@ -1168,14 +1168,62 @@ def relative_update_text(
     return detail, healthy
 
 
-def database_sheet_line_count(sheet: Any, sheet_name: str) -> int:
-    """Cuenta registros reales sin depender de la dimensión del XLSX.
+def database_sheet_xml_row_counts(workbook_bytes: bytes) -> dict[str, int]:
+    """Cuenta filas de hojas directamente desde el ZIP del XLSX, en streaming.
 
-    Las exportaciones de Google Sheets que alimentan DATA_TRANSFERS no siempre
-    incluyen ``<dimension>`` en el XML. Por eso openpyxl entrega ``max_row=None``
-    aunque sí existan datos. Aleph ya publica el total exacto en C6; para los
-    inputs manuales se cuentan las filas no vacías en modo streaming.
+    Google Sheets puede omitir la dimensión de la hoja; ``openpyxl.max_row``
+    queda en ``None``. Iterar las celdas con openpyxl corrige el número, pero
+    dispara el uso de memoria al abrir DATA_TRANSFERS. Leer sólo los nodos
+    ``<row>`` del XML evita crear objetos por cada celda.
     """
+    import xml.etree.ElementTree as ET
+
+    relationships_ns = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+    package_ns = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+    with zipfile.ZipFile(io.BytesIO(workbook_bytes)) as archive:
+        workbook_root = ET.fromstring(archive.read("xl/workbook.xml"))
+        rel_root = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+        targets = {
+            relation.attrib["Id"]: relation.attrib["Target"]
+            for relation in rel_root.findall(f"{package_ns}Relationship")
+        }
+        sheet_paths: dict[str, str] = {}
+        for sheet in workbook_root.iter():
+            if not sheet.tag.endswith("}sheet"):
+                continue
+            name = sheet.attrib.get("name")
+            relationship_id = sheet.attrib.get(f"{relationships_ns}id")
+            target = targets.get(relationship_id or "", "")
+            if not name or not target:
+                continue
+            target = target.lstrip("/")
+            sheet_paths[name] = target if target.startswith("xl/") else f"xl/{target}"
+
+        counts: dict[str, int] = {}
+        for sheet_name in REQUIRED_DATABASE_SHEETS:
+            # Las tablas Aleph pueden contener cientos de miles de filas; su
+            # resultado exacto ya está en C6 y no deben descomprimirse aquí.
+            if sheet_name in ALEPH_SHEETS:
+                continue
+            path = sheet_paths.get(sheet_name)
+            if not path or path not in archive.namelist():
+                continue
+            count = 0
+            with archive.open(path) as stream:
+                for _event, element in ET.iterparse(stream, events=("end",)):
+                    if element.tag.endswith("}row"):
+                        count += 1
+                    element.clear()
+            counts[sheet_name] = max(count - 1, 0)
+    return counts
+
+
+def database_sheet_line_count(
+    sheet: Any,
+    sheet_name: str,
+    xml_row_counts: dict[str, int],
+) -> int:
+    """Devuelve el total exacto publicado por Aleph o el conteo XML manual."""
     if sheet_name in ALEPH_SHEETS:
         result_size = str(sheet["C6"].value or "")
         match = re.search(r"([\d,]+)\s+rows?\b", result_size, flags=re.IGNORECASE)
@@ -1185,20 +1233,28 @@ def database_sheet_line_count(sheet: Any, sheet_name: str) -> int:
         # cientos de miles de filas sólo para el indicador visual.
         return 0
 
-    occupied_rows = 0
-    for row in sheet.iter_rows(min_row=2, values_only=True):
-        if any(value is not None and str(value).strip() for value in row):
-            occupied_rows += 1
-    return occupied_rows
+    return xml_row_counts.get(sheet_name, 0)
 
 
-def inspect_database(workbook_bytes: bytes) -> dict[str, Any]:
-    """Valida presencia de hojas, actualizaciones Aleph y errores IMPORTRANGE."""
+def inspect_database(
+    workbook_bytes: bytes,
+    *,
+    include_locations: bool = False,
+) -> dict[str, Any] | tuple[dict[str, Any], dict[str, str], dict[int, str]]:
+    """Valida DATA_TRANSFERS y, opcionalmente, extrae ciudades/tiendas.
+
+    ``include_locations`` permite que el arranque de la app abra el XLSX una
+    sola vez: OpenPyXL conserva estructuras internas grandes incluso tras
+    cerrar un libro, por lo que abrirlo dos veces elevaba el pico de memoria.
+    """
     rows: list[dict[str, Any]] = []
+    city_labels: dict[str, str] = {}
+    store_labels: dict[int, str] = {}
     # La validación se ejecutaba con dos libros XLSX abiertos en paralelo
     # (fórmulas + valores), duplicando el pico de memoria antes de planear.
     # Abrimos la vista calculada y solo hacemos fallback a fórmulas si una
     # celda de control no tiene valor cacheado.
+    xml_row_counts = database_sheet_xml_row_counts(workbook_bytes)
     workbook = openpyxl.load_workbook(
         io.BytesIO(workbook_bytes), read_only=True, data_only=True
     )
@@ -1218,7 +1274,7 @@ def inspect_database(workbook_bytes: bytes) -> dict[str, Any]:
                 continue
 
             sheet = workbook[sheet_name]
-            row_count = database_sheet_line_count(sheet, sheet_name)
+            row_count = database_sheet_line_count(sheet, sheet_name, xml_row_counts)
             if sheet_name in ALEPH_SHEETS:
                 value = sheet["C7"].value
                 if value is None:
@@ -1270,32 +1326,74 @@ def inspect_database(workbook_bytes: bytes) -> dict[str, Any]:
                     "LINEAS": row_count,
                 }
             )
+
+        if include_locations and "TIENDA" in workbook.sheetnames:
+            try:
+                location_rows = engine.iter_sheet_records(
+                    workbook,
+                    "TIENDA",
+                    ["CITY", "WAREHOUSE_ID", "WAREHOUSE_NAME"],
+                    ["CITY", "WAREHOUSE_ID", "WAREHOUSE_NAME"],
+                )
+                for row in location_rows:
+                    raw_city = engine.clean_text(row["CITY"])
+                    normalized_city = engine.normalize_city(raw_city)
+                    if normalized_city:
+                        city_labels.setdefault(
+                            normalized_city,
+                            CITY_DISPLAY_NAMES.get(
+                                normalized_city, raw_city or normalized_city
+                            ),
+                        )
+                    warehouse = engine.to_id(
+                        row["WAREHOUSE_ID"], "TIENDA.WAREHOUSE_ID", allow_none=True
+                    )
+                    if warehouse is not None:
+                        name = engine.clean_text(row["WAREHOUSE_NAME"])
+                        store_labels[warehouse] = f"{warehouse} - {name or 'SIN NOMBRE'}"
+            except ValueError:
+                # El estado de la base ya marcará la fuente inválida. No se
+                # pierde la pantalla completa sólo por no poder poblar filtros.
+                pass
     finally:
         workbook.close()
         if formula_workbook is not None:
             formula_workbook.close()
 
     healthy_count = sum(row["ESTADO"] == "OK" for row in rows)
-    return {
+    health = {
         "online": healthy_count == len(rows),
         "healthy_count": healthy_count,
         "total_count": len(rows),
         "error_count": len(rows) - healthy_count,
         "rows": rows,
     }
+    if not include_locations:
+        return health
+    preferred_order = {"CDMX": 0, "GDL": 1, "MTY": 2}
+    ordered_cities = dict(
+        sorted(
+            city_labels.items(),
+            key=lambda item: (preferred_order.get(item[0], 99), item[1].upper()),
+        )
+    )
+    ordered_stores = dict(sorted(store_labels.items(), key=lambda item: item[1].upper()))
+    return health, ordered_cities, ordered_stores
 
 
-def extract_available_cities(workbook_bytes: bytes) -> dict[str, str]:
+def extract_available_locations(workbook_bytes: bytes) -> tuple[dict[str, str], dict[int, str]]:
+    """Lee TIENDA una vez para construir las opciones de ciudad y tienda."""
     workbook = openpyxl.load_workbook(
         io.BytesIO(workbook_bytes), read_only=True, data_only=True
     )
     try:
         labels: dict[str, str] = {}
+        stores: dict[int, str] = {}
         for row in engine.iter_sheet_records(
             workbook,
             "TIENDA",
-            ["CITY"],
-            ["CITY"],
+            ["CITY", "WAREHOUSE_ID", "WAREHOUSE_NAME"],
+            ["CITY", "WAREHOUSE_ID", "WAREHOUSE_NAME"],
         ):
             raw_city = engine.clean_text(row["CITY"])
             normalized_city = engine.normalize_city(raw_city)
@@ -1305,11 +1403,17 @@ def extract_available_cities(workbook_bytes: bytes) -> dict[str, str]:
                 normalized_city,
                 CITY_DISPLAY_NAMES.get(normalized_city, raw_city or normalized_city),
             )
+            warehouse = engine.to_id(
+                row["WAREHOUSE_ID"], "TIENDA.WAREHOUSE_ID", allow_none=True
+            )
+            if warehouse is not None:
+                name = engine.clean_text(row["WAREHOUSE_NAME"])
+                stores[warehouse] = f"{warehouse} - {name or 'SIN NOMBRE'}"
     finally:
         workbook.close()
 
     preferred_order = {"CDMX": 0, "GDL": 1, "MTY": 2}
-    return dict(
+    cities = dict(
         sorted(
             labels.items(),
             key=lambda item: (
@@ -1318,33 +1422,17 @@ def extract_available_cities(workbook_bytes: bytes) -> dict[str, str]:
             ),
         )
     )
+    return cities, dict(sorted(stores.items(), key=lambda item: item[1].upper()))
+
+
+def extract_available_cities(workbook_bytes: bytes) -> dict[str, str]:
+    """Compatibilidad para consumidores existentes de ciudades."""
+    return extract_available_locations(workbook_bytes)[0]
 
 
 def extract_available_stores(workbook_bytes: bytes) -> dict[int, str]:
-    """Construye las opciones de tienda con formato `WAREHOUSE_ID - Nombre`."""
-    workbook = openpyxl.load_workbook(
-        io.BytesIO(workbook_bytes), read_only=True, data_only=True
-    )
-    try:
-        labels: dict[int, str] = {}
-        for row in engine.iter_sheet_records(
-            workbook,
-            "TIENDA",
-            ["WAREHOUSE_ID", "WAREHOUSE_NAME"],
-            ["WAREHOUSE_ID", "WAREHOUSE_NAME"],
-        ):
-            warehouse = engine.to_id(
-                row["WAREHOUSE_ID"],
-                "TIENDA.WAREHOUSE_ID",
-                allow_none=True,
-            )
-            if warehouse is None:
-                continue
-            name = engine.clean_text(row["WAREHOUSE_NAME"])
-            labels[warehouse] = f"{warehouse} - {name or 'SIN NOMBRE'}"
-    finally:
-        workbook.close()
-    return dict(sorted(labels.items(), key=lambda item: item[1].upper()))
+    """Compatibilidad para consumidores existentes de tiendas."""
+    return extract_available_locations(workbook_bytes)[1]
 
 
 def save_uploaded_file(uploaded_file, destination: Path) -> None:
@@ -1964,11 +2052,14 @@ def load_database_resource() -> dict[str, Any]:
     """Descarga, inspecciona y conserva la base entre todos los reruns normales."""
     try:
         workbook_bytes = fetch_public_database()
+        health, city_labels, store_labels = inspect_database(
+            workbook_bytes, include_locations=True
+        )
         return {
             "workbook_bytes": workbook_bytes,
-            "health": inspect_database(workbook_bytes),
-            "city_labels": extract_available_cities(workbook_bytes),
-            "store_labels": extract_available_stores(workbook_bytes),
+            "health": health,
+            "city_labels": city_labels,
+            "store_labels": store_labels,
             "error": "",
         }
     except Exception as exc:
