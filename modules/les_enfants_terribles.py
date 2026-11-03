@@ -978,6 +978,40 @@ def inject_styles() -> None:
             font-weight: 700;
         }
 
+        .mb-static-table-wrap {
+            width: 100%;
+            overflow-x: auto;
+            border: 3px solid var(--ink);
+            background: var(--white);
+            margin: 7px 0 12px;
+        }
+
+        .mb-static-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: .76rem;
+        }
+
+        .mb-static-table th {
+            position: sticky;
+            top: 0;
+            background: var(--ink);
+            color: var(--white);
+            text-align: left;
+            white-space: nowrap;
+            z-index: 1;
+        }
+
+        .mb-static-table th, .mb-static-table td {
+            border: 1px solid var(--ink);
+            padding: 7px 8px;
+            vertical-align: top;
+            max-width: 300px;
+            overflow-wrap: anywhere;
+        }
+
+        .mb-static-table tbody tr:nth-child(even) { background: #f2efe6; }
+
         @media (max-width: 800px) {
             .block-container { padding: 1rem 1rem 3rem; }
             .hero { padding: 22px 18px; }
@@ -1168,6 +1202,30 @@ def relative_update_text(
     return detail, healthy
 
 
+def database_sheet_line_count(sheet: Any, sheet_name: str) -> int:
+    """Cuenta registros reales sin depender de la dimensión del XLSX.
+
+    Las exportaciones de Google Sheets que alimentan DATA_TRANSFERS no siempre
+    incluyen ``<dimension>`` en el XML. Por eso openpyxl entrega ``max_row=None``
+    aunque sí existan datos. Aleph ya publica el total exacto en C6; para los
+    inputs manuales se cuentan las filas no vacías en modo streaming.
+    """
+    if sheet_name in ALEPH_SHEETS:
+        result_size = str(sheet["C6"].value or "")
+        match = re.search(r"([\d,]+)\s+rows?\b", result_size, flags=re.IGNORECASE)
+        if match:
+            return int(match.group(1).replace(",", ""))
+        # Sin el metadato de Aleph, no se recorre una tabla potencialmente de
+        # cientos de miles de filas sólo para el indicador visual.
+        return 0
+
+    occupied_rows = 0
+    for row in sheet.iter_rows(min_row=2, values_only=True):
+        if any(value is not None and str(value).strip() for value in row):
+            occupied_rows += 1
+    return occupied_rows
+
+
 def inspect_database(workbook_bytes: bytes) -> dict[str, Any]:
     """Valida presencia de hojas, actualizaciones Aleph y errores IMPORTRANGE."""
     rows: list[dict[str, Any]] = []
@@ -1194,9 +1252,7 @@ def inspect_database(workbook_bytes: bytes) -> dict[str, Any]:
                 continue
 
             sheet = workbook[sheet_name]
-            # max_row proviene de la dimensión del XLSX: cuenta las filas usadas
-            # sin iterar los ~70 MB de DATA_TRANSFERS ni elevar el pico de memoria.
-            row_count = max(int(sheet.max_row or 0) - 1, 0)
+            row_count = database_sheet_line_count(sheet, sheet_name)
             if sheet_name in ALEPH_SHEETS:
                 value = sheet["C7"].value
                 if value is None:
@@ -8286,6 +8342,38 @@ def rows_to_csv_bytes(rows: list[dict[str, Any]]) -> bytes:
     return buffer.getvalue().encode("utf-8-sig")
 
 
+def render_static_table(rows: list[dict[str, Any]]) -> None:
+    """Tabla HTML segura, independiente del bundle DataFrame de Streamlit.
+
+    El frontend de Streamlit puede quedar con un CSS hasheado en caché después
+    de un redeploy y romper todos los ``st.dataframe``. Las tablas de resultados
+    no necesitan edición, filtros ni ordenamiento en pantalla; se conservan las
+    descargas CSV para el detalle completo.
+    """
+    if not rows:
+        st.info("No existen registros para mostrar en esta sección.")
+        return
+    columns = list(dict.fromkeys(key for row in rows for key in row))
+
+    def cell(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, float) and math.isnan(value):
+            return ""
+        return html.escape(str(value))
+
+    header_html = "".join(f"<th>{cell(column)}</th>" for column in columns)
+    body_html = "".join(
+        "<tr>" + "".join(f"<td>{cell(row.get(column))}</td>" for column in columns) + "</tr>"
+        for row in rows
+    )
+    st.markdown(
+        '<div class="mb-static-table-wrap"><table class="mb-static-table">'
+        f"<thead><tr>{header_html}</tr></thead><tbody>{body_html}</tbody></table></div>",
+        unsafe_allow_html=True,
+    )
+
+
 def render_capped_dataframe(
     rows: list[dict[str, Any]],
     *,
@@ -8302,16 +8390,11 @@ def render_capped_dataframe(
         st.info("No existen registros para mostrar en esta sección.")
         return
     total = len(rows)
-    visible = min(total, max_display)
     display_rows = rows[:max_display]
-    height = (visible + 1) * 36 + 4
-    st.dataframe(
-        display_rows,
-        use_container_width=True,
-        hide_index=True,
-        height=height,
-        column_config=column_config or {},
-    )
+    # ``column_config`` se conserva en la firma por compatibilidad con los
+    # reportes actuales; esta vista es de consulta y no requiere DataFrame.
+    _ = column_config
+    render_static_table(display_rows)
     if total > max_display:
         st.caption(
             f"Mostrando {max_display:,} de {total:,} filas."
@@ -8340,14 +8423,8 @@ def report_table(
     display_rows = rows[:MAX_DISPLAY_ROWS]
     # Se limita el número de filas enviadas al navegador, no solo la altura del
     # contenedor.
-    height = min(max(150, 36 * (len(display_rows) + 1)), max_height)
-    st.dataframe(
-        display_rows,
-        use_container_width=True,
-        hide_index=True,
-        height=height,
-        column_config=column_config or {},
-    )
+    _ = column_config, max_height
+    render_static_table(display_rows)
     if total > MAX_DISPLAY_ROWS:
         st.caption(f"Mostrando {MAX_DISPLAY_ROWS:,} de {total:,} filas.")
 
@@ -9927,14 +10004,14 @@ def render_results(run: dict[str, Any]) -> None:
                     explanation = explain_store_sku(zip_path, int(query_store), int(query_sku))
                 if explanation["sent"]:
                     st.success(explanation["verdict"])
-                    st.dataframe(explanation["sent"], use_container_width=True)
+                    render_static_table(explanation["sent"])
                 elif explanation["declared"] or explanation["healthy"]:
                     st.info(explanation["verdict"])
                 else:
                     st.error(explanation["verdict"])
                 if explanation["declared"]:
                     st.markdown("**Declarado en BASE_TRANSFERS:**")
-                    st.dataframe(explanation["declared"], use_container_width=True)
+                    render_static_table(explanation["declared"])
                 if explanation["healthy"]:
                     st.markdown("**Universo sano:**")
                     st.json(explanation["healthy"])
