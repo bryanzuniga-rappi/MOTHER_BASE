@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import Counter
 from datetime import date, datetime
 import csv
+import html
 import io
 import math
 import os
@@ -212,45 +213,41 @@ def _inject_foxhound_style() -> None:
         .foxhound-kpi.acid { background:#d9ff3f; }.foxhound-kpi.coral { background:#ff5a47; }.foxhound-kpi.blue { background:#5e7cff; color:#fffdf7; }.foxhound-kpi.white { background:#fffdf7; }
         .foxhound-kpi-label { font-size:.68rem; font-weight:900; letter-spacing:.08em; }.foxhound-kpi-value { font-family:"Archivo Black",sans-serif; font-size:1.75rem; line-height:1; margin:12px 0 8px; }.foxhound-kpi-description { font-size:.65rem; font-weight:700; line-height:1.25; }
         .foxhound-note { border:2px solid #111; background:#e8edff; padding:12px 14px; margin:8px 0 18px; font-size:.78rem; font-weight:700; }
+        .foxhound-chart { border:3px solid #111; box-shadow:5px 5px 0 #111; background:#fffdf7; padding:15px; margin:7px 6px 22px 0; }
+        .foxhound-chart-title { font-family:"Archivo Black",sans-serif; font-size:.96rem; margin-bottom:13px; }
+        .foxhound-legend { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:12px; font-size:.65rem; font-weight:800; }.foxhound-legend span { display:flex; align-items:center; gap:5px; }.foxhound-dot { width:10px; height:10px; border:1px solid #111; display:inline-block; }
+        .foxhound-bar-row { display:grid; grid-template-columns:minmax(96px, 34%) 1fr 42px; gap:8px; align-items:center; margin:7px 0; font-size:.69rem; font-weight:700; }.foxhound-bar-label { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }.foxhound-bar-track { height:19px; background:#ece8dc; border:1px solid #111; display:flex; overflow:hidden; }.foxhound-bar-segment { height:100%; min-width:0; }.foxhound-bar-total { text-align:right; font-weight:900; }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
 
-def _plotly() -> Any:
-    """Importación diferida: FOXHOUND no pesa al abrir otros módulos."""
-    import plotly.graph_objects as go
-
-    return go
-
-
-def _stacked_chart(rows: list[dict[str, Any]], field: str, top: int, title: str) -> go.Figure:
-    go = _plotly()
+def _render_stacked_bars(rows: list[dict[str, Any]], field: str, top: int, title: str) -> None:
+    """Gráfica HTML sin depender del bundle dinámico Plotly de Streamlit."""
     counts: dict[str, Counter[str]] = {}
     for row in rows:
         label = _text(row.get(field)) or "Sin capturar"
         counts.setdefault(label, Counter())[row["Estado"]] += 1
     labels = sorted(counts, key=lambda item: (-sum(counts[item].values()), item))[:top]
-    figure = go.Figure()
-    for status in STATUS_ORDER:
-        figure.add_bar(name=status, y=labels, x=[counts[label][status] for label in labels], orientation="h", marker_color=STATUS_COLORS[status])
-    figure.update_layout(barmode="stack", title=title, height=max(340, len(labels) * 28 + 120), margin=dict(l=10, r=10, t=50, b=20), paper_bgcolor="#fffdf7", plot_bgcolor="#fffdf7", font=dict(family="IBM Plex Mono", color="#111"), legend=dict(orientation="h", y=1.08), yaxis=dict(autorange="reversed"), xaxis_title=None)
-    return figure
+    maximum = max((sum(counts[label].values()) for label in labels), default=1)
+    legend = "".join(f'<span><i class="foxhound-dot" style="background:{STATUS_COLORS[status]}"></i>{status}</span>' for status in STATUS_ORDER)
+    content = []
+    for label in labels:
+        total = sum(counts[label].values())
+        segments = "".join(f'<i class="foxhound-bar-segment" style="background:{STATUS_COLORS[status]};width:{counts[label][status] / maximum * 100:.4f}%" title="{status}: {counts[label][status]}"></i>' for status in STATUS_ORDER if counts[label][status])
+        content.append(f'<div class="foxhound-bar-row"><div class="foxhound-bar-label" title="{html.escape(label)}">{html.escape(label)}</div><div class="foxhound-bar-track">{segments}</div><div class="foxhound-bar-total">{total:,}</div></div>')
+    st.markdown(f'<div class="foxhound-chart"><div class="foxhound-chart-title">{html.escape(title)}</div><div class="foxhound-legend">{legend}</div>{"".join(content) or "Sin datos."}</div>', unsafe_allow_html=True)
 
 
-def _daily_chart(rows: list[dict[str, Any]]) -> go.Figure:
-    go = _plotly()
+def _render_daily_bars(rows: list[dict[str, Any]]) -> None:
     counts: dict[date, Counter[str]] = {}
     for row in rows:
         if row["fecha_ruta"]:
             counts.setdefault(row["fecha_ruta"], Counter())[row["Estado"]] += 1
     labels = sorted(counts)
-    figure = go.Figure()
-    for status in STATUS_ORDER:
-        figure.add_bar(name=status, x=labels, y=[counts[label][status] for label in labels], marker_color=STATUS_COLORS[status])
-    figure.update_layout(barmode="stack", height=355, margin=dict(l=10, r=10, t=35, b=20), paper_bgcolor="#fffdf7", plot_bgcolor="#fffdf7", font=dict(family="IBM Plex Mono", color="#111"), legend=dict(orientation="h", y=1.1), xaxis_title=None, yaxis_title="Órdenes")
-    return figure
+    mapped = [{"fecha": label.isoformat(), "Estado": status} for label in labels for status, amount in counts[label].items() for _ in range(amount)]
+    _render_stacked_bars(mapped, "fecha", len(labels), "ÓRDENES POR DÍA DE RUTA")
 
 
 def _csv_bytes(rows: list[dict[str, Any]], headers: list[str]) -> bytes:
@@ -309,25 +306,21 @@ def render() -> None:
                 st.markdown(_kpi(label, value, description, tone), unsafe_allow_html=True)
 
     st.markdown('<span class="section-label">ORDENES POR DÍA DE RUTA</span>', unsafe_allow_html=True)
-    st.plotly_chart(_daily_chart(filtered), use_container_width=True, config={"displayModeBar": False})
+    _render_daily_bars(filtered)
     first, second = st.columns(2)
     with first:
-        st.plotly_chart(_stacked_chart(filtered, "Identificador", 15, "CAMIONES · TOP 15"), use_container_width=True, config={"displayModeBar": False})
+        _render_stacked_bars(filtered, "Identificador", 15, "CAMIONES · TOP 15")
     with second:
         driver_rows = [row for row in filtered if row["conductor"] != "Sin capturar"]
-        st.plotly_chart(_stacked_chart(driver_rows, "conductor", 24, "CONDUCTORES · TOP 24"), use_container_width=True, config={"displayModeBar": False})
+        _render_stacked_bars(driver_rows, "conductor", 24, "CONDUCTORES · TOP 24")
 
     no_delivery = [row for row in filtered if row["Estado"] == "No entregado"]
     third, fourth = st.columns(2)
     with third:
-        st.plotly_chart(_stacked_chart(no_delivery, "Nombre cliente", 10, "TIENDAS CON MÁS NO ENTREGAS"), use_container_width=True, config={"displayModeBar": False})
+        _render_stacked_bars(no_delivery, "Nombre cliente", 10, "TIENDAS CON MÁS NO ENTREGAS")
     with fourth:
-        reason_counts = Counter(row["motivo"] for row in no_delivery)
-        reasons = sorted(reason_counts, key=lambda item: (-reason_counts[item], item))
-        go = _plotly()
-        figure = go.Figure(go.Bar(x=[reason_counts[item] for item in reasons], y=reasons, orientation="h", marker_color="#5e7cff"))
-        figure.update_layout(title="MOTIVOS DE NO ENTREGA", height=max(340, len(reasons) * 40 + 120), margin=dict(l=10, r=10, t=50, b=20), paper_bgcolor="#fffdf7", plot_bgcolor="#fffdf7", font=dict(family="IBM Plex Mono", color="#111"), yaxis=dict(autorange="reversed"), xaxis_title="Órdenes")
-        st.plotly_chart(figure, use_container_width=True, config={"displayModeBar": False})
+        reason_rows = [{"motivo": row["motivo"], "Estado": "Pendiente"} for row in no_delivery]
+        _render_stacked_bars(reason_rows, "motivo", 10, "MOTIVOS DE NO ENTREGA")
 
     st.markdown('<span class="section-label">BUSCADOR DE ÓRDENES</span>', unsafe_allow_html=True)
     query = st.text_input("Orden, tienda, camión, conductor o estado", key="foxhound_search")
