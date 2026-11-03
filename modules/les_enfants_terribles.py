@@ -139,6 +139,7 @@ REQUIRED_DATABASE_SHEETS = (
     "831_HV",
     "RACKEADOS",
     "CAP_RECIBO",
+    "FARMA",
     "CATALOGO",
     "KVI",
     "SHARE_VENTAS",
@@ -206,6 +207,11 @@ SHEET_DESCRIPTIONS = {
     ),
     "CAP_RECIBO": (
         "Capacidad máxima de recibo de cada tienda expresada en metros cúbicos."
+    ),
+    "FARMA": (
+        "Combinaciones WAREHOUSE_ID + PRODUCT_ID que se bloquean completamente "
+        "cuando la regla «Bloquear FARMA» está activa en CODEC. La conexión de "
+        "IMPORTRANGE se valida en FARMA!A2 porque los encabezados son manuales."
     ),
     "CATALOGO": (
         "Catálogo de surtido por tienda y producto con su ADU. Se utiliza para "
@@ -998,7 +1004,14 @@ def database_sheet_type(sheet_name: str) -> str:
 def database_sheet_control(sheet_name: str) -> str:
     if sheet_name in ALEPH_SHEETS:
         return "C7"
+    if sheet_name == "FARMA":
+        return "A2"
     return "A1"
+
+
+def database_section(sheet_name: str) -> str:
+    """Segmento visible de la tarjeta de salud de DATA_TRANSFERS."""
+    return "ALEPH" if sheet_name in ALEPH_SHEETS else "INPUTS MANUALES"
 
 
 def render_kpi_cards(
@@ -1181,6 +1194,9 @@ def inspect_database(workbook_bytes: bytes) -> dict[str, Any]:
                 continue
 
             sheet = workbook[sheet_name]
+            # max_row proviene de la dimensión del XLSX: cuenta las filas usadas
+            # sin iterar los ~70 MB de DATA_TRANSFERS ni elevar el pico de memoria.
+            row_count = max(int(sheet.max_row or 0) - 1, 0)
             if sheet_name in ALEPH_SHEETS:
                 value = sheet["C7"].value
                 if value is None:
@@ -1211,6 +1227,12 @@ def inspect_database(workbook_bytes: bytes) -> dict[str, Any]:
                     if healthy
                     else "A1 DEBE SER WAREHOUSE_ID"
                 )
+            elif sheet_name == "FARMA":
+                # A1 siempre es un encabezado escrito manualmente. El #REF! de
+                # IMPORTRANGE aparece en A2; revisar A1 daría falso positivo.
+                displayed_value = sheet["A2"].value
+                healthy = not contains_ref_error(displayed_value)
+                detail = "SIN #REF!" if healthy else "#REF! DETECTADO EN A2"
             else:
                 displayed_value = sheet["A1"].value
                 healthy = not contains_ref_error(displayed_value)
@@ -1223,6 +1245,7 @@ def inspect_database(workbook_bytes: bytes) -> dict[str, Any]:
                     "CONTROL": database_sheet_control(sheet_name),
                     "DETALLE": detail,
                     "ESTADO": "OK" if healthy else "ERROR",
+                    "LINEAS": row_count,
                 }
             )
     finally:
@@ -2826,14 +2849,13 @@ def rewrite_bulk_csvs_with_planning_reason(
         )
 
 
-def sort_health_rows_for_display(
-    rows: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Agrupa las tarjetas de salud por tipo — IMPORTRANGE/BACKEND primero, ALEPH
-    después — en vez del orden de REQUIRED_DATABASE_SHEETS, que los mezcla.
-    """
-    card_type_priority = {"IMPORTRANGE": 0, "BACKEND": 0, "ALEPH": 1}
-    return sorted(rows, key=lambda row: card_type_priority.get(row["TIPO"], 0))
+def sort_health_rows_for_display(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Agrupa para pantalla: Inputs manuales primero, después Aleph."""
+    section_priority = {"INPUTS MANUALES": 0, "ALEPH": 1}
+    return sorted(
+        rows,
+        key=lambda row: section_priority.get(database_section(row["HOJA"]), 0),
+    )
 
 
 def render_database_health(health: dict[str, Any]) -> None:
@@ -2850,36 +2872,42 @@ def render_database_health(health: dict[str, Any]) -> None:
     )
 
     rows = sort_health_rows_for_display(health["rows"])
-    for start in range(0, len(rows), 4):
-        columns = st.columns(4)
-        for column, row in zip(columns, rows[start : start + 4]):
-            card_class = "ok" if row["ESTADO"] == "OK" else "error"
-            if row["TIPO"] == "ALEPH":
-                card_meta = "ÚLTIMA ACTUALIZACIÓN"
-            elif row["TIPO"] == "BACKEND":
-                card_meta = "BLOQUEO PERMANENTE"
-            else:
-                card_meta = "CONEXIÓN IMPORTRANGE"
-            show_result = row["TIPO"] == "ALEPH" or row["ESTADO"] == "ERROR"
-            result_html = (
-                f'<div class="source-card-result">{html.escape(row["DETALLE"])}</div>'
-                if show_result
-                else ""
-            )
-            description = SHEET_DESCRIPTIONS.get(
-                row["HOJA"], "Fuente de información utilizada por el modelo de abasto."
-            )
-            card_html = (
-                f'<div class="source-card {card_class}">'
-                f'<div><div class="source-card-name">{html.escape(row["HOJA"])}</div>'
-                f'<div class="source-card-meta">{card_meta}</div></div>'
-                f'{result_html}'
-                f'<div class="source-card-tooltip"><strong>QUÉ CONTIENE</strong>'
-                f'{html.escape(description)}</div>'
-                '</div>'
-            )
-            with column:
-                st.markdown(card_html, unsafe_allow_html=True)
+    for section in ("INPUTS MANUALES", "ALEPH"):
+        section_rows = [row for row in rows if database_section(row["HOJA"]) == section]
+        if not section_rows:
+            continue
+        st.markdown(f'<span class="section-label">{section}</span>', unsafe_allow_html=True)
+        for start in range(0, len(section_rows), 4):
+            columns = st.columns(4)
+            for column, row in zip(columns, section_rows[start : start + 4]):
+                card_class = "ok" if row["ESTADO"] == "OK" else "error"
+                if row["TIPO"] == "ALEPH":
+                    card_meta = "ÚLTIMA ACTUALIZACIÓN"
+                elif row["TIPO"] == "BACKEND":
+                    card_meta = "BLOQUEO PERMANENTE"
+                else:
+                    card_meta = "CONEXIÓN IMPORTRANGE"
+                show_result = row["TIPO"] == "ALEPH" or row["ESTADO"] == "ERROR"
+                result_html = (
+                    f'<div class="source-card-result">{html.escape(row["DETALLE"])}</div>'
+                    if show_result
+                    else ""
+                )
+                description = SHEET_DESCRIPTIONS.get(
+                    row["HOJA"], "Fuente de información utilizada por el modelo de abasto."
+                )
+                card_html = (
+                    f'<div class="source-card {card_class}">' 
+                    f'<div><div class="source-card-name">{html.escape(row["HOJA"])}</div>'
+                    f'<div class="source-card-meta">{card_meta}</div></div>'
+                    f'<div class="source-card-meta">{int(row.get("LINEAS", 0)):,} LÍNEAS</div>'
+                    f'{result_html}'
+                    f'<div class="source-card-tooltip"><strong>QUÉ CONTIENE</strong>'
+                    f'{html.escape(description)}</div>'
+                    '</div>'
+                )
+                with column:
+                    st.markdown(card_html, unsafe_allow_html=True)
 
     if not online:
         st.error(
