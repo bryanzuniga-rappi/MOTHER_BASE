@@ -87,3 +87,19 @@ def test_foxhound_route_summary_uses_max_km_once_per_route():
     assert summary[0]["Paradas"] == 2
     assert summary[0]["KM planeados"] == 50
     assert summary[0]["KM reales"] == 60
+
+
+def test_foxhound_consolidates_split_dispatch_orders_and_scores_driver_quality():
+    rows = foxhound.prepare_rows([
+        {"Orden": "162000-1", "Estado": "Entregado", "Nombre de conductor": "Ana", "Fecha ruta": "2026-11-03", "Fecha estimada": "2026-11-03 10:00:00", "Fecha Llegada": "2026-11-03 09:00:00"},
+        {"Orden": "162000-2", "Estado": "Entregado", "Nombre de conductor": "Ana", "Fecha ruta": "2026-11-03", "Fecha estimada": "2026-11-03 10:00:00", "Fecha Llegada": "2026-11-03 09:01:00"},
+        {"Orden": "162001", "Estado": "No entregado", "Nombre de conductor": "Beto", "Fecha ruta": "2026-11-03"},
+    ])
+    logical = foxhound.dispatch_consolidated(rows)
+    split = next(row for row in logical if row["pedido lógico"] == "162000")
+    quality = foxhound.driver_quality_leaderboard(logical, minimum_orders=1)
+
+    assert len(logical) == 2
+    assert split["partes"] == 2 and split["estado"] == "Entregada" and split["a tiempo"] is True
+    assert quality[0]["Conductor"] == "Ana"
+    assert quality[0]["Calidad OTIF"] == 1.0
