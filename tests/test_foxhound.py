@@ -59,3 +59,31 @@ def test_foxhound_driver_fill_rate_counts_transfer_once_and_excludes_shared():
     assert ranking[0]["conductor"] == "Ana"
     assert ranking[0]["fill entrega"] == 19 / 30
     assert ranking[0]["elegible"] is True
+
+
+def test_foxhound_identifies_sla_and_operational_risk():
+    rows = foxhound.prepare_rows([
+        {
+            "Orden": "1", "Estado": "Entregado", "Nombre de conductor": "Ana",
+            "Fecha estimada": "2026-11-03 10:00:00", "Fecha Llegada": "2026-11-03 09:30:00",
+            "Asignado a vehículo": "1", "En ruta": "1",
+        },
+        {"Orden": "2", "Estado": "Pendiente", "Nombre de conductor": "", "Asignado a vehículo": "0"},
+        {"Orden": "3", "Estado": "No entregado", "Nombre de conductor": "Ana"},
+    ])
+
+    assert rows[0]["a_tiempo"] is True
+    assert rows[1]["riesgo_operativo"] == "Pendiente sin unidad"
+    assert rows[2]["riesgo_operativo"] == "No entregada"
+
+
+def test_foxhound_route_summary_uses_max_km_once_per_route():
+    rows = foxhound.prepare_rows([
+        {"Orden": "1", "Estado": "Entregado", "Identificador ruta": "Ruta 1", "Identificador": "Unidad 1", "KM de planner": 50, "Distancia recorrida de la ruta": 60, "Nombre de conductor": "Ana"},
+        {"Orden": "2", "Estado": "No entregado", "Identificador ruta": "Ruta 1", "Identificador": "Unidad 1", "KM de planner": 50, "Distancia recorrida de la ruta": 60, "Nombre de conductor": "Ana"},
+    ])
+    summary = foxhound.route_summary(rows)
+
+    assert summary[0]["Paradas"] == 2
+    assert summary[0]["KM planeados"] == 50
+    assert summary[0]["KM reales"] == 60

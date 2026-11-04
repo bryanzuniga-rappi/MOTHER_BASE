@@ -106,6 +106,32 @@ def _date(value: Any) -> date | None:
     return None
 
 
+def _datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, date):
+        return datetime.combine(value, datetime.min.time())
+    text = _text(value).replace("T", " ")
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        pass
+    for pattern in ("%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%m/%d/%Y %H:%M:%S"):
+        try:
+            return datetime.strptime(text, pattern)
+        except ValueError:
+            continue
+    return None
+
+
+def _is_marked(value: Any) -> bool:
+    """DispatchTrack mezcla fechas, 1/0 y texto en sus hitos de operación."""
+    normalized = _key(value)
+    return normalized not in {"", "0", "false", "no", "none", "nan", "null"}
+
+
 def _status(value: Any) -> str:
     normalized = _key(value)
     if "no entreg" in normalized:
@@ -167,11 +193,34 @@ def prepare_rows(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         row["Orden"] = order
         row["orden_base"] = _order_base(order)
         row["fecha_ruta"] = _date(row.get("Fecha ruta"))
+        row["fecha_estimada"] = _datetime(row.get("Fecha estimada"))
+        row["fecha_llegada"] = _datetime(row.get("Fecha Llegada"))
+        row["inicio_ruta"] = _datetime(row.get("Inicio de ruta"))
+        row["fin_ruta"] = _datetime(row.get("Fin de ruta"))
         row["Estado"] = _status(row.get("Estado"))
         delivered = row["Estado"] == "Entregado"
         row["min_en_tienda"] = _number(row.get("Tiempo en destino (minutos)")) if delivered else None
         row["valor_entregado"] = (_number(row.get("Precio")) or 0.0) if delivered else 0.0
         row["motivo"] = _reason(row.get("Razón de la no entrega en tienda")) if not delivered else ""
+        row["km_planeados"] = _number(row.get("KM de planner")) or 0.0
+        row["km_reales"] = _number(row.get("Distancia recorrida de la ruta")) or 0.0
+        row["cantidad_gestionada"] = _number(row.get("Cantidad gestionada")) or 0.0
+        row["cantidad_total"] = _number(row.get("Cantidad total")) or 0.0
+        row["asignada_unidad"] = _is_marked(row.get("Asignado a vehículo")) or bool(_text(row.get("Identificador")))
+        row["en_ruta"] = _is_marked(row.get("En ruta")) or _is_marked(row.get("En ruta a destino final"))
+        row["recogida_origen"] = _is_marked(row.get("Recogido en origen")) or _is_marked(row.get("Llegado / Recogido en origen"))
+        row["a_tiempo"] = bool(delivered and row["fecha_estimada"] and row["fecha_llegada"] and row["fecha_llegada"] <= row["fecha_estimada"])
+        row["tarde"] = bool(delivered and row["fecha_estimada"] and row["fecha_llegada"] and row["fecha_llegada"] > row["fecha_estimada"])
+        if delivered:
+            row["riesgo_operativo"] = "Entregada"
+        elif row["Estado"] == "No entregado":
+            row["riesgo_operativo"] = "No entregada"
+        elif row["en_ruta"]:
+            row["riesgo_operativo"] = "En ruta / pendiente"
+        elif not row["asignada_unidad"]:
+            row["riesgo_operativo"] = "Pendiente sin unidad"
+        else:
+            row["riesgo_operativo"] = "Pendiente programada"
         rows.append(row)
     normalize_drivers(rows)
     return rows
@@ -372,12 +421,13 @@ def _inject_foxhound_style() -> None:
         <style>
         .foxhound-kpi { min-height: 132px; border:3px solid #111; box-shadow:5px 5px 0 #111; padding:13px 15px; margin:0 6px 16px 0; box-sizing:border-box; }
         .foxhound-kpi.acid { background:#d9ff3f; }.foxhound-kpi.coral { background:#ff5a47; }.foxhound-kpi.blue { background:#5e7cff; color:#fffdf7; }.foxhound-kpi.white { background:#fffdf7; }
-        .foxhound-kpi-label { font-size:.68rem; font-weight:900; letter-spacing:.08em; }.foxhound-kpi-value { font-family:"Archivo Black",sans-serif; font-size:1.75rem; line-height:1; margin:12px 0 8px; }.foxhound-kpi-description { font-size:.65rem; font-weight:700; line-height:1.25; }
-        .foxhound-note { border:2px solid #111; background:#e8edff; padding:12px 14px; margin:8px 0 18px; font-size:.78rem; font-weight:700; }
+        .foxhound-kpi-label { font-size:.68rem; font-weight:800; letter-spacing:.08em; }.foxhound-kpi-value { font-family:Inter,Arial,sans-serif; font-size:1.9rem; font-weight:600; line-height:1; margin:12px 0 8px; }.foxhound-kpi-description { font-family:Inter,Arial,sans-serif; font-size:.72rem; font-weight:400; line-height:1.32; }
+        .foxhound-note { border:2px solid #111; background:#e8edff; padding:12px 14px; margin:8px 0 18px; font-family:Inter,Arial,sans-serif; font-size:.80rem; font-weight:400; line-height:1.45; }
         .foxhound-chart { border:3px solid #111; box-shadow:5px 5px 0 #111; background:#fffdf7; padding:15px; margin:7px 6px 22px 0; }
         .foxhound-chart-title { font-family:"Archivo Black",sans-serif; font-size:.96rem; margin-bottom:13px; }
-        .foxhound-legend { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:12px; font-size:.65rem; font-weight:800; }.foxhound-legend span { display:flex; align-items:center; gap:5px; }.foxhound-dot { width:10px; height:10px; border:1px solid #111; display:inline-block; }
-        .foxhound-bar-row { display:grid; grid-template-columns:minmax(96px, 34%) 1fr 42px; gap:8px; align-items:center; margin:7px 0; font-size:.69rem; font-weight:700; }.foxhound-bar-label { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }.foxhound-bar-track { height:19px; background:#ece8dc; border:1px solid #111; display:flex; overflow:hidden; }.foxhound-bar-segment { height:100%; min-width:0; }.foxhound-bar-total { text-align:right; font-weight:900; }
+        .foxhound-legend { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:12px; font-family:Inter,Arial,sans-serif; font-size:.70rem; font-weight:400; }.foxhound-legend span { display:flex; align-items:center; gap:5px; }.foxhound-dot { width:10px; height:10px; border:1px solid #111; display:inline-block; }
+        .foxhound-bar-row { display:grid; grid-template-columns:minmax(96px, 34%) 1fr 42px; gap:8px; align-items:center; margin:7px 0; font-family:Inter,Arial,sans-serif; font-size:.73rem; font-weight:400; }.foxhound-bar-label { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }.foxhound-bar-track { height:19px; background:#ece8dc; border:1px solid #111; display:flex; overflow:hidden; }.foxhound-bar-segment { height:100%; min-width:0; }.foxhound-bar-total { text-align:right; font-weight:600; }
+        [data-testid="stDataFrame"] { font-family:Inter,Arial,sans-serif !important; font-weight:400 !important; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -409,6 +459,24 @@ def _render_daily_bars(rows: list[dict[str, Any]]) -> None:
     labels = sorted(counts)
     mapped = [{"fecha": label.isoformat(), "Estado": status} for label in labels for status, amount in counts[label].items() for _ in range(amount)]
     _render_stacked_bars(mapped, "fecha", len(labels), "ÓRDENES POR DÍA DE RUTA")
+
+
+def _render_supply_funnel(ordered: float, picked: float, delivered: float) -> None:
+    stages = (("PLANEADO", ordered, "Unidades solicitadas"), ("PICKEADO", picked, "Unidades listas en CEDIS"), ("ENTREGADO", delivered, "Unidades confirmadas en destino"))
+    maximum = max(ordered, picked, delivered, 1.0)
+    cards = "".join(
+        f'<div style="border:2px solid #111;padding:12px;background:#fffdf7;min-width:0">'
+        f'<div style="font-size:.66rem;font-weight:800;letter-spacing:.08em">{name}</div>'
+        f'<div style="font-size:1.45rem;font-weight:600;margin:7px 0">{value:,.0f}</div>'
+        f'<div style="height:8px;border:1px solid #111;background:#ece8dc"><div style="height:100%;width:{value / maximum * 100:.2f}%;background:#d9ff3f"></div></div>'
+        f'<div style="font-size:.72rem;font-weight:400;margin-top:7px">{description}</div></div>'
+        for name, value, description in stages
+    )
+    st.markdown(
+        f'<div class="foxhound-chart"><div class="foxhound-chart-title">EMBUDO DE SERVICIO · ALEPH</div>'
+        f'<div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;font-family:Inter,Arial,sans-serif">{cards}</div></div>',
+        unsafe_allow_html=True,
+    )
 
 
 def _csv_bytes(rows: list[dict[str, Any]], headers: list[str]) -> bytes:
@@ -470,11 +538,71 @@ def _rank_view(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     } for row in rows]
 
 
+def route_summary(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Resume rutas sin multiplicar kilómetros que DT repite en cada parada."""
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        route = _text(row.get("Identificador ruta")) or _text(row.get("Identificador")) or "Sin ruta"
+        grouped[route].append(row)
+    result: list[dict[str, Any]] = []
+    for route, stops in grouped.items():
+        delivered = sum(row["Estado"] == "Entregado" for row in stops)
+        not_delivered = sum(row["Estado"] == "No entregado" for row in stops)
+        pending = sum(row["Estado"] == "Pendiente" for row in stops)
+        drivers = sorted({row["conductor"] for row in stops if row.get("conductor") and row["conductor"] != "Sin capturar"})
+        vehicles = sorted({_text(row.get("Tipo de vehículo")) for row in stops if _text(row.get("Tipo de vehículo"))})
+        result.append({
+            "Ruta": route,
+            "Unidad": _text(stops[0].get("Identificador")) or "Sin capturar",
+            "Conductor": drivers[0] if len(drivers) == 1 else ("Compartido" if drivers else "Sin capturar"),
+            "Vehículo": ", ".join(vehicles) or "Sin capturar",
+            "Paradas": len(stops),
+            "Entregadas": delivered,
+            "No entregadas": not_delivered,
+            "Pendientes": pending,
+            "Cumplimiento DT": _rate_label(_rate(delivered, delivered + not_delivered)),
+            "KM planeados": round(max((row["km_planeados"] for row in stops), default=0), 1),
+            "KM reales": round(max((row["km_reales"] for row in stops), default=0), 1),
+            "Minutos en tienda": round(sum(row["min_en_tienda"] or 0.0 for row in stops), 1),
+        })
+    return sorted(result, key=lambda item: (-item["Pendientes"], -item["No entregadas"], -item["Paradas"], item["Ruta"]))
+
+
+def store_summary(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        store = _text(row.get("tienda_canonica")) or _text(row.get("Nombre cliente")) or "Sin tienda"
+        grouped[store].append(row)
+    result: list[dict[str, Any]] = []
+    for store, events in grouped.items():
+        delivered = sum(row["Estado"] == "Entregado" for row in events)
+        not_delivered = sum(row["Estado"] == "No entregado" for row in events)
+        pending = sum(row["Estado"] == "Pendiente" for row in events)
+        delivered_minutes = [row["min_en_tienda"] for row in events if row["min_en_tienda"] is not None]
+        result.append({
+            "Tienda": store,
+            "Eventos": len(events),
+            "Entregadas": delivered,
+            "No entregadas": not_delivered,
+            "Pendientes": pending,
+            "Cumplimiento DT": _rate_label(_rate(delivered, delivered + not_delivered)),
+            "Mediana min en tienda": round(sorted(delivered_minutes)[len(delivered_minutes) // 2], 1) if delivered_minutes else None,
+        })
+    return sorted(result, key=lambda item: (-item["No entregadas"], -item["Pendientes"], -item["Eventos"], item["Tienda"]))
+
+
+def _operational_queue(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    priority = {"No entregada": 0, "Pendiente sin unidad": 1, "En ruta / pendiente": 2, "Pendiente programada": 3}
+    queue = [row for row in rows if row["riesgo_operativo"] != "Entregada"]
+    queue.sort(key=lambda row: (priority.get(row["riesgo_operativo"], 9), row["fecha_ruta"] or date.max, row["Orden"]))
+    return queue
+
+
 def render() -> None:
     render_system_stamp("MODULE 03 / FOXHOUND")
     _inject_foxhound_style()
     st.markdown(
-        '<section class="mb-hero"><span class="mb-kicker">MODULE / 03 · LOGISTICS COMMAND</span><h1>FOXHOUND.</h1><p>Seguimiento táctico de entregas, flota y cumplimiento de DispatchTrack.</p></section>',
+        '<section class="mb-hero"><span class="mb-kicker">MODULE / 03 · LOGISTICS COMMAND</span><h1>FOXHOUND.</h1><p>Torre de control: servicio, ejecución, riesgo y trazabilidad de la última milla.</p></section>',
         unsafe_allow_html=True,
     )
     try:
@@ -494,6 +622,9 @@ def render() -> None:
     matched = [row for row in filtered if row.get("transfer_id")]
     unmatched = [row for row in filtered if not row.get("transfer_id")]
     split_legs = [row for row in matched if row["match_transfer"] == "Transfer partida"]
+    route_rows = route_summary(filtered)
+    store_rows = store_summary(filtered)
+    action_queue = _operational_queue(filtered)
     st.markdown(
         f'<div class="foxhound-note">{len(filtered):,} eventos DispatchTrack · {len(transfers):,} transferencias canónicas · rutas del {min(dates).isoformat() if dates else "sin fecha"} al {max(dates).isoformat() if dates else "sin fecha"} · {len({_text(row.get("Identificador")) for row in filtered if _text(row.get("Identificador"))}):,} unidades.</div>',
         unsafe_allow_html=True,
@@ -509,14 +640,18 @@ def render() -> None:
     ordered = sum(float(row.get("ordered", 0.0) or 0.0) for row in transfers)
     picked = sum(float(row.get("picked", 0.0) or 0.0) for row in transfers)
     delivered_units = sum(float(row.get("delivered", 0.0) or 0.0) for row in transfers)
+    sla_rows = [row for row in filtered if row["Estado"] == "Entregado" and row["fecha_estimada"] and row["fecha_llegada"]]
+    on_time = sum(row["a_tiempo"] for row in sla_rows)
+    no_vehicle = sum(row["riesgo_operativo"] == "Pendiente sin unidad" for row in filtered)
+    late = sum(row["tarde"] for row in sla_rows)
     kpis = [
-        ("TRAZABILIDAD ALEPH", f"{len(matched) / len(filtered):.1%}" if filtered else "—", f"{len(matched):,} matches seguros · {len(unmatched):,} sin match.", "acid"),
-        ("FILL PICKING", _rate_label(_rate(picked, ordered)), "Unidades picked / ordered. Desempeño CEDIS.", "white"),
-        ("FILL ENTREGA", _rate_label(_rate(delivered_units, picked)), "Unidades delivered / picked. Resultado logístico.", "acid"),
-        ("FILL TOTAL", _rate_label(_rate(delivered_units, ordered)), "Unidades delivered / ordered de punta a punta.", "acid"),
-        ("TASA DE ENTREGA DT", _rate_label(_rate(delivered, delivered + not_delivered)), "Eventos entregados sobre cierres de DispatchTrack.", "white"),
-        ("NO ENTREGADAS", f"{not_delivered:,}", "Eventos cerrados sin entrega.", "coral"),
-        ("PENDIENTES", f"{pending:,}", "No se castigan como no entrega hasta cierre.", "blue"),
+        ("FILL TOTAL", _rate_label(_rate(delivered_units, ordered)), "Unidades entregadas sobre unidades solicitadas.", "acid"),
+        ("FILL ENTREGA", _rate_label(_rate(delivered_units, picked)), "Unidades entregadas sobre unidades pickeadas.", "acid"),
+        ("PUNTUALIDAD DT", _rate_label(_rate(on_time, len(sla_rows))), f"{len(sla_rows):,} entregas con timestamps para evaluar SLA.", "white"),
+        ("RIESGO SIN UNIDAD", f"{no_vehicle:,}", "Pedidos pendientes sin unidad asignada en DispatchTrack.", "coral" if no_vehicle else "acid"),
+        ("NO ENTREGADAS", f"{not_delivered:,}", "Eventos cerrados sin entrega; requieren causa y dueño.", "coral"),
+        ("PENDIENTES", f"{pending:,}", "Cola viva que necesita seguimiento operativo.", "blue"),
+        ("TRAZABILIDAD ALEPH", f"{len(matched) / len(filtered):.1%}" if filtered else "—", f"{len(unmatched):,} eventos no se fuerzan a una transferencia.", "white"),
         ("TIEMPO EN TIENDA", f"{round(median):,} min" if median is not None else "—", "Mediana de eventos entregados.", "white"),
     ]
     for start in range(0, len(kpis), 4):
@@ -524,6 +659,20 @@ def render() -> None:
         for column, (label, value, description, tone) in zip(columns, kpis[start:start + 4]):
             with column:
                 st.markdown(_kpi(label, value, description, tone), unsafe_allow_html=True)
+
+    _render_supply_funnel(ordered, picked, delivered_units)
+
+    st.markdown('<span class="section-label">COLA DE ACCIÓN · QUÉ REQUIERE INTERVENCIÓN HOY</span>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="foxhound-note">{len(action_queue):,} eventos requieren seguimiento: {not_delivered:,} no entregados, {no_vehicle:,} sin unidad y {sum(row["riesgo_operativo"] == "En ruta / pendiente" for row in filtered):,} en ruta sin cierre. {late:,} entregas llegaron tarde dentro de los registros con SLA.</div>',
+        unsafe_allow_html=True,
+    )
+    action_view = [{
+        "Prioridad": row["riesgo_operativo"], "Orden DT": row["Orden"], "Transferencia": row.get("transfer_id", ""),
+        "Tienda": row.get("tienda_canonica") or row.get("Nombre cliente", ""), "Ruta / Unidad": row.get("Identificador", ""),
+        "Conductor": row.get("conductor", ""), "Estado": row["Estado"], "Motivo": row.get("motivo", ""),
+    } for row in action_queue[:100]]
+    st.dataframe(action_view, use_container_width=True, hide_index=True)
 
     st.markdown('<span class="section-label">DESEMPEÑO DE CONDUCTORES · TRANSFERENCIAS CON PROPIETARIO ÚNICO</span>', unsafe_allow_html=True)
     leaderboard = driver_leaderboard(transfers)
@@ -541,6 +690,10 @@ def render() -> None:
         st.markdown('<span class="section-label">PEOR FILL DE ENTREGA</span>', unsafe_allow_html=True)
         st.dataframe(_rank_view(list(reversed(eligible[-10:]))), use_container_width=True, hide_index=True)
 
+    st.markdown('<span class="section-label">EJECUCIÓN DE RUTAS · DÓNDE INTERVENIR</span>', unsafe_allow_html=True)
+    st.markdown('<div class="foxhound-note">Los kilómetros se toman una sola vez por ruta usando el máximo reportado, para no multiplicarlos por cada parada.</div>', unsafe_allow_html=True)
+    st.dataframe(route_rows[:100], use_container_width=True, hide_index=True)
+
     st.markdown('<span class="section-label">ORDENES POR DÍA DE RUTA</span>', unsafe_allow_html=True)
     _render_daily_bars(filtered)
     first, second = st.columns(2)
@@ -557,6 +710,10 @@ def render() -> None:
     with fourth:
         reason_rows = [{"motivo": row["motivo"], "Estado": "Pendiente"} for row in no_delivery]
         _render_stacked_bars(reason_rows, "motivo", 10, "MOTIVOS DE NO ENTREGA")
+
+    st.markdown('<span class="section-label">SERVICIO A TIENDAS · REINCIDENCIA Y FRICCIÓN</span>', unsafe_allow_html=True)
+    st.markdown('<div class="foxhound-note">La tienda se muestra con su nombre canónico cuando existe match con Aleph; así un pedido partido no crea artificialmente una tienda distinta.</div>', unsafe_allow_html=True)
+    st.dataframe(store_rows[:100], use_container_width=True, hide_index=True)
 
     st.markdown('<span class="section-label">CONTROL DE TRAZABILIDAD Y EXCEPCIONES</span>', unsafe_allow_html=True)
     audit_left, audit_right = st.columns(2)
