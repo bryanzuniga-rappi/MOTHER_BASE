@@ -126,7 +126,7 @@ ALEPH_SHEETS = {
     "SWA",
 }
 
-MANUAL_BACKEND_SHEETS = {"TIENDAS_CERRADAS"}
+MANUAL_BACKEND_SHEETS = {"TIENDAS_CERRADAS", "PILOTO"}
 
 REQUIRED_DATABASE_SHEETS = (
     "TIENDAS_CERRADAS",
@@ -140,6 +140,7 @@ REQUIRED_DATABASE_SHEETS = (
     "RACKEADOS",
     "CAP_RECIBO",
     "FARMA",
+    "PILOTO",
     "CATALOGO",
     "KVI",
     "SHARE_VENTAS",
@@ -212,6 +213,12 @@ SHEET_DESCRIPTIONS = {
         "Combinaciones WAREHOUSE_ID + PRODUCT_ID que se bloquean completamente "
         "cuando la regla «Bloquear FARMA» está activa en CODEC. La conexión de "
         "IMPORTRANGE se valida en FARMA!A2 porque los encabezados son manuales."
+    ),
+    "PILOTO": (
+        "Tiendas con ejecución restringida: sólo puede salir lo sugerido por "
+        "Fountain9/Naked. Otacon, Solidus, Shalashaska, Liquid, Venom, "
+        "Kazuhira e Insumos no pueden agregar volumen. Una tienda por fila "
+        "en la columna WAREHOUSE_ID."
     ),
     "CATALOGO": (
         "Catálogo de surtido por tienda y producto con su ADU. Se utiliza para "
@@ -1300,11 +1307,14 @@ def inspect_database(
                     displayed_value = formula_workbook[sheet_name]["A1"].value
                 header = engine.normalize_header(displayed_value)
                 healthy = header == "WAREHOUSE_ID"
-                detail = (
-                    "BLOQUEO BACKEND DISPONIBLE"
-                    if healthy
-                    else "A1 DEBE SER WAREHOUSE_ID"
-                )
+                if healthy:
+                    detail = (
+                        "SÓLO FOUNTAIN9 / NAKED"
+                        if sheet_name == "PILOTO"
+                        else "BLOQUEO BACKEND DISPONIBLE"
+                    )
+                else:
+                    detail = "A1 DEBE SER WAREHOUSE_ID"
             elif sheet_name == "FARMA":
                 # A1 siempre es un encabezado escrito manualmente. El #REF! de
                 # IMPORTRANGE aparece en A2; revisar A1 daría falso positivo.
@@ -2997,7 +3007,11 @@ def render_database_health(health: dict[str, Any]) -> None:
                 if row["TIPO"] == "ALEPH":
                     card_meta = "ÚLTIMA ACTUALIZACIÓN"
                 elif row["TIPO"] == "BACKEND":
-                    card_meta = "BLOQUEO PERMANENTE"
+                    card_meta = (
+                        "SÓLO FOUNTAIN9"
+                        if row["HOJA"] == "PILOTO"
+                        else "BLOQUEO PERMANENTE"
+                    )
                 else:
                     card_meta = "CONEXIÓN IMPORTRANGE"
                 show_result = row["TIPO"] == "ALEPH" or row["ESTADO"] == "ERROR"
@@ -7113,6 +7127,7 @@ def execute_planning(
         # toda la planeación; al actualizar ambos archivos, el conjunto viene
         # cargado desde la hoja FARMA normalmente.
         farma_block_pairs = set(getattr(catalogs, "farma_block_pairs", set()))
+        pilot_store_ids = set(getattr(catalogs, "pilot_store_ids", set()))
         if enable_farma_block_rule:
             # Se incorpora al filtro universal destino-SKU para que Naked,
             # Otacon, Solidus, Shalashaska, Liquid, Venom y Kazuhira vean la
@@ -7133,6 +7148,13 @@ def execute_planning(
                 "Capacidad de tienda ignorada en todos los engines desde CODEC: "
                 "el uso de m³ se sigue registrando en los reportes, pero ninguna "
                 "línea se corta por capacidad."
+            )
+        if pilot_store_ids:
+            pilot_ids_text = ", ".join(map(str, sorted(pilot_store_ids)))
+            catalogs.warnings.append(
+                "Regla PILOTO activa: las tiendas "
+                f"{pilot_ids_text} sólo podrán recibir lo ejecutado por Naked/Fountain9; "
+                "los engines posteriores e Insumos quedan bloqueados."
             )
         excluded_sku_set = set(excluded_skus or ()) | catalogs.globally_blocked_skus
         manually_excluded_store_ids = set(excluded_store_ids or ())
@@ -7173,12 +7195,23 @@ def execute_planning(
                 data_path,
                 catalogs,
             )
+            pilot_insumos_count = sum(
+                row["WAREHOUSE_DESTINATION"] in pilot_store_ids
+                for row in insumos_rows
+            )
             insumos_rows = [
                 row
                 for row in insumos_rows
                 if row["RETAIL_ID"] not in excluded_sku_set
+                and row["WAREHOUSE_DESTINATION"] not in pilot_store_ids
             ]
             catalogs.warnings.extend(insumos_warnings)
+            if pilot_insumos_count:
+                catalogs.warnings.append(
+                    "Regla PILOTO: se omitieron "
+                    f"{pilot_insumos_count:,} líneas de INSUMOS para respetar "
+                    "el máximo sugerido por Fountain9."
+                )
         plan_path, consolidated_input, consolidation_summary = (
             consolidate_plan_files(
                 plan_paths,
@@ -7236,6 +7269,7 @@ def execute_planning(
             set(closed_store_ids)
             | outlier_store_ids
             | manually_excluded_store_ids
+            | pilot_store_ids
         )
         if outlier_store_ids:
             plan_read.rows = [
@@ -7315,6 +7349,13 @@ def execute_planning(
         )
         if not include_otacon_engine:
             engine_plan_rows = []
+        # PILOTO no altera Naked: Fountain9 conserva su ejecución literal.
+        # Desde Otacon en adelante no existe residual ni hardcode que pueda
+        # ampliar una tienda piloto.
+        engine_plan_rows = [
+            row for row in engine_plan_rows
+            if row["WAREHOUSE_DESTINATION"] not in pilot_store_ids
+        ]
         for row in engine_plan_rows:
             base_target, base_rule = engine.calculate_target_quantity(row, config)
             executed = naked_executed.get(
@@ -7828,6 +7869,20 @@ def execute_planning(
                 + "."
             )
 
+        # Invariante de seguridad: aunque en el futuro se añada un engine,
+        # una tienda PILOTO nunca puede terminar con una línea posterior a
+        # Naked. Fallar explícitamente es preferible a enviar volumen extra.
+        pilot_extra_allocations = [
+            allocation
+            for allocation in result.allocation_rows[len(naked_result.allocation_rows):]
+            if allocation["WAREHOUSE_DESTINATION"] in pilot_store_ids
+        ]
+        if pilot_extra_allocations:
+            raise RuntimeError(
+                "Invariante PILOTO violada: un engine posterior a Naked intentó "
+                "asignar volumen a una tienda restringida."
+            )
+
         result.warnings.insert(0, f"Versión del motor: {APP_BUILD}.")
         missing_stock_by_engine = {
             label: summary_item.get("missing_stock_treated_as_zero", 0)
@@ -8056,11 +8111,12 @@ def execute_planning(
         engine.enrich_rows_with_product_info(result.base_rows, catalogs)
         engine.enrich_rows_with_product_info(result.allocation_rows, catalogs)
         excluded_f9 = {}
+        f9_blocked_store_ids = engine_blocked_store_ids - pilot_store_ids
         for instruction in consolidation_summary.get("fountain9_instructions", []):
             destination, sku = instruction["WAREHOUSE_DESTINATION"], instruction["RETAIL_ID"]
             if sku in excluded_sku_set:
                 excluded_f9[(destination, sku)] = "SKU_BLOQUEADO"
-            elif destination in engine_blocked_store_ids:
+            elif destination in f9_blocked_store_ids:
                 excluded_f9[(destination, sku)] = (
                     "TIENDA_CERRADA" if destination in closed_store_ids else
                     "OUTLIER_F9" if destination in outlier_store_ids else "TIENDA_EXCLUIDA")

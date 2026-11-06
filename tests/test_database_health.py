@@ -23,7 +23,7 @@ def _database_bytes(*, farma_a2=820):
         elif name == "FARMA":
             sheet.append(["WAREHOUSE_ID", "PRODUCT_ID", "MAKER"])
             sheet.append([farma_a2, 10010, "RFP"])
-        elif name == "TIENDAS_CERRADAS":
+        elif name in {"TIENDAS_CERRADAS", "PILOTO"}:
             sheet.append(["WAREHOUSE_ID"])
             sheet.append([123])
         else:
@@ -37,10 +37,13 @@ def _database_bytes(*, farma_a2=820):
 def test_database_health_splits_manual_and_aleph_and_counts_used_rows():
     health = m.inspect_database(_database_bytes())
     farma = next(row for row in health["rows"] if row["HOJA"] == "FARMA")
+    piloto = next(row for row in health["rows"] if row["HOJA"] == "PILOTO")
     stock = next(row for row in health["rows"] if row["HOJA"] == "STOCK")
     assert farma["LINEAS"] == 1
     assert stock["LINEAS"] == 12
     assert m.database_section("FARMA") == "INPUTS MANUALES"
+    assert m.database_section("PILOTO") == "INPUTS MANUALES"
+    assert piloto["ESTADO"] == "OK" and "FOUNTAIN9" in piloto["DETALLE"]
     assert m.database_section("STOCK") == "ALEPH"
 
 

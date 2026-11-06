@@ -5,6 +5,8 @@ import io
 from datetime import date
 from pathlib import Path
 
+import openpyxl
+
 import modules.les_enfants_terribles as m
 from tests.e2e_fixture import FakeUpload, build_workbook_bytes
 
@@ -69,3 +71,33 @@ def test_otacon_uses_residual_and_bulk_stays_unique():
     assert int(rows[0]["QUANTITY"]) == 5
     assert m.PLANNING_REASON_FOUNTAIN9 in rows[0]["PLANNING_REASON"]
     assert m.PLANNING_REASON_OTACON in rows[0]["PLANNING_REASON"]
+
+
+def test_piloto_store_can_only_receive_the_literal_fountain9_quantity():
+    """PILOTO bloquea el residual de Otacon y cualquier ampliación posterior."""
+    raw_database = build_workbook_bytes(
+        {100: "CDMX"}, [10], origin=444, origin_stock=5
+    )
+    workbook = openpyxl.load_workbook(io.BytesIO(raw_database))
+    pilot = workbook.create_sheet("PILOTO")
+    pilot.append(["WAREHOUSE_ID"])
+    pilot.append([100])
+    database = io.BytesIO()
+    workbook.save(database)
+    workbook.close()
+
+    run = m.execute_planning(
+        uploaded_copernico=[],
+        uploaded_plans=[FakeUpload("fountain9.csv", _plan(3, 444, 10))],
+        database_bytes=database.getvalue(),
+        origins=(444,), max_tasks=100, run_date=date(2026, 10, 6),
+        include_insumos=False, enable_closed_stores_rule=False,
+        block_fruver_811=False, block_off_schedule_shipments=False,
+        minimum_positive_quantity=4,
+    )
+    rows = _bulk_rows(run)
+
+    assert len(rows) == 1
+    assert int(rows[0]["QUANTITY"]) == 3
+    assert rows[0]["PLANNING_REASON"] == m.PLANNING_REASON_FOUNTAIN9
+    assert any("Regla PILOTO activa" in warning for warning in run["warnings"])

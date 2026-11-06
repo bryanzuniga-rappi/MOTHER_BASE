@@ -689,6 +689,10 @@ class Catalogs:
     # FARMA bloquea únicamente una combinación destino-SKU. La hoja viene de
     # IMPORTRANGE y puede no estar disponible temporalmente (#REF! en A2).
     farma_block_pairs: set[tuple[int, int]] = field(default_factory=set)
+    # PILOTO contiene tiendas cuyo máximo absoluto es la recomendación de
+    # Fountain9. Naked sí puede ejecutar esa recomendación; ningún engine
+    # posterior puede generar volumen adicional para estos destinos.
+    pilot_store_ids: set[int] = field(default_factory=set)
     # Catálogo maestro de producto (hoja DATA), por SYNC_ID -> nombre y
     # categoría.
     product_catalog: dict[int, dict[str, str]] = field(default_factory=dict)
@@ -1087,6 +1091,37 @@ def load_catalogs(
             }
             put_unique(stores, warehouse, value, warnings, "TIENDA", "error")
 
+        # PILOTO es deliberadamente una lista de una sola columna. Se acepta
+        # WAREHOUSE_ID (formato operativo esperado) y, como respaldo, el
+        # nombre de tienda para que una edición manual no abra la puerta a un
+        # envío equivocado. Valores desconocidos quedan advertidos y no se
+        # aplican como piloto.
+        pilot_store_ids: set[int] = set()
+        if "PILOTO" in workbook.sheetnames:
+            pilot_sheet = workbook["PILOTO"]
+            stores_by_name = {
+                normalize_header(info.get("warehouse_name", "")): warehouse
+                for warehouse, info in stores.items()
+                if normalize_header(info.get("warehouse_name", ""))
+            }
+            for row_number, values in enumerate(
+                pilot_sheet.iter_rows(min_row=2, max_col=1, values_only=True),
+                start=2,
+            ):
+                raw_value = values[0] if values else None
+                if not clean_text(raw_value):
+                    continue
+                try:
+                    destination = to_id(raw_value, f"PILOTO fila {row_number}", True)
+                except ValueError:
+                    destination = stores_by_name.get(normalize_header(raw_value))
+                if destination is None or destination not in stores:
+                    warnings.append(
+                        f"PILOTO fila {row_number}: tienda {raw_value!r} no existe en TIENDA; se ignoró."
+                    )
+                    continue
+                pilot_store_ids.add(destination)
+
         storage: dict[int, str] = {}
         for row in iter_sheet_records(
             workbook,
@@ -1224,6 +1259,7 @@ def load_catalogs(
         copernico_unusable_by_reason=copernico_unusable_by_reason,
         globally_blocked_skus=globally_blocked_skus,
         farma_block_pairs=farma_block_pairs,
+        pilot_store_ids=pilot_store_ids,
         product_catalog=product_catalog,
         swa_potential_gain=swa_potential_gain,
         incoming_stock=dict(incoming_stock),
