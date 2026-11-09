@@ -7405,6 +7405,17 @@ def execute_planning(
             config,
         )
         daily_plan_rows = list(active_plan_rows)
+        # Universo operativo del día: Fountain9 que sobrevivió validaciones +
+        # tiendas que SCHEDULE habilita hoy. Shalashaska y Kazuhira comparten
+        # esta definición, nunca una pareja fija de orígenes.
+        planned_store_universe = build_planned_store_universe(
+            (
+                (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"])
+                for row in daily_plan_rows
+            ),
+            catalogs,
+            config.origin_warehouses,
+        )
         # 1) Naked ejecuta la decisión ya tomada por Fountain9. No usa MOV,
         # mínimos ni reasignación: Allocation DOI + Source Before Multi Source.
         naked_rows = build_naked_fountain9_rows(
@@ -7680,13 +7691,25 @@ def execute_planning(
             )
 
         # Shalashaska corre después de Solidus: puede evacuar merma hacia las
-        # tiendas que las coberturas tácticas ya activaron en esta corrida.
+        # tiendas que están planeadas hoy, aunque no lleven ese mismo SKU ni
+        # tengan una transferencia previa desde el origen de la merma.
         if include_shalashaska_engine:
+            shalashaska_extra_city_set = {
+                engine.normalize_city(city) for city in shalashaska_extra_cities
+            }
             shalashaska_allowed_cities: set[str] | None = shalashaska_forced_cities(
                 origins
-            ) | {engine.normalize_city(city) for city in shalashaska_extra_cities}
+            ) | shalashaska_extra_city_set
             if not shalashaska_allowed_cities:
                 shalashaska_allowed_cities = None
+            # Cada origen conserva su propia ciudad natural. Si hay varios
+            # orígenes (811/834/831/444 o futuros), uno no abre por accidente
+            # la ciudad forzada de otro; las ciudades extra son explícitas.
+            shalashaska_allowed_cities_by_source: dict[int, set[str]] = {}
+            for source in origins:
+                source_cities = shalashaska_forced_cities((source,)) | shalashaska_extra_city_set
+                if source_cities:
+                    shalashaska_allowed_cities_by_source[int(source)] = source_cities
             shalashaska_non_natural_keys = {
                 (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"])
                 for row in result.base_rows
@@ -7708,6 +7731,8 @@ def execute_planning(
                 run_date=run_date, target_doh=shalashaska_target_doh,
                 reason_column=PLANNING_REASON_COLUMN,
                 allowed_cities=shalashaska_allowed_cities,
+                allowed_cities_by_source=shalashaska_allowed_cities_by_source,
+                planned_destinations=planned_store_universe["stores"],
                 non_natural_keys=shalashaska_non_natural_keys,
                 evacuation_fraction=shalashaska_evacuation_fraction,
                 excluded_categories=(
@@ -7857,12 +7882,6 @@ def execute_planning(
                     f"{venom_summary['tasks_added']:,} tareas nuevas del "
                     "presupuesto compartido."
                 )
-
-        # Tiendas que se planean hoy: Bulk de Fountain9 + SCHEDULE con día
-        # válido.
-        planned_store_universe = build_planned_store_universe(
-            consolidated_input.keys(), catalogs, config.origin_warehouses
-        )
 
         kazuhira_skip_reasons: dict[tuple[int, int], str] = {}
         kazuhira_summary = empty_avl_summary(include_kazuhira_engine, 1.0)

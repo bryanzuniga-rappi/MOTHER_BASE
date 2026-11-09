@@ -2,7 +2,8 @@
 
 Posición: después de Naked, antes de Solidus.
 Entrada: POR_MERMAR (origen-SKU con vencimiento próximo), SHARE_VENTAS y ADU de CATALOGO.
-Salida: filas de asignación del remanente a tiendas, repartido por SHARE_VENTAS.
+Salida: filas de asignación del remanente a las tiendas planeadas ese día,
+repartido por SHARE_VENTAS.
 Regla clave: respeta stock, capacidad y tareas globales; POR_MERMAR no se usa
 como stock mandante.
 """
@@ -305,16 +306,22 @@ def apply_shalashaska_engine(
     target_doh: float,
     reason_column: str = "PLANNING_REASON",
     allowed_cities: set[str] | None = None,
+    allowed_cities_by_source: dict[int, set[str]] | None = None,
+    planned_destinations: set[int] | None = None,
     non_natural_keys: set[tuple[int, int]] | None = None,
     evacuation_fraction: float = 1.0,
     excluded_categories: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     """Evacúa inventario próximo a caducar sin rebasar restricciones globales.
 
-    allowed_cities: ciudades normalizadas a las que puede enviar (None = todas).
-    non_natural_keys: (destino, SKU) que NO nacieron de un ROQ positivo de
-    Fountain9 (mínimos/hardcode); una tienda solo es elegible si recibió al menos
-    una línea natural del mismo origen (None = cualquier línea cuenta).
+    allowed_cities: compatibilidad para llamadas anteriores; ciudades a las que
+    puede enviar si no se recibe una regla por origen (None = todas).
+    allowed_cities_by_source: ciudades permitidas para cada origen de merma.
+    planned_destinations: universo diario de tiendas. Si se recibe, una tienda
+    es candidata por estar planeada hoy, sin exigir que tenga el mismo SKU ni
+    una transferencia previa desde el mismo origen.
+    non_natural_keys: compatibilidad para el comportamiento anterior, donde
+    mínimos/hardcodes no abrían una ruta para merma.
     evacuation_fraction: porción de la merma reportada que se envía (1.0 = toda).
     excluded_categories: categorías sensibles que no se envían.
     """
@@ -332,7 +339,7 @@ def apply_shalashaska_engine(
 
     consumed_stock: Counter[tuple[int, int]] = Counter()
     planned_incoming: Counter[tuple[int, int]] = Counter()
-    natural_destinations_by_source: dict[int, set[int]] = {
+    routed_destinations_by_source: dict[int, set[int]] = {
         source: set() for source in config.origin_warehouses
     }
     for allocation in result.allocation_rows:
@@ -345,21 +352,39 @@ def apply_shalashaska_engine(
         source = int(allocation["WAREHOUSE_SOURCE"])
         destination = int(allocation["WAREHOUSE_DESTINATION"])
         allocation_key = (destination, int(allocation["RETAIL_ID"]))
-        if allocation_key in non_natural_keys and "SOLIDUS" not in str(allocation.get(reason_column, "")):
+        if (
+            planned_destinations is None
+            and allocation_key in non_natural_keys
+            and "SOLIDUS" not in str(allocation.get(reason_column, ""))
+        ):
             # Un mínimo (hardcode) no da derecho a recibir merma: la tienda debe
             # tener un ROQ positivo de Fountain9.
             summary["stores_without_positive_roq"] += 1
             continue
         city_norm = catalogs.stores.get(destination, {}).get("city_norm", "")
-        if allowed_cities is not None and city_norm not in allowed_cities:
+        source_cities = (
+            allowed_cities_by_source.get(source)
+            if allowed_cities_by_source is not None
+            else allowed_cities
+        )
+        if source_cities is not None and city_norm not in source_cities:
             summary["skipped_city_not_allowed"] += 1
             continue
         if (
-            source in natural_destinations_by_source
+            source in routed_destinations_by_source
             and destination not in closed_store_ids
             and city_norm not in blocked_city_set
         ):
-            natural_destinations_by_source[source].add(destination)
+            routed_destinations_by_source[source].add(destination)
+
+    # La merma no se limita a la misma ruta/SKU que abrió Fountain9: cualquier
+    # tienda que ya se planea hoy puede recibirla. El fallback preserva la
+    # conducta anterior para integraciones que aún no pasan el universo diario.
+    destination_universe = (
+        set(planned_destinations)
+        if planned_destinations is not None
+        else set().union(*routed_destinations_by_source.values())
+    )
 
     candidates: list[dict[str, Any]] = []
     for row in expiring_rows:
@@ -395,11 +420,18 @@ def apply_shalashaska_engine(
             continue
         candidate = dict(row)
         priority_rank = 4
-        for destination in natural_destinations_by_source.get(source, set()):
+        for destination in destination_universe:
             store = catalogs.stores.get(destination)
             if not store:
                 continue
             city_norm = store.get("city_norm", "")
+            source_cities = (
+                allowed_cities_by_source.get(source)
+                if allowed_cities_by_source is not None
+                else allowed_cities
+            )
+            if source_cities is not None and city_norm not in source_cities:
+                continue
             priority_profile = engine.product_priority_profile(
                 catalogs,
                 destination,
@@ -461,13 +493,21 @@ def apply_shalashaska_engine(
             continue
         m3_per_unit = catalogs.volume_m3.get(sku, config.default_m3_per_unit)
         options: list[dict[str, Any]] = []
-        for destination in natural_destinations_by_source.get(source, set()):
+        for destination in destination_universe:
             if destination == source:
                 continue
             store = catalogs.stores.get(destination)
             if not store or (destination, sku) in catalogs.route_cost_blocks:
                 continue
             city_norm = store.get("city_norm", "")
+            source_cities = (
+                allowed_cities_by_source.get(source)
+                if allowed_cities_by_source is not None
+                else allowed_cities
+            )
+            if source_cities is not None and city_norm not in source_cities:
+                summary["skipped_city_not_allowed"] += 1
+                continue
             priority_profile = engine.product_priority_profile(
                 catalogs,
                 destination,

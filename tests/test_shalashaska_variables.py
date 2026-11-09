@@ -8,7 +8,7 @@ from engines import shalashaska_engine as sh
 from tests.e2e_fixture import FakeUpload, build_plan_csv_bytes, build_workbook_bytes
 from tests.test_e2e_kazuhira import _bulk_lines
 
-STORES = {100: "CDMX", 200: "Guadalajara", 300: "Monterrey"}
+STORES = {100: "CDMX", 101: "CDMX", 200: "Guadalajara", 300: "Monterrey"}
 SKUS = [10, 11]
 DAY = date(2026, 10, 5)
 # (origen, sku, unidades en riesgo, valor, llegada, caducidad)
@@ -74,14 +74,22 @@ def test_extra_cities_are_matched_by_normalized_name():
     assert set(got) == {100, 300}
 
 
-# --- ROQ positivo mandante ---------------------------------------------------------------------
+# --- universo diario mandante ------------------------------------------------------------------
 
-def test_store_with_only_a_hardcode_minimum_never_receives_merma():
-    # 100: ROQ positivo; 200: solo mínimo por forecast cero (hardcode)
+def test_any_store_planned_today_can_receive_merma():
+    # 100 abre una línea natural; 101 se planea por otro SKU. Shalashaska
+    # debe poder evacuar el SKU 10 hacia ambas tiendas CDMX.
+    plan = [(100, 11, 5), (101, 11, 5)]
+    got = shala_units(run_planning(plan))
+    assert {100, 101}.issubset(got)
+
+
+def test_store_with_only_a_hardcode_is_part_of_daily_universe():
+    # La tienda 200 tiene una línea de mínimo, pero sí está planeada hoy. Al
+    # abrir GDL explícitamente debe poder recibir la merma.
     plan = [(100, 11, 5), (200, 11, 0, 0, 0, 0)]
     run = run_planning(plan, shalashaska_extra_cities=("Guadalajara",))
-    assert 200 not in shala_units(run) and 100 in shala_units(run)
-    assert run["shalashaska"]["stores_without_positive_roq"] >= 1
+    assert {100, 200}.issubset(shala_units(run))
 
 
 def test_store_with_a_natural_line_still_qualifies_even_if_it_also_has_a_hardcode():
