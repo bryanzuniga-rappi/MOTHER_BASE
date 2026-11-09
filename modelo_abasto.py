@@ -2805,6 +2805,16 @@ def write_planning_report(
                 int(getattr(result, "catalog_healthy_count", 0) or 0),
             ),
         ]
+        catalog_integrity = getattr(result, "catalog_integrity", {}) or {}
+        metrics.extend(
+            [
+                ("CATALOGO_FILAS_LEIDAS", int(catalog_integrity.get("catalog_rows_read", 0) or 0)),
+                ("CATALOGO_FILAS_VALIDAS", int(catalog_integrity.get("catalog_rows_valid", 0) or 0)),
+                ("CATALOGO_FILAS_INVALIDAS", int(catalog_integrity.get("catalog_rows_invalid", 0) or 0)),
+                ("CATALOGO_DUPLICADOS_CONSOLIDADOS", int(catalog_integrity.get("catalog_duplicate_pairs", 0) or 0)),
+                ("CATALOGO_COMBINACIONES_UNICAS", int(catalog_integrity.get("catalog_unique_pairs", 0) or 0)),
+            ]
+        )
 
         summary = workbook.add_worksheet("RESUMEN")
         summary.hide_gridlines(2)

@@ -22,6 +22,7 @@ import html
 import io
 import math
 import csv
+import hashlib
 import gc
 import re
 import shutil
@@ -1213,9 +1214,11 @@ def database_sheet_xml_row_counts(workbook_bytes: bytes) -> dict[str, int]:
 
         counts: dict[str, int] = {}
         for sheet_name in REQUIRED_DATABASE_SHEETS:
-            # Las tablas Aleph pueden contener cientos de miles de filas; su
-            # resultado exacto ya está en C6 y no deben descomprimirse aquí.
-            if sheet_name in ALEPH_SHEETS:
+            # Las tablas Aleph pueden contener cientos de miles de filas y no
+            # deben descomprimirse sólo para pintar tarjetas. CATALOGO es la
+            # excepción crítica: es el universo que usan las coberturas y su
+            # conteo físico permite detectar una exportación incompleta.
+            if sheet_name in ALEPH_SHEETS and sheet_name != "CATALOGO":
                 continue
             path = sheet_paths.get(sheet_name)
             if not path or path not in archive.namelist():
@@ -1236,6 +1239,8 @@ def database_sheet_line_count(
     xml_row_counts: dict[str, int],
 ) -> int:
     """Devuelve el total exacto publicado por Aleph o el conteo XML manual."""
+    if sheet_name == "CATALOGO":
+        return xml_row_counts.get(sheet_name, 0)
     if sheet_name in ALEPH_SHEETS:
         result_size = str(sheet["C6"].value or "")
         match = re.search(r"([\d,]+)\s+rows?\b", result_size, flags=re.IGNORECASE)
@@ -1246,6 +1251,47 @@ def database_sheet_line_count(
         return 0
 
     return xml_row_counts.get(sheet_name, 0)
+
+
+def database_download_manifest(workbook_bytes: bytes) -> dict[str, Any]:
+    """Prueba que el XLSX descargado es íntegro antes de usarlo.
+
+    Un export de Google Sheets no puede quedar "medio descargado" y seguir
+    pasando esta validación: cada miembro del ZIP se verifica con su CRC y se
+    valida que todas las hojas requeridas estén presentes. La huella permite
+    además reconocer exactamente qué versión alimentó una corrida.
+    """
+    digest = hashlib.sha256(workbook_bytes).hexdigest()
+    try:
+        with zipfile.ZipFile(io.BytesIO(workbook_bytes)) as archive:
+            corrupted_member = archive.testzip()
+            if corrupted_member:
+                raise RuntimeError(
+                    f"DATA_TRANSFERS está corrupto: CRC inválido en {corrupted_member}."
+                )
+            workbook_root = archive.read("xl/workbook.xml")
+    except (KeyError, zipfile.BadZipFile) as exc:
+        raise RuntimeError("DATA_TRANSFERS no es un XLSX íntegro o está truncado.") from exc
+
+    import xml.etree.ElementTree as ET
+
+    root = ET.fromstring(workbook_root)
+    present = {
+        sheet.attrib.get("name", "")
+        for sheet in root.iter()
+        if sheet.tag.endswith("}sheet")
+    }
+    missing = [sheet for sheet in REQUIRED_DATABASE_SHEETS if sheet not in present]
+    if missing:
+        raise RuntimeError(
+            "DATA_TRANSFERS llegó sin hojas requeridas: " + ", ".join(missing)
+        )
+    return {
+        "sha256": digest,
+        "bytes": len(workbook_bytes),
+        "sheets": len(present),
+        "required_sheets": len(REQUIRED_DATABASE_SHEETS),
+    }
 
 
 def inspect_database(
@@ -1266,6 +1312,7 @@ def inspect_database(
     # (fórmulas + valores), duplicando el pico de memoria antes de planear.
     # Abrimos la vista calculada y solo hacemos fallback a fórmulas si una
     # celda de control no tiene valor cacheado.
+    manifest = database_download_manifest(workbook_bytes)
     xml_row_counts = database_sheet_xml_row_counts(workbook_bytes)
     workbook = openpyxl.load_workbook(
         io.BytesIO(workbook_bytes), read_only=True, data_only=True
@@ -1382,6 +1429,7 @@ def inspect_database(
         "total_count": len(rows),
         "error_count": len(rows) - healthy_count,
         "rows": rows,
+        "manifest": manifest,
     }
     if not include_locations:
         return health
@@ -2183,10 +2231,17 @@ def load_venom_catalog_lookup(
 
 def load_avl_catalog_rows(
     database_path: Path,
-) -> tuple[list[dict[str, Any]], list[str]]:
-    """Carga CATALOGO y consolida una ADU por tienda-SKU."""
+) -> tuple[list[dict[str, Any]], list[str], dict[str, int]]:
+    """Carga CATALOGO y documenta exactamente qué consumió el motor."""
     consolidated: dict[tuple[int, int], float] = {}
     warnings: list[str] = []
+    integrity = {
+        "catalog_rows_read": 0,
+        "catalog_rows_valid": 0,
+        "catalog_rows_invalid": 0,
+        "catalog_duplicate_pairs": 0,
+        "catalog_unique_pairs": 0,
+    }
     workbook = openpyxl.load_workbook(database_path, read_only=True, data_only=True)
     try:
         for record in engine.iter_sheet_records(
@@ -2195,23 +2250,33 @@ def load_avl_catalog_rows(
             ["WAREHOUSE_ID", "PRODUCT_ID", "ADU"],
             ["WAREHOUSE_ID", "PRODUCT_ID", "ADU"],
         ):
-            destination = engine.to_id(
-                record["WAREHOUSE_ID"],
-                "CATALOGO.WAREHOUSE_ID",
-                allow_none=True,
-            )
-            sku = engine.to_id(
-                record["PRODUCT_ID"],
-                "CATALOGO.PRODUCT_ID",
-                allow_none=True,
-            )
+            integrity["catalog_rows_read"] += 1
+            try:
+                destination = engine.to_id(
+                    record["WAREHOUSE_ID"],
+                    "CATALOGO.WAREHOUSE_ID",
+                    allow_none=True,
+                )
+                sku = engine.to_id(
+                    record["PRODUCT_ID"],
+                    "CATALOGO.PRODUCT_ID",
+                    allow_none=True,
+                )
+            except ValueError as exc:
+                integrity["catalog_rows_invalid"] += 1
+                if len(warnings) < 20:
+                    warnings.append(f"CATALOGO: fila inválida omitida ({exc}).")
+                continue
             adu = max(engine.to_float(record["ADU"], 0.0), 0.0)
             if destination is None or sku is None:
+                integrity["catalog_rows_invalid"] += 1
                 continue
+            integrity["catalog_rows_valid"] += 1
             key = (destination, sku)
             if key in consolidated and not math.isclose(
                 consolidated[key], adu, abs_tol=1e-9
             ):
+                integrity["catalog_duplicate_pairs"] += 1
                 previous = consolidated[key]
                 consolidated[key] = max(previous, adu)
                 if len(warnings) < 20:
@@ -2220,6 +2285,8 @@ def load_avl_catalog_rows(
                         f"se usó la mayor ({consolidated[key]})."
                     )
             else:
+                if key in consolidated:
+                    integrity["catalog_duplicate_pairs"] += 1
                 consolidated[key] = adu
     finally:
         workbook.close()
@@ -2232,7 +2299,8 @@ def load_avl_catalog_rows(
         }
         for (destination, sku), adu in consolidated.items()
     ]
-    return rows, warnings
+    integrity["catalog_unique_pairs"] = len(consolidated)
+    return rows, warnings, integrity
 
 
 def resolve_adu_with_city_fallback(
@@ -2998,6 +3066,15 @@ def render_database_health(health: dict[str, Any]) -> None:
         """,
         unsafe_allow_html=True,
     )
+    manifest = health.get("manifest", {})
+    if manifest:
+        st.caption(
+            "Exportación verificada: "
+            f"{int(manifest.get('bytes', 0)) / (1024 * 1024):.1f} MB · "
+            f"{int(manifest.get('sheets', 0))} hojas · "
+            f"SHA-256 {str(manifest.get('sha256', ''))[:12]}… · "
+            "CRC XLSX íntegro"
+        )
 
     rows = sort_health_rows_for_display(health["rows"])
     for section in ("INPUTS MANUALES", "ALEPH"):
@@ -7437,6 +7514,7 @@ def execute_planning(
 
         store_shares_cache: dict[int, float] | None = None
         catalog_fill_rows_cache: list[dict[str, Any]] | None = None
+        catalog_integrity_cache: dict[str, int] | None = None
 
         def ensure_catalog_rows() -> list[dict[str, Any]]:
             """CATALOGO se carga UNA sola vez por corrida y se reutiliza en
@@ -7444,11 +7522,14 @@ def execute_planning(
             salud y SWA. Antes cada uno cargaba su propia copia completa y
             todas seguían vivas hasta el final de la función: con un
             catálogo grande eso multiplica memoria y tiempo."""
-            nonlocal catalog_fill_rows_cache
+            nonlocal catalog_fill_rows_cache, catalog_integrity_cache
             if catalog_fill_rows_cache is None:
-                loaded_rows, loaded_warnings = load_avl_catalog_rows(data_path)
+                loaded_rows, loaded_warnings, loaded_integrity = load_avl_catalog_rows(
+                    data_path
+                )
                 result.warnings.extend(loaded_warnings)
                 catalog_fill_rows_cache = loaded_rows
+                catalog_integrity_cache = loaded_integrity
             return catalog_fill_rows_cache
         shalashaska_summary = empty_shalashaska_summary(
             include_shalashaska_engine
@@ -8149,6 +8230,20 @@ def execute_planning(
         result.catalog_healthy_path = sweep_healthy_path
         result.catalog_healthy_count = sweep_healthy_count
         result.catalog_universe_count = len(ensure_catalog_rows())
+        result.catalog_integrity = catalog_integrity_cache or {
+            "catalog_rows_read": 0,
+            "catalog_rows_valid": 0,
+            "catalog_rows_invalid": 0,
+            "catalog_duplicate_pairs": 0,
+            "catalog_unique_pairs": 0,
+        }
+        if result.catalog_integrity["catalog_rows_invalid"]:
+            raise RuntimeError(
+                "Integridad de CATALOGO fallida: "
+                f"{result.catalog_integrity['catalog_rows_invalid']:,} fila(s) no "
+                "tienen WAREHOUSE_ID/PRODUCT_ID válidos. Mother Base no generó "
+                "archivos para evitar planear con un Catálogo parcial."
+            )
         local_files = engine.create_output_files(
             result,
             config,
