@@ -11,8 +11,6 @@ install()
 from modules.militaires_sans_frontieres import (
     DISPATCHTRACK_OUTPUT_HEADERS,
     _assign_and_split,
-    _round_down_small_capacity_tail,
-    _selected_fleet,
     _cap_final_output_parts,
     _guarantee_priority_torton_coverage,
     _mark_split_destination,
@@ -112,7 +110,7 @@ def test_split_conserves_capacity_cost_and_secondary_capacity_when_fleet_is_frag
     assert [item['CAPACIDAD UNO'] for item in output] == ['2.8875', '0.9625']
 
 
-def test_first_torton_turn_uses_all_priority_capacity_before_non_priority_filler():
+def test_first_torton_turn_maximizes_complete_priority_stores_then_sends_overflow_in_3_5():
     headers = ['CÓDIGO DE PARADA*', 'IDENTIFICADOR CONTACTO*', 'CAPACIDAD UNO', 'Tipo camion', 'IMPORTANCIA']
     rows = [
         {'CÓDIGO DE PARADA*': f'P-{store}', 'IDENTIFICADOR CONTACTO*': store, 'CAPACIDAD UNO': '6'}
@@ -132,50 +130,30 @@ def test_first_torton_turn_uses_all_priority_capacity_before_non_priority_filler
 
     assert all(next(iter(truck_by_store[store])).startswith('TORTON_') for store in ('A','B','C'))
     assert {next(iter(truck_by_store[store])) for store in ('A','B','C')} == {'TORTON_1','TORTON_2','TORTON_3'}
-    assert all(next(iter(truck_by_store['D'])).startswith('TORTON_') for _ in [0])
+    assert truck_by_store['D']=={'3.5'}
     assert truck_by_store['E']=={'3.5'}
     assert all(next(iter(truck_by_store[store])).startswith('TORTON_') for store in ('A','B','C','F'))
-    assert sum(float(item['CAPACIDAD UNO']) for item in output if item['Tipo camion'].startswith('TORTON_') and item['IDENTIFICADOR CONTACTO*'].split('-')[0] in {'A','B','C','D'}) == 24
+    assert sum(float(item['CAPACIDAD UNO']) for item in output if item['Tipo camion'].startswith('TORTON_')) == 24
     assert {item['IMPORTANCIA'] for item in output if item['IDENTIFICADOR CONTACTO*'].split('-')[0] in {'A','B','C','D','E'}} == {'1'}
-    assert {item['IMPORTANCIA'] for item in output if item['IDENTIFICADOR CONTACTO*'].split('-')[0]=='F'} == {''}
+    assert {item['IMPORTANCIA'] for item in output if item['IDENTIFICADOR CONTACTO*'].split('-')[0]=='F'} == {'2'}
 
 
-def test_all_selected_tortons_are_dynamic_and_unused_v1_capacity_fills_non_priority():
+def test_disabling_mother_base_routes_keeps_physical_torton_tags_without_v2_logic():
     headers = ['CÓDIGO DE PARADA*', 'IDENTIFICADOR CONTACTO*', 'CAPACIDAD UNO', 'Tipo camion']
     rows = [
         {'CÓDIGO DE PARADA*':f'P-{store}','IDENTIFICADOR CONTACTO*':store,'CAPACIDAD UNO':'4'}
-        for store in ('A','B','C','D')
+        for store in ('A','B','C')
     ]
     output, _ = _assign_and_split(headers, rows, [
         {'UNIDAD':'TORTON_1','CANTIDAD':1,'CAPACIDAD':8,'VUELTAS':2},
         {'UNIDAD':'TORTON_2','CANTIDAD':1,'CAPACIDAD':8,'VUELTAS':2},
         {'UNIDAD':'TORTON_3','CANTIDAD':1,'CAPACIDAD':8,'VUELTAS':2},
-        {'UNIDAD':'TORTON_4','CANTIDAD':1,'CAPACIDAD':8,'VUELTAS':2},
     ], {store.lower():{'PRIORITY':1} for store in ('A','B','C')}, mother_base_routes=False)
 
-    assert {item['Tipo camion'] for item in output} == {'TORTON_1','TORTON_2','TORTON_3','TORTON_4'}
+    assert {item['Tipo camion'] for item in output} == {'TORTON_1','TORTON_2','TORTON_3'}
 
 
-def test_large_priority_store_uses_free_torton_before_non_priority_filler():
-    headers=['CÓDIGO DE PARADA*','IDENTIFICADOR CONTACTO*','CAPACIDAD UNO','Tipo camion','IMPORTANCIA']
-    rows=[
-        {'CÓDIGO DE PARADA*':'ANGEL-8','IDENTIFICADOR CONTACTO*':'ANGEL','CAPACIDAD UNO':'8'},
-        {'CÓDIGO DE PARADA*':'ANGEL-4','IDENTIFICADOR CONTACTO*':'ANGEL','CAPACIDAD UNO':'4'},
-        {'CÓDIGO DE PARADA*':'B','IDENTIFICADOR CONTACTO*':'B','CAPACIDAD UNO':'4'},
-        {'CÓDIGO DE PARADA*':'C','IDENTIFICADOR CONTACTO*':'C','CAPACIDAD UNO':'4'},
-        {'CÓDIGO DE PARADA*':'D','IDENTIFICADOR CONTACTO*':'D','CAPACIDAD UNO':'4'},
-        {'CÓDIGO DE PARADA*':'N','IDENTIFICADOR CONTACTO*':'N','CAPACIDAD UNO':'3'},
-    ]
-    fleet=[{'UNIDAD':f'TORTON_{index}','CANTIDAD':1,'CAPACIDAD':8,'VUELTAS':2} for index in range(1,5)]
-    directions={store.lower():{'PRIORITY':1} for store in ('ANGEL','B','C','D')}
-    output,_=_assign_and_split(headers,rows,fleet,directions,split_orders=False,mother_base_routes=False)
-    by_stop={row['CÓDIGO DE PARADA*']:row for row in output}
-    assert by_stop['ANGEL-8']['Tipo camion']=='TORTON_4'
-    assert by_stop['ANGEL-4']['Tipo camion'] in {'TORTON_1','TORTON_2','TORTON_3'}
-    assert by_stop['N']['Tipo camion']==''
-
-
-def test_routes_off_reserves_torton_capacity_when_priority_store_overflows():
+def test_routes_off_leaves_non_torton_orders_untyped_and_only_p1_has_importance():
     headers = ['CÓDIGO DE PARADA*', 'IDENTIFICADOR CONTACTO*', 'CAPACIDAD UNO', 'Tipo camion', 'IMPORTANCIA']
     rows = [
         {'CÓDIGO DE PARADA*':'P','IDENTIFICADOR CONTACTO*':'P','CAPACIDAD UNO':'9'},
@@ -189,7 +167,7 @@ def test_routes_off_reserves_torton_capacity_when_priority_store_overflows():
     for item in output:
         by_store.setdefault(item['IDENTIFICADOR CONTACTO*'].split('-')[0],[]).append(item)
 
-    assert {item['Tipo camion'] for item in by_store['P']} == {'TORTON_1',''}
+    assert {item['Tipo camion'] for item in by_store['P']} == {''}
     assert {item['IMPORTANCIA'] for item in by_store['P']} == {'1'}
     assert {item['Tipo camion'] for item in by_store['N']} == {''}
     assert {item['IMPORTANCIA'] for item in by_store['N']} == {''}
@@ -244,7 +222,7 @@ def test_torton_routes_fill_first_turn_before_second_and_write_delivery_windows(
         assert {item['Tipo camion'] for item in by_store[store]} == {'TORTON_1'}
         assert {(item['MIN VENTANA HORARIA 1*'],item['MAX VENTANA HORARIA 1*']) for item in by_store[store]} == {('00:00','03:00')}
     assert {item['IMPORTANCIA'] for item in by_store['A']} == {'1'}
-    assert {item['IMPORTANCIA'] for item in by_store['B']} == {''}
+    assert {item['IMPORTANCIA'] for item in by_store['B']} == {'2'}
     assert {item['Tipo camion'] for item in by_store['C']} == {'TORTON_1'}
     assert {(item['MIN VENTANA HORARIA 1*'],item['MAX VENTANA HORARIA 1*']) for item in by_store['C']} == {('03:00','06:00')}
 
@@ -259,7 +237,7 @@ def test_split_controls_only_split_when_the_toggle_is_on():
     unsplit, _ = _assign_and_split(headers, [row], [{'UNIDAD': '3.5', 'CANTIDAD': 1, 'CAPACIDAD': 8, 'VUELTAS': 1}], split_orders=False)
     assert [float(item['CAPACIDAD UNO']) for item in unsplit] == [5]
     oversized_setting, _ = _assign_and_split(headers, [row], [{'UNIDAD': '3.5', 'CANTIDAD': 1, 'CAPACIDAD': 8, 'VUELTAS': 1}], split_orders=True, split_capacity=9)
-    assert [float(item['CAPACIDAD UNO']) for item in oversized_setting] == [4, 1]
+    assert [float(item['CAPACIDAD UNO']) for item in oversized_setting] == [5]
 
     constrained, _ = _assign_and_split(headers, [
         {'CÓDIGO DE PARADA*': 'B', 'IDENTIFICADOR CONTACTO*': 'B', 'CAPACIDAD UNO': '3'},
@@ -270,24 +248,14 @@ def test_split_controls_only_split_when_the_toggle_is_on():
     assert {item['Tipo camion'] for item in constrained} == {'1.5'}
 
 
-def test_selected_fleet_never_readds_a_torton_removed_from_the_menu():
-    fleet=[
-        {'UNIDAD':'TORTON','CANTIDAD':1,'CAPACIDAD':8,'VUELTAS':2},
-        {'UNIDAD':'TORTON_1','CANTIDAD':1,'CAPACIDAD':8,'VUELTAS':2},
-        {'UNIDAD':'TORTON_2','CANTIDAD':1,'CAPACIDAD':8,'VUELTAS':2},
-    ]
-    selected=_selected_fleet(fleet,['TORTON_1','TORTON_2'])
-    assert [item['UNIDAD'] for item in selected] == ['TORTON_1','TORTON_2']
+def test_split_capacity_above_four_is_respected_by_both_split_guarantees():
+    headers = ['CÓDIGO DE PARADA*', 'IDENTIFICADOR CONTACTO*', 'CAPACIDAD UNO']
+    row = {'CÓDIGO DE PARADA*': 'A', 'IDENTIFICADOR CONTACTO*': 'A', 'CAPACIDAD UNO': '11'}
+    fleet = [{'UNIDAD': '3.5', 'CANTIDAD': 2, 'CAPACIDAD': 8, 'VUELTAS': 1}]
 
+    assigned, _ = _assign_and_split(headers, [row], fleet, split_orders=True, split_capacity=7)
+    final = _cap_final_output_parts(headers, [dict(row)], 7)
 
-def test_small_capacity_tail_rounds_down_only_above_one_pallet():
-    headers=['CÓDIGO DE PARADA*','CAPACIDAD UNO']
-    rows=[
-        {'CÓDIGO DE PARADA*':'ANGEL','CAPACIDAD UNO':'8.02'},
-        {'CÓDIGO DE PARADA*':'LOW','CAPACIDAD UNO':'1.09'},
-        {'CÓDIGO DE PARADA*':'TINY','CAPACIDAD UNO':'0.10'},
-        {'CÓDIGO DE PARADA*':'KEEP','CAPACIDAD UNO':'3.20'},
-    ]
-    _round_down_small_capacity_tail(rows,headers)
-    assert [row['CAPACIDAD UNO'] for row in rows] == ['8','1','0.10','3.20']
+    assert [float(item['CAPACIDAD UNO']) for item in assigned] == [7, 4]
+    assert [float(item['CAPACIDAD UNO']) for item in final] == [7, 4]
 
