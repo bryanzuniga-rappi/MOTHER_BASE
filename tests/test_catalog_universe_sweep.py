@@ -39,6 +39,9 @@ def test_healthy_sku_gets_healthy_label():
     assert rows[0]["REGLA_DEMANDA"] == m.CATALOG_UNIVERSE_HEALTHY_REGLA
     assert rows[0]["CANTIDAD_OBJETIVO"] == 0
     assert rows[0]["CANTIDAD_ASIGNADA"] == 0
+    assert rows[0]["ADU_CATALOGO"] == 1.0
+    assert rows[0]["DOH_DESTINO"] == 50.0
+    assert "sin necesidad de envío" in rows[0]["DETALLE_MOTIVO"]
 
 
 def test_stockout_sku_gets_uncovered_label():

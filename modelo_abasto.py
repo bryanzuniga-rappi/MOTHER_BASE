@@ -2796,6 +2796,14 @@ def write_planning_report(
             ("TAREAS_GENERADAS", result.tasks_used),
             ("MAX_TASKS", result.max_tasks),
             ("ADVERTENCIAS_DATOS", len(result.warnings)),
+            (
+                "CATALOGO_COMBINACIONES_LEIDAS",
+                int(getattr(result, "catalog_universe_count", 0) or 0),
+            ),
+            (
+                "CATALOGO_SANO_SIN_ENVIO",
+                int(getattr(result, "catalog_healthy_count", 0) or 0),
+            ),
         ]
 
         summary = workbook.add_worksheet("RESUMEN")
@@ -2884,6 +2892,28 @@ def write_planning_report(
                     ),
                 },
             )
+
+        # Las combinaciones sanas de CATALOGO se generan en streaming por el
+        # pipeline. Antes quedaban sólo como CSV dentro del ZIP, por lo que
+        # parecían "desaparecer" del reporte. Se incorporan como una pestaña
+        # ligera y filtrable sin añadirlas a base_rows ni duplicar memoria.
+        healthy_path_raw = getattr(result, "catalog_healthy_path", None)
+        healthy_path = Path(healthy_path_raw) if healthy_path_raw else None
+        if healthy_path and healthy_path.exists():
+            healthy = workbook.add_worksheet("CATALOGO_SANO")
+            healthy.hide_gridlines(2)
+            with healthy_path.open("r", encoding="utf-8-sig", newline="") as handle:
+                reader = csv.DictReader(handle)
+                headers = list(reader.fieldnames or [])
+                if headers:
+                    write_rectangular_sheet(
+                        workbook,
+                        healthy,
+                        headers,
+                        reader,
+                        header_format,
+                        boolean_format,
+                    )
 
         detail = workbook.add_worksheet("DETALLE_ASIGNACION")
         detail.hide_gridlines(2)

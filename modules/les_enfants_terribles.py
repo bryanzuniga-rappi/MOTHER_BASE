@@ -369,7 +369,9 @@ KAZUHIRA_UNCOVERED_LABELS: dict[str, str] = {
     "SIN_DURATION": "QUIEBRE NO CUBIERTO · SIN DURATION/LEAD TIME",
 }
 
-# Columnas del CSV de universo sano (filas que NO viven en base_rows).
+# Columnas del universo sano. Estas combinaciones no requieren envío, pero sí
+# deben ser trazables: BASE_TRANSFERS + este universo reconstruyen el 100% de
+# CATALOGO sin inflar en memoria el reporte operativo.
 HEALTHY_UNIVERSE_COLUMNS = [
     "WAREHOUSE_DESTINATION",
     "WAREHOUSE_NAME",
@@ -378,7 +380,10 @@ HEALTHY_UNIVERSE_COLUMNS = [
     "PRODUCT_NAME",
     "CATEGORY_NAME",
     "PREDICTED_OPENING_INVENTORY",
+    "ADU_CATALOGO",
+    "DOH_DESTINO",
     "TIPO_DE_CORTE",
+    "DETALLE_MOTIVO",
 ]
 
 BREAKDOWN_ORDER = (
@@ -3913,6 +3918,16 @@ def iter_catalog_universe_sweep_rows(
                 "PREDICTED_DEMAND": 0.0,
                 "PREDICTED_OPENING_INVENTORY": destination_stock,
                 "NET_INTER_STORE_TRANSFERS": 0.0,
+                "ADU_CATALOGO": max(engine.to_float(row.get("ADU"), 0.0), 0.0),
+                "DOH_DESTINO": (
+                    destination_stock / max(engine.to_float(row.get("ADU"), 0.0), 0.0)
+                    if engine.to_float(row.get("ADU"), 0.0) > 0
+                    else "SIN ADU"
+                ),
+                "DETALLE_MOTIVO": (
+                    "Combinación activa en CATALOGO sin necesidad de envío: "
+                    "la posición de inventario en destino cumple la regla vigente."
+                ),
         }
 
 
@@ -8128,6 +8143,12 @@ def execute_planning(
         )
         result.fountain9_audit = fountain9_audit
         result.build = APP_BUILD
+        # El archivo se escribe en streaming durante el barrido para evitar
+        # duplicar el universo completo de CATALOGO en RAM. El escritor del
+        # reporte lo incorpora como pestaña CATALOGO_SANO.
+        result.catalog_healthy_path = sweep_healthy_path
+        result.catalog_healthy_count = sweep_healthy_count
+        result.catalog_universe_count = len(ensure_catalog_rows())
         local_files = engine.create_output_files(
             result,
             config,
@@ -10140,6 +10161,9 @@ def render_results(run: dict[str, Any]) -> None:
         fountain9_zero_paths = [
             p for p in all_paths if p.name.startswith("Fountain9_Sin_Recomendacion_")
         ]
+        catalog_healthy_paths = [
+            p for p in all_paths if p.name.startswith("Universo_Catalogo_Sin_Necesidad_")
+        ]
         outlier_paths = [
             p for p in all_paths if p.name.startswith("Outliers_Fountain9_Excluidos_")
         ]
@@ -10150,6 +10174,7 @@ def render_results(run: dict[str, Any]) -> None:
             set(report_paths)
             | set(bulk_paths)
             | set(fountain9_zero_paths)
+            | set(catalog_healthy_paths)
             | set(outlier_paths)
             | set(pdf_paths)
         )
@@ -10186,6 +10211,15 @@ def render_results(run: dict[str, Any]) -> None:
                     path,
                     "Descargar sin recomendación Fountain9",
                     f"download_f9zero_{index}",
+                )
+
+        if catalog_healthy_paths:
+            st.caption("Universo completo de Catálogo — sin necesidad de envío")
+            for index, path in enumerate(catalog_healthy_paths):
+                _download_button(
+                    path,
+                    "Descargar Catálogo sano",
+                    f"download_catalog_healthy_{index}",
                 )
 
         if outlier_paths:
