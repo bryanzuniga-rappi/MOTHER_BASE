@@ -7732,7 +7732,11 @@ def execute_planning(
                 reason_column=PLANNING_REASON_COLUMN,
                 allowed_cities=shalashaska_allowed_cities,
                 allowed_cities_by_source=shalashaska_allowed_cities_by_source,
-                planned_destinations=planned_store_universe["stores"],
+                # PILOTO es una restricción absoluta: aunque la tienda se
+                # planee hoy, sólo Naked puede asignarle lo que F9 pidió.
+                planned_destinations=(
+                    planned_store_universe["stores"] - pilot_store_ids
+                ),
                 non_natural_keys=shalashaska_non_natural_keys,
                 evacuation_fraction=shalashaska_evacuation_fraction,
                 excluded_categories=(

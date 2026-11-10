@@ -421,6 +421,8 @@ def apply_shalashaska_engine(
         candidate = dict(row)
         priority_rank = 4
         for destination in destination_universe:
+            if destination in closed_store_ids:
+                continue
             store = catalogs.stores.get(destination)
             if not store:
                 continue
@@ -495,6 +497,8 @@ def apply_shalashaska_engine(
         options: list[dict[str, Any]] = []
         for destination in destination_universe:
             if destination == source:
+                continue
+            if destination in closed_store_ids:
                 continue
             store = catalogs.stores.get(destination)
             if not store or (destination, sku) in catalogs.route_cost_blocks:

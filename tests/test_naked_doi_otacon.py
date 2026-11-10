@@ -101,3 +101,38 @@ def test_piloto_store_can_only_receive_the_literal_fountain9_quantity():
     assert int(rows[0]["QUANTITY"]) == 3
     assert rows[0]["PLANNING_REASON"] == m.PLANNING_REASON_FOUNTAIN9
     assert any("Regla PILOTO activa" in warning for warning in run["warnings"])
+
+
+def test_shalashaska_never_uses_a_piloto_store_as_evacuation_destination():
+    """PILOTO permanece exclusivo de Naked aunque Shalashaska use el universo diario."""
+    raw_database = build_workbook_bytes(
+        {100: "CDMX", 101: "CDMX"},
+        [10],
+        schedule_only_stores={101},
+        origin=444,
+        origin_stock=100,
+        extra_rows={
+            "POR_MERMAR": [(444, 10, 50, 10.0, date(2026, 10, 1), date(2026, 10, 12))],
+            "SHARE_VENTAS": [(100, 0.5), (101, 0.5)],
+        },
+    )
+    workbook = openpyxl.load_workbook(io.BytesIO(raw_database))
+    pilot = workbook.create_sheet("PILOTO")
+    pilot.append(["WAREHOUSE_ID"])
+    pilot.append([100])
+    database = io.BytesIO()
+    workbook.save(database)
+    workbook.close()
+
+    run = m.execute_planning(
+        uploaded_copernico=[],
+        uploaded_plans=[FakeUpload("fountain9.csv", _plan(3, 444, 10))],
+        database_bytes=database.getvalue(),
+        origins=(444,), max_tasks=100, run_date=date(2026, 10, 6),
+        include_insumos=False, include_shalashaska_engine=True,
+        enable_closed_stores_rule=False,
+        block_fruver_811=False, block_off_schedule_shipments=False,
+    )
+    by_store = {int(row["WAREHOUSE_DESTINATION"]): int(row["QUANTITY"]) for row in _bulk_rows(run)}
+    assert by_store[100] == 3
+    assert by_store[101] == 50
