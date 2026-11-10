@@ -315,11 +315,11 @@ def test_classify_zero_demand():
     assert m.classify_no_recommendation_reason(row) == "SIN DEMANDA PROYECTADA"
 
 
-def test_classify_transfer_covers_need():
+def test_net_transfer_never_closes_a_deficit_as_covered():
     row = _no_rec_row(100, 10, demand=10, opening=2, net_transfer=15)
     assert (
         m.classify_no_recommendation_reason(row)
-        == "TRANSFERENCIA ENTRE TIENDAS CUBRE LA NECESIDAD"
+        == "DÉFICIT SIN RECOMENDACIÓN · REVISAR COBERTURA"
     )
 
 
@@ -338,9 +338,12 @@ def test_classify_tight_margin():
 
 def test_classify_fallback_when_data_does_not_fit_any_bucket():
     """Caso sintético que viola la invariante esperada (opening < demand,
-    sin transferencia) — no debe tronar, debe caer al comodín."""
+    sin transferencia) — no debe tronar ni presentarse como cubierto."""
     row = _no_rec_row(100, 10, demand=10, opening=3, net_transfer=0)
-    assert m.classify_no_recommendation_reason(row) == "SIN MOTIVO IDENTIFICADO"
+    assert (
+        m.classify_no_recommendation_reason(row)
+        == "DÉFICIT SIN RECOMENDACIÓN · REVISAR COBERTURA"
+    )
 
 
 def test_build_no_recommendation_breakdown_counts_correctly():
@@ -360,13 +363,13 @@ def test_build_no_recommendation_breakdown_counts_correctly():
     assert sum(r["CASOS"] for r in rows) == 3
 
 
-def test_no_recommendation_breakdown_includes_swa_informativo():
+def test_no_recommendation_breakdown_has_zero_swa_potential():
     row = _no_rec_row(100, 10, demand=0, opening=5)
     row["SWA_POTENTIAL_GAIN_COUNTRY"] = 0.75
     result = SimpleNamespace(base_rows=[row])
     rows = m.build_no_recommendation_breakdown(result)
     sin_demanda = next(r for r in rows if r["MOTIVO"] == "SIN DEMANDA PROYECTADA")
-    assert sin_demanda["SWA_INFORMATIVO"] == 0.75
+    assert sin_demanda["SWA_POTENCIAL"] == 0.0
 
 
 def test_cuts_detail_no_longer_includes_sin_recomendacion():

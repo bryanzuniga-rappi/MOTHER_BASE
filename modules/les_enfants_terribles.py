@@ -3611,58 +3611,62 @@ def build_cuts_detail_rows(
     ]
 
 
-# Motivos de SIN RECOMENDACIÓN, solo con columnas del Bulk de Fountain9. Todo
-# SKU aquí cumple opening >= demanda: los motivos distinguen el tipo de
-# cobertura.
+# Motivos de SIN RECOMENDACIÓN, solo con columnas del Bulk de Fountain9.
+# Una fila puede vivir aquí únicamente si Fountain9 no pidió envío Y la
+# posición proyectada ya es sana. Un déficit no se explica con una supuesta
+# transferencia entre tiendas: se convierte en necesidad de Otacon/Solidus/
+# Kazuhira y, si nadie puede cubrirlo, termina como un corte real.
 NO_RECOMMENDATION_AMPLE_MARGIN_MULTIPLIER = 2.0
 
 NO_RECOMMENDATION_REASONS = (
     "SIN DEMANDA PROYECTADA",
-    "TRANSFERENCIA ENTRE TIENDAS CUBRE LA NECESIDAD",
     "INVENTARIO CON AMPLIO MARGEN",
     "INVENTARIO SUFICIENTE CON MARGEN AJUSTADO",
-    "SIN MOTIVO IDENTIFICADO",
+    "DÉFICIT SIN RECOMENDACIÓN · REVISAR COBERTURA",
 )
 
 
 def classify_no_recommendation_reason(row: dict[str, Any]) -> str:
     """Clasifica UNA fila SIN RECOMENDACIÓN en su motivo específico, usando solo
-    PREDICTED_DEMAND, PREDICTED_OPENING_INVENTORY y NET_INTER_STORE_TRANSFERS.
+    PREDICTED_DEMAND y PREDICTED_OPENING_INVENTORY.
+
+    NET_INTER_STORE_TRANSFERS es una señal de Fountain9, no evidencia de que
+    Mother Base haya cubierto una necesidad. Por ello nunca puede cerrar un
+    caso ni ocultarlo dentro de este breakdown.
     """
     demand = float(row.get("PREDICTED_DEMAND", 0) or 0)
     opening = float(row.get("PREDICTED_OPENING_INVENTORY", 0) or 0)
-    net_transfer = float(row.get("NET_INTER_STORE_TRANSFERS", 0) or 0)
 
     if demand <= 0:
         return "SIN DEMANDA PROYECTADA"
-    if net_transfer >= demand:
-        return "TRANSFERENCIA ENTRE TIENDAS CUBRE LA NECESIDAD"
     if opening >= demand * NO_RECOMMENDATION_AMPLE_MARGIN_MULTIPLIER:
         return "INVENTARIO CON AMPLIO MARGEN"
     if opening >= demand:
         return "INVENTARIO SUFICIENTE CON MARGEN AJUSTADO"
-    return "SIN MOTIVO IDENTIFICADO"
+    # Defensivo: esta etiqueta no debe ser frecuente porque
+    # calculate_target_quantity convierte opening < demand en una necesidad
+    # positiva. Si alguna fuente inconsistente la deja llegar a esta tabla, no
+    # la maquillamos como una transferencia cubierta.
+    return "DÉFICIT SIN RECOMENDACIÓN · REVISAR COBERTURA"
 
 
 def build_no_recommendation_breakdown(result) -> list[dict[str, Any]]:
     """Tabla 3: por qué Fountain9 no pidió nada (TIPO_DE_CORTE = SIN RECOMENDACIÓN)."""
     counts: Counter[str] = Counter()
-    swa_informativo: Counter[str] = Counter()
     for row in result.base_rows:
         if row.get("TIPO_DE_CORTE") != "SIN RECOMENDACIÓN":
             continue
         reason = classify_no_recommendation_reason(row)
         counts[reason] += 1
-        swa_informativo[reason] += float(
-            row.get("SWA_POTENTIAL_GAIN_COUNTRY", 0.0) or 0.0
-        )
 
     order = {label: index for index, label in enumerate(NO_RECOMMENDATION_REASONS)}
     return [
         {
             "MOTIVO": reason,
             "CASOS": count,
-            "SWA_INFORMATIVO": round(swa_informativo[reason], 4),
+            # Por definición estos casos no son una oportunidad no atendida.
+            # No se propagan valores crudos de SWA provenientes del bulk.
+            "SWA_POTENCIAL": 0.0,
         }
         for reason, count in sorted(
             counts.items(), key=lambda item: (order.get(item[0], len(order)), item[0])
@@ -10395,10 +10399,10 @@ def render_results(run: dict[str, Any]) -> None:
 
     st.markdown("##### Sin recomendación — por qué Fountain9 no pidió nada")
     st.caption(
-        "Otacon: Fountain9 no pidió nada para estas tienda-SKU. Los motivos usan "
-        "solo columnas del Bulk (demanda, opening, net transfer). SWA_INFORMATIVO no "
-        "es 'perdido': suele ser un desfase entre el opening predicho y el stock "
-        "real."
+        "Fountain9 no pidió nada para estas tienda-SKU porque no detectó necesidad "
+        "proyectada o porque el inventario proyectado ya la cubría. SWA potencial "
+        "es cero por definición. Si existe un déficit, Mother Base lo entrega a los "
+        "engines; si no se logra cubrir, aparece como un corte real."
     )
     no_recommendation_rows = run.get("no_recommendation_rows", [])
     render_capped_dataframe(

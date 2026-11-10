@@ -280,7 +280,7 @@ Hoja Aleph (cada hora) con `SWA_POTENTIAL_GAIN_COUNTRY` por tienda-SKU: el SWA p
 - **Ganado es binario:** cualquier envío que saque la tienda-SKU del quiebre captura su valor completo. Ausente de la hoja = 0.
 - **Universo:** todo quiebre del catálogo (`stock_base` = 0), lo haya intentado cubrir un engine o no. Cálculo autoritativo: `build_swa_report()`, que suma lo asignado por destino-SKU de todos los engines. Insumos corre aparte: se pasan sus llaves cubiertas y su SWA se calcula desde sus propias filas.
 - **Dónde aparece:** sección inicial de resultados; columna `SWA_POTENTIAL_GAIN_COUNTRY` en CSV, `BASE_TRANSFERS` y `DETALLE_ASIGNACION` (informativa por fila: no sumar sin deduplicar por destino-SKU); `SWA_GANADO` y `SWA_PERDIDO` por engine y por corte; columna `SWA` en Overview y PDF; una tarjeta "SWA GANADO" por engine; reporte Golden/Infaltable/Anchor; y Fountain9 vs Mother Base.
-- **"Sin recomendación"** usa `SWA_INFORMATIVO`, no "perdido": esas filas tienen opening ≥ demanda, así que normalmente no son quiebres reales.
+- **"Sin recomendación"** tiene `SWA_POTENCIAL = 0`: solo conserva casos sin demanda proyectada o con inventario proyectado suficiente. Un déficit sin ROQ no se maquilla como transferencia cubierta; lo atienden los engines o queda como corte real.
 
 ---
 
