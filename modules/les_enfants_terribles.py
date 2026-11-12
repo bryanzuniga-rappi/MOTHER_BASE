@@ -492,6 +492,8 @@ ENGINE_TOPUP_REGLA_DEMANDA: frozenset[str] = frozenset(
     }
 )
 PLANNING_REASON_FOUNTAIN9 = "FOUNTAIN9 · NAKED ENGINE"
+PLANNING_REASON_PILOT_FOUNTAIN9 = "PILOTO · CANTIDAD FOUNTAIN9 / ORIGEN CODEC"
+PLANNING_REASON_OTACON_F9_PROTECTED = "FOUNTAIN9 PROTEGIDO · OTACON ENGINE"
 PLANNING_REASON_OTACON = "REMANENTE · OTACON ENGINE"
 PLANNING_REASON_MANUAL_FORECAST_ZERO = "MÍNIMO · OTACON ENGINE"
 PLANNING_REASON_AVL = "CUBRIR AVL · SOLIDUS ENGINE"
@@ -1978,6 +1980,8 @@ def enrich_consolidated_plan_read(
 def build_naked_fountain9_rows(
     instructions: list[dict[str, Any]],
     plan_rows: list[dict[str, Any]],
+    *,
+    forced_rule: str = "FOUNTAIN9_DOI",
 ) -> list[dict[str, Any]]:
     """Arma la cola Naked desde Allocation (DOI Based).
 
@@ -2001,13 +2005,62 @@ def build_naked_fountain9_rows(
             {
                 "FORCED_TARGET": int(instruction["QUANTITY"]),
                 "FORCED_SOURCE": instruction.get("WAREHOUSE_SOURCE"),
-                "FORCED_RULE": "FOUNTAIN9_DOI",
+                "FORCED_RULE": forced_rule,
                 "ALLOW_PARTIAL": True,
                 "SOURCE_PRIORITY_CODEC": True,
             }
         )
         naked_rows.append(base)
     return naked_rows
+
+
+def build_pilot_fountain9_codec_rows(
+    instructions: list[dict[str, Any]],
+    plan_rows: list[dict[str, Any]],
+    pilot_store_ids: set[int],
+) -> list[dict[str, Any]]:
+    """Construye la pasada PILOTO: cantidad DOI Fountain9, origen por CODEC.
+
+    La instrucción se consolida por destino-SKU para que DOI multi-source sea
+    un único techo de cantidad. Esta pasada es independiente de Naked: no usa
+    MOV, mínimos ni hardcodes y corre aunque Naked esté apagado.
+    """
+    by_key = {
+        (int(row["WAREHOUSE_DESTINATION"]), int(row["RETAIL_ID"])): row
+        for row in plan_rows
+    }
+    requested: Counter[tuple[int, int]] = Counter()
+    f9_sources: dict[tuple[int, int], set[Any]] = defaultdict(set)
+    for instruction in instructions:
+        destination = int(instruction["WAREHOUSE_DESTINATION"])
+        sku = int(instruction["RETAIL_ID"])
+        key = (destination, sku)
+        if destination not in pilot_store_ids or key not in by_key:
+            continue
+        requested[key] += int(instruction.get("QUANTITY", 0) or 0)
+        source = instruction.get("WAREHOUSE_SOURCE")
+        if source is not None:
+            f9_sources[key].add(source)
+
+    rows: list[dict[str, Any]] = []
+    for (destination, sku), quantity in sorted(requested.items()):
+        if quantity <= 0:
+            continue
+        row = dict(by_key[(destination, sku)])
+        row.update(
+            {
+                "FORCED_TARGET": int(quantity),
+                "FORCED_SOURCE": None,
+                "F9_SOURCES_PILOTO": " | ".join(
+                    str(source) for source in sorted(f9_sources[(destination, sku)])
+                ),
+                "FORCED_RULE": "PILOTO_F9_CANTIDAD_CODEC",
+                "ALLOW_PARTIAL": True,
+                "SOURCE_PRIORITY_CODEC": True,
+            }
+        )
+        rows.append(row)
+    return rows
 
 
 def attach_consolidated_input_to_result(
@@ -3190,6 +3243,8 @@ ENGINE_COVERAGE_BY_CUT: dict[str, tuple[str, str]] = {
 }
 ENGINE_COVERAGE_BY_REASON: dict[str, tuple[str, str]] = {
     PLANNING_REASON_FOUNTAIN9: ("Naked", COVERAGE_FOUNTAIN9),
+    PLANNING_REASON_PILOT_FOUNTAIN9: ("Naked", COVERAGE_FOUNTAIN9),
+    PLANNING_REASON_OTACON_F9_PROTECTED: ("Otacon", COVERAGE_FOUNTAIN9),
     PLANNING_REASON_OTACON: ("Otacon", COVERAGE_FOUNTAIN9),
     PLANNING_REASON_MANUAL_FORECAST_ZERO: ("Otacon", COVERAGE_MINIMUMS),
     PLANNING_REASON_AVL: ("Solidus", COVERAGE_AVL),
@@ -3345,6 +3400,8 @@ def attribute_row(row: dict[str, Any]) -> tuple[str, str]:
         return (SWEEP_ONLY_ENGINE, NO_COVERAGE)
     if rule == "FOUNTAIN9_DOI":
         return ("Naked", COVERAGE_FOUNTAIN9)
+    if rule == "OTACON_F9_PROTEGIDO":
+        return ("Otacon", COVERAGE_FOUNTAIN9)
     if rule in MANUAL_FORECAST_ZERO_RULES:
         return ("Otacon", COVERAGE_MINIMUMS)
     return ("Otacon", COVERAGE_FOUNTAIN9)
@@ -4225,8 +4282,14 @@ def build_fountain9_audit(result, instructions, excluded=None, naked_enabled=Tru
         qty = int(row["QUANTITY"])
         reason = row.get(PLANNING_REASON_COLUMN, "")
         total[key] += qty
-        if reason == PLANNING_REASON_FOUNTAIN9:
-            naked[(row["WAREHOUSE_SOURCE"], *key)] += qty
+        if reason in (
+            PLANNING_REASON_FOUNTAIN9,
+            PLANNING_REASON_PILOT_FOUNTAIN9,
+            PLANNING_REASON_OTACON_F9_PROTECTED,
+        ):
+            # La cantidad Fountain9 se concilia por destino-SKU. El origen F9
+            # es referencia auditada; el origen efectivo puede venir de CODEC.
+            naked[key] += qty
         elif reason in (PLANNING_REASON_OTACON, PLANNING_REASON_MANUAL_FORECAST_ZERO):
             otacon[key] += qty
         else:
@@ -4235,7 +4298,7 @@ def build_fountain9_audit(result, instructions, excluded=None, naked_enabled=Tru
     final_cuts = defaultdict(set)
     for row in result.base_rows:
         key = (int(row["WAREHOUSE_DESTINATION"]), int(row["RETAIL_ID"]))
-        if row.get("REGLA_DEMANDA") == "FOUNTAIN9_DOI":
+        if row.get("REGLA_DEMANDA") in {"FOUNTAIN9_DOI", "OTACON_F9_PROTEGIDO"}:
             cuts[(row.get("F9_SOURCE"), *key)] = row.get("TIPO_DE_CORTE", "")
         if int(row.get("CANTIDAD_FALTANTE", 0) or 0) > 0:
             final_cuts[key].add(str(row.get("TIPO_DE_CORTE", "")))
@@ -4244,7 +4307,8 @@ def build_fountain9_audit(result, instructions, excluded=None, naked_enabled=Tru
         source = instruction.get("WAREHOUSE_SOURCE")
         key = (int(instruction["WAREHOUSE_DESTINATION"]), int(instruction["RETAIL_ID"]))
         requested = int(instruction["QUANTITY"])
-        literal = min(requested, naked[(source, *key)])
+        literal = min(requested, naked[key])
+        naked[key] -= literal
         recovered = min(requested - literal, otacon[key])
         otacon[key] -= recovered
         later = min(requested - literal - recovered, other[key])
@@ -7249,8 +7313,9 @@ def execute_planning(
             pilot_ids_text = ", ".join(map(str, sorted(pilot_store_ids)))
             catalogs.warnings.append(
                 "Regla PILOTO activa: las tiendas "
-                f"{pilot_ids_text} sólo podrán recibir lo ejecutado por Naked/Fountain9; "
-                "los engines posteriores e Insumos quedan bloqueados."
+                f"{pilot_ids_text} recibirán como máximo la cantidad DOI de Fountain9, "
+                "surtida según el orden de orígenes de CODEC incluso si Naked está "
+                "apagado; los engines posteriores e Insumos quedan bloqueados."
             )
         excluded_sku_set = set(excluded_skus or ()) | catalogs.globally_blocked_skus
         manually_excluded_store_ids = set(excluded_store_ids or ())
@@ -7420,15 +7485,48 @@ def execute_planning(
             catalogs,
             config.origin_warehouses,
         )
-        # 1) Naked ejecuta la decisión ya tomada por Fountain9. No usa MOV,
-        # mínimos ni reasignación: Allocation DOI + Source Before Multi Source.
-        naked_rows = build_naked_fountain9_rows(
-            consolidation_summary.get("fountain9_instructions", []),
+        # 1) La cantidad DOI de Fountain9 se protege antes de cualquier
+        # ampliación. Con Naked activo se etiqueta como Naked; con Naked
+        # apagado, Otacon conserva exactamente esa primera pasada y únicamente
+        # cambia el origen mediante la prioridad de CODEC. PILOTO siempre opera
+        # con este último criterio.
+        fountain9_instructions = consolidation_summary.get(
+            "fountain9_instructions", []
+        )
+        non_pilot_plan_rows = [
+            row for row in daily_plan_rows
+            if row["WAREHOUSE_DESTINATION"] not in pilot_store_ids
+        ]
+        naked_rows = []
+        if include_naked_engine:
+            naked_rows = build_naked_fountain9_rows(
+                fountain9_instructions,
+                non_pilot_plan_rows,
+            )
+        elif include_otacon_engine:
+            naked_rows = build_naked_fountain9_rows(
+                fountain9_instructions,
+                non_pilot_plan_rows,
+                forced_rule="OTACON_F9_PROTEGIDO",
+            )
+        pilot_fountain9_rows = build_pilot_fountain9_codec_rows(
+            fountain9_instructions,
             daily_plan_rows,
-        ) if include_naked_engine else []
-        naked_result = engine.plan_transfers(naked_rows, catalogs, config)
+            pilot_store_ids,
+        )
+        naked_result = engine.plan_transfers(
+            naked_rows + pilot_fountain9_rows, catalogs, config
+        )
         for allocation in naked_result.allocation_rows:
-            allocation[PLANNING_REASON_COLUMN] = PLANNING_REASON_FOUNTAIN9
+            allocation[PLANNING_REASON_COLUMN] = (
+                PLANNING_REASON_PILOT_FOUNTAIN9
+                if allocation["WAREHOUSE_DESTINATION"] in pilot_store_ids
+                else (
+                    PLANNING_REASON_FOUNTAIN9
+                    if include_naked_engine
+                    else PLANNING_REASON_OTACON_F9_PROTECTED
+                )
+            )
 
         naked_executed: dict[tuple[int, int], int] = defaultdict(int)
         for allocation in naked_result.allocation_rows:
@@ -7456,9 +7554,9 @@ def execute_planning(
         )
         if not include_otacon_engine:
             engine_plan_rows = []
-        # PILOTO no altera Naked: Fountain9 conserva su ejecución literal.
         # Desde Otacon en adelante no existe residual ni hardcode que pueda
-        # ampliar una tienda piloto.
+        # ampliar una tienda PILOTO: su techo DOI ya se procesó con sourcing
+        # CODEC en la pasada inicial.
         engine_plan_rows = [
             row for row in engine_plan_rows
             if row["WAREHOUSE_DESTINATION"] not in pilot_store_ids
@@ -7993,8 +8091,8 @@ def execute_planning(
             )
 
         # Invariante de seguridad: aunque en el futuro se añada un engine,
-        # una tienda PILOTO nunca puede terminar con una línea posterior a
-        # Naked. Fallar explícitamente es preferible a enviar volumen extra.
+        # una tienda PILOTO nunca puede terminar con una línea posterior a su
+        # pasada DOI Fountain9 con sourcing CODEC.
         pilot_extra_allocations = [
             allocation
             for allocation in result.allocation_rows[len(naked_result.allocation_rows):]
@@ -8002,7 +8100,8 @@ def execute_planning(
         ]
         if pilot_extra_allocations:
             raise RuntimeError(
-                "Invariante PILOTO violada: un engine posterior a Naked intentó "
+                "Invariante PILOTO violada: un engine posterior a la pasada "
+                "Fountain9/CODEC intentó "
                 "asignar volumen a una tienda restringida."
             )
 
@@ -8247,7 +8346,7 @@ def execute_planning(
                 excluded_f9[(destination, sku)] = "CIUDAD_BLOQUEADA"
         fountain9_audit = build_fountain9_audit(
             result, consolidation_summary.get("fountain9_instructions", []),
-            excluded_f9, include_naked_engine,
+            excluded_f9, include_naked_engine or include_otacon_engine,
         )
         result.fountain9_audit = fountain9_audit
         result.build = APP_BUILD
