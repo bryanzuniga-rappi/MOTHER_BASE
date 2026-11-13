@@ -110,6 +110,26 @@ ORIGIN_WAREHOUSES = {
     856: "CEDIS - LOCAL MTY",
     49: "NODO ALTAVISTA",
 }
+CHEDRAUI_PRIORITY_ORIGINS: tuple[int, ...] = (831, 834)
+
+
+def effective_origin_order(
+    origins: Iterable[int],
+    prioritize_chedraui_origins: bool = False,
+) -> tuple[int, ...]:
+    """Devuelve el orden global que consumen todos los engines.
+
+    Con prioridad Chedraui activa, 831 y 834 se fuerzan al frente incluso si
+    no se marcaron en el selector. El resto conserva exactamente el orden de
+    CODEC y se eliminan duplicados para no evaluar un origen dos veces.
+    """
+    selected = tuple(dict.fromkeys(int(origin) for origin in origins))
+    if not prioritize_chedraui_origins:
+        return selected
+    return (
+        *CHEDRAUI_PRIORITY_ORIGINS,
+        *(origin for origin in selected if origin not in CHEDRAUI_PRIORITY_ORIGINS),
+    )
 
 ALEPH_SHEETS = {
     "CATALOGO",
@@ -7121,6 +7141,7 @@ def execute_planning(
     special_doh_target: float = 3.0,
     special_doh_targets: dict[str, float] | None = None,
     solidus_swa_priority: bool = True,
+    prioritize_chedraui_origins: bool = False,
     include_naked_engine: bool = True,
     include_otacon_engine: bool = True,
     cover_fountain9_hardcodes: bool = True,
@@ -7169,6 +7190,7 @@ def execute_planning(
     venom_manual_skus_by_origin: dict[int, set[int]] | None = None,
     venom_only_manual_skus: bool = False,
 ) -> dict[str, Any]:
+    origins = effective_origin_order(origins, prioritize_chedraui_origins)
     # El resultado anterior puede contener cientos de miles de diccionarios y
     # permanecer en session_state mientras se construye la siguiente corrida.
     # Liberarlo antes de abrir el XLSX evita que dos planeaciones convivan en
@@ -7241,6 +7263,11 @@ def execute_planning(
             config,
             copernico_csv_path=copernico_paths,
         )
+        if prioritize_chedraui_origins:
+            catalogs.warnings.append(
+                "Prioridad Chedraui activa: todos los engines consumen primero "
+                "831 y 834; los demás orígenes conservan el orden de CODEC."
+            )
         catalogs.origin_storage_override_enabled = bool(
             apply_origin_storage_override
         )
@@ -11874,6 +11901,24 @@ def render() -> None:
                     "la prioridad, elimina las opciones y vuelve a elegirlas."
                 ),
             )
+            prioritize_chedraui_origins = st.toggle(
+                "Priorizar inventario Chedraui (831 / 834)",
+                value=False,
+                help=(
+                    "Fuerza 831 y 834 al inicio para todos los engines, incluso "
+                    "si no se seleccionaron arriba. Después se respetan los demás "
+                    "orígenes en el orden de CODEC y todas sus restricciones."
+                ),
+            )
+            planning_origins = effective_origin_order(
+                selected_origins,
+                prioritize_chedraui_origins,
+            )
+            if prioritize_chedraui_origins:
+                st.caption(
+                    "Orden efectivo de la corrida: "
+                    + " → ".join(map(str, planning_origins))
+                )
         with right:
             max_tasks = st.number_input(
                 "Máximo de tareas",
@@ -12384,7 +12429,7 @@ def render() -> None:
             )
             st.rerun()
         if include_shalashaska_engine:
-            forced_cities = shalashaska_forced_cities(tuple(selected_origins))
+            forced_cities = shalashaska_forced_cities(tuple(planning_origins))
             city_names = {"CDMX": "Ciudad de México", "GDL": "Guadalajara", "MTY": "Monterrey"}
             if forced_cities:
                 st.markdown(
@@ -12517,8 +12562,8 @@ def render() -> None:
                 liquid_automatic_tail_origins = set(
                     st.multiselect(
                         "Orígenes habilitados para remanentes automáticos",
-                        options=list(selected_origins),
-                        default=list(selected_origins),
+                        options=list(planning_origins),
+                        default=list(planning_origins),
                         format_func=format_origin,
                         disabled=not liquid_automatic_tail,
                         help=(
@@ -12536,9 +12581,9 @@ def render() -> None:
                 )
 
             st.markdown("#### SKUs manuales a agotar por origen")
-            if selected_origins:
+            if planning_origins:
                 sku_columns = st.columns(2)
-                for index, origin in enumerate(selected_origins):
+                for index, origin in enumerate(planning_origins):
                     with sku_columns[index % 2]:
                         liquid_manual_skus_by_origin_raw[origin] = st.text_area(
                             f"{format_origin(origin)}",
@@ -12591,8 +12636,8 @@ def render() -> None:
             with venom_left:
                 venom_origins = st.multiselect(
                     "Orígenes (Venom)",
-                    options=list(selected_origins),
-                    default=list(selected_origins),
+                    options=list(planning_origins),
+                    default=list(planning_origins),
                     format_func=format_origin,
                     help=(
                         "Solo puede usar orígenes ya seleccionados arriba en "
@@ -12925,11 +12970,11 @@ def render() -> None:
         if not uploaded_plans:
             st.error("Primero sube al menos un CSV de planeación.")
             st.stop()
-        if not selected_origins:
+        if not planning_origins:
             st.error("Selecciona al menos un warehouse origen.")
             st.stop()
         origins_needing_copernico = (
-            set(selected_origins) & COPERNICO_REQUIRED_WAREHOUSES
+            set(planning_origins) & COPERNICO_REQUIRED_WAREHOUSES
         )
         if origins_needing_copernico:
             copernico_warehouses = detect_copernico_warehouses(uploaded_copernico)
@@ -12956,7 +13001,7 @@ def render() -> None:
             st.error("Activa al menos un engine para ejecutar la misión.")
             st.stop()
         try:
-            origins = tuple(selected_origins)
+            origins = tuple(planning_origins)
             excluded_skus = parse_manual_skus(excluded_skus_raw)
             liquid_manual_skus_by_origin = {
                 int(origin): parsed
@@ -13103,6 +13148,7 @@ def render() -> None:
                     special_doh_target=float(special_doh_target),
                     special_doh_targets=special_doh_targets,
                     solidus_swa_priority=solidus_swa_priority,
+                    prioritize_chedraui_origins=prioritize_chedraui_origins,
                     include_naked_engine=include_naked_engine,
                     include_otacon_engine=include_otacon_engine,
                     shalashaska_extra_cities=tuple(shalashaska_extra_cities),
