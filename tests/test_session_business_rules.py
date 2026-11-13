@@ -553,23 +553,24 @@ def test_sku_76491_target_updated_to_5000():
     assert m.INSUMO_STOCK_RULES[76491]["target_stock"] == 5_000
 
 
-def test_sku_82126_has_no_city_restriction():
-    assert 82126 not in m.INSUMO_CITY_RESTRICTIONS
+def test_sku_82126_and_90532_have_the_explicit_store_whitelist():
+    expected = frozenset({
+        129, 804, 847, 247, 389, 819, 89, 270, 327, 850, 320, 434,
+        53, 71, 63, 263, 52, 417, 184, 49,
+    })
+    assert m.INSUMO_ALLOWED_DESTINATIONS[82126] == expected
+    assert m.INSUMO_ALLOWED_DESTINATIONS[90532] == expected
 
 
-def test_sku_90532_restricted_to_cdmx_only():
-    assert m.INSUMO_CITY_RESTRICTIONS[90532] == frozenset({"CDMX"})
-
-
-def test_append_insumos_blocks_90532_outside_cdmx(tmp_path):
+def test_append_insumos_blocks_restricted_skus_outside_whitelist(tmp_path):
     catalogs = engine.Catalogs(
         volume_m3={82126: 0.001, 90532: 0.001},
         blocked_products=set(),
         route_cost_blocks=set(),
-        store_priority={100: 1, 200: 1},
+        store_priority={129: 1, 200: 1},
         high_value={},
         rackeados_444=set(),
-        store_capacity={100: 100.0, 200: 100.0},
+        store_capacity={129: 100.0, 200: 100.0},
         copernico_unusable_444={},
         unavailable_stock={},
         stock_base={
@@ -579,7 +580,7 @@ def test_append_insumos_blocks_90532_outside_cdmx(tmp_path):
         golden_infaltables=set(),
         stores={
             444: {"city": "CDMX", "city_norm": "CDMX", "warehouse_name": "O444"},
-            100: {"city": "CDMX", "city_norm": "CDMX", "warehouse_name": "STORE CDMX"},
+            129: {"city": "CDMX", "city_norm": "CDMX", "warehouse_name": "STORE PERMITIDO"},
             200: {"city": "Guadalajara", "city_norm": "GDL", "warehouse_name": "STORE GDL"},
         },
         storage={},
@@ -588,16 +589,16 @@ def test_append_insumos_blocks_90532_outside_cdmx(tmp_path):
     )
     result = SimpleNamespace(
         allocation_rows=[
-            {"WAREHOUSE_DESTINATION": 100, "WAREHOUSE_SOURCE": 444, "RETAIL_ID": 999, "QUANTITY": 1},
+            {"WAREHOUSE_DESTINATION": 129, "WAREHOUSE_SOURCE": 444, "RETAIL_ID": 999, "QUANTITY": 1},
             {"WAREHOUSE_DESTINATION": 200, "WAREHOUSE_SOURCE": 444, "RETAIL_ID": 999, "QUANTITY": 1},
         ],
         base_rows=[],
         warnings=[],
     )
     insumos_rows = [
-        {"WAREHOUSE_DESTINATION": 100, "RETAIL_ID": 90532, "QUANTITY": 1050},
+        {"WAREHOUSE_DESTINATION": 129, "RETAIL_ID": 90532, "QUANTITY": 1050},
         {"WAREHOUSE_DESTINATION": 200, "RETAIL_ID": 90532, "QUANTITY": 1050},
-        {"WAREHOUSE_DESTINATION": 100, "RETAIL_ID": 82126, "QUANTITY": 1050},
+        {"WAREHOUSE_DESTINATION": 129, "RETAIL_ID": 82126, "QUANTITY": 1050},
         {"WAREHOUSE_DESTINATION": 200, "RETAIL_ID": 82126, "QUANTITY": 1050},
     ]
 
@@ -616,11 +617,11 @@ def test_append_insumos_blocks_90532_outside_cdmx(tmp_path):
         for row in written_rows
         if int(row["RETAIL_ID"]) in (82126, 90532)
     }
-    assert (100, 90532) in dest_by_sku  # CDMX: permitido
-    assert (200, 90532) not in dest_by_sku  # GDL: bloqueado
-    assert (100, 82126) in dest_by_sku  # 82126 sin restricción: ambas tiendas
-    assert (200, 82126) in dest_by_sku
-    assert summary["lines_blocked_city_restriction"] == 1
+    assert (129, 90532) in dest_by_sku
+    assert (129, 82126) in dest_by_sku
+    assert (200, 90532) not in dest_by_sku
+    assert (200, 82126) not in dest_by_sku
+    assert summary["lines_blocked_destination_restriction"] == 2
 
 
 # --- Nombre + categoría de producto en entregables (hoja DATA) -----------

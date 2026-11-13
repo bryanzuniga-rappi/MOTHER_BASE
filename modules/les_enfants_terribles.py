@@ -545,11 +545,23 @@ INSUMO_STOCK_RULES = {
     90532: {"name": "INSUMO 90532", "target_stock": 1_050, "moq": 350},
 }
 
-# SKUs de INSUMOS limitados a ciertas ciudades: los renglones de otras tiendas
-# se descartan.
-INSUMO_CITY_RESTRICTIONS: dict[int, frozenset[str]] = {
-    90532: frozenset({"CDMX"}),
+# Restricción dura de destino para insumos sensibles. Es una whitelist que se
+# aplica al construir el BulkCD_444, independiente de lo que llegue desde
+# DATA_TRANSFERS / Aleph: fuera de esta lista, el SKU no puede salir.
+INSUMO_ALLOWED_DESTINATIONS: dict[int, frozenset[int]] = {
+    82126: frozenset({
+        129, 804, 847, 247, 389, 819, 89, 270, 327, 850, 320, 434,
+        53, 71, 63, 263, 52, 417, 184, 49,
+    }),
+    90532: frozenset({
+        129, 804, 847, 247, 389, 819, 89, 270, 327, 850, 320, 434,
+        53, 71, 63, 263, 52, 417, 184, 49,
+    }),
 }
+
+# Se mantiene el mecanismo para futuras reglas de ciudad, pero 82126 y 90532
+# ya no se filtran por ciudad: su whitelist contiene CDMX, GDL y MTY.
+INSUMO_CITY_RESTRICTIONS: dict[int, frozenset[str]] = {}
 
 CITY_DISPLAY_NAMES = {
     "CDMX": "Ciudad de México",
@@ -2826,6 +2838,7 @@ def append_insumos_to_bulk_444(
         "lines_blocked_regional": 0,
         "lines_blocked_schedule": 0,
         "lines_blocked_city_restriction": 0,
+        "lines_blocked_destination_restriction": 0,
         "stock_detail": [],
         "swa_ganado": 0.0,
         "assigned_keys": set(),
@@ -2849,6 +2862,13 @@ def append_insumos_to_bulk_444(
         if destination not in eligible_destinations:
             continue
         if sku in catalogs.excluded_products:
+            continue
+        allowed_destinations = INSUMO_ALLOWED_DESTINATIONS.get(sku)
+        if (
+            allowed_destinations is not None
+            and destination not in allowed_destinations
+        ):
+            summary["lines_blocked_destination_restriction"] += 1
             continue
         store = catalogs.stores.get(destination, {})
         city_norm = store.get("city_norm", "")
