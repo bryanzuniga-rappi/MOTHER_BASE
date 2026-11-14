@@ -134,17 +134,15 @@ def effective_origin_order(
 ALEPH_SHEETS = {
     "CATALOGO",
     "KVI",
-    "SHARE_VENTAS",
     "NO_DISPONIBLE",
     "POR_MERMAR",
     "STOCK",
     "INSUMOS",
     "GOLDEN_INFALTABLES_ANCHOR",
     "TIENDA",
-    "STORAGE",
-    "OWNER",
     "DATA",
     "SWA",
+    "FARMA",
 }
 
 MANUAL_BACKEND_SHEETS = {"TIENDAS_CERRADAS", "PILOTO"}
@@ -164,15 +162,12 @@ REQUIRED_DATABASE_SHEETS = (
     "PILOTO",
     "CATALOGO",
     "KVI",
-    "SHARE_VENTAS",
     "NO_DISPONIBLE",
     "POR_MERMAR",
     "STOCK",
     "INSUMOS",
     "GOLDEN_INFALTABLES_ANCHOR",
     "TIENDA",
-    "STORAGE",
-    "OWNER",
     "SCHEDULE",
     "DATA",
     "SWA",
@@ -219,10 +214,6 @@ SHEET_DESCRIPTIONS = {
         "Override opcional de STORAGE_TYPE por warehouse origen y producto. "
         "WAREHOUSE_ID identifica el origen, nunca la tienda destino."
     ),
-    "OWNER": (
-        "Inventario disponible separado por owner. Para los orígenes 425 y 856 "
-        "divide los entregables de Turbo y Chedraui sin mezclar inventario."
-    ),
     "RACKEADOS": (
         "Productos rackeados por warehouse. Para el origen 444, estos productos "
         "se excluyen completamente del stock utilizable."
@@ -232,8 +223,8 @@ SHEET_DESCRIPTIONS = {
     ),
     "FARMA": (
         "Combinaciones WAREHOUSE_ID + PRODUCT_ID que se bloquean completamente "
-        "cuando la regla «Bloquear FARMA» está activa en CODEC. La conexión de "
-        "IMPORTRANGE se valida en FARMA!A2 porque los encabezados son manuales."
+        "cuando la regla «Bloquear FARMA» está activa en CODEC. Se actualiza "
+        "cada 24 horas desde Aleph."
     ),
     "PILOTO": (
         "Tiendas con ejecución restringida: sólo puede salir lo sugerido por "
@@ -261,7 +252,8 @@ SHEET_DESCRIPTIONS = {
     ),
     "STOCK": (
         "Stock disponible final por warehouse y producto. Es la fuente mandante "
-        "para determinar cuánto puede enviarse."
+        "para determinar cuánto puede enviarse e incluye OWNER_NAME para separar "
+        "los entregables de los orígenes que manejan más de un owner."
     ),
     "INSUMOS": (
         "Cantidades de insumos calculadas automáticamente por Aleph para cada "
@@ -273,15 +265,8 @@ SHEET_DESCRIPTIONS = {
         "INFALTABLES, GOLDEN y ANCHOR con jerarquía estricta en ese orden."
     ),
     "TIENDA": (
-        "Catálogo de warehouses con el nombre y la ciudad de cada tienda o nodo."
-    ),
-    "STORAGE": (
-        "Condición de almacenamiento de cada producto, como room temperature, "
-        "refrigerated o freezer."
-    ),
-    "SHARE_VENTAS": (
-        "Share general de ventas por tienda. Liquid Engine lo utiliza para "
-        "distribuir excedentes cuando ya no puede nivelar por DOH."
+        "Catálogo de warehouses con nombre, ciudad y SHARE. Liquid Engine usa "
+        "SHARE para distribuir excedentes cuando ya no puede nivelar por DOH."
     ),
     "SCHEDULE": (
         "Frecuencia de envío permitida por combinación de WAREHOUSE_ID destino "
@@ -296,7 +281,8 @@ SHEET_DESCRIPTIONS = {
         "etc.). SYNC_ID es la llave que empata con el SKU que usa todo el "
         "resto del sistema (RETAIL_ID de Fountain9, PRODUCT_ID de CATALOGO). "
         "Se usa para darle nombre y categoría legibles a reportes y "
-        "entregables, no para ninguna regla de negocio."
+        "entregables. TEMPERATURE_NAME también sustituye a la antigua hoja "
+        "STORAGE para definir el ambiente de cada SKU."
     ),
     "SWA": (
         "Sales Weighted Availability por WAREHOUSE_ID/PRODUCT_ID "
@@ -315,9 +301,7 @@ ALEPH_MAX_AGE_HOURS = {
     "CATALOGO": 24.0,
     "GOLDEN_INFALTABLES_ANCHOR": 24.0,
     "TIENDA": 24.0,
-    "STORAGE": 24.0,
-    "SHARE_VENTAS": 24.0,
-    "OWNER": 1.2,
+    "FARMA": 24.0,
     "DATA": 24.0,
     "SWA": 1.2,
 }
@@ -1051,8 +1035,6 @@ def database_sheet_type(sheet_name: str) -> str:
 def database_sheet_control(sheet_name: str) -> str:
     if sheet_name in ALEPH_SHEETS:
         return "C7"
-    if sheet_name == "FARMA":
-        return "A2"
     return "A1"
 
 
@@ -1401,12 +1383,6 @@ def inspect_database(
                     )
                 else:
                     detail = "A1 DEBE SER WAREHOUSE_ID"
-            elif sheet_name == "FARMA":
-                # A1 siempre es un encabezado escrito manualmente. El #REF! de
-                # IMPORTRANGE aparece en A2; revisar A1 daría falso positivo.
-                displayed_value = sheet["A2"].value
-                healthy = not contains_ref_error(displayed_value)
-                detail = "SIN #REF!" if healthy else "#REF! DETECTADO EN A2"
             else:
                 displayed_value = sheet["A1"].value
                 healthy = not contains_ref_error(displayed_value)
@@ -3338,7 +3314,7 @@ ENGINE_INFO: dict[str, dict[str, Any]] = {
             "Envía a tiendas activadas por Naked, Otacon o Solidus desde el mismo origen; los mínimos solos no activan una ruta.",
             "Solo a las ciudades que cubre cada origen (444, 811, 831 y 834: CDMX; 425: Guadalajara; 856 y 49: Monterrey) más las que agregues.",
             "Puede evacuar solo un porcentaje de la merma y excluir categorías sensibles (Huevo).",
-            "Reparte parejo por ADU y luego por SHARE_VENTAS; POR_MERMAR no sustituye al stock final.",
+            "Reparte parejo por ADU y luego por SHARE de TIENDA; POR_MERMAR no sustituye al stock final.",
         ),
     },
     "Solidus": {
@@ -3376,7 +3352,7 @@ ENGINE_INFO: dict[str, dict[str, Any]] = {
         "how": (
             "Candidatos: SKUs manuales por origen y remanentes bajo el umbral.",
             "Solo envía a tiendas que ya recibieron unidades de otro engine en la corrida; no exige el SKU en CATALOGO.",
-            "Nivela con el ADU de CATALOGO hasta 14 DOH y reparte por SHARE_VENTAS sin rebasar stock, capacidad ni tareas.",
+            "Nivela con el ADU de CATALOGO hasta 14 DOH y reparte por SHARE de TIENDA sin rebasar stock, capacidad ni tareas.",
         ),
     },
     "Venom": {
@@ -12040,8 +12016,7 @@ def render() -> None:
                 value=True,
                 help=(
                     "Bloquea por completo cada combinación WAREHOUSE_ID + PRODUCT_ID "
-                    "de la hoja FARMA. Si FARMA!A2 tiene #REF!, se avisa y no se "
-                    "interpreta la hoja."
+                    "de la hoja FARMA, actualizada por Aleph cada 24 horas."
                 ),
             )
 

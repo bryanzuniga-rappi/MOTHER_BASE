@@ -2,7 +2,7 @@
 
 Posición: después de Solidus, antes de Venom.
 Entrada: remanente por origen-SKU (cola automática por umbral o SKUs manuales)
-y SHARE_VENTAS.
+y SHARE de TIENDA.
 Salida: filas de asignación solo a tiendas que ya recibieron unidades en la corrida.
 Regla clave: no rebasa stock, capacidad ni tareas globales.
 """
@@ -62,23 +62,23 @@ def parse_manual_skus(raw_value: str) -> set[int]:
 
 
 def load_store_shares(database_path: Path) -> dict[int, float]:
-    """Lee SHARE_VENTAS; acepta proporciones o porcentajes como ponderadores."""
+    """Lee SHARE de TIENDA; acepta proporciones o porcentajes como ponderadores."""
     workbook = openpyxl.load_workbook(database_path, read_only=True, data_only=True)
     try:
-        if "SHARE_VENTAS" not in workbook.sheetnames:
+        if "TIENDA" not in workbook.sheetnames:
             raise ValueError(
-                "Liquid Engine requiere la pestaña SHARE_VENTAS con las columnas "
+                "Liquid Engine requiere la pestaña TIENDA con las columnas "
                 "WAREHOUSE_ID y SHARE."
             )
         shares: dict[int, float] = {}
         for row in engine.iter_sheet_records(
             workbook,
-            "SHARE_VENTAS",
+            "TIENDA",
             ["WAREHOUSE_ID", "SHARE"],
         ):
             warehouse = engine.to_id(
                 row["WAREHOUSE_ID"],
-                "SHARE_VENTAS.WAREHOUSE_ID",
+                "TIENDA.WAREHOUSE_ID",
                 True,
             )
             if warehouse is None:
@@ -88,12 +88,12 @@ def load_store_shares(database_path: Path) -> dict[int, float]:
                 shares[warehouse], share, abs_tol=1e-12
             ):
                 raise ValueError(
-                    "SHARE_VENTAS tiene valores distintos para el warehouse "
+                    "TIENDA tiene valores distintos para el warehouse "
                     f"{warehouse}."
                 )
             shares[warehouse] = share
         if not shares:
-            raise ValueError("SHARE_VENTAS no contiene shares válidos.")
+            raise ValueError("TIENDA no contiene shares válidos.")
         return shares
     finally:
         workbook.close()

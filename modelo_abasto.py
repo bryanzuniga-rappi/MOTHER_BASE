@@ -310,17 +310,20 @@ def iter_product_catalog_records(workbook) -> Iterator[dict[str, Any]]:
     """
     if "DATA" not in workbook.sheetnames:
         return
+    _, positions = find_header_row(workbook["DATA"], ["SYNC_ID", "PRODUCT_NAME"])
+    selected = [
+        "SYNC_ID",
+        "PRODUCT_NAME",
+        "MACROCATEGORY_NAME",
+        "CATEGORY_NAME",
+        "SUBCATEGORY_NAME",
+    ]
+    # DATA sustituye a la antigua hoja STORAGE. TEMPERATURE_NAME es la
+    # clasificación de ambiente mandante que utiliza el ruteo.
+    if normalize_header("TEMPERATURE_NAME") in positions:
+        selected.append("TEMPERATURE_NAME")
     yield from iter_sheet_records(
-        workbook,
-        "DATA",
-        ["SYNC_ID", "PRODUCT_NAME"],
-        [
-            "SYNC_ID",
-            "PRODUCT_NAME",
-            "MACROCATEGORY_NAME",
-            "CATEGORY_NAME",
-            "SUBCATEGORY_NAME",
-        ],
+        workbook, "DATA", ["SYNC_ID", "PRODUCT_NAME"], selected
     )
 
 
@@ -748,26 +751,17 @@ def load_catalogs(
         }
         globally_blocked_skus.discard(None)
 
-        # FARMA tiene encabezados manuales en la fila 1. La disponibilidad del
-        # IMPORTRANGE se valida exclusivamente en A2: A1 nunca debe usarse
-        # como señal de #REF! porque siempre contiene WAREHOUSE_ID.
+        # FARMA ahora se publica por Aleph. Se lee con el mismo detector de
+        # encabezados que las demás hojas Aleph (la cabecera puede estar debajo
+        # de los metadatos de la consulta).
         farma_block_pairs: set[tuple[int, int]] = set()
-        if "FARMA" in workbook.sheetnames:
-            farma_a2 = workbook["FARMA"].cell(row=2, column=1).value
-            if clean_text(farma_a2).upper() == "#REF!":
-                warnings.append(
-                    "FARMA no se aplicó: el IMPORTRANGE tiene #REF! en FARMA!A2."
-                )
-            else:
-                for row in iter_sheet_records(
-                    workbook, "FARMA", ["WAREHOUSE_ID", "PRODUCT_ID"]
-                ):
-                    destination = to_id(
-                        row["WAREHOUSE_ID"], "FARMA.WAREHOUSE_ID", True
-                    )
-                    sku = to_id(row["PRODUCT_ID"], "FARMA.PRODUCT_ID", True)
-                    if destination is not None and sku is not None:
-                        farma_block_pairs.add((destination, sku))
+        for row in iter_sheet_records(
+            workbook, "FARMA", ["WAREHOUSE_ID", "PRODUCT_ID"]
+        ):
+            destination = to_id(row["WAREHOUSE_ID"], "FARMA.WAREHOUSE_ID", True)
+            sku = to_id(row["PRODUCT_ID"], "FARMA.PRODUCT_ID", True)
+            if destination is not None and sku is not None:
+                farma_block_pairs.add((destination, sku))
 
         route_cost_blocks: set[tuple[int, int]] = set()
         for row in iter_sheet_records(
@@ -975,9 +969,13 @@ def load_catalogs(
         stock_selected = list(stock_required)
         if has_incoming_column:
             stock_selected.append(incoming_column)
+        has_owner_column = normalize_header("OWNER_NAME") in stock_header_positions
+        if has_owner_column:
+            stock_selected.append("OWNER_NAME")
 
         stock_base: dict[tuple[int, int], float] = {}
         incoming_stock: dict[tuple[int, int], float] = defaultdict(float)
+        owner_stock: dict[tuple[int, int, str], int] = defaultdict(int)
         for row in iter_sheet_records(
             workbook, "STOCK", stock_required, stock_selected
         ):
@@ -991,21 +989,7 @@ def load_catalogs(
                 incoming_stock[(warehouse, sku)] += max(
                     to_float(row.get(incoming_column)), 0.0
                 )
-
-        owner_stock: dict[tuple[int, int, str], int] = defaultdict(int)
-        for row in iter_sheet_records(
-            workbook,
-            "OWNER",
-            [
-                "WAREHOUSE_ID",
-                "PRODUCT_ID",
-                "OWNER_NAME",
-                "STOCK_DISPONIBLE_FINAL",
-            ],
-        ):
-            source = to_id(row["WAREHOUSE_ID"], "OWNER.WAREHOUSE_ID", True)
-            sku = to_id(row["PRODUCT_ID"], "OWNER.PRODUCT_ID", True)
-            owner = normalize_header(row["OWNER_NAME"])
+            owner = normalize_header(row.get("OWNER_NAME"))
             quantity = int(
                 math.floor(
                     max(to_float(row["STOCK_DISPONIBLE_FINAL"], 0.0), 0.0)
@@ -1013,12 +997,12 @@ def load_catalogs(
                 )
             )
             if (
-                source in OWNER_SPLIT_SOURCES
+                warehouse in OWNER_SPLIT_SOURCES
                 and sku is not None
                 and owner
                 and quantity > 0
             ):
-                owner_stock[(source, sku, owner)] += quantity
+                owner_stock[(warehouse, sku, owner)] += quantity
 
         # Campo legado conservado vacío para compatibilidad de objetos Catalogs.
         golden_infaltables: set[tuple[int, str]] = set()
@@ -1122,17 +1106,6 @@ def load_catalogs(
                     continue
                 pilot_store_ids.add(destination)
 
-        storage: dict[int, str] = {}
-        for row in iter_sheet_records(
-            workbook,
-            "STORAGE",
-            ["PRODUCT_ID", "STORAGE_NAME"],
-        ):
-            sku = to_id(row["PRODUCT_ID"], "STORAGE.PRODUCT_ID", True)
-            if sku is not None:
-                value = clean_text(row["STORAGE_NAME"]) or "UNKNOWN"
-                put_unique(storage, sku, value, warnings, "STORAGE", "first")
-
         # Cada par destino-origen de SCHEDULE es independiente y opcional; la
         # ausencia de la hoja en sí no bloquea la carga (ver iter_schedule_records).
         schedule_days: dict[tuple[int, int], frozenset[str]] = {}
@@ -1177,6 +1150,7 @@ def load_catalogs(
         # Catálogo maestro de producto (hoja DATA): nombre y categoría por
         # SYNC_ID, solo para reportes — nunca participa en asignación.
         product_catalog: dict[int, dict[str, str]] = {}
+        storage: dict[int, str] = {}
         for row in iter_product_catalog_records(workbook):
             sku = to_id(row["SYNC_ID"], "DATA.SYNC_ID", True)
             if sku is None:
@@ -1195,6 +1169,7 @@ def load_catalogs(
                     )
                 continue
             product_catalog[sku] = info
+            storage[sku] = clean_text(row.get("TEMPERATURE_NAME")) or "UNKNOWN"
 
         swa_potential_gain: dict[tuple[int, int], float] = {}
         for row in iter_swa_records(workbook):
