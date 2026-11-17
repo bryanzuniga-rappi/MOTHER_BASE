@@ -12299,7 +12299,7 @@ def render() -> None:
             with avl_left:
                 include_avl_fill = st.toggle(
                     "Cubrir quiebres del catálogo (AVL)",
-                    value=False,
+                    value=True,
                     help=(
                         "Busca productos del catálogo con stock final cero y utiliza "
                         "exclusivamente tareas sobrantes."
@@ -12308,7 +12308,7 @@ def render() -> None:
             with preventive_mid:
                 include_preventive_fill = st.toggle(
                     "Blindar posibles quiebres del catálogo",
-                    value=False,
+                    value=True,
                     help=(
                         "Busca inventarios positivos menores a 1 DOH o a 3 unidades, "
                         "sin recomendación positiva de Fountain9."
@@ -12317,7 +12317,7 @@ def render() -> None:
             with no_f9_right:
                 include_no_fountain9_coverage = st.toggle(
                     "Cubrir quiebres sin recomendación positiva de Fountain9",
-                    value=False,
+                    value=True,
                     help=(
                         "Corre al final de Solidus, con lo que sobró después de "
                         "AVL/Preventivo/Refuerzo. Cubre SKUs de catálogo con stock "
@@ -12357,7 +12357,7 @@ def render() -> None:
                 with column:
                     bucket_on = st.toggle(
                         toggle_label,
-                        value=False,
+                        value=True,
                         key=f"mb_special_{bucket.lower()}_on",
                         help=(
                             f"Sube el DOH de los {plural} que estén por debajo de su "
