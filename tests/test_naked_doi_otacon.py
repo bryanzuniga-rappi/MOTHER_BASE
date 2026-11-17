@@ -104,18 +104,22 @@ def test_otacon_protects_fountain9_quantity_when_naked_is_off():
     assert run["fountain9_audit"][0]["NAKED_EJECUTADO"] == 3
 
 
-def test_chedraui_priority_forces_831_and_834_for_all_engine_ordering():
-    """El toggle debe anteponer 831/834 incluso si CODEC sólo marcó 444."""
-    assert m.effective_origin_order((444,), True) == (831, 834, 444)
+def test_chedraui_priority_uses_only_selected_origins_from_its_sheet():
+    """El toggle no puede inyectar orígenes que CODEC no seleccionó."""
+    assert m.effective_origin_order((444,), True, (831, 834)) == (444,)
+    assert m.effective_origin_order((444, 834, 831), True, (831, 834)) == (
+        834, 831, 444,
+    )
 
     raw_database = build_workbook_bytes(
         {100: "CDMX"}, [10], origin=444, origin_stock=0
     )
     workbook = openpyxl.load_workbook(io.BytesIO(raw_database))
     workbook["TIENDA"].append(["CDMX", 831, "S831"])
-    workbook["TIENDA"].append(["CDMX", 834, "S834"])
     workbook["STOCK"].append([831, 10, 3, 0])
-    workbook["STOCK"].append([834, 10, 0, 0])
+    cedis_chedraui = workbook["CEDIS_CHEDRAUI"]
+    cedis_chedraui.append([831])
+    cedis_chedraui.append([834])
     database = io.BytesIO()
     workbook.save(database)
     workbook.close()
@@ -124,7 +128,7 @@ def test_chedraui_priority_forces_831_and_834_for_all_engine_ordering():
         uploaded_copernico=[],
         uploaded_plans=[FakeUpload("fountain9.csv", _plan(3, 444, 3))],
         database_bytes=database.getvalue(),
-        origins=(444,), max_tasks=100, run_date=date(2026, 10, 6),
+        origins=(444, 831), max_tasks=100, run_date=date(2026, 10, 6),
         prioritize_chedraui_origins=True,
         include_insumos=False, enable_closed_stores_rule=False,
         block_fruver_811=False, block_off_schedule_shipments=False,
@@ -134,7 +138,7 @@ def test_chedraui_priority_forces_831_and_834_for_all_engine_ordering():
 
     assert len(rows) == 1
     assert int(rows[0]["WAREHOUSE_SOURCE"]) == 831
-    assert run["origins"] == [831, 834, 444]
+    assert run["origins"] == [831, 444]
     assert any("Prioridad Chedraui activa" in warning for warning in run["warnings"])
 
 

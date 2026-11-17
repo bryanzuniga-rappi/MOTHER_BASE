@@ -110,26 +110,58 @@ ORIGIN_WAREHOUSES = {
     856: "CEDIS - LOCAL MTY",
     49: "NODO ALTAVISTA",
 }
-CHEDRAUI_PRIORITY_ORIGINS: tuple[int, ...] = (831, 834)
-
-
 def effective_origin_order(
     origins: Iterable[int],
     prioritize_chedraui_origins: bool = False,
+    chedraui_origins: Iterable[int] = (),
 ) -> tuple[int, ...]:
     """Devuelve el orden global que consumen todos los engines.
 
-    Con prioridad Chedraui activa, 831 y 834 se fuerzan al frente incluso si
-    no se marcaron en el selector. El resto conserva exactamente el orden de
-    CODEC y se eliminan duplicados para no evaluar un origen dos veces.
+    Con prioridad Chedraui activa, adelanta exclusivamente los orígenes que
+    están tanto en CODEC como en CEDIS_CHEDRAUI. El resto conserva exactamente
+    el orden de CODEC y se eliminan duplicados para no evaluar un origen dos
+    veces. Nunca agrega un origen que no se seleccionó en CODEC.
     """
     selected = tuple(dict.fromkeys(int(origin) for origin in origins))
     if not prioritize_chedraui_origins:
         return selected
+    chedraui_set = {int(origin) for origin in chedraui_origins}
+    prioritized = tuple(origin for origin in selected if origin in chedraui_set)
     return (
-        *CHEDRAUI_PRIORITY_ORIGINS,
-        *(origin for origin in selected if origin not in CHEDRAUI_PRIORITY_ORIGINS),
+        *prioritized,
+        *(origin for origin in selected if origin not in chedraui_set),
     )
+
+
+def configured_chedraui_origins(workbook_bytes: bytes | None) -> tuple[int, ...]:
+    """Lee CEDIS_CHEDRAUI sin asumir IDs ni alterar la selección de CODEC."""
+    if not workbook_bytes:
+        return ()
+    workbook = openpyxl.load_workbook(
+        io.BytesIO(workbook_bytes), read_only=True, data_only=True
+    )
+    try:
+        if "CEDIS_CHEDRAUI" not in workbook.sheetnames:
+            return ()
+        sheet = workbook["CEDIS_CHEDRAUI"]
+        if engine.normalize_header(sheet["A1"].value) != "WAREHOUSE_ID":
+            raise ValueError(
+                "CEDIS_CHEDRAUI!A1 debe contener el encabezado WAREHOUSE_ID."
+            )
+        configured: list[int] = []
+        for row_number, (value,) in enumerate(
+            sheet.iter_rows(min_row=2, max_col=1, values_only=True), start=2
+        ):
+            if not engine.clean_text(value):
+                continue
+            warehouse = engine.to_id(
+                value, f"CEDIS_CHEDRAUI fila {row_number}", True
+            )
+            if warehouse is not None and warehouse not in configured:
+                configured.append(warehouse)
+        return tuple(configured)
+    finally:
+        workbook.close()
 
 ALEPH_SHEETS = {
     "CATALOGO",
@@ -145,7 +177,7 @@ ALEPH_SHEETS = {
     "FARMA",
 }
 
-MANUAL_BACKEND_SHEETS = {"TIENDAS_CERRADAS", "PILOTO"}
+MANUAL_BACKEND_SHEETS = {"TIENDAS_CERRADAS", "PILOTO", "CEDIS_CHEDRAUI"}
 
 REQUIRED_DATABASE_SHEETS = (
     "TIENDAS_CERRADAS",
@@ -160,6 +192,7 @@ REQUIRED_DATABASE_SHEETS = (
     "CAP_RECIBO",
     "FARMA",
     "PILOTO",
+    "CEDIS_CHEDRAUI",
     "CATALOGO",
     "KVI",
     "NO_DISPONIBLE",
@@ -231,6 +264,11 @@ SHEET_DESCRIPTIONS = {
         "Fountain9/Naked. Otacon, Solidus, Shalashaska, Liquid, Venom, "
         "Kazuhira e Insumos no pueden agregar volumen. Una tienda por fila "
         "en la columna WAREHOUSE_ID."
+    ),
+    "CEDIS_CHEDRAUI": (
+        "Lista manual de warehouses origen que pertenecen a Chedraui. Cuando "
+        "se activa la prioridad de inventario Chedraui, sólo los orígenes de "
+        "esta lista que también estén seleccionados en CODEC pasan al frente."
     ),
     "CATALOGO": (
         "Catálogo de surtido por tienda y producto con su ADU. Se utiliza para "
@@ -7186,7 +7224,15 @@ def execute_planning(
     venom_manual_skus_by_origin: dict[int, set[int]] | None = None,
     venom_only_manual_skus: bool = False,
 ) -> dict[str, Any]:
-    origins = effective_origin_order(origins, prioritize_chedraui_origins)
+    chedraui_origins = configured_chedraui_origins(database_bytes)
+    origins = effective_origin_order(
+        origins,
+        prioritize_chedraui_origins,
+        chedraui_origins,
+    )
+    prioritized_chedraui_origins = tuple(
+        origin for origin in origins if origin in set(chedraui_origins)
+    )
     # El resultado anterior puede contener cientos de miles de diccionarios y
     # permanecer en session_state mientras se construye la siguiente corrida.
     # Liberarlo antes de abrir el XLSX evita que dos planeaciones convivan en
@@ -7259,10 +7305,16 @@ def execute_planning(
             config,
             copernico_csv_path=copernico_paths,
         )
-        if prioritize_chedraui_origins:
+        if prioritize_chedraui_origins and prioritized_chedraui_origins:
             catalogs.warnings.append(
                 "Prioridad Chedraui activa: todos los engines consumen primero "
-                "831 y 834; los demás orígenes conservan el orden de CODEC."
+                + ", ".join(map(str, prioritized_chedraui_origins))
+                + "; los demás orígenes conservan el orden de CODEC."
+            )
+        elif prioritize_chedraui_origins:
+            catalogs.warnings.append(
+                "Prioridad Chedraui activa, pero ningún origen seleccionado en "
+                "CODEC aparece en CEDIS_CHEDRAUI. Se conservó el orden de CODEC."
             )
         catalogs.origin_storage_override_enabled = bool(
             apply_origin_storage_override
@@ -11871,6 +11923,7 @@ def render() -> None:
     default_origins = [
         origin for origin in DEFAULT_ORIGINS if origin in ORIGIN_WAREHOUSES
     ]
+    chedraui_origins = configured_chedraui_origins(database_bytes)
 
     blockable_city_options = list(city_labels)
     if is_raiden:
@@ -11898,17 +11951,19 @@ def render() -> None:
                 ),
             )
             prioritize_chedraui_origins = st.toggle(
-                "Priorizar inventario Chedraui (831 / 834)",
+                "Priorizar inventario Chedraui",
                 value=False,
                 help=(
-                    "Fuerza 831 y 834 al inicio para todos los engines, incluso "
-                    "si no se seleccionaron arriba. Después se respetan los demás "
-                    "orígenes en el orden de CODEC y todas sus restricciones."
+                    "Adelanta para todos los engines sólo los orígenes incluidos "
+                    "en CEDIS_CHEDRAUI que también seleccionaste arriba. No agrega "
+                    "orígenes que no estén en CODEC. Después se respetan los demás "
+                    "orígenes, sus restricciones y su orden relativo."
                 ),
             )
             planning_origins = effective_origin_order(
                 selected_origins,
                 prioritize_chedraui_origins,
+                chedraui_origins,
             )
             if prioritize_chedraui_origins:
                 st.caption(

@@ -25,7 +25,7 @@ def _database_bytes(*, farma_updated_at=None):
                 farma_updated_at if name == "FARMA" and farma_updated_at is not None
                 else datetime(2026, 11, 3, 9, 0),
             )
-        elif name in {"TIENDAS_CERRADAS", "PILOTO"}:
+        elif name in {"TIENDAS_CERRADAS", "PILOTO", "CEDIS_CHEDRAUI"}:
             sheet.append(["WAREHOUSE_ID"])
             sheet.append([123])
         else:
