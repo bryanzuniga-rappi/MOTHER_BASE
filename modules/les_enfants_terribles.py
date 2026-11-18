@@ -133,8 +133,26 @@ def effective_origin_order(
     )
 
 
+def configured_chedraui_origins_from_sheet(sheet) -> tuple[int, ...]:
+    """Extrae CEDIS_CHEDRAUI desde un workbook que ya está abierto."""
+    if engine.normalize_header(sheet["A1"].value) != "WAREHOUSE_ID":
+        raise ValueError(
+            "CEDIS_CHEDRAUI!A1 debe contener el encabezado WAREHOUSE_ID."
+        )
+    configured: list[int] = []
+    for row_number, (value,) in enumerate(
+        sheet.iter_rows(min_row=2, max_col=1, values_only=True), start=2
+    ):
+        if not engine.clean_text(value):
+            continue
+        warehouse = engine.to_id(value, f"CEDIS_CHEDRAUI fila {row_number}", True)
+        if warehouse is not None and warehouse not in configured:
+            configured.append(warehouse)
+    return tuple(configured)
+
+
 def configured_chedraui_origins(workbook_bytes: bytes | None) -> tuple[int, ...]:
-    """Lee CEDIS_CHEDRAUI sin asumir IDs ni alterar la selección de CODEC."""
+    """Fallback para ejecuciones directas fuera del recurso cacheado."""
     if not workbook_bytes:
         return ()
     workbook = openpyxl.load_workbook(
@@ -143,23 +161,7 @@ def configured_chedraui_origins(workbook_bytes: bytes | None) -> tuple[int, ...]
     try:
         if "CEDIS_CHEDRAUI" not in workbook.sheetnames:
             return ()
-        sheet = workbook["CEDIS_CHEDRAUI"]
-        if engine.normalize_header(sheet["A1"].value) != "WAREHOUSE_ID":
-            raise ValueError(
-                "CEDIS_CHEDRAUI!A1 debe contener el encabezado WAREHOUSE_ID."
-            )
-        configured: list[int] = []
-        for row_number, (value,) in enumerate(
-            sheet.iter_rows(min_row=2, max_col=1, values_only=True), start=2
-        ):
-            if not engine.clean_text(value):
-                continue
-            warehouse = engine.to_id(
-                value, f"CEDIS_CHEDRAUI fila {row_number}", True
-            )
-            if warehouse is not None and warehouse not in configured:
-                configured.append(warehouse)
-        return tuple(configured)
+        return configured_chedraui_origins_from_sheet(workbook["CEDIS_CHEDRAUI"])
     finally:
         workbook.close()
 
@@ -1362,6 +1364,7 @@ def inspect_database(
     rows: list[dict[str, Any]] = []
     city_labels: dict[str, str] = {}
     store_labels: dict[int, str] = {}
+    chedraui_origins: tuple[int, ...] = ()
     # La validación se ejecutaba con dos libros XLSX abiertos en paralelo
     # (fórmulas + valores), duplicando el pico de memoria antes de planear.
     # Abrimos la vista calculada y solo hacemos fallback a fórmulas si una
@@ -1465,6 +1468,18 @@ def inspect_database(
                 # El estado de la base ya marcará la fuente inválida. No se
                 # pierde la pantalla completa sólo por no poder poblar filtros.
                 pass
+        if include_locations and "CEDIS_CHEDRAUI" in workbook.sheetnames:
+            try:
+                # El libro ya está abierto para validar la base. Extraer esta
+                # lista pequeña aquí evita reabrir el XLSX completo en cada
+                # rerun sólo para renderizar CODEC.
+                chedraui_origins = configured_chedraui_origins_from_sheet(
+                    workbook["CEDIS_CHEDRAUI"]
+                )
+            except ValueError:
+                # La tarjeta de salud ya marca el encabezado inválido; no
+                # impedimos que la interfaz muestre ese diagnóstico.
+                chedraui_origins = ()
     finally:
         workbook.close()
         if formula_workbook is not None:
@@ -1478,6 +1493,7 @@ def inspect_database(
         "error_count": len(rows) - healthy_count,
         "rows": rows,
         "manifest": manifest,
+        "chedraui_origins": chedraui_origins,
     }
     if not include_locations:
         return health
@@ -2222,6 +2238,7 @@ def load_database_resource() -> dict[str, Any]:
             "health": health,
             "city_labels": city_labels,
             "store_labels": store_labels,
+            "chedraui_origins": tuple(health.get("chedraui_origins", ())),
             "error": "",
         }
     except Exception as exc:
@@ -2231,6 +2248,7 @@ def load_database_resource() -> dict[str, Any]:
             "health": None,
             "city_labels": {},
             "store_labels": {},
+            "chedraui_origins": (),
             "error": str(exc),
         }
 
@@ -7176,6 +7194,7 @@ def execute_planning(
     special_doh_targets: dict[str, float] | None = None,
     solidus_swa_priority: bool = True,
     prioritize_chedraui_origins: bool = False,
+    chedraui_origins: Iterable[int] | None = None,
     include_naked_engine: bool = True,
     include_otacon_engine: bool = True,
     cover_fountain9_hardcodes: bool = True,
@@ -7224,7 +7243,12 @@ def execute_planning(
     venom_manual_skus_by_origin: dict[int, set[int]] | None = None,
     venom_only_manual_skus: bool = False,
 ) -> dict[str, Any]:
-    chedraui_origins = configured_chedraui_origins(database_bytes)
+    # La interfaz pasa esta lista desde el recurso cacheado de la base. El
+    # fallback sólo existe para llamadas directas de pruebas o integraciones.
+    if chedraui_origins is None:
+        chedraui_origins = configured_chedraui_origins(database_bytes)
+    else:
+        chedraui_origins = tuple(dict.fromkeys(int(origin) for origin in chedraui_origins))
     origins = effective_origin_order(
         origins,
         prioritize_chedraui_origins,
@@ -11792,6 +11816,7 @@ def render() -> None:
     database_health = database_state["health"]
     city_labels = database_state["city_labels"]
     store_labels = database_state["store_labels"]
+    chedraui_origins = database_state["chedraui_origins"]
     database_error = database_state["error"]
 
     if database_health is not None:
@@ -11923,7 +11948,6 @@ def render() -> None:
     default_origins = [
         origin for origin in DEFAULT_ORIGINS if origin in ORIGIN_WAREHOUSES
     ]
-    chedraui_origins = configured_chedraui_origins(database_bytes)
 
     blockable_city_options = list(city_labels)
     if is_raiden:
@@ -13199,6 +13223,7 @@ def render() -> None:
                     special_doh_targets=special_doh_targets,
                     solidus_swa_priority=solidus_swa_priority,
                     prioritize_chedraui_origins=prioritize_chedraui_origins,
+                    chedraui_origins=chedraui_origins,
                     include_naked_engine=include_naked_engine,
                     include_otacon_engine=include_otacon_engine,
                     shalashaska_extra_cities=tuple(shalashaska_extra_cities),
