@@ -103,6 +103,47 @@ def test_tasks_cut_a_second_instruction_but_not_an_existing_route():
     assert "TAREAS" in result.base_rows[1]["TIPO_DE_CORTE"]
 
 
+def test_task_cut_maximizes_swa_before_operating_priority():
+    """Con presupuesto escaso, el mayor SWA debe ganar aunque tenga menor
+    prioridad operativa en el orden histórico.
+    """
+    low_swa = row(3, destination=100)
+    high_swa = row(3, destination=200)
+    high_swa["RETAIL_ID"] = 20
+    high_swa["INPUT_ROW"] = 2
+    cat = catalogs(
+        stock_base={(444, 10): 3, (444, 20): 3},
+        store_priority={100: 1, 200: 2},
+        swa_potential_gain={(100, 10): 0.1, (200, 20): 1.0},
+    )
+
+    result = engine.plan_transfers(
+        [low_swa, high_swa], cat, engine.Config(origin_warehouses=(444,), max_tasks=1)
+    )
+
+    assert [(row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"])
+            for row in result.allocation_rows] == [(200, 20)]
+    assert "TAREAS" in result.base_rows[1]["TIPO_DE_CORTE"]
+
+
+def test_without_task_pressure_keeps_operating_priority_order():
+    low_swa = row(3, destination=100)
+    high_swa = row(3, destination=200)
+    high_swa["RETAIL_ID"] = 20
+    high_swa["INPUT_ROW"] = 2
+    cat = catalogs(
+        stock_base={(444, 10): 3, (444, 20): 3},
+        store_priority={100: 1, 200: 2},
+        swa_potential_gain={(100, 10): 0.1, (200, 20): 1.0},
+    )
+
+    result = engine.plan_transfers(
+        [low_swa, high_swa], cat, engine.Config(origin_warehouses=(444,), max_tasks=2)
+    )
+
+    assert [row["WAREHOUSE_DESTINATION"] for row in result.base_rows] == [100, 200]
+
+
 @pytest.mark.parametrize("source", [425, 856])
 def test_owner_is_reserved_before_otacon_and_task_limit(source):
     cat = catalogs(stock_base={(source, 10): 20},

@@ -1895,8 +1895,41 @@ def plan_transfers(
         )
         prepared.append(enriched)
 
+    # El límite de tareas es global y cada combinación origen-destino-SKU que
+    # se abre consume una. Cuando el presupuesto podría agotarse, el orden de
+    # la primera pasada debe capturar primero el mayor SWA país: una entrega a
+    # una tienda-SKU en quiebre captura todo su valor, no sólo una fracción.
+    # Sin riesgo de corte preservamos exactamente la jerarquía operativa
+    # histórica (bucket, prioridad de tienda, DOI y DOH).
+    existing_tasks = int(initial_result.tasks_used) if initial_result else 0
+    potential_task_cases = {
+        (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"])
+        for row in prepared
+        if int(row.get("CANTIDAD_OBJETIVO", 0) or 0) > 0
+    }
+    prioritize_swa_for_task_cut = (
+        existing_tasks + len(potential_task_cases) > config.max_tasks
+    )
+    task_swa_warning = (
+        "Límite de tareas potencialmente restrictivo: la asignación base "
+        "se ordenó por SWA potencial descendente antes de aplicar el corte."
+    )
+    if prioritize_swa_for_task_cut and task_swa_warning not in catalogs.warnings:
+        catalogs.warnings.append(task_swa_warning)
+
+    def task_cut_swa(row: dict[str, Any]) -> float:
+        if not prioritize_swa_for_task_cut:
+            return 0.0
+        key = (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"])
+        # Debe usar el stock real de DATA_TRANSFERS, igual que el reporte SWA,
+        # no el inventario reportado por Fountain9.
+        if catalogs.stock_base.get(key, 0.0) > 0:
+            return 0.0
+        return float(catalogs.swa_potential_gain.get(key, 0.0) or 0.0)
+
     prepared.sort(
         key=lambda row: (
+            -task_cut_swa(row),
             row["RANGO_PRIORIDAD_PRODUCTO"],
             row["PRIORIDAD_TIENDA"],
             float(row.get("DOI", float("inf"))),
