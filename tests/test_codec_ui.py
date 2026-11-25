@@ -18,7 +18,12 @@ def test_requested_defaults():
     assert k["block_fruver_811"] is True
     assert k["block_off_schedule_shipments"] is True
     assert k["venom_lead_time_days"] == 2.0
-    assert k["special_doh_targets"] == {}              # buckets del Refuerzo apagados
+    assert k["special_doh_targets"] == {
+        "INFALTABLE": 3.0,
+        "GOLDEN": 3.0,
+        "ANCHOR": 3.0,
+        "KVI": 3.0,
+    }
     assert k["avl_doh"] == 3.0
 
 
@@ -63,6 +68,22 @@ def test_naked_controls_reach_the_engine():
     })
     assert k["hardcode_inventory_below_demand"] is False and k["net_transfer_max"] == 5.0
     assert k["raise_small_roq_to_minimum"] is False and k["use_extra_mov_columns"] is False
+
+
+def test_811_and_834_activate_cross_docking_parameters():
+    k = kwargs_for(
+        {"Orígenes (en orden de prioridad)": [811, 834]},
+        force_toggles=True,
+    )
+    assert k["minimum_positive_quantity"] == 1
+    assert (k["net_transfer_max"], k["destination_stock_below"]) == (1.0, 2.0)
+    assert k["avl_doh"] == 1.5
+    assert k["special_doh_targets"] == {
+        "INFALTABLE": 1.5,
+        "GOLDEN": 1.5,
+        "ANCHOR": 1.5,
+        "KVI": 1.5,
+    }
 
 
 def test_hardcode_rules_hidden_when_master_toggle_is_off():

@@ -110,6 +110,28 @@ ORIGIN_WAREHOUSES = {
     856: "CEDIS - LOCAL MTY",
     49: "NODO ALTAVISTA",
 }
+XDOCK_PROFILE_ORIGINS: frozenset[int] = frozenset({811, 834})
+
+
+def codec_origin_parameter_defaults(
+    origins: Iterable[int], *, is_raiden: bool = False
+) -> dict[str, float | int | bool]:
+    """Defaults operativos que dependen de la combinación de orígenes.
+
+    La dupla 811 + 834 opera como cross-docking: necesita pedidos más finos y
+    menor cobertura objetivo que la planeación local de Citypark.
+    """
+    selected = {int(origin) for origin in origins}
+    xdock_profile = XDOCK_PROFILE_ORIGINS.issubset(selected)
+    return {
+        "xdock_profile": xdock_profile,
+        "minimum_positive_quantity": 1 if xdock_profile else (3 if is_raiden else 4),
+        "net_transfer_max": 1.0 if xdock_profile else 3.0,
+        "destination_stock_below": 2.0 if xdock_profile else 3.0,
+        "doh_target": 1.5 if xdock_profile else 3.0,
+    }
+
+
 def effective_origin_order(
     origins: Iterable[int],
     prioritize_chedraui_origins: bool = False,
@@ -11816,7 +11838,7 @@ def render() -> None:
     database_health = database_state["health"]
     city_labels = database_state["city_labels"]
     store_labels = database_state["store_labels"]
-    chedraui_origins = database_state["chedraui_origins"]
+    chedraui_origins = database_state.get("chedraui_origins", ())
     database_error = database_state["error"]
 
     if database_health is not None:
@@ -11994,6 +12016,40 @@ def render() -> None:
                     "Orden efectivo de la corrida: "
                     + " → ".join(map(str, planning_origins))
                 )
+            origin_defaults = codec_origin_parameter_defaults(
+                selected_origins, is_raiden=is_raiden
+            )
+            origin_profile = (
+                "XDOCK_811_834" if origin_defaults["xdock_profile"] else "STANDARD"
+            )
+            # Se actualizan una sola vez al entrar o salir del perfil, para
+            # que CODEC adapte la corrida sin sobrescribir ajustes manuales
+            # posteriores del usuario dentro de la misma combinación.
+            if st.session_state.get("mb_origin_parameter_profile") != origin_profile:
+                st.session_state.update(
+                    {
+                        "mb_minimum_positive_quantity": origin_defaults[
+                            "minimum_positive_quantity"
+                        ],
+                        "mb_net_transfer_max": origin_defaults["net_transfer_max"],
+                        "mb_destination_stock_below": origin_defaults[
+                            "destination_stock_below"
+                        ],
+                        "mb_avl_doh": origin_defaults["doh_target"],
+                        **{
+                            f"mb_special_{bucket.lower()}_doh": origin_defaults[
+                                "doh_target"
+                            ]
+                            for bucket in ("INFALTABLE", "GOLDEN", "ANCHOR", "KVI")
+                        },
+                        "mb_origin_parameter_profile": origin_profile,
+                    }
+                )
+            if origin_defaults["xdock_profile"]:
+                st.caption(
+                    "Perfil cross-docking 811 + 834: mínimo 1, net transfer 1, "
+                    "stock destino < 2 y DOH objetivo 1.5."
+                )
         with right:
             max_tasks = st.number_input(
                 "Máximo de tareas",
@@ -12029,8 +12085,9 @@ def render() -> None:
         minimum_positive_quantity = st.number_input(
             "Mínimo de unidades a enviar (cuando sí se manda algo)",
             min_value=1,
-            value=3 if is_raiden else 4,
+            value=int(origin_defaults["minimum_positive_quantity"]),
             step=1,
+            key="mb_minimum_positive_quantity",
             help=(
                 "Piso general de unidades cuando el modelo decide enviar "
                 "algo: MOV_MINIMO_3, los hardcodes de Otacon (Cubrir a "
@@ -12238,8 +12295,8 @@ def render() -> None:
             hardcode_zero_total = True
             hardcode_inventory_below_demand = True
             hardcode_low_net_transfer = True
-            net_transfer_max = 3.0
-            destination_stock_below = 3.0
+            net_transfer_max = float(origin_defaults["net_transfer_max"])
+            destination_stock_below = float(origin_defaults["destination_stock_below"])
             raise_small_roq_to_minimum = True
             use_extra_mov_columns = True
             naked_left, naked_right = st.columns(2)
@@ -12311,8 +12368,9 @@ def render() -> None:
                                 "Net transfer máximo (unidades)",
                                 min_value=0.0,
                                 max_value=50.0,
-                                value=3.0,
+                                value=float(origin_defaults["net_transfer_max"]),
                                 step=1.0,
+                                key="mb_net_transfer_max",
                                 help="La regla aplica con net transfer menor o igual a este valor.",
                             )
                         )
@@ -12322,8 +12380,9 @@ def render() -> None:
                                 "Stock destino menor a (unidades)",
                                 min_value=0.0,
                                 max_value=50.0,
-                                value=3.0,
+                                value=float(origin_defaults["destination_stock_below"]),
                                 step=1.0,
+                                key="mb_destination_stock_below",
                                 help="La regla aplica con stock en destino estrictamente menor a este valor.",
                             )
                         )
@@ -12332,8 +12391,8 @@ def render() -> None:
         include_preventive_fill = False
         include_special_doh_fill = False
         include_no_fountain9_coverage = False
-        avl_doh = 3.0
-        special_doh_target = 3.0
+        avl_doh = float(origin_defaults["doh_target"])
+        special_doh_target = float(origin_defaults["doh_target"])
         special_doh_targets: dict[str, float] = {}
         solidus_swa_priority = True
     with st.container(border=True, key="engine_solidus_module"):
@@ -12415,8 +12474,9 @@ def render() -> None:
                 "DOH objetivo (AVL y preventivo)",
                 min_value=0.5,
                 max_value=30.0,
-                value=3.0,
+                value=float(origin_defaults["doh_target"]),
                 step=0.5,
+                key="mb_avl_doh",
                 disabled=not (include_avl_fill or include_preventive_fill),
                 help=(
                     "Aplica a cobertura AVL y prevención. Se envían al menos 3 "
@@ -12448,7 +12508,7 @@ def render() -> None:
                         f"DOH objetivo ({plural})",
                         min_value=0.5,
                         max_value=90.0,
-                        value=3.0,
+                        value=float(origin_defaults["doh_target"]),
                         step=0.5,
                         key=f"mb_special_{bucket.lower()}_doh",
                         disabled=not bucket_on,
