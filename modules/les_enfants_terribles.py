@@ -11883,8 +11883,12 @@ def render() -> None:
             """
             - `Bodega`: warehouse al que pertenece el inventario.
             - `EAN`: identificador interno del producto (`PRODUCT_ID`).
-            - `Ubicacion`: ubicación física utilizada para determinar si el saldo es usable.
+            - `Ubicacion`: ubicación física. Define si el saldo es usable en 444,
+              831 y cualquier bodega distinta de 856.
             - `Saldo`: unidades disponibles en esa ubicación.
+            - `ZonaPiso`: obligatoria **sólo si el archivo contiene Bodega 856**.
+              En 856 esta columna sustituye a `Ubicacion` para decidir usabilidad y
+              ambiente.
 
             Cada saldo no usable se descuenta únicamente de la combinación
             **Bodega + EAN** correspondiente. Por ejemplo, una fila con Bodega 856
@@ -11893,12 +11897,24 @@ def render() -> None:
             `DATA_TRANSFERS` ya no participa en el cálculo. Si no cargas ningún
             archivo, no se aplicará ningún descuento por ubicaciones no pickeables.
 
-            **Reglas especiales para Bodega 856 usando `ZonaPiso`:**
+            **Qué columna manda para decidir el inventario usable:**
 
-            - `E`: inventario usable y `STORAGE_TYPE = Room Temperature`.
+            - **Bodegas distintas de 856:** manda `Ubicacion`. Es usable si empieza
+              con `Z`, si empieza con `RECIBO_` o si tiene al menos 8 caracteres;
+              `CANCELADOS` se descuenta.
+            - **Bodega 856:** manda exclusivamente `ZonaPiso`; el valor de
+              `Ubicacion` no determina si el saldo se puede planear.
+            - **Cualquier bodega:** `ZonaPiso = LOST` siempre se descuenta.
+
+            **Reglas de Bodega 856 usando `ZonaPiso`:**
+
+            - `D` (actual) y `E` (histórico): inventario usable y
+              `STORAGE_TYPE = Room Temperature`.
             - `RCC`: inventario usable y `STORAGE_TYPE = Freezer`.
             - `RR`: inventario usable y `STORAGE_TYPE = Refrigerated`.
-            - `BIN`, `DIF` y `RC`: inventario no usable; su saldo se descuenta.
+            - Cualquier otro valor —incluidos `BIN`, `DIF`, `RC`, vacío o una zona
+              desconocida— es inventario no usable y su saldo se descuenta como
+              `ZONA_856`.
             - `MRM`: se ignora porque ya está descontado en el stock de la base.
 
             El override derivado de COPÉRNICO 856 se aplica automáticamente y
