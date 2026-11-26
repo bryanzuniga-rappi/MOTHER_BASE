@@ -12123,7 +12123,9 @@ def render() -> None:
                 value=True,
                 help=(
                     "Si se apaga, el bloqueo CDMX→GDL/MTY de la hoja "
-                    "BLOQUEOS_FORANEAS deja de aplicarse."
+                    "BLOQUEOS_FORANEAS deja de aplicarse. No afecta las "
+                    "restricciones duras de CEDIS locales: 425 sólo atiende "
+                    "Guadalajara y 856 sólo Monterrey/Saltillo."
                 ),
             )
         with rules_col4:

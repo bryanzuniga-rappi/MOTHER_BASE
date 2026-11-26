@@ -70,6 +70,23 @@ def test_is_schedule_blocked_off_by_default():
     assert engine.is_schedule_blocked(catalogs, 444, 100) is False
 
 
+def test_local_cedis_are_hard_limited_to_their_operational_city():
+    """425/856 never become national origins, even with regional toggle off."""
+    stores = {
+        425: {"city": "Guadalajara", "city_norm": engine.GDL, "warehouse_name": "425"},
+        856: {"city": "Monterrey", "city_norm": engine.MTY, "warehouse_name": "856"},
+        100: {"city": "CDMX", "city_norm": engine.CDMX, "warehouse_name": "CDMX store"},
+        101: {"city": "Guadalajara", "city_norm": engine.GDL, "warehouse_name": "GDL store"},
+        102: {"city": "Saltillo", "city_norm": engine.MTY, "warehouse_name": "Saltillo store"},
+    }
+    catalogs = make_catalogs(stores=stores, regional_block_enabled=False)
+
+    assert engine.is_regional_block(catalogs, 425, 100, 10, engine.CDMX, False)
+    assert not engine.is_regional_block(catalogs, 425, 101, 10, engine.GDL, False)
+    assert engine.is_regional_block(catalogs, 856, 101, 10, engine.GDL, False)
+    assert not engine.is_regional_block(catalogs, 856, 102, 10, engine.normalize_city("Saltillo"), False)
+
+
 def test_is_schedule_blocked_blocks_off_day():
     catalogs = make_catalogs(
         schedule_block_enabled=True,

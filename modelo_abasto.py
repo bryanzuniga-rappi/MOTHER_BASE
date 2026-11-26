@@ -96,6 +96,15 @@ GDL = "GDL"
 MTY = "MTY"
 FOREIGN_DESTINATION_CITIES = {GDL, MTY}
 
+# CEDIS locales: son nodos operativos de última milla y nunca pueden surtir
+# otra plaza.  Esta restricción es deliberadamente independiente de SCHEDULE
+# y de los toggles de CODEC: un calendario incompleto no debe abrir envíos
+# nacionales desde estos orígenes.
+LOCAL_CEDIS_ALLOWED_CITIES: dict[int, frozenset[str]] = {
+    425: frozenset({GDL}),
+    856: frozenset({MTY}),  # Saltillo se normaliza operativamente como MTY.
+}
+
 # ---- SCHEDULE: frecuencia de envío por destino-origen ----------------
 
 # date.weekday(): 0 = lunes ... 6 = domingo.
@@ -143,7 +152,7 @@ def normalize_city(value: Any) -> str:
         return CDMX
     if "GUADALAJARA" in folded or folded == "GDL":
         return GDL
-    if "MONTERREY" in folded or folded == "MTY":
+    if "MONTERREY" in folded or "SALTILLO" in folded or folded == "MTY":
         return MTY
     return folded
 
@@ -1763,9 +1772,17 @@ def is_regional_block(
     destination_city_norm: str,
     is_golden_infaltable: bool,
 ) -> bool:
-    """Aplica únicamente los bloqueos explícitos de la hoja BLOQUEOS."""
+    """Devuelve si una ruta queda bloqueada por una restricción territorial.
+
+    Los CEDIS locales se validan primero y siempre.  El bloqueo configurable
+    de ``BLOQUEOS_FORANEAS`` sólo controla las restricciones de SKU desde
+    CDMX, nunca la plaza que puede atender un CEDIS local.
+    """
     if source == destination:
         return True
+    allowed_cities = LOCAL_CEDIS_ALLOWED_CITIES.get(source)
+    if allowed_cities is not None:
+        return destination_city_norm not in allowed_cities
     if not catalogs.regional_block_enabled:
         return False
     source_city_norm = catalogs.stores[source]["city_norm"]
