@@ -12320,7 +12320,7 @@ def render() -> None:
             naked_left, naked_right = st.columns(2)
             with naked_left:
                 raise_small_roq_to_minimum = st.toggle(
-                    "Subir recomendaciones pequeñas al mínimo",
+                    "Elevar recomendaciones al mínimo de envío",
                     value=True,
                     help=(
                         "Una recomendación positiva de Fountain9 menor al mínimo "
@@ -12330,7 +12330,7 @@ def render() -> None:
                 )
             with naked_right:
                 use_extra_mov_columns = st.toggle(
-                    "Usar columnas adicionales de MOV",
+                    "Considerar columnas adicionales de MOV",
                     value=True,
                     help=(
                         "El MOV efectivo es el máximo entre la columna MOV y las "
@@ -12339,7 +12339,7 @@ def render() -> None:
                     ),
                 )
             cover_fountain9_hardcodes = st.toggle(
-                "Cubrir a Fountain9",
+                "Generar cobertura sin recomendación de Fountain9",
                 value=True,
                 help=(
                     "Cuando Fountain9 no dio un ROQ positivo (MOV ≤ 0), el "
@@ -12353,7 +12353,7 @@ def render() -> None:
                 rule_left, rule_center, rule_right = st.columns(3)
                 with rule_left:
                     hardcode_zero_total = st.toggle(
-                        "Cubrir forecast y stock en cero",
+                        "Cubrir con demanda e inventario inicial en cero",
                         value=True,
                         help=(
                             "Regla HARDCODE_4_CERO_TOTAL: demanda y opening "
@@ -12362,7 +12362,7 @@ def render() -> None:
                     )
                 with rule_center:
                     hardcode_inventory_below_demand = st.toggle(
-                        "Cubrir inventario menor a la demanda",
+                        "Cubrir cuando el inventario sea menor que la demanda",
                         value=True,
                         help=(
                             "Regla HARDCODE_3_INVENTARIO_MENOR_DEMANDA: ROQ no "
@@ -12371,7 +12371,7 @@ def render() -> None:
                     )
                 with rule_right:
                     hardcode_low_net_transfer = st.toggle(
-                        "Cubrir net transfer bajo",
+                        "Cubrir ante bajo net transfer e inventario limitado",
                         value=True,
                         help=(
                             "Regla HARDCODE_3_NET_TRANSFER_BAJO: ROQ no positivo, "
@@ -12383,25 +12383,25 @@ def render() -> None:
                     with net_left:
                         net_transfer_max = float(
                             st.number_input(
-                                "Net transfer máximo (unidades)",
+                                "Umbral máximo de net transfer (unidades)",
                                 min_value=0.0,
                                 max_value=50.0,
                                 value=float(origin_defaults["net_transfer_max"]),
                                 step=1.0,
                                 key="mb_net_transfer_max",
-                                help="La regla aplica con net transfer menor o igual a este valor.",
+                                help="La regla aplica cuando el net transfer es menor o igual a este umbral.",
                             )
                         )
                     with net_right:
                         destination_stock_below = float(
                             st.number_input(
-                                "Stock destino menor a (unidades)",
+                                "Umbral de inventario en destino (unidades)",
                                 min_value=0.0,
                                 max_value=50.0,
                                 value=float(origin_defaults["destination_stock_below"]),
                                 step=1.0,
                                 key="mb_destination_stock_below",
-                                help="La regla aplica con stock en destino estrictamente menor a este valor.",
+                                help="La regla aplica cuando el inventario en destino es estrictamente menor a este umbral.",
                             )
                         )
     
