@@ -539,6 +539,9 @@ def load_copernico_unusable_csv(
                             "856 pero no incluye la columna ZonaPiso"
                         )
                     storage_by_zone = {
+                        # 856 migró ambiente de E a D. Se conserva E para
+                        # archivos históricos durante la transición.
+                        "D": "Room Temperature",
                         "E": "Room Temperature",
                         "RCC": "Freezer",
                         "RR": "Refrigerated",

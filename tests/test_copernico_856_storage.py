@@ -93,6 +93,19 @@ def test_zone_decides_the_storage_of_the_856(tmp_path):
     assert (856, 7004) not in overrides                      # BIN: no usable, sin override
 
 
+def test_new_d_zone_is_usable_ambient_and_overrides_storage(tmp_path):
+    """856 cambió ambiente de E a D; no debe caer como ZONA_856."""
+    unusable, overrides, summary = load(
+        write_copernico(
+            tmp_path,
+            [["856", 99001, "ref", "Producto ambiente", "D01", 17, "Aprobado", "30", "D"]],
+        )
+    )
+    assert (856, 99001) not in unusable
+    assert overrides[(856, 99001)] == "Room Temperature"
+    assert summary["warehouse_856_unknown_zones"] == {}
+
+
 def test_the_7235_case_is_read_in_full(tmp_path):
     """Regresión del 7235: con el lector viejo se leían 21 de 62 filas."""
     rows = real_pattern_rows()
